@@ -3,7 +3,7 @@ requires = ["setuptools>=69", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "pyiceberg-firestore-gcs"
+name = "pyiceberg_firestore_gcs"
 version = "0.1.0"
 description = "A GCP opinionated pyiceberg catalog."
 readme = "README.md"
@@ -16,10 +16,10 @@ dependencies = [
 ]
 
 [tool.setuptools.package-dir]
-"" = "src"
+"" = "."
 
 [tool.setuptools.packages.find]
-where = ["src"]
+where = ["."]
 
 [tool.isort]
 profile = "black"
