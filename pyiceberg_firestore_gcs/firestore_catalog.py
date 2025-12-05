@@ -498,3 +498,6 @@ class FirestoreCatalog(MetastoreCatalog):
 
     def view_exists(self, identifier: Union[str, Identifier]) -> bool:
         return False
+
+    def drop_view(self, identifier: Union[str, Identifier]) -> None:
+        raise NoSuchTableError(f"View not found: {identifier}")
