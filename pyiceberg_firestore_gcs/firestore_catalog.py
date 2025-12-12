@@ -238,6 +238,7 @@ class FirestoreCatalog(MetastoreCatalog):
         self._validate_metadata_location(metadata_location)
 
         payload: Dict[str, Any] = {
+            "workspace": self.catalog_name,
             "name": table_name,
             "namespace": namespace,
             "metadata_location": metadata_location,
@@ -331,11 +332,7 @@ class FirestoreCatalog(MetastoreCatalog):
         src_ref.delete()
 
         logger.debug(
-            "Renamed table %s.%s to %s.%s",
-            from_namespace,
-            from_table,
-            to_namespace,
-            to_table,
+            f"Renamed table {from_namespace}.{from_table} to {to_namespace}.{to_table}",
         )
 
         # Return the updated table
@@ -395,6 +392,7 @@ class FirestoreCatalog(MetastoreCatalog):
         payload: Dict[str, Any] = {
             "name": table_name,
             "namespace": namespace,
+            "workspace": self.catalog_name,
             "metadata_location": metadata_location,
             "created_at": firestore.SERVER_TIMESTAMP,
             "updated_at": firestore.SERVER_TIMESTAMP,
