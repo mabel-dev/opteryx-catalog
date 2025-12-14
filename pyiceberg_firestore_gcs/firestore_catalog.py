@@ -2,10 +2,6 @@
 
 from __future__ import annotations
 
-import os
-import time
-import uuid
-from functools import lru_cache
 from typing import Any
 from typing import Dict
 from typing import List
@@ -15,12 +11,10 @@ from typing import Union
 
 import orjson
 from google.cloud import firestore
-from google.cloud import storage
 from orso.logging import get_logger
 from pyiceberg.catalog import Identifier
 from pyiceberg.catalog import MetastoreCatalog
 from pyiceberg.catalog import PropertiesUpdateSummary
-from pyiceberg.exceptions import CommitFailedException
 from pyiceberg.exceptions import NamespaceAlreadyExistsError
 from pyiceberg.exceptions import NamespaceNotEmptyError
 from pyiceberg.exceptions import NoSuchNamespaceError
@@ -43,16 +37,6 @@ from pyiceberg.table.update import TableUpdate
 from pyiceberg.typedef import EMPTY_DICT
 from pyiceberg.typedef import Properties
 
-
-def _prefix():
-    return f"{time.time_ns():x}-{_get_node()}"
-
-
-@lru_cache(1)
-def _get_node():
-    return f"{uuid.getnode():x}-{os.getpid():x}"
-
-
 logger = get_logger()
 
 
@@ -62,20 +46,6 @@ def _get_firestore_client(
     if project:
         return firestore.Client(project=project, database=database)
     return firestore.Client(database=database)
-
-
-def _get_storage_client() -> storage.Client:
-    return storage.Client()
-
-
-def _parse_gcs_uri(uri: str) -> Tuple[str, str]:
-    if not uri.startswith("gs://"):
-        raise ValueError("metadata_location must be a GCS URI starting with gs://")
-    path = uri[5:]
-    if "/" not in path:
-        raise ValueError("metadata_location must include a path after the bucket")
-    bucket, blob = path.split("/", 1)
-    return bucket, blob
 
 
 class FirestoreCatalog(MetastoreCatalog):
@@ -95,8 +65,8 @@ class FirestoreCatalog(MetastoreCatalog):
         super().__init__(catalog_name, **properties)
 
         self.catalog_name = catalog_name
+        self.bucket_name = gcs_bucket
         self.firestore_client = _get_firestore_client(firestore_project, firestore_database)
-        self.storage_client = _get_storage_client()
         self._catalog_ref = self.firestore_client.collection(catalog_name)
         self._properties = properties
 
@@ -124,11 +94,55 @@ class FirestoreCatalog(MetastoreCatalog):
     def _table_doc_ref(self, namespace: str, table_name: str) -> firestore.DocumentReference:
         return self._tables_collection(namespace).document(table_name)
 
-    def _validate_metadata_location(self, metadata_location: str) -> None:
-        bucket, blob = _parse_gcs_uri(metadata_location)
-        bucket_obj = self.storage_client.bucket(bucket)
-        if not bucket_obj.blob(blob).exists():
-            raise ValueError(f"metadata path {metadata_location} cannot be found in GCS")
+    def _metadata_doc_ref(self, namespace: str, table_name: str) -> firestore.DocumentReference:
+        """Get the Firestore document reference for table metadata.
+
+        Path: /<catalog>/$properties/metadata/<catalog>.<namespace>.<dataset>
+        """
+        metadata_key = f"{self.catalog_name}.{namespace}.{table_name}"
+        return (
+            self.firestore_client.collection(self.catalog_name)
+            .document("$properties")
+            .collection("metadata")
+            .document(metadata_key)
+        )
+
+    def _load_metadata_from_firestore(
+        self, namespace: str, table_name: str
+    ) -> Optional[TableMetadataV2]:
+        """Load metadata from Firestore if available."""
+        try:
+            metadata_doc = self._metadata_doc_ref(namespace, table_name).get()
+            if metadata_doc.exists:
+                data = metadata_doc.to_dict() or {}
+                # Extract the metadata fields (everything except our tracking fields)
+                metadata_fields = {
+                    k: v for k, v in data.items() if k not in ("metadata_location", "updated_at")
+                }
+                if metadata_fields:
+                    logger.debug(f"Loaded metadata for {namespace}.{table_name} from Firestore")
+                    return TableMetadataV2(**metadata_fields)
+        except Exception as e:
+            logger.warning(f"Failed to load metadata from Firestore: {e}")
+        return None
+
+    def _save_metadata_to_firestore(
+        self, namespace: str, table_name: str, metadata: TableMetadataV2
+    ) -> None:
+        """Save metadata to Firestore."""
+        try:
+            metadata_dict = orjson.loads(metadata.model_dump_json(exclude_none=True))
+            metadata_doc_ref = self._metadata_doc_ref(namespace, table_name)
+            # Store metadata as a proper JSON document with tracking fields
+            metadata_doc_ref.set(
+                {
+                    **metadata_dict,
+                    "updated_at": firestore.SERVER_TIMESTAMP,
+                }
+            )
+            logger.debug(f"Saved metadata for {namespace}.{table_name} to Firestore")
+        except Exception as e:
+            logger.warning(f"Failed to save metadata to Firestore: {e}")
 
     def create_namespace(
         self,
@@ -235,23 +249,17 @@ class FirestoreCatalog(MetastoreCatalog):
         if doc_ref.get().exists:
             raise TableAlreadyExistsError(f"{namespace}.{table_name}")
 
-        self._validate_metadata_location(metadata_location)
-
         payload: Dict[str, Any] = {
             "workspace": self.catalog_name,
             "name": table_name,
             "namespace": namespace,
-            "metadata_location": metadata_location,
             "created_at": firestore.SERVER_TIMESTAMP,
             "updated_at": firestore.SERVER_TIMESTAMP,
         }
 
         doc_ref.set(payload)
         logger.debug(
-            "Registered table %s.%s in catalog %s",
-            namespace,
-            table_name,
-            self.catalog_name,
+            f"Registered table {namespace}.{table_name} in catalog {self.catalog_name}",
         )
 
         # Return a Table object
@@ -271,24 +279,17 @@ class FirestoreCatalog(MetastoreCatalog):
         if not doc.exists:
             raise NoSuchTableError(identifier)
 
-        data = doc.to_dict() or {}
-        metadata_location = data.get("metadata_location")
-        if not metadata_location:
-            raise NoSuchTableError(identifier)
+        # metadata is stored in firestore
+        metadata = self._load_metadata_from_firestore(namespace, table_name)
+        if not metadata:
+            raise NoSuchTableError(f"{self.catalog_name}.{namespace}.{table_name}")
 
-        # Load metadata directly from GCS
-        bucket_name, blob_path = _parse_gcs_uri(metadata_location)
-        bucket = self.storage_client.bucket(bucket_name)
-        blob = bucket.blob(blob_path)
-        metadata_bytes = blob.download_as_bytes()
-        metadata = TableMetadataV2(**orjson.loads(metadata_bytes))
-
-        io = self._load_file_io({"type": "gcs", "bucket": bucket_name})
+        io = self._load_file_io({"type": "gcs", "bucket": self.bucket_name})
 
         return StaticTable(
             identifier=(namespace, table_name),
             metadata=metadata,
-            metadata_location=metadata_location,
+            metadata_location=None,
             io=io,
             catalog=self,
         )
@@ -299,7 +300,7 @@ class FirestoreCatalog(MetastoreCatalog):
         if not doc_ref.get().exists:
             raise NoSuchTableError(f"{namespace}.{table_name}")
         doc_ref.delete()
-        logger.debug("Dropped table %s.%s", namespace, table_name)
+        logger.debug(f"Dropped table {namespace}.{table_name}")
 
     def purge_table(self, identifier: Union[str, Identifier]) -> None:
         # For purge_table, you might want to also delete the metadata files from GCS
@@ -372,28 +373,23 @@ class FirestoreCatalog(MetastoreCatalog):
             # Use a default location based on catalog properties or identifier
             location = f"gs://{self._properties.get('gcs_bucket')}/{self.catalog_name}/{namespace}/{table_name}"
 
-        metadata_location = f"{location}/metadata/{_prefix()}.json"
-
         # Create new table metadata
         metadata = new_table_metadata(
-            location=location,
             schema=schema,
             partition_spec=partition_spec,
             sort_order=sort_order,
+            location=location,
             properties=properties,
         )
 
-        # Write metadata to GCS
-        output_file = io.new_output(metadata_location)
-        with output_file.create() as f:
-            f.write(metadata.model_dump_json(exclude_none=True).encode("utf-8"))
+        # Save metadata to Firestore
+        self._save_metadata_to_firestore(namespace, table_name, metadata)
 
         # Register the table in Firestore
         payload: Dict[str, Any] = {
             "name": table_name,
             "namespace": namespace,
             "workspace": self.catalog_name,
-            "metadata_location": metadata_location,
             "created_at": firestore.SERVER_TIMESTAMP,
             "updated_at": firestore.SERVER_TIMESTAMP,
         }
@@ -404,7 +400,7 @@ class FirestoreCatalog(MetastoreCatalog):
         return StaticTable(
             identifier=(namespace, table_name),
             metadata=metadata,
-            metadata_location=metadata_location,
+            metadata_location=None,
             io=io,
             catalog=self,
         )
@@ -435,10 +431,6 @@ class FirestoreCatalog(MetastoreCatalog):
         # Get the identifier
         namespace, table_name = table.name()
 
-        # Get the new metadata location from the table
-        if not hasattr(table, "metadata_location") or not table.metadata_location:
-            raise CommitFailedException("Table has no metadata_location")
-
         current_table: Table | None
         try:
             current_table = self.load_table((namespace, table_name))
@@ -449,24 +441,13 @@ class FirestoreCatalog(MetastoreCatalog):
             current_table, (namespace, table_name), requirements, updates
         )
 
-        previous_metadata_location = table.metadata_location
-        new_metadata_location = updated_staged_table.metadata_location
-
-        # Write new metadata to GCS
-        bucket_name, blob_path = _parse_gcs_uri(new_metadata_location)
-        bucket = self.storage_client.bucket(bucket_name)
-        blob = bucket.blob(blob_path)
-        metadata_bytes = updated_staged_table.metadata.model_dump_json(exclude_none=True).encode(
-            "utf-8"
-        )
-        blob.upload_from_string(metadata_bytes)
+        # Save metadata to Firestore
+        self._save_metadata_to_firestore(namespace, table_name, updated_staged_table.metadata)
 
         # Update Firestore
         table_ref = self._table_doc_ref(namespace, table_name)
         table_ref.set(
             {
-                "metadata_location": new_metadata_location,
-                "previous_metadata_location": previous_metadata_location,
                 "updated_at": firestore.SERVER_TIMESTAMP,
             },
             merge=True,
