@@ -144,6 +144,10 @@ class FirestoreCatalog(MetastoreCatalog):
         except Exception as e:
             logger.warning(f"Failed to save metadata to Firestore: {e}")
 
+    @staticmethod
+    def _parse_metadata_version(metadata_location: str) -> int:
+        return 0
+
     def create_namespace(
         self,
         namespace: Union[str, Identifier],
