@@ -12,8 +12,6 @@ from typing import Union
 import orjson
 from google.cloud import firestore
 from orso.logging import get_logger
-from .parquet_manifest import OptimizedStaticTable
-from .parquet_manifest import write_parquet_manifest
 from pyiceberg.catalog import Identifier
 from pyiceberg.catalog import MetastoreCatalog
 from pyiceberg.catalog import PropertiesUpdateSummary
@@ -38,6 +36,9 @@ from pyiceberg.table.update import TableRequirement
 from pyiceberg.table.update import TableUpdate
 from pyiceberg.typedef import EMPTY_DICT
 from pyiceberg.typedef import Properties
+
+from .parquet_manifest import OptimizedStaticTable
+from .parquet_manifest import write_parquet_manifest
 
 logger = get_logger()
 
@@ -181,7 +182,7 @@ class FirestoreCatalog(MetastoreCatalog):
         if any(True for _ in self._tables_collection(namespace_str).stream()):
             raise NamespaceNotEmptyError(namespace_str)
         namespace_ref.delete()
-        logger.debug("Dropped namespace %s from catalog %s", namespace_str, self.catalog_name)
+        logger.debug(f"Dropped namespace {namespace_str} from catalog {self.catalog_name}")
 
     def list_namespaces(self, namespace: Union[str, Identifier] = ()) -> List[Identifier]:
         tuple_identifier = self.identifier_to_tuple(namespace)
@@ -464,11 +465,7 @@ class FirestoreCatalog(MetastoreCatalog):
 
         if parquet_path:
             logger.info(
-                "Wrote Parquet manifest for %s.%s.%s at %s",
-                self.catalog_name,
-                namespace,
-                table_name,
-                parquet_path,
+                f"Wrote Parquet manifest for {self.catalog_name}.{namespace}.{table_name} at {parquet_path}"
             )
 
         # Update Firestore
@@ -480,7 +477,7 @@ class FirestoreCatalog(MetastoreCatalog):
             merge=True,
             timeout=5,
         )
-        logger.info("Committed table %s.%s.%s", self.catalog_name, namespace, table_name)
+        logger.info(f"Committed table {self.catalog_name}.{namespace}.{table_name}")
 
         return CommitTableResponse(
             metadata=updated_staged_table.metadata,
