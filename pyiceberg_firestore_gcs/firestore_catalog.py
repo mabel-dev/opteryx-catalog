@@ -37,6 +37,9 @@ from pyiceberg.table.update import TableUpdate
 from pyiceberg.typedef import EMPTY_DICT
 from pyiceberg.typedef import Properties
 
+from parquet_manifest import OptimizedStaticTable
+from parquet_manifest import write_parquet_manifest
+
 logger = get_logger()
 
 
@@ -290,7 +293,8 @@ class FirestoreCatalog(MetastoreCatalog):
 
         io = self._load_file_io({"type": "gcs", "bucket": self.bucket_name})
 
-        return StaticTable(
+        # Return OptimizedStaticTable for fast query planning with Parquet manifests
+        return OptimizedStaticTable(
             identifier=(namespace, table_name),
             metadata=metadata,
             metadata_location=None,
@@ -448,6 +452,24 @@ class FirestoreCatalog(MetastoreCatalog):
         # Save metadata to Firestore
         self._save_metadata_to_firestore(namespace, table_name, updated_staged_table.metadata)
 
+        # Write Parquet manifest for fast query planning
+        # This is in addition to the standard Avro manifests already written
+        io = self._load_file_io(updated_staged_table.metadata.properties, updated_staged_table.metadata.location)
+        parquet_path = write_parquet_manifest(
+            updated_staged_table.metadata,
+            io,
+            updated_staged_table.metadata.location,
+        )
+        
+        if parquet_path:
+            logger.info(
+                "Wrote Parquet manifest for %s.%s.%s at %s",
+                self.catalog_name,
+                namespace,
+                table_name,
+                parquet_path,
+            )
+
         # Update Firestore
         table_ref = self._table_doc_ref(namespace, table_name)
         table_ref.set(
@@ -457,7 +479,7 @@ class FirestoreCatalog(MetastoreCatalog):
             merge=True,
             timeout=5,
         )
-        logger.info(f"Committed table {self.catalog_name}.{namespace}.{table_name}")
+        logger.info("Committed table %s.%s.%s", self.catalog_name, namespace, table_name)
 
         return CommitTableResponse(
             metadata=updated_staged_table.metadata,
