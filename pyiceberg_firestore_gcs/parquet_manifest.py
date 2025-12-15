@@ -172,13 +172,27 @@ def _value_to_int64(raw_bytes: bytes, field_type: PrimitiveType) -> int:
         # Pad to 8 bytes, keeping first byte 0 for sign
         buf = b'\x00' + raw_bytes[:7]
         buf = buf.ljust(8, b'\x00')
-        return struct.unpack('>q', buf)[0]
+        # Ensure we return a valid signed int64
+        value = struct.unpack('>q', buf)[0]
+        # Clamp to int64 range if needed
+        if value > 9223372036854775807:  # 2^63 - 1
+            value = 9223372036854775807
+        elif value < -9223372036854775808:  # -2^63
+            value = -9223372036854775808
+        return value
     
     # For other types, use a hash of the bytes
     else:
         # Use first 8 bytes as int64
         buf = raw_bytes[:8].ljust(8, b'\x00')
-        return struct.unpack('>q', buf)[0]
+        # Ensure we return a valid signed int64
+        value = struct.unpack('>q', buf)[0]
+        # Clamp to int64 range if needed
+        if value > 9223372036854775807:  # 2^63 - 1
+            value = 9223372036854775807
+        elif value < -9223372036854775808:  # -2^63
+            value = -9223372036854775808
+        return value
 
 
 def entry_to_dict(entry: ManifestEntry, schema: Any) -> Dict[str, Any]:
@@ -246,19 +260,23 @@ def entry_to_dict(entry: ManifestEntry, schema: Any) -> Dict[str, Any]:
         column_sizes_array = [None] * (max_stat_field_id + 1)
         nan_counts_array = [None] * (max_stat_field_id + 1)
         
-        # Fill in the arrays where we have data
+        # Fill in the arrays where we have data, clamping to int64 range
+        # PyArrow requires values to fit in signed int64 (-2^63 to 2^63-1)
+        INT64_MIN = -9223372036854775808
+        INT64_MAX = 9223372036854775807
+        
         if df.null_value_counts:
             for field_id, count in df.null_value_counts.items():
-                null_counts_array[field_id] = count
+                null_counts_array[field_id] = max(INT64_MIN, min(INT64_MAX, count))
         if df.value_counts:
             for field_id, count in df.value_counts.items():
-                value_counts_array[field_id] = count
+                value_counts_array[field_id] = max(INT64_MIN, min(INT64_MAX, count))
         if df.column_sizes:
             for field_id, size in df.column_sizes.items():
-                column_sizes_array[field_id] = size
+                column_sizes_array[field_id] = max(INT64_MIN, min(INT64_MAX, size))
         if df.nan_value_counts:
             for field_id, count in df.nan_value_counts.items():
-                nan_counts_array[field_id] = count
+                nan_counts_array[field_id] = max(INT64_MIN, min(INT64_MAX, count))
 
     # Convert lists to JSON
     split_offsets_json = json.dumps(df.split_offsets) if df.split_offsets else None
@@ -269,17 +287,21 @@ def entry_to_dict(entry: ManifestEntry, schema: Any) -> Dict[str, Any]:
     if df.partition:
         partition_json = json.dumps({k: _serialize_value(v) for k, v in df.partition.items()})
 
+    # Clamp integer values to int64 range for PyArrow compatibility
+    INT64_MIN = -9223372036854775808
+    INT64_MAX = 9223372036854775807
+
     return {
         "file_path": df.file_path,
-        "snapshot_id": entry.snapshot_id,
-        "sequence_number": entry.sequence_number,
-        "file_sequence_number": entry.file_sequence_number,
+        "snapshot_id": max(INT64_MIN, min(INT64_MAX, entry.snapshot_id)),
+        "sequence_number": max(INT64_MIN, min(INT64_MAX, entry.sequence_number)),
+        "file_sequence_number": max(INT64_MIN, min(INT64_MAX, entry.file_sequence_number)),
         "active": entry.status != ManifestEntryStatus.DELETED,
         "partition_spec_id": df.spec_id,
         "partition_json": partition_json,
         "file_format": df.file_format.name if df.file_format else None,
-        "record_count": df.record_count,
-        "file_size_bytes": df.file_size_in_bytes,
+        "record_count": max(INT64_MIN, min(INT64_MAX, df.record_count)),
+        "file_size_bytes": max(INT64_MIN, min(INT64_MAX, df.file_size_in_bytes)),
         "lower_bounds": lower_bounds_array,
         "upper_bounds": upper_bounds_array,
         "null_counts": null_counts_array,
