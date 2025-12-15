@@ -12,8 +12,8 @@ from typing import Union
 import orjson
 from google.cloud import firestore
 from orso.logging import get_logger
-from parquet_manifest import OptimizedStaticTable
-from parquet_manifest import write_parquet_manifest
+from .parquet_manifest import OptimizedStaticTable
+from .parquet_manifest import write_parquet_manifest
 from pyiceberg.catalog import Identifier
 from pyiceberg.catalog import MetastoreCatalog
 from pyiceberg.catalog import PropertiesUpdateSummary
