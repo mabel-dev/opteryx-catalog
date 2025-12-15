@@ -12,6 +12,8 @@ from typing import Union
 import orjson
 from google.cloud import firestore
 from orso.logging import get_logger
+from parquet_manifest import OptimizedStaticTable
+from parquet_manifest import write_parquet_manifest
 from pyiceberg.catalog import Identifier
 from pyiceberg.catalog import MetastoreCatalog
 from pyiceberg.catalog import PropertiesUpdateSummary
@@ -36,9 +38,6 @@ from pyiceberg.table.update import TableRequirement
 from pyiceberg.table.update import TableUpdate
 from pyiceberg.typedef import EMPTY_DICT
 from pyiceberg.typedef import Properties
-
-from parquet_manifest import OptimizedStaticTable
-from parquet_manifest import write_parquet_manifest
 
 logger = get_logger()
 
@@ -454,13 +453,15 @@ class FirestoreCatalog(MetastoreCatalog):
 
         # Write Parquet manifest for fast query planning
         # This is in addition to the standard Avro manifests already written
-        io = self._load_file_io(updated_staged_table.metadata.properties, updated_staged_table.metadata.location)
+        io = self._load_file_io(
+            updated_staged_table.metadata.properties, updated_staged_table.metadata.location
+        )
         parquet_path = write_parquet_manifest(
             updated_staged_table.metadata,
             io,
             updated_staged_table.metadata.location,
         )
-        
+
         if parquet_path:
             logger.info(
                 "Wrote Parquet manifest for %s.%s.%s at %s",
