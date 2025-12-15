@@ -155,17 +155,21 @@ def _value_to_int64(raw_bytes: bytes, field_type: PrimitiveType) -> int:
             return int(struct.unpack('>f', raw_bytes)[0])
         return int(struct.unpack('>d', raw_bytes)[0])
     
-    # Timestamps - microseconds since epoch
+    # Timestamps - convert from microseconds to seconds (rounded)
     elif isinstance(field_type, (TimestampType, TimestamptzType)):
-        return struct.unpack('>q', raw_bytes)[0]
+        micros = struct.unpack('>q', raw_bytes)[0]
+        # Convert microseconds to seconds for comparison
+        return micros // 1000000
     
-    # Date - days since epoch  
+    # Date - already stored as days since epoch (keeps order)
     elif isinstance(field_type, DateType):
         return struct.unpack('>i', raw_bytes)[0]
         
-    # Time - microseconds since midnight
+    # Time - convert from microseconds to seconds since midnight
     elif isinstance(field_type, TimeType):
-        return struct.unpack('>q', raw_bytes)[0]
+        micros = struct.unpack('>q', raw_bytes)[0]
+        # Convert microseconds to seconds for comparison
+        return micros // 1000000
     
     # Strings - use first 7 bytes as int (similar to your approach)
     elif isinstance(field_type, StringType):
@@ -685,6 +689,8 @@ def _can_prune_file_with_predicate(
         return False
 
     try:
+        import struct
+        import datetime
 
         # Convert predicate value to int64
         # For the predicate value, we need to serialize it first then convert
@@ -692,16 +698,28 @@ def _can_prune_file_with_predicate(
         
         # Serialize the predicate value to bytes (using Iceberg's serialization)
         from pyiceberg.types import StringType
+        
         if isinstance(field.field_type, StringType) and isinstance(pred_value, str):
             pred_value_bytes = pred_value.encode('utf-8')
+        elif isinstance(pred_value, datetime.datetime):
+            # Convert datetime to seconds since epoch (rounded)
+            timestamp_seconds = int(round(pred_value.timestamp()))
+            pred_value_bytes = struct.pack('>q', timestamp_seconds)
+        elif isinstance(pred_value, datetime.date) and not isinstance(pred_value, datetime.datetime):
+            # Convert date to days since epoch
+            epoch = datetime.date(1970, 1, 1)
+            days = (pred_value - epoch).days
+            pred_value_bytes = struct.pack('>i', days)
+        elif isinstance(pred_value, datetime.time):
+            # Convert time to seconds since midnight
+            seconds = pred_value.hour * 3600 + pred_value.minute * 60 + pred_value.second
+            pred_value_bytes = struct.pack('>q', seconds)
         elif isinstance(pred_value, int):
-            import struct
             if isinstance(field.field_type, IntegerType):
                 pred_value_bytes = struct.pack('>i', pred_value)
             else:
                 pred_value_bytes = struct.pack('>q', pred_value)
         elif isinstance(pred_value, float):
-            import struct
             if isinstance(field.field_type, FloatType):
                 pred_value_bytes = struct.pack('>f', pred_value)
             else:
