@@ -290,18 +290,24 @@ def entry_to_dict(entry: ManifestEntry, schema: Any) -> Dict[str, Any]:
     # Clamp integer values to int64 range for PyArrow compatibility
     INT64_MIN = -9223372036854775808
     INT64_MAX = 9223372036854775807
+    
+    # Helper function to safely clamp integers (handles None)
+    def clamp_int(value):
+        if value is None:
+            return None
+        return max(INT64_MIN, min(INT64_MAX, value))
 
     return {
         "file_path": df.file_path,
-        "snapshot_id": max(INT64_MIN, min(INT64_MAX, entry.snapshot_id)),
-        "sequence_number": max(INT64_MIN, min(INT64_MAX, entry.sequence_number)),
-        "file_sequence_number": max(INT64_MIN, min(INT64_MAX, entry.file_sequence_number)),
+        "snapshot_id": clamp_int(entry.snapshot_id),
+        "sequence_number": clamp_int(entry.sequence_number),
+        "file_sequence_number": clamp_int(entry.file_sequence_number),
         "active": entry.status != ManifestEntryStatus.DELETED,
-        "partition_spec_id": df.spec_id,
+        "partition_spec_id": clamp_int(df.spec_id),
         "partition_json": partition_json,
         "file_format": df.file_format.name if df.file_format else None,
-        "record_count": max(INT64_MIN, min(INT64_MAX, df.record_count)),
-        "file_size_bytes": max(INT64_MIN, min(INT64_MAX, df.file_size_in_bytes)),
+        "record_count": clamp_int(df.record_count),
+        "file_size_bytes": clamp_int(df.file_size_in_bytes),
         "lower_bounds": lower_bounds_array,
         "upper_bounds": upper_bounds_array,
         "null_counts": null_counts_array,
@@ -311,7 +317,7 @@ def entry_to_dict(entry: ManifestEntry, schema: Any) -> Dict[str, Any]:
         "key_metadata": df.key_metadata,
         "split_offsets_json": split_offsets_json,
         "equality_ids_json": equality_ids_json,
-        "sort_order_id": df.sort_order_id,
+        "sort_order_id": clamp_int(df.sort_order_id),
     }
 
 
@@ -360,6 +366,19 @@ def write_parquet_manifest(
         return None
 
     logger.debug(f"Collected {len(all_entries)} data file entries from {manifest_count} manifests")
+
+    # Debug: Check for overflow values before creating Arrow table
+    INT64_MIN = -9223372036854775808
+    INT64_MAX = 9223372036854775807
+    
+    for i, entry in enumerate(all_entries):
+        for key, value in entry.items():
+            if isinstance(value, int) and (value < INT64_MIN or value > INT64_MAX):
+                logger.error(f"Entry {i}, field '{key}': value {value} overflows int64 range!")
+            elif isinstance(value, list):
+                for j, v in enumerate(value):
+                    if isinstance(v, int) and (v < INT64_MIN or v > INT64_MAX):
+                        logger.error(f"Entry {i}, field '{key}[{j}]': value {v} overflows int64 range!")
 
     # Convert to Arrow table
     schema = get_parquet_manifest_schema()
