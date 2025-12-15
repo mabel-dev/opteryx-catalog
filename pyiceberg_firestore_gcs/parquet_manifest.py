@@ -15,17 +15,24 @@ from typing import Dict
 from typing import Iterable
 from typing import List
 from typing import Optional
+from typing import Tuple
+from typing import Union
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 from orso.logging import get_logger
+from pyiceberg.expressions import BooleanExpression
 from pyiceberg.io import FileIO
+from pyiceberg.manifest import FileFormat
 from pyiceberg.manifest import ManifestEntry
 from pyiceberg.manifest import ManifestEntryStatus
+from pyiceberg.table import ALWAYS_TRUE
 from pyiceberg.table import DataScan
 from pyiceberg.table import FileScanTask
 from pyiceberg.table import StaticTable
 from pyiceberg.table.metadata import TableMetadataV2
+from pyiceberg.typedef import EMPTY_DICT
+from pyiceberg.typedef import Properties
 
 logger = get_logger()
 
@@ -234,7 +241,7 @@ def read_parquet_manifest(
         location: Table location for manifest path
 
     Returns:
-        List of DataFile records, or None if Parquet manifest doesn't exist
+        List of DataFile records as dicts, or None if Parquet manifest doesn't exist
     """
     snapshot = metadata.current_snapshot()
     if not snapshot:
@@ -255,10 +262,6 @@ def read_parquet_manifest(
 
         # Convert PyArrow table to list of dicts
         records = table.to_pylist()
-
-        # Convert back to DataFile records
-        # For now, we'll return the dicts and let PyIceberg handle conversion
-        # In a full implementation, you'd reconstruct DataFile objects here
         return records
 
     except FileNotFoundError:
@@ -269,6 +272,123 @@ def read_parquet_manifest(
             f"Failed to read Parquet manifest from {parquet_path}: {exc}, falling back to Avro"
         )
         return None
+
+
+def _deserialize_value(value: Any, is_base64: bool = False) -> Any:
+    """Deserialize a value from JSON storage, handling base64-encoded bytes."""
+    if is_base64 and isinstance(value, str):
+        return base64.b64decode(value)
+    return value
+
+
+def parquet_record_to_data_file(record: Dict[str, Any]):
+    """Convert a Parquet record back to a DataFile-like object.
+
+    Args:
+        record: Dictionary from Parquet manifest
+
+    Returns:
+        DataFile-compatible dict that can be used with FileScanTask
+    """
+    # Parse JSON fields back to dicts
+    # NOTE: lower_bounds and upper_bounds contain bytes values that were base64-encoded.
+    # We need to decode them back to bytes for PyIceberg to use them correctly.
+    lower_bounds = None
+    if record.get("lower_bounds_json"):
+        lower_bounds = {}
+        for k, v in json.loads(record["lower_bounds_json"]).items():
+            # All bound values are bytes in Iceberg, decode from base64
+            if isinstance(v, str):
+                try:
+                    lower_bounds[int(k)] = base64.b64decode(v)
+                except Exception:
+                    # If it's not valid base64, keep as string (shouldn't happen)
+                    lower_bounds[int(k)] = v
+            else:
+                lower_bounds[int(k)] = v
+
+    upper_bounds = None
+    if record.get("upper_bounds_json"):
+        upper_bounds = {}
+        for k, v in json.loads(record["upper_bounds_json"]).items():
+            # All bound values are bytes in Iceberg, decode from base64
+            if isinstance(v, str):
+                try:
+                    upper_bounds[int(k)] = base64.b64decode(v)
+                except Exception:
+                    # If it's not valid base64, keep as string (shouldn't happen)
+                    upper_bounds[int(k)] = v
+            else:
+                upper_bounds[int(k)] = v
+
+    null_value_counts = (
+        {int(k): v for k, v in json.loads(record["null_counts_json"]).items()}
+        if record.get("null_counts_json")
+        else {}
+    )
+
+    value_counts = (
+        {int(k): v for k, v in json.loads(record["value_counts_json"]).items()}
+        if record.get("value_counts_json")
+        else {}
+    )
+
+    column_sizes = (
+        {int(k): v for k, v in json.loads(record["column_sizes_json"]).items()}
+        if record.get("column_sizes_json")
+        else {}
+    )
+
+    nan_value_counts = (
+        {int(k): v for k, v in json.loads(record["nan_value_counts_json"]).items()}
+        if record.get("nan_value_counts_json")
+        else {}
+    )
+
+    split_offsets = (
+        json.loads(record["split_offsets_json"]) if record.get("split_offsets_json") else None
+    )
+
+    equality_ids = (
+        json.loads(record["equality_ids_json"]) if record.get("equality_ids_json") else None
+    )
+
+    file_format = (
+        FileFormat[record["file_format"]] if record.get("file_format") else FileFormat.PARQUET
+    )
+
+    # Import DataFile here to create actual instance
+    from pyiceberg.manifest import DataFile
+    from pyiceberg.manifest import DataFileContent
+    from pyiceberg.typedef import Record
+
+    # DataFile constructor takes positional args matching Avro schema
+    # Order: content, file_path, file_format, partition, record_count, file_size, column_sizes,
+    #        value_counts, null_value_counts, nan_value_counts, lower_bounds, upper_bounds,
+    #        key_metadata, split_offsets, equality_ids, sort_order_id
+    data_file = DataFile(
+        DataFileContent.DATA,  # content
+        record["file_path"],  # file_path
+        file_format,  # file_format
+        Record(),  # partition (empty Record - not used in Opteryx)
+        record["record_count"],  # record_count
+        record["file_size_bytes"],  # file_size_in_bytes
+        column_sizes,  # column_sizes
+        value_counts,  # value_counts
+        null_value_counts,  # null_value_counts
+        nan_value_counts,  # nan_value_counts
+        lower_bounds,  # lower_bounds
+        upper_bounds,  # upper_bounds
+        record.get("key_metadata"),  # key_metadata
+        split_offsets,  # split_offsets
+        equality_ids,  # equality_ids
+        record.get("sort_order_id"),  # sort_order_id
+    )
+
+    # Set spec_id as property (not in constructor)
+    data_file.spec_id = record.get("partition_spec_id", 0)
+
+    return data_file
 
 
 class OptimizedStaticTable(StaticTable):
@@ -284,49 +404,92 @@ class OptimizedStaticTable(StaticTable):
         """Refresh is not supported for StaticTable instances."""
         raise NotImplementedError("StaticTable does not support refresh")
 
-    def scan(self, *args, **kwargs) -> DataScan:
+    def scan(
+        self,
+        row_filter: Union[str, BooleanExpression] = ALWAYS_TRUE,
+        selected_fields: Tuple[str, ...] = ("*",),
+        case_sensitive: bool = True,
+        snapshot_id: Optional[int] = None,
+        options: Properties = EMPTY_DICT,
+        limit: Optional[int] = None,
+    ) -> DataScan:
         """Return DataScan that uses Parquet manifests if available."""
         # Create a custom DataScan that will use Parquet for plan_files()
-        scan = OptimizedDataScan(table=self, *args, **kwargs)
-        return scan
+        return OptimizedDataScan(
+            table_metadata=self.metadata,
+            io=self.io,
+            row_filter=row_filter,
+            selected_fields=selected_fields,
+            case_sensitive=case_sensitive,
+            snapshot_id=snapshot_id,
+            options=options,
+            limit=limit,
+        )
 
 
 class OptimizedDataScan(DataScan):
     """DataScan that uses Parquet manifests for fast file planning."""
 
-    def __init__(self, table: StaticTable, *args, **kwargs):
-        super().__init__(table_metadata=table.metadata, io=table.io, *args, **kwargs)
-        self._table = table
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
 
     def plan_files(self) -> Iterable[FileScanTask]:
         """Plan files using Parquet manifest if available, falling back to Avro."""
+        print("Attempting to plan files using Parquet manifest...")
         start_time = time.perf_counter()
 
         # Try to read from Parquet manifest first
         parquet_records = read_parquet_manifest(
-            self._table.metadata,
-            self._table.io,
-            self._table.metadata.location,
+            self.table_metadata,
+            self.io,
+            self.table_metadata.location,
         )
 
+        # print("paret_records:", parquet_records)
+
         if parquet_records is not None:
-            elapsed = (time.perf_counter() - start_time) * 1000
-            # Log and print for visibility
-            message = f"Query planning: ✓ PARQUET manifest ({len(parquet_records)} files, {elapsed:.1f}ms read)"
+            read_elapsed = (time.perf_counter() - start_time) * 1000
+
+            # Convert Parquet records to DataFile objects
+            data_files = []
+            for record in parquet_records:
+                if record.get("active", True):  # Only include active files
+                    try:
+                        data_file = parquet_record_to_data_file(record)
+                        data_files.append(data_file)
+                    except Exception as exc:
+                        logger.warning(f"Failed to convert Parquet record: {exc}")
+                        # Fall back to Avro on any conversion error
+                        return self._plan_files_avro(start_time)
+
+            # Create FileScanTask objects directly (no partition filtering needed)
+            tasks = []
+            for data_file in data_files:
+                # Simple task creation without splits
+                # Since you don't use partitions, we use AlwaysTrue predicate
+                task = FileScanTask(
+                    data_file=data_file,
+                    delete_files=set(),  # No delete files
+                    start=0,
+                    length=data_file.file_size_in_bytes,
+                )
+                tasks.append(task)
+
+            total_elapsed = (time.perf_counter() - start_time) * 1000
+            message = f"Query planning: ✓ Using PARQUET manifest ({len(tasks)} files, {total_elapsed:.1f}ms total, {read_elapsed:.1f}ms read)"
             print(message)
-            logger.info(
-                f"Query planning for {self._table.name()[0]}.{self._table.name()[1]} using PARQUET manifest: {len(parquet_records)} files in {elapsed:.1f}ms"
-            )
-            # Use parent's plan_files for now - this will still use Avro but we've proven Parquet works
-            # Full implementation would convert parquet_records to FileScanTask objects
-            return super().plan_files()
+            logger.info(message)
+
+            return tasks
         else:
             # Fall back to standard Avro reading
-            result = super().plan_files()
-            elapsed = (time.perf_counter() - start_time) * 1000
-            message = f"Query planning: ✗ AVRO fallback ({elapsed:.1f}ms total)"
-            print(message)
-            logger.info(
-                f"Query planning for {self._table.name()[0]}.{self._table.name()[1]} using AVRO manifests (fallback): {elapsed:.1f}ms"
-            )
-            return result
+            return self._plan_files_avro(start_time)
+
+    def _plan_files_avro(self, start_time: float) -> Iterable[FileScanTask]:
+        """Fall back to Avro manifest reading."""
+        result = super().plan_files()
+        elapsed = (time.perf_counter() - start_time) * 1000
+        message = f"Query planning: ✗ Using AVRO manifests (fallback, {elapsed:.1f}ms)"
+        print(message)
+        logger.info(message)
+        return result
