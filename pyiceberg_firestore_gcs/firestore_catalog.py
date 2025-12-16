@@ -43,6 +43,7 @@ from pyiceberg.typedef import Properties
 from .parquet_manifest import OptimizedStaticTable
 from .parquet_manifest import write_parquet_manifest
 from .view import View
+from .view import ViewAlreadyExistsError
 from .view import ViewMetadata
 
 logger = get_logger()
@@ -576,7 +577,7 @@ class FirestoreCatalog(MetastoreCatalog):
 
         # Check if view already exists
         if self.view_exists(identifier):
-            raise TableAlreadyExistsError(
+            raise ViewAlreadyExistsError(
                 f"View {self.catalog_name}.{namespace}.{view_name} already exists"
             )
 
@@ -685,8 +686,8 @@ class FirestoreCatalog(MetastoreCatalog):
             update_data["last_row_count"] = row_count
 
         if execution_time is not None:
-            # Store execution time as a nested field in properties
-            update_data["properties.last_execution_time_seconds"] = execution_time
+            # Store execution time in properties using nested dict
+            update_data["properties"] = {"last_execution_time_seconds": execution_time}
 
         doc_ref.set(update_data, merge=True)
         logger.debug(f"Updated execution metadata for view {namespace}.{view_name}")
