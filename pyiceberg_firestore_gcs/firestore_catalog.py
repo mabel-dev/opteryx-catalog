@@ -40,6 +40,8 @@ from pyiceberg.typedef import Properties
 
 from .parquet_manifest import OptimizedStaticTable
 from .parquet_manifest import write_parquet_manifest
+from .view import View
+from .view import ViewMetadata
 
 logger = get_logger()
 
@@ -154,6 +156,37 @@ class FirestoreCatalog(MetastoreCatalog):
             logger.debug(f"Saved metadata for {namespace}.{table_name} to Firestore")
         except Exception as e:
             logger.warning(f"Failed to save metadata to Firestore: {e}")
+
+    def _load_view_metadata_from_firestore(
+        self, namespace: str, view_name: str
+    ) -> Optional[ViewMetadata]:
+        """Load view metadata from Firestore."""
+        try:
+            view_doc = self._view_doc_ref(namespace, view_name).get()
+            if view_doc.exists:
+                data = view_doc.to_dict() or {}
+                logger.debug(f"Loaded view metadata for {namespace}.{view_name} from Firestore")
+                return ViewMetadata.from_dict(data)
+        except Exception as e:
+            logger.warning(f"Failed to load view metadata from Firestore: {e}")
+        return None
+
+    def _save_view_metadata_to_firestore(
+        self, namespace: str, view_name: str, metadata: ViewMetadata
+    ) -> None:
+        """Save view metadata to Firestore."""
+        try:
+            view_doc_ref = self._view_doc_ref(namespace, view_name)
+            metadata_dict = metadata.to_dict()
+            # Add tracking timestamps
+            metadata_dict["updated_at"] = firestore.SERVER_TIMESTAMP
+            if metadata.created_at is None:
+                metadata_dict["created_at"] = firestore.SERVER_TIMESTAMP
+
+            view_doc_ref.set(metadata_dict)
+            logger.debug(f"Saved view metadata for {namespace}.{view_name} to Firestore")
+        except Exception as e:
+            logger.warning(f"Failed to save view metadata to Firestore: {e}")
 
     @staticmethod
     def _parse_metadata_version(metadata_location: str) -> int:
@@ -505,6 +538,105 @@ class FirestoreCatalog(MetastoreCatalog):
         # Store properties for later use
         self._properties.update(catalog_properties)
 
+    def create_view(
+        self,
+        identifier: Union[str, Identifier],
+        sql: str,
+        schema: Optional[Schema] = None,
+        author: Optional[str] = None,
+        description: Optional[str] = None,
+        properties: Properties = EMPTY_DICT,
+    ) -> View:
+        """Create a new SQL view in the catalog.
+
+        Args:
+            identifier: View identifier (namespace, view_name)
+            sql: The SQL statement that defines the view
+            schema: Optional schema of the view result set
+            author: Optional username or identifier of the creator
+            description: Optional human-readable description
+            properties: Additional properties for the view
+
+        Returns:
+            View: The created view object
+
+        Raises:
+            TableAlreadyExistsError: If a view with this identifier already exists
+            NoSuchNamespaceError: If the namespace doesn't exist
+        """
+        import pyarrow as _pa
+        from pyiceberg.io.pyarrow import _pyarrow_to_schema_without_ids
+
+        namespace, view_name = self._parse_identifier(identifier)
+
+        # Convert pyarrow schema if needed
+        if isinstance(schema, _pa.Schema):
+            schema = _pyarrow_to_schema_without_ids(schema)
+
+        # Check if namespace exists, create if not
+        namespace_ref = self._namespace_ref(namespace)
+        if not namespace_ref.get().exists:
+            self.create_namespace(namespace)
+
+        # Check if view already exists
+        if self.view_exists(identifier):
+            raise TableAlreadyExistsError(
+                f"View {self.catalog_name}.{namespace}.{view_name} already exists"
+            )
+
+        # Create view metadata
+        metadata = ViewMetadata(
+            sql_text=sql,
+            schema=schema,
+            author=author,
+            description=description,
+            properties=dict(properties),
+        )
+
+        # Save view metadata to Firestore
+        self._save_view_metadata_to_firestore(namespace, view_name, metadata)
+
+        logger.debug(f"Created view {namespace}.{view_name} in catalog {self.catalog_name}")
+
+        # Return the created view
+        return View(
+            identifier=(namespace, view_name),
+            metadata=metadata,
+            catalog_name=self.catalog_name,
+        )
+
+    def load_view(self, identifier: Union[str, Identifier]) -> View:
+        """Load a view from the catalog.
+
+        Args:
+            identifier: View identifier (namespace, view_name)
+
+        Returns:
+            View: The loaded view object
+
+        Raises:
+            NoSuchViewError: If the view doesn't exist
+        """
+        namespace, view_name = self._parse_identifier(identifier)
+
+        # Check if view exists
+        if not self.view_exists(identifier):
+            raise NoSuchViewError(f"View not found: {identifier}")
+
+        # Load metadata from Firestore
+        metadata = self._load_view_metadata_from_firestore(namespace, view_name)
+        if not metadata:
+            raise NoSuchViewError(
+                f"View metadata not found: {self.catalog_name}.{namespace}.{view_name}"
+            )
+
+        # Return the view
+        return View(
+            identifier=(namespace, view_name),
+            metadata=metadata,
+            catalog_name=self.catalog_name,
+        )
+
     def list_views(self, namespace: Union[str, Identifier]) -> List[Identifier]:
         namespace_str = self._require_namespace(namespace)
         return [(namespace_str, doc.id) for doc in self._views_collection(namespace_str).stream()]
@@ -520,3 +652,50 @@ class FirestoreCatalog(MetastoreCatalog):
             raise NoSuchViewError(f"View not found: {identifier}")
         doc_ref.delete()
         logger.debug(f"Dropped view {namespace}.{view_name}")
+
+    def update_view_execution_metadata(
+        self,
+        identifier: Union[str, Identifier],
+        row_count: Optional[int] = None,
+        execution_time: Optional[float] = None,
+    ) -> None:
+        """Update view execution metadata after a view is run.
+
+        This method updates the last_run_at timestamp and optionally the
+        row count from the last execution. This is useful for tracking
+        view usage and for query planning.
+
+        Args:
+            identifier: View identifier (namespace, view_name)
+            row_count: Number of rows returned by the view
+            execution_time: Execution time in seconds (stored in properties)
+
+        Raises:
+            NoSuchViewError: If the view doesn't exist
+        """
+        namespace, view_name = self._parse_identifier(identifier)
+        doc_ref = self._view_doc_ref(namespace, view_name)
+
+        if not doc_ref.get().exists:
+            raise NoSuchViewError(f"View not found: {identifier}")
+
+        # Build update dict
+        update_data: Dict[str, Any] = {
+            "last_run_at": firestore.SERVER_TIMESTAMP,
+            "updated_at": firestore.SERVER_TIMESTAMP,
+        }
+
+        if row_count is not None:
+            update_data["last_row_count"] = row_count
+
+        if execution_time is not None:
+            # Store execution time in properties
+            doc = doc_ref.get()
+            if doc.exists:
+                data = doc.to_dict() or {}
+                properties = data.get("properties", {})
+                properties["last_execution_time_seconds"] = execution_time
+                update_data["properties"] = properties
+
+        doc_ref.set(update_data, merge=True)
+        logger.debug(f"Updated execution metadata for view {namespace}.{view_name}")
