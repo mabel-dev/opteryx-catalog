@@ -55,6 +55,7 @@ class FirestoreCatalog(MetastoreCatalog):
     """PyIceberg catalog implementation backed by Firestore documents and GCS metadata."""
 
     TABLES_SUBCOLLECTION = "tables"
+    VIEWS_SUBCOLLECTION = "views"
 
     def __init__(
         self,
@@ -79,6 +80,9 @@ class FirestoreCatalog(MetastoreCatalog):
     def _tables_collection(self, namespace: str) -> firestore.CollectionReference:
         return self._namespace_ref(namespace).collection(self.TABLES_SUBCOLLECTION)
 
+    def _views_collection(self, namespace: str) -> firestore.CollectionReference:
+        return self._namespace_ref(namespace).collection(self.VIEWS_SUBCOLLECTION)
+
     def _normalize_namespace(self, namespace: Union[str, Identifier]) -> str:
         tuple_identifier = self.identifier_to_tuple(namespace)
         if not tuple_identifier:
@@ -96,6 +100,9 @@ class FirestoreCatalog(MetastoreCatalog):
 
     def _table_doc_ref(self, namespace: str, table_name: str) -> firestore.DocumentReference:
         return self._tables_collection(namespace).document(table_name)
+
+    def _view_doc_ref(self, namespace: str, view_name: str) -> firestore.DocumentReference:
+        return self._views_collection(namespace).document(view_name)
 
     def _metadata_doc_ref(self, namespace: str, table_name: str) -> firestore.DocumentReference:
         """Get the Firestore document reference for table metadata.
@@ -180,6 +187,8 @@ class FirestoreCatalog(MetastoreCatalog):
         if not namespace_ref.get().exists:
             raise NoSuchNamespaceError(namespace_str)
         if any(True for _ in self._tables_collection(namespace_str).stream()):
+            raise NamespaceNotEmptyError(namespace_str)
+        if any(True for _ in self._views_collection(namespace_str).stream()):
             raise NamespaceNotEmptyError(namespace_str)
         namespace_ref.delete()
         logger.debug(f"Dropped namespace {namespace_str} from catalog {self.catalog_name}")
@@ -496,11 +505,17 @@ class FirestoreCatalog(MetastoreCatalog):
         self._properties.update(catalog_properties)
 
     def list_views(self, namespace: Union[str, Identifier]) -> List[Identifier]:
-        # Views are not supported in this implementation
-        return []
+        namespace_str = self._require_namespace(namespace)
+        return [(namespace_str, doc.id) for doc in self._views_collection(namespace_str).stream()]
 
     def view_exists(self, identifier: Union[str, Identifier]) -> bool:
-        return False
+        namespace, view_name = self._parse_identifier(identifier)
+        return self._view_doc_ref(namespace, view_name).get().exists
 
     def drop_view(self, identifier: Union[str, Identifier]) -> None:
-        raise NoSuchTableError(f"View not found: {identifier}")
+        namespace, view_name = self._parse_identifier(identifier)
+        doc_ref = self._view_doc_ref(namespace, view_name)
+        if not doc_ref.get().exists:
+            raise NoSuchTableError(f"View not found: {identifier}")
+        doc_ref.delete()
+        logger.debug(f"Dropped view {namespace}.{view_name}")

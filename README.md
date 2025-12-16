@@ -92,11 +92,15 @@ Key methods include:
 - `drop_table(identifier)`
 - `rename_table(from_identifier, to_identifier)`
 - `commit_table(table, requirements, updates)`
+- `list_views(namespace)`
+- `view_exists(identifier)`
+- `drop_view(identifier)`
 
 Notes about behavior:
 - `create_table` will try to infer a default GCS location using the provided `gcs_bucket` property if `location` is omitted.
 - `register_table` validates that the provided `metadata_location` points to an existing GCS blob.
-- Views and table transactions are intentionally unimplemented.
+- Views are stored in a Firestore collection similar to tables. View-related APIs (`list_views`, `view_exists`, `drop_view`) are fully functional.
+- Table transactions are intentionally unimplemented.
 
 ## Development & Linting 🧪
 
@@ -118,7 +122,6 @@ python -m pytest
 ## Limitations & KNOWN ISSUES ⚠️
 
 - No support for table-level transactions. `create_table_transaction` raises `NotImplementedError`.
-- Views are not implemented — attempting to use view-related APIs will either return an empty list or raise `NoSuchTableError`.
 - The catalog stores metadata location references in Firestore; purging metadata files from GCS is not implemented.
 - This is an opinionated implementation intended for internal or controlled environments. Review for production constraints before use in multi-tenant environments.
 
