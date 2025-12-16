@@ -21,3 +21,6 @@ def create_catalog(
 
 
 __all__ = ["create_catalog", "FirestoreCatalog"]
+
+# Compaction utilities are available via pyiceberg_firestore_gcs.compaction
+# Example: from pyiceberg_firestore_gcs.compaction import compact_table

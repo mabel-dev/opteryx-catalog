@@ -115,6 +115,45 @@ Running tests (if you add tests):
 python -m pytest
 ```
 
+## Compaction 🔧
+
+This catalog supports small file compaction to improve query performance. See [COMPACTION.md](COMPACTION.md) for detailed design documentation.
+
+### Quick Start
+
+```python
+from pyiceberg_firestore_gcs import create_catalog
+from pyiceberg_firestore_gcs.compaction import compact_table, get_compaction_stats
+
+catalog = create_catalog(...)
+
+# Check if compaction is needed
+table = catalog.load_table(("namespace", "table_name"))
+stats = get_compaction_stats(table)
+print(f"Small files: {stats['small_file_count']}")
+
+# Run compaction
+result = compact_table(catalog, ("namespace", "table_name"))
+print(f"Compacted {result.files_rewritten} files")
+```
+
+### Configuration
+
+Control compaction behavior via table properties:
+
+```python
+table = catalog.create_table(
+    identifier=("namespace", "table_name"),
+    schema=schema,
+    properties={
+        "compaction.enabled": "true",
+        "compaction.min-file-count": "10",
+        "compaction.max-small-file-size-bytes": "33554432",  # 32 MB
+        "write.target-file-size-bytes": "134217728"  # 128 MB
+    }
+)
+```
+
 ## Limitations & KNOWN ISSUES ⚠️
 
 - No support for table-level transactions. `create_table_transaction` raises `NotImplementedError`.
