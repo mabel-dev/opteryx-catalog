@@ -46,37 +46,42 @@ if files:
     print("\nSample file bounds check:")
     print(f"  Has lower_bounds: {sample_file.lower_bounds is not None}")
     print(f"  Has upper_bounds: {sample_file.upper_bounds is not None}")
-    
+
     # Check severity bounds (field 6)
     if sample_file.lower_bounds and 6 in sample_file.lower_bounds:
         print("  Severity (field 6) bounds present: Yes")
         try:
             lower_bytes = sample_file.lower_bounds[6]
             upper_bytes = sample_file.upper_bounds[6]
-            lower_severity = lower_bytes.decode('utf-8')
-            upper_severity = upper_bytes.decode('utf-8')
+            lower_severity = lower_bytes.decode("utf-8")
+            upper_severity = upper_bytes.decode("utf-8")
             print(f"    Lower: '{lower_severity}'")
             print(f"    Upper: '{upper_severity}'")
         except Exception as e:
             print(f"    Could not decode: {e}")
     else:
         print("  Severity (field 6) bounds: NOT PRESENT")
-    
+
     if sample_file.lower_bounds and 8 in sample_file.lower_bounds:
         print("  Timestamp (field 8) lower bound present: Yes")
         # Try to decode
         try:
             import struct
             import datetime
+
             lower_bytes = sample_file.lower_bounds[8]
             upper_bytes = sample_file.upper_bounds[8]
-            lower_ts = struct.unpack('>q', lower_bytes)[0]
-            upper_ts = struct.unpack('>q', upper_bytes)[0]
+            lower_ts = struct.unpack(">q", lower_bytes)[0]
+            upper_ts = struct.unpack(">q", upper_bytes)[0]
             print(f"  Lower timestamp (raw): {lower_ts}")
             print(f"  Upper timestamp (raw): {upper_ts}")
             # Try interpreting as microseconds since epoch
-            print(f"  Lower as datetime (µs): {datetime.datetime.fromtimestamp(lower_ts/1000000, datetime.timezone.utc)}")
-            print(f"  Upper as datetime (µs): {datetime.datetime.fromtimestamp(upper_ts/1000000, datetime.timezone.utc)}")
+            print(
+                f"  Lower as datetime (µs): {datetime.datetime.fromtimestamp(lower_ts / 1000000, datetime.timezone.utc)}"
+            )
+            print(
+                f"  Upper as datetime (µs): {datetime.datetime.fromtimestamp(upper_ts / 1000000, datetime.timezone.utc)}"
+            )
         except Exception as e:
             print(f"  Could not decode: {e}")
     else:
@@ -92,9 +97,7 @@ try:
     from pyiceberg.expressions import EqualTo
 
     # Filter for WARNING severity - should eliminate files with different severities
-    scan_with_filter = table.scan(
-        row_filter=EqualTo("severity", "WARNING")
-    )
+    scan_with_filter = table.scan(row_filter=EqualTo("severity", "WARNING"))
     filtered_files = list(scan_with_filter.plan_files())
     print(f"Files after filter: {len(filtered_files)}")
 
@@ -103,9 +106,7 @@ try:
         pruned_pct = (pruned / len(files)) * 100
         print(f"✓ BRIN pruning eliminated {pruned} files ({pruned_pct:.1f}%)!")
     else:
-        print(
-            "Note: No files were pruned - possible reasons:"
-        )
+        print("Note: No files were pruned - possible reasons:")
         print("  - All files might contain mixed severities (overlapping ranges)")
         print("  - EqualTo predicate might not be implemented yet")
         print("  - Bounds might show all files could contain WARNING")

@@ -5,11 +5,13 @@ import pyarrow.parquet as pq
 from io import BytesIO
 
 # Test if None values work with list fields
-schema = pa.schema([
-    ("file_path", pa.string()),
-    ("lower_bounds", pa.list_(pa.int64())),
-    ("upper_bounds", pa.list_(pa.int64())),
-])
+schema = pa.schema(
+    [
+        ("file_path", pa.string()),
+        ("lower_bounds", pa.list_(pa.int64())),
+        ("upper_bounds", pa.list_(pa.int64())),
+    ]
+)
 
 # Test 1: All None
 data1 = [

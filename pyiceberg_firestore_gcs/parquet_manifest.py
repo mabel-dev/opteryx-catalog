@@ -26,8 +26,11 @@ Features:
 from __future__ import annotations
 
 import base64
+import datetime
 import json
+import struct
 import time
+from decimal import Decimal
 from io import BytesIO
 from typing import Any
 from typing import Dict
@@ -61,13 +64,71 @@ from pyiceberg.table import StaticTable
 from pyiceberg.table.metadata import TableMetadataV2
 from pyiceberg.typedef import EMPTY_DICT
 from pyiceberg.typedef import Properties
+from pyiceberg.types import BinaryType
+from pyiceberg.types import BooleanType
 from pyiceberg.types import DoubleType
 from pyiceberg.types import FloatType
 from pyiceberg.types import IntegerType
 from pyiceberg.types import LongType
 from pyiceberg.types import PrimitiveType
+from pyiceberg.types import StringType
+from pyiceberg.types import TimestampType
+from pyiceberg.types import TimestamptzType
+
+from .to_int import to_int
 
 logger = get_logger()
+
+
+def decode_iceberg_value(
+    value: Union[int, float, bytes], data_type: str, scale: int = None
+) -> Union[int, float, str, datetime.datetime, Decimal, bool]:
+    """
+    Decode Iceberg-encoded values based on the specified data type.
+
+    Parameters:
+        value: Union[int, float, bytes]
+            The encoded value from Iceberg.
+        data_type: str
+            The type of the value ('int', 'long', 'float', 'double', 'timestamp', 'date', 'string', 'decimal', 'boolean').
+        scale: int, optional
+            Scale used for decoding decimal types, defaults to None.
+
+    Returns:
+        The decoded value in its original form.
+    """
+
+    data_type_class = data_type.__class__
+
+    if data_type_class == LongType:
+        return int.from_bytes(value, "little", signed=True)
+    elif data_type_class == DoubleType:
+        # IEEE 754 encoded floats are typically decoded directly
+        return struct.unpack("<d", value)[0]  # 8-byte IEEE 754 double
+    elif data_type_class in (TimestampType, TimestamptzType):
+        # Iceberg stores timestamps as microseconds since epoch
+        interval = int.from_bytes(value, "little", signed=True)
+        if interval < 0:
+            # Windows specifically doesn't like negative timestamps
+            return datetime.datetime(1970, 1, 1) + datetime.timedelta(microseconds=interval)
+        return datetime.datetime.fromtimestamp(interval / 1_000_000)
+    elif data_type == "date":
+        # Iceberg stores dates as days since epoch (1970-01-01)
+        interval = int.from_bytes(value, "little", signed=True)
+        return datetime.datetime(1970, 1, 1) + datetime.timedelta(days=interval)
+    elif data_type_class == StringType:
+        # Assuming UTF-8 encoded bytes (or already decoded string)
+        return value.decode("utf-8") if isinstance(value, bytes) else str(value)
+    elif data_type_class == BinaryType:
+        return value
+    elif str(data_type).startswith("decimal"):
+        # Iceberg stores decimals as unscaled integers
+        int_value = int.from_bytes(value, byteorder="big", signed=True)
+        return Decimal(int_value) / (10**data_type.scale)
+    elif data_type_class == BooleanType:
+        return bool(value)
+
+    ValueError(f"Unsupported data type: {data_type}, {str(data_type)}")
 
 
 def get_parquet_manifest_schema() -> pa.Schema:
@@ -121,92 +182,6 @@ def _serialize_value(value: Any) -> Any:
     return value
 
 
-def _value_to_int64(raw_bytes: bytes, field_type: PrimitiveType) -> Optional[int]:
-    """Convert a bound value to int64 for order-preserving comparisons.
-
-    This allows us to compare values of different types using simple integer
-    comparisons without complex deserialization logic.
-
-    Args:
-        raw_bytes: Serialized bytes from Iceberg bounds
-        field_type: The field type for deserialization
-
-    Returns:
-        int64 value that preserves ordering, or None if conversion not supported
-    """
-    import struct
-
-    from pyiceberg.types import BinaryType
-    from pyiceberg.types import DateType
-    from pyiceberg.types import FixedType
-    from pyiceberg.types import StringType
-    from pyiceberg.types import TimestampType
-    from pyiceberg.types import TimestamptzType
-    from pyiceberg.types import TimeType
-    from pyiceberg.types import UUIDType
-
-    # Numeric types - extract as integers
-    if isinstance(field_type, (IntegerType, LongType)):
-        if isinstance(field_type, IntegerType):
-            return struct.unpack(">i", raw_bytes)[0]
-        return struct.unpack(">q", raw_bytes)[0]
-
-    # Floats - round to int64
-    elif isinstance(field_type, (FloatType, DoubleType)):
-        if isinstance(field_type, FloatType):
-            return int(struct.unpack(">f", raw_bytes)[0])
-        return int(struct.unpack(">d", raw_bytes)[0])
-
-    # Timestamps - stored as microseconds in Iceberg, keep as-is for order preservation
-    # The values are already in the right range for int64
-    elif isinstance(field_type, (TimestampType, TimestamptzType)):
-        return struct.unpack(">q", raw_bytes)[0]
-
-    # Date - stored as days since epoch (int32)
-    elif isinstance(field_type, DateType):
-        return struct.unpack(">i", raw_bytes)[0]
-
-    # Time - stored as microseconds since midnight (int64)
-    elif isinstance(field_type, TimeType):
-        return struct.unpack(">q", raw_bytes)[0]
-
-    # Strings - use first 7 bytes after a zero byte for lexicographic comparison
-    # This matches the Cython implementation: buf[0]=0, buf[1:8]=first 7 bytes
-    elif isinstance(field_type, StringType):
-        # Keep first byte as 0, copy up to 7 bytes starting at position 1
-        buf = bytearray(8)
-        buf[0] = 0  # First byte is 0
-        copy_length = min(len(raw_bytes), 7)
-        buf[1:1+copy_length] = raw_bytes[:copy_length]
-        # Decode as signed big-endian
-        value = struct.unpack(">q", bytes(buf))[0]
-        # Ensure in int64 range (should already be, but just in case)
-        value = max(-9223372036854775808, min(9223372036854775807, value))
-        return value
-
-    # Binary and Fixed types - same encoding as strings
-    elif isinstance(field_type, (BinaryType, FixedType)):
-        # Keep first byte as 0, copy up to 7 bytes starting at position 1
-        buf = bytearray(8)
-        buf[0] = 0  # First byte is 0
-        copy_length = min(len(raw_bytes), 7)
-        buf[1:1+copy_length] = raw_bytes[:copy_length]
-        # Decode as signed big-endian
-        value = struct.unpack(">q", bytes(buf))[0]
-        # Ensure in int64 range (should already be, but just in case)
-        value = max(-9223372036854775808, min(9223372036854775807, value))
-        return value
-
-    # For UUID and other types that don't have meaningful ordering,
-    # return None so they won't be used for pruning
-    elif isinstance(field_type, UUIDType):
-        return None
-
-    # For any other unknown types, return None
-    else:
-        return None
-
-
 def entry_to_dict(entry: ManifestEntry, schema: Any) -> Dict[str, Any]:
     """Convert ManifestEntry to flat dictionary for Parquet storage.
 
@@ -238,11 +213,12 @@ def entry_to_dict(entry: ManifestEntry, schema: Any) -> Dict[str, Any]:
                 field = schema.find_field(field_id)
                 if field and isinstance(field.field_type, PrimitiveType):
                     try:
-                        lower_bounds_array[field_id] = _value_to_int64(
-                            df.lower_bounds[field_id], field.field_type
-                        )
-                        upper_bounds_array[field_id] = _value_to_int64(
-                            df.upper_bounds[field_id], field.field_type
+                        lower_value = decode_iceberg_value(df.lower_bounds[field_id])
+                        lower_bounds_array[field_id] = to_int(lower_value, field.field_type)
+                        upper_value = decode_iceberg_value(df.upper_bounds[field_id])
+                        upper_bounds_array[field_id] = to_int(upper_value, field.field_type)
+                        print(
+                            f"Field ID {field_id}: lower={df.lower_bounds[field_id]} => {lower_bounds_array[field_id]}, upper={df.upper_bounds[field_id]} =>{upper_bounds_array[field_id]}"
                         )
                     except Exception:
                         # If conversion fails, leave as None
@@ -379,7 +355,7 @@ def write_parquet_manifest(
 
     logger.debug(f"Collected {len(all_entries)} data file entries from {manifest_count} manifests")
 
-    # Debug: Check for overflow values before creating Arrow table
+    # Debug: Check for overflow values before creating Arrow table and clamp them
     INT64_MIN = -9223372036854775808
     INT64_MAX = 9223372036854775807
 
@@ -387,12 +363,16 @@ def write_parquet_manifest(
         for key, value in entry.items():
             if isinstance(value, int) and (value < INT64_MIN or value > INT64_MAX):
                 logger.error(f"Entry {i}, field '{key}': value {value} overflows int64 range!")
+                # Clamp to int64 range
+                entry[key] = max(INT64_MIN, min(INT64_MAX, value))
             elif isinstance(value, list):
                 for j, v in enumerate(value):
                     if isinstance(v, int) and (v < INT64_MIN or v > INT64_MAX):
                         logger.error(
                             f"Entry {i}, field '{key}[{j}]': value {v} overflows int64 range!"
                         )
+                        # Clamp to int64 range
+                        value[j] = max(INT64_MIN, min(INT64_MAX, v))
 
     # Convert to Arrow table
     schema = get_parquet_manifest_schema()
@@ -493,7 +473,7 @@ def parquet_record_to_data_file(record: Dict[str, Any]):
         DataFile-compatible dict that can be used with FileScanTask
     """
     import struct
-    
+
     # Bounds are stored as int64 values, but DataFile expects bytes in Iceberg format (Big Endian)
     # We need to convert int64 back to bytes for compatibility with PyIceberg's DataFile
     lower_bounds = None
@@ -513,8 +493,8 @@ def parquet_record_to_data_file(record: Dict[str, Any]):
                 if max_val is not None:
                     # Convert int64 values back to Big Endian bytes (Iceberg format)
                     # This ensures compatibility with PyIceberg's DataFile expectations
-                    lower_bounds[field_id] = struct.pack('>q', min_val)
-                    upper_bounds[field_id] = struct.pack('>q', max_val)
+                    lower_bounds[field_id] = struct.pack(">q", min_val)
+                    upper_bounds[field_id] = struct.pack(">q", max_val)
 
     # Convert arrays to dicts for DataFile
     null_value_counts = {}
@@ -687,10 +667,10 @@ def _can_prune_file_with_predicate(
     if field_id not in data_file.lower_bounds or field_id not in data_file.upper_bounds:
         return False
 
-# Get the bounds - they are now in Big Endian bytes format (Iceberg format)
+    # Get the bounds - they are now in Big Endian bytes format (Iceberg format)
     file_min_bytes = data_file.lower_bounds[field_id]
     file_max_bytes = data_file.upper_bounds[field_id]
-    
+
     # Handle None values
     if file_min_bytes is None or file_max_bytes is None:
         return False
