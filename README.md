@@ -92,11 +92,59 @@ Key methods include:
 - `drop_table(identifier)`
 - `rename_table(from_identifier, to_identifier)`
 - `commit_table(table, requirements, updates)`
+- `create_view(identifier, sql, schema=None, author=None, description=None, properties={})`
+- `load_view(identifier)`
+- `list_views(namespace)`
+- `view_exists(identifier)`
+- `drop_view(identifier)`
+- `update_view_execution_metadata(identifier, row_count=None, execution_time=None)`
+
+### Views 👁️
+
+Views are SQL queries stored in the catalog that can be referenced like tables. Each view includes:
+- **SQL statement**: The query that defines the view
+- **Schema**: The expected result schema (optional but recommended)
+- **Metadata**: Author, description, creation/update timestamps
+- **Execution history**: Last run time, row count, execution time
+
+Example usage:
+```python
+from pyiceberg.schema import Schema, NestedField
+from pyiceberg.types import IntegerType, StringType
+
+# Create a schema for the view
+schema = Schema(
+    NestedField(field_id=1, name="user_id", field_type=IntegerType(), required=True),
+    NestedField(field_id=2, name="username", field_type=StringType(), required=False),
+)
+
+# Create a view
+view = catalog.create_view(
+    identifier=("my_namespace", "active_users"),
+    sql="SELECT user_id, username FROM users WHERE active = true",
+    schema=schema,
+    author="data_team",
+    description="View of all active users in the system"
+)
+
+# Load a view
+view = catalog.load_view(("my_namespace", "active_users"))
+print(f"SQL: {view.sql}")
+print(f"Schema: {view.metadata.schema}")
+
+# Update execution metadata after running the view
+catalog.update_view_execution_metadata(
+    ("my_namespace", "active_users"),
+    row_count=1250,
+    execution_time=0.45
+)
+```
 
 Notes about behavior:
 - `create_table` will try to infer a default GCS location using the provided `gcs_bucket` property if `location` is omitted.
 - `register_table` validates that the provided `metadata_location` points to an existing GCS blob.
-- Views and table transactions are intentionally unimplemented.
+- Views are stored as Firestore documents with complete metadata including SQL, schema, authorship, and execution history.
+- Table transactions are intentionally unimplemented.
 
 ## Development & Linting 🧪
 
@@ -157,7 +205,6 @@ table = catalog.create_table(
 ## Limitations & KNOWN ISSUES ⚠️
 
 - No support for table-level transactions. `create_table_transaction` raises `NotImplementedError`.
-- Views are not implemented — attempting to use view-related APIs will either return an empty list or raise `NoSuchTableError`.
 - The catalog stores metadata location references in Firestore; purging metadata files from GCS is not implemented.
 - This is an opinionated implementation intended for internal or controlled environments. Review for production constraints before use in multi-tenant environments.
 
