@@ -52,15 +52,13 @@ class CompactionConfig:
         """
         return cls(
             target_file_size_bytes=int(
-                properties.get("write.target-file-size-bytes", cls.target_file_size_bytes)
+                properties.get("write.target-file-size-bytes", 128 * 1024 * 1024)
             ),
-            min_file_count=int(properties.get("compaction.min-file-count", cls.min_file_count)),
+            min_file_count=int(properties.get("compaction.min-file-count", 10)),
             max_small_file_size_bytes=int(
-                properties.get(
-                    "compaction.max-small-file-size-bytes", cls.max_small_file_size_bytes
-                )
+                properties.get("compaction.max-small-file-size-bytes", 32 * 1024 * 1024)
             ),
-            strategy=properties.get("compaction.strategy", cls.strategy),
+            strategy=properties.get("compaction.strategy", "binpack"),
             enabled=properties.get("compaction.enabled", "true").lower() == "true",
         )
 
