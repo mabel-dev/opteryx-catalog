@@ -75,7 +75,7 @@ def get_parquet_manifest_schema() -> pa.Schema:
 
     This schema stores all data file metadata in a flat structure
     optimized for fast filtering with PyArrow.
-    
+
     Note: Bounds are stored as int64 for order-preserving comparisons.
     We convert all types to int64 using an order-preserving transformation,
     allowing fast native integer comparisons without deserialization.
@@ -100,10 +100,10 @@ def get_parquet_manifest_schema() -> pa.Schema:
             ("lower_bounds", pa.list_(pa.int64())),  # lower_bounds[field_id] = min value
             ("upper_bounds", pa.list_(pa.int64())),  # upper_bounds[field_id] = max value
             # Column statistics as parallel arrays indexed by field_id
-            ("null_counts", pa.list_(pa.int64())),     # null_counts[field_id] = null count
-            ("value_counts", pa.list_(pa.int64())),    # value_counts[field_id] = value count
-            ("column_sizes", pa.list_(pa.int64())),    # column_sizes[field_id] = size in bytes
-            ("nan_counts", pa.list_(pa.int64())),      # nan_counts[field_id] = NaN count
+            ("null_counts", pa.list_(pa.int64())),  # null_counts[field_id] = null count
+            ("value_counts", pa.list_(pa.int64())),  # value_counts[field_id] = value count
+            ("column_sizes", pa.list_(pa.int64())),  # column_sizes[field_id] = size in bytes
+            ("nan_counts", pa.list_(pa.int64())),  # nan_counts[field_id] = NaN count
             # Additional metadata
             ("key_metadata", pa.binary()),
             ("split_offsets_json", pa.string()),
@@ -123,71 +123,70 @@ def _serialize_value(value: Any) -> Any:
 
 def _value_to_int64(raw_bytes: bytes, field_type: PrimitiveType) -> int:
     """Convert a bound value to int64 for order-preserving comparisons.
-    
+
     This allows us to compare values of different types using simple integer
     comparisons without complex deserialization logic.
-    
+
     Args:
         raw_bytes: Serialized bytes from Iceberg bounds
         field_type: The field type for deserialization
-        
+
     Returns:
         int64 value that preserves ordering
     """
     import struct
-    from pyiceberg.types import (
-        StringType,
-        TimestampType,
-        TimestamptzType,
-        DateType,
-        TimeType,
-    )
-    
+
+    from pyiceberg.types import DateType
+    from pyiceberg.types import StringType
+    from pyiceberg.types import TimestampType
+    from pyiceberg.types import TimestamptzType
+    from pyiceberg.types import TimeType
+
     # Numeric types - extract as integers
     if isinstance(field_type, (IntegerType, LongType)):
         if isinstance(field_type, IntegerType):
-            return struct.unpack('>i', raw_bytes)[0]
-        return struct.unpack('>q', raw_bytes)[0]
-        
+            return struct.unpack(">i", raw_bytes)[0]
+        return struct.unpack(">q", raw_bytes)[0]
+
     # Floats - round to int64
     elif isinstance(field_type, (FloatType, DoubleType)):
         if isinstance(field_type, FloatType):
-            return int(struct.unpack('>f', raw_bytes)[0])
-        return int(struct.unpack('>d', raw_bytes)[0])
-    
+            return int(struct.unpack(">f", raw_bytes)[0])
+        return int(struct.unpack(">d", raw_bytes)[0])
+
     # Timestamps - stored as microseconds in Iceberg, keep as-is for order preservation
     # The values are already in the right range for int64
     elif isinstance(field_type, (TimestampType, TimestamptzType)):
-        return struct.unpack('>q', raw_bytes)[0]
-    
+        return struct.unpack(">q", raw_bytes)[0]
+
     # Date - stored as days since epoch (int32)
     elif isinstance(field_type, DateType):
-        return struct.unpack('>i', raw_bytes)[0]
-        
+        return struct.unpack(">i", raw_bytes)[0]
+
     # Time - stored as microseconds since midnight (int64)
     elif isinstance(field_type, TimeType):
-        return struct.unpack('>q', raw_bytes)[0]
-    
+        return struct.unpack(">q", raw_bytes)[0]
+
     # Strings - use first 7 bytes as int (similar to your approach)
     elif isinstance(field_type, StringType):
         # Pad to 8 bytes, keeping first byte 0 for sign
-        buf = b'\x00' + raw_bytes[:7]
-        buf = buf.ljust(8, b'\x00')
+        buf = b"\x00" + raw_bytes[:7]
+        buf = buf.ljust(8, b"\x00")
         # Ensure we return a valid signed int64
-        value = struct.unpack('>q', buf)[0]
+        value = struct.unpack(">q", buf)[0]
         # Clamp to int64 range if needed
         if value > 9223372036854775807:  # 2^63 - 1
             value = 9223372036854775807
         elif value < -9223372036854775808:  # -2^63
             value = -9223372036854775808
         return value
-    
+
     # For other types, use a hash of the bytes
     else:
         # Use first 8 bytes as int64
-        buf = raw_bytes[:8].ljust(8, b'\x00')
+        buf = raw_bytes[:8].ljust(8, b"\x00")
         # Ensure we return a valid signed int64
-        value = struct.unpack('>q', buf)[0]
+        value = struct.unpack(">q", buf)[0]
         # Clamp to int64 range if needed
         if value > 9223372036854775807:  # 2^63 - 1
             value = 9223372036854775807
@@ -212,15 +211,15 @@ def entry_to_dict(entry: ManifestEntry, schema: Any) -> Dict[str, Any]:
     # This allows O(1) lookup: lower_bounds[field_id] gives min value
     lower_bounds_array = None
     upper_bounds_array = None
-    
+
     if df.lower_bounds and df.upper_bounds:
         # Find max field_id to size arrays
         max_field_id = max(max(df.lower_bounds.keys()), max(df.upper_bounds.keys()))
-        
+
         # Initialize arrays with None (will be sparse if not all fields have bounds)
         lower_bounds_array = [None] * (max_field_id + 1)
         upper_bounds_array = [None] * (max_field_id + 1)
-        
+
         # Fill in bounds where available
         for field_id in df.lower_bounds.keys():
             if field_id in df.upper_bounds:
@@ -248,24 +247,24 @@ def entry_to_dict(entry: ManifestEntry, schema: Any) -> Dict[str, Any]:
         all_field_ids.update(df.column_sizes.keys())
     if df.nan_value_counts:
         all_field_ids.update(df.nan_value_counts.keys())
-    
+
     null_counts_array = None
     value_counts_array = None
     column_sizes_array = None
     nan_counts_array = None
-    
+
     if all_field_ids:
         max_stat_field_id = max(all_field_ids)
         null_counts_array = [None] * (max_stat_field_id + 1)
         value_counts_array = [None] * (max_stat_field_id + 1)
         column_sizes_array = [None] * (max_stat_field_id + 1)
         nan_counts_array = [None] * (max_stat_field_id + 1)
-        
+
         # Fill in the arrays where we have data, clamping to int64 range
         # PyArrow requires values to fit in signed int64 (-2^63 to 2^63-1)
         INT64_MIN = -9223372036854775808
         INT64_MAX = 9223372036854775807
-        
+
         if df.null_value_counts:
             for field_id, count in df.null_value_counts.items():
                 null_counts_array[field_id] = max(INT64_MIN, min(INT64_MAX, count))
@@ -291,7 +290,7 @@ def entry_to_dict(entry: ManifestEntry, schema: Any) -> Dict[str, Any]:
     # Clamp integer values to int64 range for PyArrow compatibility
     INT64_MIN = -9223372036854775808
     INT64_MAX = 9223372036854775807
-    
+
     # Helper function to safely clamp integers (handles None)
     def clamp_int(value):
         if value is None:
@@ -371,7 +370,7 @@ def write_parquet_manifest(
     # Debug: Check for overflow values before creating Arrow table
     INT64_MIN = -9223372036854775808
     INT64_MAX = 9223372036854775807
-    
+
     for i, entry in enumerate(all_entries):
         for key, value in entry.items():
             if isinstance(value, int) and (value < INT64_MIN or value > INT64_MAX):
@@ -379,7 +378,9 @@ def write_parquet_manifest(
             elif isinstance(value, list):
                 for j, v in enumerate(value):
                     if isinstance(v, int) and (v < INT64_MIN or v > INT64_MAX):
-                        logger.error(f"Entry {i}, field '{key}[{j}]': value {v} overflows int64 range!")
+                        logger.error(
+                            f"Entry {i}, field '{key}[{j}]': value {v} overflows int64 range!"
+                        )
 
     # Convert to Arrow table
     schema = get_parquet_manifest_schema()
@@ -483,16 +484,16 @@ def parquet_record_to_data_file(record: Dict[str, Any]):
     # We keep them as-is for pruning (no need to convert back to bytes for DataFile)
     lower_bounds = None
     upper_bounds = None
-    
+
     lower_array = record.get("lower_bounds")
     upper_array = record.get("upper_bounds")
-    
+
     if lower_array and upper_array:
         # Store as dict mapping field_id -> int64 value
         # We'll use these directly in pruning without conversion
         lower_bounds = {}
         upper_bounds = {}
-        
+
         for field_id, min_val in enumerate(lower_array):
             if min_val is not None and field_id < len(upper_array):
                 max_val = upper_array[field_id]
@@ -675,7 +676,7 @@ def _can_prune_file_with_predicate(
     # Get the int64 bounds directly - already converted!
     file_min_int = data_file.lower_bounds[field_id]
     file_max_int = data_file.upper_bounds[field_id]
-    
+
     # Handle None values
     if file_min_int is None or file_max_int is None:
         return False
@@ -686,52 +687,56 @@ def _can_prune_file_with_predicate(
         return False
 
     try:
-        import struct
         import datetime
+        import struct
 
         # Convert predicate value to int64
         # For the predicate value, we need to serialize it first then convert
         pred_value = predicate.literal.value
-        
+
         # Serialize the predicate value to bytes (using Iceberg's serialization)
         from pyiceberg.types import StringType
-        
+
         if isinstance(field.field_type, StringType) and isinstance(pred_value, str):
-            pred_value_bytes = pred_value.encode('utf-8')
+            pred_value_bytes = pred_value.encode("utf-8")
         elif isinstance(pred_value, datetime.datetime):
             # Convert datetime to microseconds since epoch (Iceberg format)
             timestamp_micros = int(round(pred_value.timestamp() * 1_000_000))
-            pred_value_bytes = struct.pack('>q', timestamp_micros)
-        elif isinstance(pred_value, datetime.date) and not isinstance(pred_value, datetime.datetime):
+            pred_value_bytes = struct.pack(">q", timestamp_micros)
+        elif isinstance(pred_value, datetime.date) and not isinstance(
+            pred_value, datetime.datetime
+        ):
             # Convert date to days since epoch (int32 in Iceberg)
             epoch = datetime.date(1970, 1, 1)
             days = (pred_value - epoch).days
-            pred_value_bytes = struct.pack('>i', days)
+            pred_value_bytes = struct.pack(">i", days)
         elif isinstance(pred_value, datetime.time):
             # Convert time to microseconds since midnight (Iceberg format)
-            micros = (pred_value.hour * 3600 + pred_value.minute * 60 + pred_value.second) * 1_000_000
+            micros = (
+                pred_value.hour * 3600 + pred_value.minute * 60 + pred_value.second
+            ) * 1_000_000
             micros += pred_value.microsecond
-            pred_value_bytes = struct.pack('>q', micros)
+            pred_value_bytes = struct.pack(">q", micros)
         elif isinstance(pred_value, int):
             if isinstance(field.field_type, IntegerType):
-                pred_value_bytes = struct.pack('>i', pred_value)
+                pred_value_bytes = struct.pack(">i", pred_value)
             else:
-                pred_value_bytes = struct.pack('>q', pred_value)
+                pred_value_bytes = struct.pack(">q", pred_value)
         elif isinstance(pred_value, float):
             if isinstance(field.field_type, FloatType):
-                pred_value_bytes = struct.pack('>f', pred_value)
+                pred_value_bytes = struct.pack(">f", pred_value)
             else:
-                pred_value_bytes = struct.pack('>d', pred_value)
+                pred_value_bytes = struct.pack(">d", pred_value)
         else:
             # For other types, try to use the raw value if it's already bytes
             if isinstance(pred_value, bytes):
                 pred_value_bytes = pred_value
             else:
                 # Fallback: convert to string and encode
-                pred_value_bytes = str(pred_value).encode('utf-8')
-        
+                pred_value_bytes = str(pred_value).encode("utf-8")
+
         pred_value_int = _value_to_int64(pred_value_bytes, field.field_type)
-        
+
         # Debug logging - now comparing simple integers!
         logger.debug(
             f"Pruning check for field {field_id} ({field.name}): "
@@ -808,7 +813,7 @@ def prune_data_files_with_predicates(
     # Debug logging
     logger.info(f"prune_data_files_with_predicates called with row_filter type: {type(row_filter)}")
     logger.info(f"row_filter value: {row_filter}")
-    
+
     # If no filter or ALWAYS_TRUE, no pruning
     if row_filter == ALWAYS_TRUE or isinstance(row_filter, AlwaysTrue):
         logger.info("No filter or ALWAYS_TRUE, skipping pruning")
@@ -924,10 +929,10 @@ class OptimizedDataScan(DataScan):
             # Use the projected_schema which has the bound filter
             # Access the bound row filter from DataScan's internal state
             bound_filter = self.row_filter
-            
+
             # Debug: Check if we have a filter
             logger.info(f"Pruning with filter: {bound_filter} (type: {type(bound_filter)})")
-            
+
             data_files, pruned_count = prune_data_files_with_predicates(
                 data_files,
                 bound_filter,
