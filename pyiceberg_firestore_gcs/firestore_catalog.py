@@ -10,6 +10,7 @@ from typing import Tuple
 from typing import Union
 
 import orjson
+import pyarrow as pa
 from google.cloud import firestore
 from orso.logging import get_logger
 from pyiceberg.catalog import Identifier
@@ -23,6 +24,7 @@ from pyiceberg.exceptions import NoSuchViewError
 from pyiceberg.exceptions import TableAlreadyExistsError
 from pyiceberg.io import FileIO
 from pyiceberg.io import load_file_io
+from pyiceberg.io.pyarrow import _pyarrow_to_schema_without_ids
 from pyiceberg.partitioning import UNPARTITIONED_PARTITION_SPEC
 from pyiceberg.partitioning import PartitionSpec
 from pyiceberg.schema import Schema
@@ -399,12 +401,9 @@ class FirestoreCatalog(MetastoreCatalog):
         sort_order: SortOrder = UNSORTED_SORT_ORDER,
         properties: Properties = EMPTY_DICT,
     ) -> Table:
-        import pyarrow as _pa
-        from pyiceberg.io.pyarrow import _pyarrow_to_schema_without_ids
-
         namespace, table_name = self._parse_identifier(identifier)
 
-        if isinstance(schema, _pa.Schema):
+        if isinstance(schema, pa.Schema):
             schema = _pyarrow_to_schema_without_ids(schema)
 
         # Check if namespace exists, create if not
@@ -564,13 +563,10 @@ class FirestoreCatalog(MetastoreCatalog):
             TableAlreadyExistsError: If a view with this identifier already exists
             NoSuchNamespaceError: If the namespace doesn't exist
         """
-        import pyarrow as _pa
-        from pyiceberg.io.pyarrow import _pyarrow_to_schema_without_ids
-
         namespace, view_name = self._parse_identifier(identifier)
 
         # Convert pyarrow schema if needed
-        if isinstance(schema, _pa.Schema):
+        if isinstance(schema, pa.Schema):
             schema = _pyarrow_to_schema_without_ids(schema)
 
         # Check if namespace exists, create if not
@@ -689,13 +685,8 @@ class FirestoreCatalog(MetastoreCatalog):
             update_data["last_row_count"] = row_count
 
         if execution_time is not None:
-            # Store execution time in properties
-            doc = doc_ref.get()
-            if doc.exists:
-                data = doc.to_dict() or {}
-                properties = data.get("properties", {})
-                properties["last_execution_time_seconds"] = execution_time
-                update_data["properties"] = properties
+            # Store execution time as a nested field in properties
+            update_data["properties.last_execution_time_seconds"] = execution_time
 
         doc_ref.set(update_data, merge=True)
         logger.debug(f"Updated execution metadata for view {namespace}.{view_name}")

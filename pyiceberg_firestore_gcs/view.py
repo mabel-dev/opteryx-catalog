@@ -9,6 +9,7 @@ from typing import Any
 from typing import Dict
 from typing import Optional
 
+import orjson
 from pyiceberg.catalog import Identifier
 from pyiceberg.schema import Schema
 
@@ -100,8 +101,6 @@ class ViewMetadata:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> ViewMetadata:
         """Create a ViewMetadata instance from a Firestore document."""
-        import orjson
-
         schema = None
         if "schema" in data and data["schema"]:
             # Deserialize schema from JSON
@@ -140,17 +139,21 @@ class View:
     catalog_name: str
     """Name of the catalog this view belongs to"""
 
+    def _is_valid_tuple_identifier(self) -> bool:
+        """Check if identifier is a valid tuple with at least 2 elements."""
+        return isinstance(self.identifier, tuple) and len(self.identifier) >= 2
+
     @property
     def name(self) -> str:
         """Return the view name."""
-        if isinstance(self.identifier, tuple) and len(self.identifier) >= 2:
+        if self._is_valid_tuple_identifier():
             return self.identifier[1]
         return str(self.identifier)
 
     @property
     def namespace(self) -> str:
         """Return the namespace."""
-        if isinstance(self.identifier, tuple) and len(self.identifier) >= 2:
+        if self._is_valid_tuple_identifier():
             return self.identifier[0]
         return ""
 
