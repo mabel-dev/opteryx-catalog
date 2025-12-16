@@ -1,6 +1,9 @@
 from typing import Optional
 
 from .firestore_catalog import FirestoreCatalog
+from .view import View
+from .view import ViewAlreadyExistsError
+from .view import ViewMetadata
 
 
 def create_catalog(
@@ -20,7 +23,4 @@ def create_catalog(
     )
 
 
-__all__ = ["create_catalog", "FirestoreCatalog"]
-
-# Compaction utilities are available via pyiceberg_firestore_gcs.compaction
-# Example: from pyiceberg_firestore_gcs.compaction import compact_table
+__all__ = ["create_catalog", "FirestoreCatalog", "View", "ViewMetadata", "ViewAlreadyExistsError"]
