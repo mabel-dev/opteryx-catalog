@@ -2,6 +2,7 @@ from typing import Optional
 
 from .firestore_catalog import FirestoreCatalog
 from .view import View
+from .view import ViewAlreadyExistsError
 from .view import ViewMetadata
 
 
@@ -22,4 +23,4 @@ def create_catalog(
     )
 
 
-__all__ = ["create_catalog", "FirestoreCatalog", "View", "ViewMetadata"]
+__all__ = ["create_catalog", "FirestoreCatalog", "View", "ViewMetadata", "ViewAlreadyExistsError"]

@@ -14,6 +14,12 @@ from pyiceberg.catalog import Identifier
 from pyiceberg.schema import Schema
 
 
+class ViewAlreadyExistsError(Exception):
+    """Raised when trying to create a view that already exists."""
+
+    pass
+
+
 @dataclass
 class ViewMetadata:
     """Metadata for a SQL view stored in Firestore.
