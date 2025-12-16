@@ -2,6 +2,8 @@ import os
 import sys
 import time
 
+# Add local paths to sys.path to use local code instead of installed packages
+sys.path.insert(0, os.path.join(sys.path[0], ".."))  # Add parent dir for pyiceberg_firestore_gcs
 sys.path.insert(1, os.path.join(sys.path[0], "../../opteryx"))
 
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = (
@@ -37,13 +39,13 @@ opteryx.register_store(
     gcs_bucket="opteryx_data",
 )
 
-# catalog.create_namespace(workspace)
+catalog.create_namespace_if_not_exists(workspace)
 
 df = opteryx.query_to_arrow("SELECT * FROM $planets")
 
-#s = catalog.create_table(f"{schema_name}.{table}", df.schema)
+s = catalog.create_table(f"{schema_name}.{table}", df.schema)
 
-s = catalog.load_table(f"{schema_name}.{table}")
+# s = catalog.load_table(f"{schema_name}.{table}")
 s.append(df)
 
 quit()

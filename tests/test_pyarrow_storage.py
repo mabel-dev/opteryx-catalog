@@ -1,20 +1,16 @@
 """Test what PyArrow actually stores in Parquet."""
+
 import pyarrow as pa
 import pyarrow.parquet as pq
 from io import BytesIO
-import struct
 
 # Create a test with the timestamp value
 test_value = 1765836905000000  # The correct Big Endian interpretation
 
 # Store in PyArrow list
-schema = pa.schema([
-    ("test_bounds", pa.list_(pa.int64()))
-])
+schema = pa.schema([("test_bounds", pa.list_(pa.int64()))])
 
-data = [
-    {"test_bounds": [None, test_value, None, test_value * 2]}
-]
+data = [{"test_bounds": [None, test_value, None, test_value * 2]}]
 
 table = pa.Table.from_pylist(data, schema=schema)
 print(f"Created table with value: {test_value}")
@@ -30,7 +26,7 @@ table2 = pq.read_table(buffer)
 print(f"\nRead back table:\n{table2}")
 
 # Get the actual values
-values = table2['test_bounds'].to_pylist()[0]
+values = table2["test_bounds"].to_pylist()[0]
 print(f"\nValues as Python list: {values}")
 print(f"First non-None value: {values[1]}")
 print(f"Matches original: {values[1] == test_value}")
