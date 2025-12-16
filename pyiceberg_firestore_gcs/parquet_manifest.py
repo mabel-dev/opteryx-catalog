@@ -480,8 +480,10 @@ def parquet_record_to_data_file(record: Dict[str, Any]):
     Returns:
         DataFile-compatible dict that can be used with FileScanTask
     """
-    # Bounds are stored as int64 arrays indexed by field_id
-    # We keep them as-is for pruning (no need to convert back to bytes for DataFile)
+    import struct
+    
+    # Bounds are stored as int64 values, but DataFile expects bytes in Iceberg format (Big Endian)
+    # We need to convert int64 back to bytes for compatibility with PyIceberg's DataFile
     lower_bounds = None
     upper_bounds = None
 
@@ -489,8 +491,7 @@ def parquet_record_to_data_file(record: Dict[str, Any]):
     upper_array = record.get("upper_bounds")
 
     if lower_array and upper_array:
-        # Store as dict mapping field_id -> int64 value
-        # We'll use these directly in pruning without conversion
+        # Store as dict mapping field_id -> bytes (Iceberg format)
         lower_bounds = {}
         upper_bounds = {}
 
@@ -498,9 +499,10 @@ def parquet_record_to_data_file(record: Dict[str, Any]):
             if min_val is not None and field_id < len(upper_array):
                 max_val = upper_array[field_id]
                 if max_val is not None:
-                    # Store int64 values directly - no bytes conversion needed!
-                    lower_bounds[field_id] = min_val
-                    upper_bounds[field_id] = max_val
+                    # Convert int64 values back to Big Endian bytes (Iceberg format)
+                    # This ensures compatibility with PyIceberg's DataFile expectations
+                    lower_bounds[field_id] = struct.pack('>q', min_val)
+                    upper_bounds[field_id] = struct.pack('>q', max_val)
 
     # Convert arrays to dicts for DataFile
     null_value_counts = {}
@@ -673,12 +675,12 @@ def _can_prune_file_with_predicate(
     if field_id not in data_file.lower_bounds or field_id not in data_file.upper_bounds:
         return False
 
-    # Get the int64 bounds directly - already converted!
-    file_min_int = data_file.lower_bounds[field_id]
-    file_max_int = data_file.upper_bounds[field_id]
-
+# Get the bounds - they are now in Big Endian bytes format (Iceberg format)
+    file_min_bytes = data_file.lower_bounds[field_id]
+    file_max_bytes = data_file.upper_bounds[field_id]
+    
     # Handle None values
-    if file_min_int is None or file_max_int is None:
+    if file_min_bytes is None or file_max_bytes is None:
         return False
 
     # Get field type from schema for converting predicate value
@@ -689,6 +691,10 @@ def _can_prune_file_with_predicate(
     try:
         import datetime
         import struct
+
+        # Convert bounds from bytes to int64 for comparison
+        file_min_int = _value_to_int64(file_min_bytes, field.field_type)
+        file_max_int = _value_to_int64(file_max_bytes, field.field_type)
 
         # Convert predicate value to int64
         # For the predicate value, we need to serialize it first then convert
