@@ -155,6 +155,8 @@ class FirestoreCatalog(MetastoreCatalog):
                 }
 
                 # Load snapshots from subcollection
+                # Note: Ordering by snapshot-id ensures consistent retrieval, though PyIceberg
+                # looks up snapshots by ID rather than position, so order doesn't affect functionality
                 snapshots_collection = self._snapshots_collection(namespace, table_name)
                 snapshots = []
                 for snapshot_doc in snapshots_collection.order_by("snapshot-id").stream():
@@ -204,6 +206,9 @@ class FirestoreCatalog(MetastoreCatalog):
             )
 
             # Store snapshots in subcollection
+            # Note: Using delete-then-recreate strategy for simplicity and to ensure consistency.
+            # This avoids stale snapshots and handles snapshot removal correctly.
+            # For tables with many snapshots, this could be optimized to only update changes.
             snapshots_collection = self._snapshots_collection(namespace, table_name)
             # Delete existing snapshots first (we'll replace with the full list)
             for doc in snapshots_collection.stream():
@@ -216,6 +221,9 @@ class FirestoreCatalog(MetastoreCatalog):
                     snapshots_collection.document(str(snapshot_id)).set(snapshot)
 
             # Store snapshot log in subcollection
+            # Note: Using delete-then-recreate for consistency with snapshots approach.
+            # Since snapshot log is append-only in practice, this could be optimized to
+            # only append new entries in the future.
             snapshot_log_collection = self._snapshot_log_collection(namespace, table_name)
             # Delete existing snapshot log first (we'll replace with the full list)
             for doc in snapshot_log_collection.stream():
@@ -224,11 +232,16 @@ class FirestoreCatalog(MetastoreCatalog):
             # Write new snapshot log entries
             for idx, log_entry in enumerate(snapshot_log):
                 # Use a combination of snapshot-id and timestamp for the document ID
+                # snapshot-id and timestamp-ms are required fields in SnapshotLogEntry
                 snapshot_id = log_entry.get("snapshot-id")
                 timestamp_ms = log_entry.get("timestamp-ms")
-                doc_id = (
-                    f"{snapshot_id}_{timestamp_ms}" if snapshot_id and timestamp_ms else str(idx)
-                )
+                if snapshot_id is None or timestamp_ms is None:
+                    logger.warning(
+                        f"Snapshot log entry missing required fields: {log_entry}, using index {idx}"
+                    )
+                    doc_id = f"entry_{idx}"
+                else:
+                    doc_id = f"{snapshot_id}_{timestamp_ms}"
                 snapshot_log_collection.document(doc_id).set(log_entry)
 
             logger.debug(f"Saved metadata for {namespace}.{table_name} to Firestore")
