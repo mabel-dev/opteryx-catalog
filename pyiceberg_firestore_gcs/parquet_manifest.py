@@ -121,7 +121,7 @@ def _serialize_value(value: Any) -> Any:
     return value
 
 
-def _value_to_int64(raw_bytes: bytes, field_type: PrimitiveType) -> int:
+def _value_to_int64(raw_bytes: bytes, field_type: PrimitiveType) -> Optional[int]:
     """Convert a bound value to int64 for order-preserving comparisons.
 
     This allows us to compare values of different types using simple integer
@@ -132,15 +132,18 @@ def _value_to_int64(raw_bytes: bytes, field_type: PrimitiveType) -> int:
         field_type: The field type for deserialization
 
     Returns:
-        int64 value that preserves ordering
+        int64 value that preserves ordering, or None if conversion not supported
     """
     import struct
 
+    from pyiceberg.types import BinaryType
     from pyiceberg.types import DateType
+    from pyiceberg.types import FixedType
     from pyiceberg.types import StringType
     from pyiceberg.types import TimestampType
     from pyiceberg.types import TimestamptzType
     from pyiceberg.types import TimeType
+    from pyiceberg.types import UUIDType
 
     # Numeric types - extract as integers
     if isinstance(field_type, (IntegerType, LongType)):
@@ -167,32 +170,41 @@ def _value_to_int64(raw_bytes: bytes, field_type: PrimitiveType) -> int:
     elif isinstance(field_type, TimeType):
         return struct.unpack(">q", raw_bytes)[0]
 
-    # Strings - use first 7 bytes as int (similar to your approach)
+    # Strings - use first 7 bytes after a zero byte for lexicographic comparison
+    # This matches the Cython implementation: buf[0]=0, buf[1:8]=first 7 bytes
     elif isinstance(field_type, StringType):
-        # Pad to 8 bytes, keeping first byte 0 for sign
-        buf = b"\x00" + raw_bytes[:7]
-        buf = buf.ljust(8, b"\x00")
-        # Ensure we return a valid signed int64
-        value = struct.unpack(">q", buf)[0]
-        # Clamp to int64 range if needed
-        if value > 9223372036854775807:  # 2^63 - 1
-            value = 9223372036854775807
-        elif value < -9223372036854775808:  # -2^63
-            value = -9223372036854775808
+        # Keep first byte as 0, copy up to 7 bytes starting at position 1
+        buf = bytearray(8)
+        buf[0] = 0  # First byte is 0
+        copy_length = min(len(raw_bytes), 7)
+        buf[1:1+copy_length] = raw_bytes[:copy_length]
+        # Decode as signed big-endian
+        value = struct.unpack(">q", bytes(buf))[0]
+        # Ensure in int64 range (should already be, but just in case)
+        value = max(-9223372036854775808, min(9223372036854775807, value))
         return value
 
-    # For other types, use a hash of the bytes
-    else:
-        # Use first 8 bytes as int64
-        buf = raw_bytes[:8].ljust(8, b"\x00")
-        # Ensure we return a valid signed int64
-        value = struct.unpack(">q", buf)[0]
-        # Clamp to int64 range if needed
-        if value > 9223372036854775807:  # 2^63 - 1
-            value = 9223372036854775807
-        elif value < -9223372036854775808:  # -2^63
-            value = -9223372036854775808
+    # Binary and Fixed types - same encoding as strings
+    elif isinstance(field_type, (BinaryType, FixedType)):
+        # Keep first byte as 0, copy up to 7 bytes starting at position 1
+        buf = bytearray(8)
+        buf[0] = 0  # First byte is 0
+        copy_length = min(len(raw_bytes), 7)
+        buf[1:1+copy_length] = raw_bytes[:copy_length]
+        # Decode as signed big-endian
+        value = struct.unpack(">q", bytes(buf))[0]
+        # Ensure in int64 range (should already be, but just in case)
+        value = max(-9223372036854775808, min(9223372036854775807, value))
         return value
+
+    # For UUID and other types that don't have meaningful ordering,
+    # return None so they won't be used for pruning
+    elif isinstance(field_type, UUIDType):
+        return None
+
+    # For any other unknown types, return None
+    else:
+        return None
 
 
 def entry_to_dict(entry: ManifestEntry, schema: Any) -> Dict[str, Any]:
@@ -696,6 +708,10 @@ def _can_prune_file_with_predicate(
         file_min_int = _value_to_int64(file_min_bytes, field.field_type)
         file_max_int = _value_to_int64(file_max_bytes, field.field_type)
 
+        # If conversion returns None (unsupported type), we can't prune
+        if file_min_int is None or file_max_int is None:
+            return False
+
         # Convert predicate value to int64
         # For the predicate value, we need to serialize it first then convert
         pred_value = predicate.literal.value
@@ -742,6 +758,10 @@ def _can_prune_file_with_predicate(
                 pred_value_bytes = str(pred_value).encode("utf-8")
 
         pred_value_int = _value_to_int64(pred_value_bytes, field.field_type)
+
+        # If conversion returns None (unsupported type), we can't prune
+        if pred_value_int is None:
+            return False
 
         # Debug logging - now comparing simple integers!
         logger.debug(
