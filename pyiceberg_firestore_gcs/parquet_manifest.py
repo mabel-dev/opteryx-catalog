@@ -79,6 +79,14 @@ from .to_int import to_int
 
 logger = get_logger()
 
+INT64_MIN = -9223372036854775808
+INT64_MAX = 9223372036854775807
+
+# Helper function to safely clamp integers (handles None)
+def clamp_int(value):
+    if value is None:
+        return None
+    return max(INT64_MIN, min(INT64_MAX, value))
 
 def decode_iceberg_value(
     value: Union[int, float, bytes], data_type: str, scale: int = None
@@ -213,13 +221,10 @@ def entry_to_dict(entry: ManifestEntry, schema: Any) -> Dict[str, Any]:
                 field = schema.find_field(field_id)
                 if field and isinstance(field.field_type, PrimitiveType):
                     try:
-                        lower_value = decode_iceberg_value(df.lower_bounds[field_id])
-                        lower_bounds_array[field_id] = to_int(lower_value, field.field_type)
-                        upper_value = decode_iceberg_value(df.upper_bounds[field_id])
-                        upper_bounds_array[field_id] = to_int(upper_value, field.field_type)
-                        print(
-                            f"Field ID {field_id}: lower={df.lower_bounds[field_id]} => {lower_bounds_array[field_id]}, upper={df.upper_bounds[field_id]} =>{upper_bounds_array[field_id]}"
-                        )
+                        lower_value = decode_iceberg_value(df.lower_bounds[field_id], field.field_type)
+                        lower_bounds_array[field_id] = to_int(lower_value)
+                        upper_value = decode_iceberg_value(df.upper_bounds[field_id], field.field_type)
+                        upper_bounds_array[field_id] = to_int(upper_value)
                     except Exception:
                         # If conversion fails, leave as None
                         pass
@@ -250,21 +255,19 @@ def entry_to_dict(entry: ManifestEntry, schema: Any) -> Dict[str, Any]:
 
         # Fill in the arrays where we have data, clamping to int64 range
         # PyArrow requires values to fit in signed int64 (-2^63 to 2^63-1)
-        INT64_MIN = -9223372036854775808
-        INT64_MAX = 9223372036854775807
 
         if df.null_value_counts:
             for field_id, count in df.null_value_counts.items():
-                null_counts_array[field_id] = max(INT64_MIN, min(INT64_MAX, count))
+                null_counts_array[field_id] = clamp_int(count)
         if df.value_counts:
             for field_id, count in df.value_counts.items():
-                value_counts_array[field_id] = max(INT64_MIN, min(INT64_MAX, count))
+                value_counts_array[field_id] = clamp_int(count)
         if df.column_sizes:
             for field_id, size in df.column_sizes.items():
-                column_sizes_array[field_id] = max(INT64_MIN, min(INT64_MAX, size))
+                column_sizes_array[field_id] = clamp_int(size)
         if df.nan_value_counts:
             for field_id, count in df.nan_value_counts.items():
-                nan_counts_array[field_id] = max(INT64_MIN, min(INT64_MAX, count))
+                nan_counts_array[field_id] = clamp_int(count)
 
     # Convert lists to JSON
     split_offsets_json = json.dumps(df.split_offsets) if df.split_offsets else None
@@ -274,16 +277,6 @@ def entry_to_dict(entry: ManifestEntry, schema: Any) -> Dict[str, Any]:
     partition_json = None
     if df.partition:
         partition_json = json.dumps({k: _serialize_value(v) for k, v in df.partition.items()})
-
-    # Clamp integer values to int64 range for PyArrow compatibility
-    INT64_MIN = -9223372036854775808
-    INT64_MAX = 9223372036854775807
-
-    # Helper function to safely clamp integers (handles None)
-    def clamp_int(value):
-        if value is None:
-            return None
-        return max(INT64_MIN, min(INT64_MAX, value))
 
     return {
         "file_path": df.file_path,
@@ -355,16 +348,12 @@ def write_parquet_manifest(
 
     logger.debug(f"Collected {len(all_entries)} data file entries from {manifest_count} manifests")
 
-    # Debug: Check for overflow values before creating Arrow table and clamp them
-    INT64_MIN = -9223372036854775808
-    INT64_MAX = 9223372036854775807
-
     for i, entry in enumerate(all_entries):
         for key, value in entry.items():
             if isinstance(value, int) and (value < INT64_MIN or value > INT64_MAX):
                 logger.error(f"Entry {i}, field '{key}': value {value} overflows int64 range!")
                 # Clamp to int64 range
-                entry[key] = max(INT64_MIN, min(INT64_MAX, value))
+                entry[key] = clamp_int(value)
             elif isinstance(value, list):
                 for j, v in enumerate(value):
                     if isinstance(v, int) and (v < INT64_MIN or v > INT64_MAX):
@@ -372,7 +361,7 @@ def write_parquet_manifest(
                             f"Entry {i}, field '{key}[{j}]': value {v} overflows int64 range!"
                         )
                         # Clamp to int64 range
-                        value[j] = max(INT64_MIN, min(INT64_MAX, v))
+                        value[j] = clamp_int(v)
 
     # Convert to Arrow table
     schema = get_parquet_manifest_schema()
@@ -456,13 +445,6 @@ def read_parquet_manifest(
         return None
 
 
-def _deserialize_value(value: Any, is_base64: bool = False) -> Any:
-    """Deserialize a value from JSON storage, handling base64-encoded bytes."""
-    if is_base64 and isinstance(value, str):
-        return base64.b64decode(value)
-    return value
-
-
 def parquet_record_to_data_file(record: Dict[str, Any]):
     """Convert a Parquet record back to a DataFile-like object.
 
@@ -472,8 +454,6 @@ def parquet_record_to_data_file(record: Dict[str, Any]):
     Returns:
         DataFile-compatible dict that can be used with FileScanTask
     """
-    import struct
-
     # Bounds are stored as int64 values, but DataFile expects bytes in Iceberg format (Big Endian)
     # We need to convert int64 back to bytes for compatibility with PyIceberg's DataFile
     lower_bounds = None
@@ -565,76 +545,6 @@ def parquet_record_to_data_file(record: Dict[str, Any]):
     data_file.spec_id = record.get("partition_spec_id", 0)
 
     return data_file
-
-
-def _deserialize_bound_value(raw_value: bytes, field_type: PrimitiveType) -> Any:
-    """Deserialize a bound value from bytes to its native Python type.
-
-    Args:
-        raw_value: Serialized bytes value from Iceberg bounds
-        field_type: The Iceberg field type to deserialize to
-
-    Returns:
-        Deserialized Python value
-    """
-    # Import here to avoid circular dependency
-    from pyiceberg.types import BinaryType
-    from pyiceberg.types import BooleanType
-    from pyiceberg.types import DateType
-    from pyiceberg.types import DecimalType
-    from pyiceberg.types import FixedType
-    from pyiceberg.types import StringType
-    from pyiceberg.types import TimestampType
-    from pyiceberg.types import TimestamptzType
-    from pyiceberg.types import TimeType
-    from pyiceberg.types import UUIDType
-
-    # For numeric types
-    if isinstance(field_type, (IntegerType, LongType)):
-        import struct
-
-        if isinstance(field_type, IntegerType):
-            return struct.unpack(">i", raw_value)[0]
-        else:  # LongType
-            return struct.unpack(">q", raw_value)[0]
-    elif isinstance(field_type, (FloatType, DoubleType)):
-        import struct
-
-        if isinstance(field_type, FloatType):
-            return struct.unpack(">f", raw_value)[0]
-        else:  # DoubleType
-            return struct.unpack(">d", raw_value)[0]
-    elif isinstance(field_type, (DateType, TimeType)):
-        import struct
-
-        return struct.unpack(">i", raw_value)[0]
-    elif isinstance(field_type, (TimestampType, TimestamptzType)):
-        import struct
-
-        return struct.unpack(">q", raw_value)[0]
-    elif isinstance(field_type, StringType):
-        return raw_value.decode("utf-8")
-    elif isinstance(field_type, UUIDType):
-        import uuid
-
-        return uuid.UUID(bytes=raw_value)
-    elif isinstance(field_type, (BinaryType, FixedType)):
-        return raw_value
-    elif isinstance(field_type, BooleanType):
-        return bool(raw_value[0])
-    elif isinstance(field_type, DecimalType):
-        # Handle decimal - convert to int first
-        import struct
-
-        if len(raw_value) <= 8:
-            return struct.unpack(">q", raw_value.rjust(8, b"\x00"))[0]
-        else:
-            # For larger decimals, use int.from_bytes
-            return int.from_bytes(raw_value, byteorder="big", signed=True)
-    else:
-        # Fallback: return as-is
-        return raw_value
-
 
 def _can_prune_file_with_predicate(
     data_file,
