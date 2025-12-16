@@ -19,6 +19,7 @@ from pyiceberg.exceptions import NamespaceAlreadyExistsError
 from pyiceberg.exceptions import NamespaceNotEmptyError
 from pyiceberg.exceptions import NoSuchNamespaceError
 from pyiceberg.exceptions import NoSuchTableError
+from pyiceberg.exceptions import NoSuchViewError
 from pyiceberg.exceptions import TableAlreadyExistsError
 from pyiceberg.io import FileIO
 from pyiceberg.io import load_file_io
@@ -516,6 +517,6 @@ class FirestoreCatalog(MetastoreCatalog):
         namespace, view_name = self._parse_identifier(identifier)
         doc_ref = self._view_doc_ref(namespace, view_name)
         if not doc_ref.get().exists:
-            raise NoSuchTableError(f"View not found: {identifier}")
+            raise NoSuchViewError(f"View not found: {identifier}")
         doc_ref.delete()
         logger.debug(f"Dropped view {namespace}.{view_name}")
