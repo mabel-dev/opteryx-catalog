@@ -10,7 +10,6 @@ This test verifies that:
 import unittest
 from unittest.mock import patch
 
-
 from pyiceberg_firestore_gcs import FirestoreCatalog
 
 

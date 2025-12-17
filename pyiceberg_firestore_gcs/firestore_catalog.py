@@ -473,8 +473,8 @@ class FirestoreCatalog(MetastoreCatalog):
         # If iceberg_compatible, also write metadata JSON to GCS
         metadata_location = None
         if self._is_iceberg_compatible(properties):
-            # Generate metadata location
-            metadata_version = 0
+            # Generate metadata location for new table (version 0)
+            metadata_version = 0  # Initial version for newly created tables
             provider = load_location_provider(location, properties)
             metadata_location = provider.new_table_metadata_file_location(metadata_version)
 
