@@ -28,9 +28,11 @@ from pyiceberg.io.pyarrow import _pyarrow_to_schema_without_ids
 from pyiceberg.partitioning import UNPARTITIONED_PARTITION_SPEC
 from pyiceberg.partitioning import PartitionSpec
 from pyiceberg.schema import Schema
+from pyiceberg.serializers import ToOutputFile
 from pyiceberg.table import CommitTableResponse
 from pyiceberg.table import StaticTable
 from pyiceberg.table import Table
+from pyiceberg.table.locations import load_location_provider
 from pyiceberg.table.metadata import TableMetadataV2
 from pyiceberg.table.metadata import new_table_metadata
 from pyiceberg.table.sorting import UNSORTED_SORT_ORDER
@@ -471,9 +473,6 @@ class FirestoreCatalog(MetastoreCatalog):
         # If iceberg_compatible, also write metadata JSON to GCS
         metadata_location = None
         if self._is_iceberg_compatible(properties):
-            from pyiceberg.io import load_location_provider
-            from pyiceberg.serializers import ToOutputFile
-
             # Generate metadata location
             metadata_version = 0
             provider = load_location_provider(location, properties)
@@ -545,8 +544,6 @@ class FirestoreCatalog(MetastoreCatalog):
 
         # If iceberg_compatible, also write metadata JSON to GCS
         if self._is_iceberg_compatible(updated_staged_table.metadata.properties):
-            from pyiceberg.serializers import ToOutputFile
-
             # Write metadata JSON to the location determined by _update_and_stage_table
             io_for_write = self._load_file_io(
                 updated_staged_table.metadata.properties, updated_staged_table.metadata.location
