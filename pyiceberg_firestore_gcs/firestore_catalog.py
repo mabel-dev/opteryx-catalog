@@ -210,9 +210,13 @@ class FirestoreCatalog(MetastoreCatalog):
         if self.iceberg_compatible:
             return True
 
-        # Otherwise check table-level property
+        # Otherwise check table-level property (defaults to True)
         table_compat = table_properties.get("iceberg_compatible", "true")
-        return table_compat.lower() in ("true", "1", "yes")
+        # Handle various boolean string formats
+        if isinstance(table_compat, str):
+            return table_compat.strip().lower() in ("true", "1", "yes")
+        # Handle boolean type
+        return bool(table_compat)
 
     @staticmethod
     def _parse_metadata_version(metadata_location: str) -> int:
