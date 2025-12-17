@@ -13,7 +13,8 @@ GCP-based environments.
 ## Features ✅
 
 - Firestore-backed catalog and namespace storage
-- GCS-based Iceberg table metadata storage
+- GCS-based Iceberg table metadata storage (with optional compatibility mode)
+- Configurable Iceberg compatibility flag for flexible metadata output
 - Table creation, registration, listing, loading, renaming, and deletion
 - Commit operations that write updated metadata to GCS and persist references in Firestore
 - Simple, opinionated defaults (e.g., default GCS location derived from catalog properties)
@@ -69,6 +70,7 @@ print(tbl.metadata)
 - GCP authentication: Use `GOOGLE_APPLICATION_CREDENTIALS` or Application Default Credentials
 - `firestore_project` and `firestore_database` can be supplied when creating the catalog
 - `gcs_bucket` is recommended to allow `create_table` to write metadata automatically; otherwise pass `location` explicitly to `create_table`
+- `iceberg_compatible` (default: `True`) controls whether to write standard Iceberg metadata JSON and Avro manifest files to GCS
 
 Example environment variables:
 
@@ -76,6 +78,53 @@ Example environment variables:
 export GOOGLE_APPLICATION_CREDENTIALS="/path/to/service-account.json"
 export GOOGLE_CLOUD_PROJECT="my-gcp-project"
 ```
+
+### Iceberg Compatibility Flag
+
+The catalog supports an `iceberg_compatible` flag that controls metadata file output:
+
+**When `iceberg_compatible=True` (default):**
+- Writes standard Iceberg metadata JSON files to GCS (e.g., `00000-*.metadata.json`)
+- Writes Avro manifest files alongside Parquet manifests
+- Ensures full compatibility with standard Iceberg tools
+- All tables in the catalog are forced to be compatible
+
+**When `iceberg_compatible=False`:**
+- Only writes metadata to Firestore (more efficient for this catalog)
+- Only writes Parquet manifests (faster query planning)
+- Reduces GCS storage costs and write operations
+- Tables can individually override to be compatible
+
+Example usage:
+
+```python
+# Default behavior - fully Iceberg compatible
+catalog = create_catalog(
+    "my_catalog",
+    firestore_project="my-gcp-project",
+    gcs_bucket="my-bucket",
+    iceberg_compatible=True  # default
+)
+
+# Optimized mode - Firestore + Parquet only
+catalog = create_catalog(
+    "my_catalog",
+    firestore_project="my-gcp-project",
+    gcs_bucket="my-bucket",
+    iceberg_compatible=False
+)
+
+# Table-level override (only works when catalog is False)
+table = catalog.create_table(
+    identifier=("namespace", "table_name"),
+    schema=schema,
+    properties={
+        "iceberg_compatible": "true"  # Write standard Iceberg files for this table
+    }
+)
+```
+
+**Note:** When the catalog-level flag is `True`, all tables are forced to be compatible regardless of table-level properties. This ensures consistency across the catalog.
 
 ## API overview 📚
 

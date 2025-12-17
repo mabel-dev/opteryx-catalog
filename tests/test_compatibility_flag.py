@@ -8,10 +8,8 @@ This test verifies that:
 """
 
 import unittest
-from unittest.mock import MagicMock, patch, mock_open
+from unittest.mock import patch
 
-from pyiceberg.schema import Schema
-from pyiceberg.types import IntegerType, StringType, NestedField
 
 from pyiceberg_firestore_gcs import FirestoreCatalog
 
@@ -60,11 +58,11 @@ class TestCompatibilityFlag(unittest.TestCase):
                 gcs_bucket="test-bucket",
                 iceberg_compatible=True,
             )
-            
+
             # Even if table tries to set iceberg_compatible=False, it should be True
             result = catalog._is_iceberg_compatible({"iceberg_compatible": "false"})
             self.assertTrue(result)
-            
+
             # With no table property, should be True
             result = catalog._is_iceberg_compatible({})
             self.assertTrue(result)
@@ -78,15 +76,15 @@ class TestCompatibilityFlag(unittest.TestCase):
                 gcs_bucket="test-bucket",
                 iceberg_compatible=False,
             )
-            
+
             # Table can override to True
             result = catalog._is_iceberg_compatible({"iceberg_compatible": "true"})
             self.assertTrue(result)
-            
+
             # Table defaults to True even when catalog is False
             result = catalog._is_iceberg_compatible({})
             self.assertTrue(result)
-            
+
             # Table can be explicitly False
             result = catalog._is_iceberg_compatible({"iceberg_compatible": "false"})
             self.assertFalse(result)
@@ -100,12 +98,12 @@ class TestCompatibilityFlag(unittest.TestCase):
                 gcs_bucket="test-bucket",
                 iceberg_compatible=False,
             )
-            
+
             # Test various True formats
             for true_val in ["true", "True", "TRUE", "1", "yes", "Yes", "YES"]:
                 result = catalog._is_iceberg_compatible({"iceberg_compatible": true_val})
                 self.assertTrue(result, f"Expected True for '{true_val}'")
-            
+
             # Test various False formats
             for false_val in ["false", "False", "FALSE", "0", "no", "No", "NO"]:
                 result = catalog._is_iceberg_compatible({"iceberg_compatible": false_val})
