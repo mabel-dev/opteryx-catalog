@@ -28,9 +28,11 @@ from pyiceberg.io.pyarrow import _pyarrow_to_schema_without_ids
 from pyiceberg.partitioning import UNPARTITIONED_PARTITION_SPEC
 from pyiceberg.partitioning import PartitionSpec
 from pyiceberg.schema import Schema
+from pyiceberg.serializers import ToOutputFile
 from pyiceberg.table import CommitTableResponse
 from pyiceberg.table import StaticTable
 from pyiceberg.table import Table
+from pyiceberg.table.locations import load_location_provider
 from pyiceberg.table.metadata import TableMetadataV2
 from pyiceberg.table.metadata import new_table_metadata
 from pyiceberg.table.sorting import UNSORTED_SORT_ORDER
@@ -69,13 +71,16 @@ class FirestoreCatalog(MetastoreCatalog):
         firestore_project: Optional[str] = None,
         firestore_database: Optional[str] = None,
         gcs_bucket: Optional[str] = None,
+        iceberg_compatible: bool = True,
         **properties: str,
     ):
         properties["gcs_bucket"] = gcs_bucket
+        properties["iceberg_compatible"] = str(iceberg_compatible)
         super().__init__(catalog_name, **properties)
 
         self.catalog_name = catalog_name
         self.bucket_name = gcs_bucket
+        self.iceberg_compatible = iceberg_compatible
         self.firestore_client = _get_firestore_client(firestore_project, firestore_database)
         self._catalog_ref = self.firestore_client.collection(catalog_name)
         self._properties = properties
@@ -190,6 +195,35 @@ class FirestoreCatalog(MetastoreCatalog):
             logger.debug(f"Saved view metadata for {namespace}.{view_name} to Firestore")
         except Exception as e:
             logger.warning(f"Failed to save view metadata to Firestore: {e}")
+
+    def _is_iceberg_compatible(self, table_properties: Properties = EMPTY_DICT) -> bool:
+        """Determine if a table should be Iceberg compatible.
+
+        If the catalog is iceberg_compatible=True, all tables are forced to be compatible.
+        Otherwise, tables inherit the catalog setting unless explicitly overridden.
+
+        Args:
+            table_properties: Properties from the table
+
+        Returns:
+            bool: True if the table should write Iceberg metadata JSON and Avro files
+        """
+        # If catalog is iceberg_compatible, all tables must be compatible
+        if self.iceberg_compatible:
+            return True
+
+        # Check if table has an explicit property set
+        if "iceberg_compatible" not in table_properties:
+            # No table-level override, inherit catalog setting (False in this case)
+            return False
+
+        # Table has explicit property, parse it
+        table_compat = table_properties["iceberg_compatible"]
+        # Handle various boolean string formats
+        if isinstance(table_compat, str):
+            return table_compat.strip().lower() in ("true", "1", "yes")
+        # Handle boolean type
+        return bool(table_compat)
 
     @staticmethod
     def _parse_metadata_version(metadata_location: str) -> int:
@@ -436,6 +470,19 @@ class FirestoreCatalog(MetastoreCatalog):
         # Save metadata to Firestore
         self._save_metadata_to_firestore(namespace, table_name, metadata)
 
+        # If iceberg_compatible, also write metadata JSON to GCS
+        metadata_location = None
+        if self._is_iceberg_compatible(properties):
+            # Generate metadata location for new table (version 0)
+            metadata_version = 0  # Initial version for newly created tables
+            provider = load_location_provider(location, properties)
+            metadata_location = provider.new_table_metadata_file_location(metadata_version)
+
+            # Write metadata JSON to GCS
+            io_for_write = self._load_file_io(properties, location)
+            ToOutputFile.table_metadata(metadata, io_for_write.new_output(metadata_location))
+            logger.debug(f"Wrote Iceberg metadata JSON to {metadata_location}")
+
         # Register the table in Firestore
         payload: Dict[str, Any] = {
             "name": table_name,
@@ -451,7 +498,7 @@ class FirestoreCatalog(MetastoreCatalog):
         return StaticTable(
             identifier=(namespace, table_name),
             metadata=metadata,
-            metadata_location=None,
+            metadata_location=metadata_location,
             io=io,
             catalog=self,
         )
@@ -494,6 +541,18 @@ class FirestoreCatalog(MetastoreCatalog):
 
         # Save metadata to Firestore
         self._save_metadata_to_firestore(namespace, table_name, updated_staged_table.metadata)
+
+        # If iceberg_compatible, also write metadata JSON to GCS
+        if self._is_iceberg_compatible(updated_staged_table.metadata.properties):
+            # Write metadata JSON to the location determined by _update_and_stage_table
+            io_for_write = self._load_file_io(
+                updated_staged_table.metadata.properties, updated_staged_table.metadata.location
+            )
+            ToOutputFile.table_metadata(
+                updated_staged_table.metadata,
+                io_for_write.new_output(updated_staged_table.metadata_location),
+            )
+            logger.debug(f"Wrote Iceberg metadata JSON to {updated_staged_table.metadata_location}")
 
         # Write Parquet manifest for fast query planning
         # This is in addition to the standard Avro manifests already written
