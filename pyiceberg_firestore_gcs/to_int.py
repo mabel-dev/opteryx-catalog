@@ -1,11 +1,12 @@
 import datetime
+import math
 import struct
 from decimal import Decimal
 from typing import Any
 
-MIN_SIGNED_64BIT = -(2**63)
+NULL_FLAG = -(2**63)
 MAX_SIGNED_64BIT = (2**63) - 1
-NULL_FLAG = MIN_SIGNED_64BIT  # Assuming NULL_FLAG is same as min value
+MIN_SIGNED_64BIT = -(2**63) + 1
 
 
 def _ensure_64bit_range(val):
@@ -38,15 +39,14 @@ def to_int(value: Any) -> int:
             return MAX_SIGNED_64BIT
         if value == float("-inf"):
             return MIN_SIGNED_64BIT
-        import math
 
         if math.isnan(value):
             return NULL_FLAG
-        return _ensure_64bit_range(int(round(value)))
+        return _ensure_64bit_range(int(math.trunc(value)))
 
     if value_type is datetime.datetime:
         # Use timestamp method for datetime
-        return _ensure_64bit_range(int(round(value.timestamp())))
+        return _ensure_64bit_range(int(math.trunc(value.timestamp())))
 
     if value_type is datetime.date:
         # Convert to days since epoch (1970-01-01)
@@ -60,7 +60,7 @@ def to_int(value: Any) -> int:
         return _ensure_64bit_range(result)
 
     if value_type is Decimal:
-        return _ensure_64bit_range(int(round(value)))
+        return _ensure_64bit_range(int(math.trunc(value)))
 
     if value_type is str:
         # Keep the first byte as 0 to ensure the order of the 64bit int

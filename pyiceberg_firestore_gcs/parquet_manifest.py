@@ -51,7 +51,6 @@ from pyiceberg.expressions import BoundGreaterThan
 from pyiceberg.expressions import BoundGreaterThanOrEqual
 from pyiceberg.expressions import BoundLessThan
 from pyiceberg.expressions import BoundLessThanOrEqual
-from pyiceberg.expressions import BoundPredicate
 from pyiceberg.expressions import Or
 from pyiceberg.io import FileIO
 from pyiceberg.manifest import FileFormat
@@ -67,8 +66,6 @@ from pyiceberg.typedef import Properties
 from pyiceberg.types import BinaryType
 from pyiceberg.types import BooleanType
 from pyiceberg.types import DoubleType
-from pyiceberg.types import FloatType
-from pyiceberg.types import IntegerType
 from pyiceberg.types import LongType
 from pyiceberg.types import PrimitiveType
 from pyiceberg.types import StringType
@@ -78,15 +75,18 @@ from pyiceberg.types import TimestamptzType
 from .to_int import to_int
 
 logger = get_logger()
+logger.setLevel(5)
 
 INT64_MIN = -9223372036854775808
 INT64_MAX = 9223372036854775807
+
 
 # Helper function to safely clamp integers (handles None)
 def clamp_int(value):
     if value is None:
         return None
     return max(INT64_MIN, min(INT64_MAX, value))
+
 
 def decode_iceberg_value(
     value: Union[int, float, bytes], data_type: str, scale: int = None
@@ -221,9 +221,13 @@ def entry_to_dict(entry: ManifestEntry, schema: Any) -> Dict[str, Any]:
                 field = schema.find_field(field_id)
                 if field and isinstance(field.field_type, PrimitiveType):
                     try:
-                        lower_value = decode_iceberg_value(df.lower_bounds[field_id], field.field_type)
+                        lower_value = decode_iceberg_value(
+                            df.lower_bounds[field_id], field.field_type
+                        )
                         lower_bounds_array[field_id] = to_int(lower_value)
-                        upper_value = decode_iceberg_value(df.upper_bounds[field_id], field.field_type)
+                        upper_value = decode_iceberg_value(
+                            df.upper_bounds[field_id], field.field_type
+                        )
                         upper_bounds_array[field_id] = to_int(upper_value)
                     except Exception:
                         # If conversion fails, leave as None
@@ -546,9 +550,10 @@ def parquet_record_to_data_file(record: Dict[str, Any]):
 
     return data_file
 
+
 def _can_prune_file_with_predicate(
     data_file,
-    predicate: BoundPredicate,
+    predicate: Any,
     schema: Any,
 ) -> bool:
     """Check if a data file can be pruned based on a bound predicate.
@@ -558,13 +563,14 @@ def _can_prune_file_with_predicate(
 
     Args:
         data_file: DataFile object with bounds information
-        predicate: Bound predicate to evaluate
+        predicate: Bound predicate to evaluate (BoundLessThan, BoundGreaterThan, etc.)
         schema: Table schema for field lookups
 
     Returns:
         True if the file can be pruned (doesn't match), False if it might contain matches
     """
-    if not isinstance(predicate, BoundPredicate):
+    # Check if this is a bound predicate with a term that has a field
+    if not hasattr(predicate, "term") or not hasattr(predicate.term, "field"):
         return False
 
     # Get the field being filtered
@@ -581,6 +587,10 @@ def _can_prune_file_with_predicate(
     file_min_bytes = data_file.lower_bounds[field_id]
     file_max_bytes = data_file.upper_bounds[field_id]
 
+    print(
+        f"Pruning check for field_id {field_id}: file_min_bytes={file_min_bytes}, file_max_bytes={file_max_bytes}"
+    )
+
     # Handle None values
     if file_min_bytes is None or file_max_bytes is None:
         return False
@@ -591,67 +601,15 @@ def _can_prune_file_with_predicate(
         return False
 
     try:
-        import datetime
-        import struct
-
         # Convert bounds from bytes to int64 for comparison
-        file_min_int = _value_to_int64(file_min_bytes, field.field_type)
-        file_max_int = _value_to_int64(file_max_bytes, field.field_type)
-
-        # If conversion returns None (unsupported type), we can't prune
-        if file_min_int is None or file_max_int is None:
-            return False
+        # Bounds are stored as Big Endian signed 64-bit integers
+        file_min_int = struct.unpack(">q", file_min_bytes)[0]
+        file_max_int = struct.unpack(">q", file_max_bytes)[0]
 
         # Convert predicate value to int64
-        # For the predicate value, we need to serialize it first then convert
+        # Use the to_int function which handles all type conversions
         pred_value = predicate.literal.value
-
-        # Serialize the predicate value to bytes (using Iceberg's serialization)
-        from pyiceberg.types import StringType
-
-        if isinstance(field.field_type, StringType) and isinstance(pred_value, str):
-            pred_value_bytes = pred_value.encode("utf-8")
-        elif isinstance(pred_value, datetime.datetime):
-            # Convert datetime to microseconds since epoch (Iceberg format)
-            timestamp_micros = int(round(pred_value.timestamp() * 1_000_000))
-            pred_value_bytes = struct.pack(">q", timestamp_micros)
-        elif isinstance(pred_value, datetime.date) and not isinstance(
-            pred_value, datetime.datetime
-        ):
-            # Convert date to days since epoch (int32 in Iceberg)
-            epoch = datetime.date(1970, 1, 1)
-            days = (pred_value - epoch).days
-            pred_value_bytes = struct.pack(">i", days)
-        elif isinstance(pred_value, datetime.time):
-            # Convert time to microseconds since midnight (Iceberg format)
-            micros = (
-                pred_value.hour * 3600 + pred_value.minute * 60 + pred_value.second
-            ) * 1_000_000
-            micros += pred_value.microsecond
-            pred_value_bytes = struct.pack(">q", micros)
-        elif isinstance(pred_value, int):
-            if isinstance(field.field_type, IntegerType):
-                pred_value_bytes = struct.pack(">i", pred_value)
-            else:
-                pred_value_bytes = struct.pack(">q", pred_value)
-        elif isinstance(pred_value, float):
-            if isinstance(field.field_type, FloatType):
-                pred_value_bytes = struct.pack(">f", pred_value)
-            else:
-                pred_value_bytes = struct.pack(">d", pred_value)
-        else:
-            # For other types, try to use the raw value if it's already bytes
-            if isinstance(pred_value, bytes):
-                pred_value_bytes = pred_value
-            else:
-                # Fallback: convert to string and encode
-                pred_value_bytes = str(pred_value).encode("utf-8")
-
-        pred_value_int = _value_to_int64(pred_value_bytes, field.field_type)
-
-        # If conversion returns None (unsupported type), we can't prune
-        if pred_value_int is None:
-            return False
+        pred_value_int = to_int(pred_value)
 
         # Debug logging - now comparing simple integers!
         logger.debug(
@@ -662,16 +620,16 @@ def _can_prune_file_with_predicate(
         # Apply BRIN-style pruning logic with simple int64 comparisons
         if isinstance(predicate, BoundLessThan):
             # WHERE col < value: prune if file_min >= value
-            return file_min_int >= pred_value_int
+            return file_min_int > pred_value_int
         elif isinstance(predicate, BoundLessThanOrEqual):
             # WHERE col <= value: prune if file_min > value
-            return file_min_int > pred_value_int
+            return file_min_int >= pred_value_int
         elif isinstance(predicate, BoundGreaterThan):
             # WHERE col > value: prune if file_max <= value
-            return file_max_int <= pred_value_int
+            return file_max_int < pred_value_int
         elif isinstance(predicate, BoundGreaterThanOrEqual):
             # WHERE col >= value: prune if file_max < value
-            return file_max_int < pred_value_int
+            return file_max_int <= pred_value_int
         elif isinstance(predicate, BoundEqualTo):
             # WHERE col = value: prune if value < file_min OR value > file_max
             return pred_value_int < file_min_int or pred_value_int > file_max_int
@@ -685,18 +643,20 @@ def _can_prune_file_with_predicate(
         return False
 
 
-def _extract_bound_predicates(expr: BooleanExpression) -> List[BoundPredicate]:
-    """Recursively extract all BoundPredicate objects from an expression tree.
+def _extract_bound_predicates(expr: BooleanExpression) -> List[Any]:
+    """Recursively extract all bound predicate objects from an expression tree.
 
     Args:
         expr: Boolean expression to extract predicates from
 
     Returns:
-        List of BoundPredicate objects
+        List of bound predicate objects (BoundLessThan, BoundGreaterThan, etc.)
     """
     predicates = []
 
-    if isinstance(expr, BoundPredicate):
+    print(type(expr))
+    # Check if this is a bound predicate (has term.field attribute)
+    if hasattr(expr, "term") and hasattr(expr, "literal") and hasattr(expr.term, "field"):
         predicates.append(expr)
     elif isinstance(expr, (And, Or)):
         # Recursively extract from left and right
@@ -822,8 +782,6 @@ class OptimizedDataScan(DataScan):
             self.table_metadata.location,
         )
 
-        # print("paret_records:", parquet_records)
-
         if parquet_records is not None:
             read_elapsed = (time.perf_counter() - start_time) * 1000
 
@@ -832,6 +790,7 @@ class OptimizedDataScan(DataScan):
             for record in parquet_records:
                 if record.get("active", True):  # Only include active files
                     try:
+                        print("Converting Parquet record to DataFile...")
                         data_file = parquet_record_to_data_file(record)
                         data_files.append(data_file)
                     except Exception as exc:
@@ -842,12 +801,18 @@ class OptimizedDataScan(DataScan):
             conversion_elapsed = (time.perf_counter() - start_time) * 1000
 
             # Apply BRIN-style pruning based on predicates
-            # Use the projected_schema which has the bound filter
-            # Access the bound row filter from DataScan's internal state
-            bound_filter = self.row_filter
+            # Bind the row filter to the schema if it's not already bound
+            row_filter = self.row_filter
+
+            # Bind the filter if it's unbound (has a .bind() method)
+            if hasattr(row_filter, "bind"):
+                bound_filter = row_filter.bind(self.table_metadata.schema(), case_sensitive=True)
+            else:
+                bound_filter = row_filter
 
             # Debug: Check if we have a filter
             logger.info(f"Pruning with filter: {bound_filter} (type: {type(bound_filter)})")
+            print(f"Pruning with filter: {bound_filter} (type: {type(bound_filter)})")
 
             data_files, pruned_count = prune_data_files_with_predicates(
                 data_files,
