@@ -93,7 +93,7 @@ The catalog supports an `iceberg_compatible` flag that controls metadata file ou
 - Only writes metadata to Firestore (more efficient for this catalog)
 - Only writes Parquet manifests (faster query planning)
 - Reduces GCS storage costs and write operations
-- Tables can individually override to be compatible
+- Tables inherit this setting but can individually override to be compatible
 
 Example usage:
 
@@ -114,17 +114,25 @@ catalog = create_catalog(
     iceberg_compatible=False
 )
 
-# Table-level override (only works when catalog is False)
+# With catalog in non-compatible mode, tables inherit False by default
+# But can explicitly override to True for specific tables
 table = catalog.create_table(
     identifier=("namespace", "table_name"),
     schema=schema,
     properties={
-        "iceberg_compatible": "true"  # Write standard Iceberg files for this table
+        "iceberg_compatible": "true"  # This table writes standard Iceberg files
     }
+)
+
+# Tables without explicit property inherit catalog setting (False in this case)
+table2 = catalog.create_table(
+    identifier=("namespace", "optimized_table"),
+    schema=schema,
+    # No iceberg_compatible property - inherits catalog's False setting
 )
 ```
 
-**Note:** When the catalog-level flag is `True`, all tables are forced to be compatible regardless of table-level properties. This ensures consistency across the catalog.
+**Note:** When the catalog-level flag is `True`, all tables are forced to be compatible regardless of table-level properties. When the catalog flag is `False`, tables inherit this setting unless they explicitly override to `True`. This ensures consistency while allowing flexibility where needed.
 
 ## API overview 📚
 

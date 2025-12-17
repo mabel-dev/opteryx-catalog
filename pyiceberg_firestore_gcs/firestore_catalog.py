@@ -198,7 +198,7 @@ class FirestoreCatalog(MetastoreCatalog):
         """Determine if a table should be Iceberg compatible.
 
         If the catalog is iceberg_compatible=True, all tables are forced to be compatible.
-        Otherwise, check the table-level property.
+        Otherwise, tables inherit the catalog setting unless explicitly overridden.
 
         Args:
             table_properties: Properties from the table
@@ -210,8 +210,13 @@ class FirestoreCatalog(MetastoreCatalog):
         if self.iceberg_compatible:
             return True
 
-        # Otherwise check table-level property (defaults to True)
-        table_compat = table_properties.get("iceberg_compatible", "true")
+        # Check if table has an explicit property set
+        if "iceberg_compatible" not in table_properties:
+            # No table-level override, inherit catalog setting (False in this case)
+            return False
+
+        # Table has explicit property, parse it
+        table_compat = table_properties["iceberg_compatible"]
         # Handle various boolean string formats
         if isinstance(table_compat, str):
             return table_compat.strip().lower() in ("true", "1", "yes")

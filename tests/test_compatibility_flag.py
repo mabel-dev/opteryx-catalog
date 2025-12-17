@@ -68,7 +68,7 @@ class TestCompatibilityFlag(unittest.TestCase):
             self.assertTrue(result)
 
     def test_is_iceberg_compatible_catalog_false_allows_table_override(self):
-        """Test that when catalog is iceberg_compatible=False, tables can override to True."""
+        """Test that when catalog is iceberg_compatible=False, tables inherit False but can override to True."""
         with patch("pyiceberg_firestore_gcs.firestore_catalog._get_firestore_client"):
             catalog = FirestoreCatalog(
                 catalog_name="test_catalog",
@@ -77,13 +77,13 @@ class TestCompatibilityFlag(unittest.TestCase):
                 iceberg_compatible=False,
             )
 
-            # Table can override to True
+            # Table can explicitly override to True
             result = catalog._is_iceberg_compatible({"iceberg_compatible": "true"})
             self.assertTrue(result)
 
-            # Table defaults to True even when catalog is False
+            # Table inherits catalog setting (False) when no property set
             result = catalog._is_iceberg_compatible({})
-            self.assertTrue(result)
+            self.assertFalse(result)
 
             # Table can be explicitly False
             result = catalog._is_iceberg_compatible({"iceberg_compatible": "false"})
