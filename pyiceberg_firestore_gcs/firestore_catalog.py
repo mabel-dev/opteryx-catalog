@@ -118,53 +118,48 @@ class FirestoreCatalog(MetastoreCatalog):
     def _metadata_doc_ref(self, namespace: str, table_name: str) -> firestore.DocumentReference:
         """Get the Firestore document reference for table metadata.
 
-        Path: /<catalog>/$properties/metadata/<catalog>.<namespace>.<dataset>
+        Path: /<catalog>/<namespace>/tables/<table_name>
         """
-        metadata_key = f"{self.catalog_name}.{namespace}.{table_name}"
-        return (
-            self.firestore_client.collection(self.catalog_name)
-            .document("$properties")
-            .collection("metadata")
-            .document(metadata_key)
-        )
+        return self._table_doc_ref(namespace, table_name)
 
     def _snapshots_collection(
         self, namespace: str, table_name: str
     ) -> firestore.CollectionReference:
         """Get the Firestore collection reference for table snapshots.
 
-        Path: /<catalog>/$properties/metadata/<catalog>.<namespace>.<dataset>/snapshots
+        Path: /<catalog>/<namespace>/tables/<table_name>/snapshots
         """
-        return self._metadata_doc_ref(namespace, table_name).collection("snapshots")
+        return self._table_doc_ref(namespace, table_name).collection("snapshots")
 
     def _snapshot_log_collection(
         self, namespace: str, table_name: str
     ) -> firestore.CollectionReference:
         """Get the Firestore collection reference for snapshot log.
 
-        Path: /<catalog>/$properties/metadata/<catalog>.<namespace>.<dataset>/snapshot_log
+        Path: /<catalog>/<namespace>/tables/<table_name>/snapshot_log
         """
-        return self._metadata_doc_ref(namespace, table_name).collection("snapshot_log")
+        return self._table_doc_ref(namespace, table_name).collection("snapshot_log")
 
     def _load_metadata_from_firestore(
         self, namespace: str, table_name: str
     ) -> Optional[TableMetadataV2]:
         """Load metadata from Firestore if available."""
         try:
-            metadata_doc = self._metadata_doc_ref(namespace, table_name).get()
-            if metadata_doc.exists:
-                data = metadata_doc.to_dict() or {}
-                # Extract the metadata fields (everything except our tracking fields)
+            table_doc = self._table_doc_ref(namespace, table_name).get()
+            if table_doc.exists:
+                data = table_doc.to_dict() or {}
+                # Extract the metadata fields (exclude table management fields)
                 metadata_fields = {
-                    k: v for k, v in data.items() if k not in ("metadata_location", "updated_at")
+                    k: v for k, v in data.items() 
+                    if k not in ("name", "namespace", "workspace", "created_at", "updated_at", "metadata_location")
                 }
 
                 # Load snapshots from subcollection
-                # Note: Ordering by snapshot-id ensures consistent retrieval, though PyIceberg
-                # looks up snapshots by ID rather than position, so order doesn't affect functionality
+                # Note: PyIceberg looks up snapshots by ID rather than position, so order
+                # doesn't affect functionality. Document IDs are snapshot IDs.
                 snapshots_collection = self._snapshots_collection(namespace, table_name)
                 snapshots = []
-                for snapshot_doc in snapshots_collection.order_by("snapshot-id").stream():
+                for snapshot_doc in snapshots_collection.stream():
                     snapshot_data = snapshot_doc.to_dict()
                     if snapshot_data:
                         snapshots.append(snapshot_data)
@@ -175,7 +170,7 @@ class FirestoreCatalog(MetastoreCatalog):
                 # Load snapshot log from subcollection
                 snapshot_log_collection = self._snapshot_log_collection(namespace, table_name)
                 snapshot_log = []
-                for log_doc in snapshot_log_collection.order_by("timestamp-ms").stream():
+                for log_doc in snapshot_log_collection.stream():
                     log_data = log_doc.to_dict()
                     if log_data:
                         snapshot_log.append(log_data)
@@ -193,22 +188,27 @@ class FirestoreCatalog(MetastoreCatalog):
     def _save_metadata_to_firestore(
         self, namespace: str, table_name: str, metadata: TableMetadataV2
     ) -> None:
-        """Save metadata to Firestore."""
+        """Save metadata to Firestore, merging with existing table document."""
         try:
             metadata_dict = orjson.loads(metadata.model_dump_json(exclude_none=True))
-            metadata_doc_ref = self._metadata_doc_ref(namespace, table_name)
+            table_doc_ref = self._table_doc_ref(namespace, table_name)
 
             # Extract snapshots and snapshot-log to store in subcollections
             snapshots = metadata_dict.pop("snapshots", [])
             snapshot_log = metadata_dict.pop("snapshot-log", [])
 
-            # Store main metadata as a proper JSON document with tracking fields
-            metadata_doc_ref.set(
-                {
-                    **metadata_dict,
-                    "updated_at": firestore.SERVER_TIMESTAMP,
-                }
-            )
+            logger.debug(f"Saving metadata for {namespace}.{table_name}: {len(snapshots)} snapshots, {len(snapshot_log)} log entries")
+
+            # Get existing table document to preserve table management fields
+            existing_doc = table_doc_ref.get()
+            table_data = existing_doc.to_dict() if existing_doc.exists else {}
+            
+            # Merge metadata with existing table data, preserving table management fields
+            table_data.update(metadata_dict)
+            table_data["updated_at"] = firestore.SERVER_TIMESTAMP
+            
+            # Store combined data to table document
+            table_doc_ref.set(table_data)
 
             # Store snapshots in subcollection
             # Note: Using delete-then-recreate strategy for simplicity and to ensure consistency.
@@ -223,7 +223,10 @@ class FirestoreCatalog(MetastoreCatalog):
             for snapshot in snapshots:
                 snapshot_id = snapshot.get("snapshot-id")
                 if snapshot_id is not None:
+                    logger.debug(f"Writing snapshot {snapshot_id} to Firestore")
                     snapshots_collection.document(str(snapshot_id)).set(snapshot)
+                else:
+                    logger.warning(f"Snapshot missing snapshot-id: {snapshot}")
 
             # Store snapshot log in subcollection
             # Note: Using delete-then-recreate for consistency with snapshots approach.
@@ -247,6 +250,7 @@ class FirestoreCatalog(MetastoreCatalog):
                     doc_id = f"entry_{idx}"
                 else:
                     doc_id = f"{snapshot_id}_{timestamp_ms}"
+                logger.debug(f"Writing snapshot log entry {doc_id} to Firestore")
                 snapshot_log_collection.document(doc_id).set(log_entry)
 
             logger.debug(f"Saved metadata for {namespace}.{table_name} to Firestore")
@@ -298,20 +302,26 @@ class FirestoreCatalog(MetastoreCatalog):
         """
         # If catalog is iceberg_compatible, all tables must be compatible
         if self.iceberg_compatible:
+            logger.debug("Catalog is iceberg_compatible=True, forcing compatibility")
             return True
 
         # Check if table has an explicit property set
         if "iceberg_compatible" not in table_properties:
             # No table-level override, inherit catalog setting (False in this case)
+            logger.debug("No iceberg_compatible property in table, inheriting catalog setting (False)")
             return False
 
         # Table has explicit property, parse it
         table_compat = table_properties["iceberg_compatible"]
         # Handle various boolean string formats
         if isinstance(table_compat, str):
-            return table_compat.strip().lower() in ("true", "1", "yes")
-        # Handle boolean type
-        return bool(table_compat)
+            result = table_compat.strip().lower() in ("true", "1", "yes")
+        else:
+            # Handle boolean type
+            result = bool(table_compat)
+        
+        logger.debug(f"Table iceberg_compatible property='{table_compat}', result={result}")
+        return result
 
     @staticmethod
     def _parse_metadata_version(metadata_location: str) -> int:
@@ -555,7 +565,17 @@ class FirestoreCatalog(MetastoreCatalog):
             properties=properties,
         )
 
-        # Save metadata to Firestore
+        # Register the table in Firestore first with basic info
+        payload: Dict[str, Any] = {
+            "name": table_name,
+            "namespace": namespace,
+            "workspace": self.catalog_name,
+            "created_at": firestore.SERVER_TIMESTAMP,
+            "updated_at": firestore.SERVER_TIMESTAMP,
+        }
+        self._table_doc_ref(namespace, table_name).set(payload)
+
+        # Now save metadata (which will merge with the existing document)
         self._save_metadata_to_firestore(namespace, table_name, metadata)
 
         # If iceberg_compatible, also write metadata JSON to GCS
@@ -570,17 +590,6 @@ class FirestoreCatalog(MetastoreCatalog):
             io_for_write = self._load_file_io(properties, location)
             ToOutputFile.table_metadata(metadata, io_for_write.new_output(metadata_location))
             logger.debug(f"Wrote Iceberg metadata JSON to {metadata_location}")
-
-        # Register the table in Firestore
-        payload: Dict[str, Any] = {
-            "name": table_name,
-            "namespace": namespace,
-            "workspace": self.catalog_name,
-            "created_at": firestore.SERVER_TIMESTAMP,
-            "updated_at": firestore.SERVER_TIMESTAMP,
-        }
-
-        self._table_doc_ref(namespace, table_name).set(payload)
 
         # Return the created table
         return StaticTable(
@@ -657,6 +666,18 @@ class FirestoreCatalog(MetastoreCatalog):
             logger.info(
                 f"Wrote Parquet manifest for {self.catalog_name}.{namespace}.{table_name} at {parquet_path}"
             )
+            
+            # Store Parquet manifest path in the current snapshot document
+            current_snapshot_id = updated_staged_table.metadata.current_snapshot_id
+            if current_snapshot_id is not None:
+                snapshot_ref = self._snapshots_collection(namespace, table_name).document(
+                    str(current_snapshot_id)
+                )
+                snapshot_ref.set(
+                    {"parquet-manifest": parquet_path},
+                    merge=True,
+                )
+                logger.debug(f"Added parquet-manifest reference to snapshot {current_snapshot_id}")
 
         # Update Firestore
         table_ref = self._table_doc_ref(namespace, table_name)

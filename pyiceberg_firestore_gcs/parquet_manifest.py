@@ -52,6 +52,7 @@ from pyiceberg.expressions import BoundGreaterThanOrEqual
 from pyiceberg.expressions import BoundLessThan
 from pyiceberg.expressions import BoundLessThanOrEqual
 from pyiceberg.expressions import Or
+from pyiceberg.expressions.visitors import bind
 from pyiceberg.io import FileIO
 from pyiceberg.manifest import FileFormat
 from pyiceberg.manifest import ManifestEntry
@@ -65,6 +66,7 @@ from pyiceberg.typedef import EMPTY_DICT
 from pyiceberg.typedef import Properties
 from pyiceberg.types import BinaryType
 from pyiceberg.types import BooleanType
+from pyiceberg.types import DateType
 from pyiceberg.types import DoubleType
 from pyiceberg.types import LongType
 from pyiceberg.types import PrimitiveType
@@ -120,10 +122,10 @@ def decode_iceberg_value(
             # Windows specifically doesn't like negative timestamps
             return datetime.datetime(1970, 1, 1) + datetime.timedelta(microseconds=interval)
         return datetime.datetime.fromtimestamp(interval / 1_000_000)
-    elif data_type == "date":
+    elif data_type_class == DateType:
         # Iceberg stores dates as days since epoch (1970-01-01)
         interval = int.from_bytes(value, "little", signed=True)
-        return datetime.datetime(1970, 1, 1) + datetime.timedelta(days=interval)
+        return datetime.date(1970, 1, 1) + datetime.timedelta(days=interval)
     elif data_type_class == StringType:
         # Assuming UTF-8 encoded bytes (or already decoded string)
         return value.decode("utf-8") if isinstance(value, bytes) else str(value)
@@ -620,16 +622,16 @@ def _can_prune_file_with_predicate(
         # Apply BRIN-style pruning logic with simple int64 comparisons
         if isinstance(predicate, BoundLessThan):
             # WHERE col < value: prune if file_min >= value
-            return file_min_int > pred_value_int
+            return file_min_int >= pred_value_int
         elif isinstance(predicate, BoundLessThanOrEqual):
             # WHERE col <= value: prune if file_min > value
-            return file_min_int >= pred_value_int
+            return file_min_int > pred_value_int
         elif isinstance(predicate, BoundGreaterThan):
             # WHERE col > value: prune if file_max <= value
-            return file_max_int < pred_value_int
+            return file_max_int <= pred_value_int
         elif isinstance(predicate, BoundGreaterThanOrEqual):
             # WHERE col >= value: prune if file_max < value
-            return file_max_int <= pred_value_int
+            return file_max_int < pred_value_int
         elif isinstance(predicate, BoundEqualTo):
             # WHERE col = value: prune if value < file_min OR value > file_max
             return pred_value_int < file_min_int or pred_value_int > file_max_int
@@ -801,12 +803,12 @@ class OptimizedDataScan(DataScan):
             conversion_elapsed = (time.perf_counter() - start_time) * 1000
 
             # Apply BRIN-style pruning based on predicates
-            # Bind the row filter to the schema if it's not already bound
+            # Bind the row filter to the schema
             row_filter = self.row_filter
 
-            # Bind the filter if it's unbound (has a .bind() method)
-            if hasattr(row_filter, "bind"):
-                bound_filter = row_filter.bind(self.table_metadata.schema(), case_sensitive=True)
+            # Use the bind visitor to properly bind all expression types including And/Or
+            if row_filter != ALWAYS_TRUE and not isinstance(row_filter, AlwaysTrue):
+                bound_filter = bind(self.table_metadata.schema(), row_filter, case_sensitive=True)
             else:
                 bound_filter = row_filter
 
