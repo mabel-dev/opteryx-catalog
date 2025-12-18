@@ -656,7 +656,6 @@ def _extract_bound_predicates(expr: BooleanExpression) -> List[Any]:
     """
     predicates = []
 
-    print(type(expr))
     # Check if this is a bound predicate (has term.field attribute)
     if hasattr(expr, "term") and hasattr(expr, "literal") and hasattr(expr.term, "field"):
         predicates.append(expr)
