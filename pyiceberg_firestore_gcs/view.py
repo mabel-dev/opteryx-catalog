@@ -66,12 +66,18 @@ class ViewMetadata:
     view_version: str = "1"
     """Version of the view metadata format"""
 
+    # Workspace (catalog) name for permissions and scoping
+    workspace: Optional[str] = None
+    """Name of the workspace (catalog) this view belongs to"""
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert the metadata to a dictionary for Firestore storage."""
         result: Dict[str, Any] = {
             "sql_text": self.sql_text,
             "view_version": self.view_version,
         }
+        if self.workspace is not None:
+            result["workspace"] = self.workspace
 
         if self.schema is not None:
             # Store schema as JSON
@@ -124,6 +130,7 @@ class ViewMetadata:
             last_row_count=data.get("last_row_count"),
             properties=data.get("properties", {}),
             view_version=data.get("view_version", "1"),
+            workspace=data.get("workspace"),
         )
 
 

@@ -3,7 +3,10 @@ import sys
 
 # Add local paths to sys.path to use local code instead of installed packages
 sys.path.insert(0, os.path.join(sys.path[0], ".."))  # Add parent dir for pyiceberg_firestore_gcs
-#sys.path.insert(1, os.path.join(sys.path[0], "../../opteryx"))
+sys.path.insert(1, os.path.join(sys.path[0], "../opteryx-core"))
+
+import opteryx
+print("Opteryx version:", opteryx.__version__)
 
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = (
     "/Users/justin/Nextcloud/mabel/mabeldev-b37f651c2916.json"
@@ -18,7 +21,7 @@ from pyiceberg_firestore_gcs import FirestoreCatalog
 from opteryx.connectors.iceberg_connector import IcebergConnector
 
 workspace = "public"
-schema_name = "space"
+schema_name = "examples"
 table = "planets"
 
 # Step 1: Create a local Iceberg catalog
@@ -45,10 +48,10 @@ catalog.create_namespace_if_not_exists(schema_name, properties={"iceberg_compati
 df = opteryx.query_to_arrow("SELECT * FROM $planets")
 
 # Drop table if it exists
-#try:
-#    catalog.drop_table(f"{schema_name}.{table}")
-#except Exception:
-#    pass
+try:
+    catalog.drop_table(f"{schema_name}.{table}")
+except Exception:
+    pass
 
 s = catalog.create_table(f"{schema_name}.{table}", df.schema, properties={"iceberg_compatible": "false"})
 

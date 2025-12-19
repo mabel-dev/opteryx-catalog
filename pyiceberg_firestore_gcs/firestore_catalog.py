@@ -210,37 +210,38 @@ class FirestoreCatalog(MetastoreCatalog):
             # Store combined data to table document
             table_doc_ref.set(table_data)
 
-            # Store snapshots in subcollection
-            # Note: Using delete-then-recreate strategy for simplicity and to ensure consistency.
-            # This avoids stale snapshots and handles snapshot removal correctly.
-            # For tables with many snapshots, this could be optimized to only update changes.
+            # Store snapshots in subcollection without deleting everything first
+            # Load existing docs so we can do a minimal diffed write/delete set
             snapshots_collection = self._snapshots_collection(namespace, table_name)
-            # Delete existing snapshots first (we'll replace with the full list)
-            for doc in snapshots_collection.stream():
-                doc.reference.delete()
+            existing_snapshots = {
+                doc.id: doc.to_dict() or {} for doc in snapshots_collection.stream()
+            }
 
-            # Write new snapshots
+            new_snapshots = {}
             for snapshot in snapshots:
                 snapshot_id = snapshot.get("snapshot-id")
-                if snapshot_id is not None:
-                    logger.debug(f"Writing snapshot {snapshot_id} to Firestore")
-                    snapshots_collection.document(str(snapshot_id)).set(snapshot)
-                else:
+                if snapshot_id is None:
                     logger.warning(f"Snapshot missing snapshot-id: {snapshot}")
+                    continue
+                new_snapshots[str(snapshot_id)] = snapshot
 
-            # Store snapshot log in subcollection
-            # Note: Using delete-then-recreate for consistency with snapshots approach.
-            # Since snapshot log is append-only in practice, this could be optimized to
-            # only append new entries in the future.
+            # Upsert changed or new snapshots
+            for doc_id, snapshot in new_snapshots.items():
+                if existing_snapshots.get(doc_id) != snapshot:
+                    logger.debug(f"Writing snapshot {doc_id} to Firestore")
+                    snapshots_collection.document(doc_id).set(snapshot)
+
+            # Delete snapshots that no longer exist
+            for doc_id in existing_snapshots.keys() - new_snapshots.keys():
+                logger.debug(f"Deleting stale snapshot {doc_id} from Firestore")
+                snapshots_collection.document(doc_id).delete()
+
+            # Store snapshot log in subcollection without wholesale deletes
             snapshot_log_collection = self._snapshot_log_collection(namespace, table_name)
-            # Delete existing snapshot log first (we'll replace with the full list)
-            for doc in snapshot_log_collection.stream():
-                doc.reference.delete()
+            existing_log = {doc.id: doc.to_dict() or {} for doc in snapshot_log_collection.stream()}
 
-            # Write new snapshot log entries
+            new_log_entries = {}
             for idx, log_entry in enumerate(snapshot_log):
-                # Use a combination of snapshot-id and timestamp for the document ID
-                # snapshot-id and timestamp-ms are required fields in SnapshotLogEntry
                 snapshot_id = log_entry.get("snapshot-id")
                 timestamp_ms = log_entry.get("timestamp-ms")
                 if snapshot_id is None or timestamp_ms is None:
@@ -250,8 +251,18 @@ class FirestoreCatalog(MetastoreCatalog):
                     doc_id = f"entry_{idx}"
                 else:
                     doc_id = f"{snapshot_id}_{timestamp_ms}"
-                logger.debug(f"Writing snapshot log entry {doc_id} to Firestore")
-                snapshot_log_collection.document(doc_id).set(log_entry)
+                new_log_entries[doc_id] = log_entry
+
+            # Upsert changed/new log entries
+            for doc_id, log_entry in new_log_entries.items():
+                if existing_log.get(doc_id) != log_entry:
+                    logger.debug(f"Writing snapshot log entry {doc_id} to Firestore")
+                    snapshot_log_collection.document(doc_id).set(log_entry)
+
+            # Delete removed log entries
+            for doc_id in existing_log.keys() - new_log_entries.keys():
+                logger.debug(f"Deleting stale snapshot log entry {doc_id} from Firestore")
+                snapshot_log_collection.document(doc_id).delete()
 
             logger.debug(f"Saved metadata for {namespace}.{table_name} to Firestore")
         except Exception as e:
@@ -756,6 +767,7 @@ class FirestoreCatalog(MetastoreCatalog):
             author=author,
             description=description,
             properties=dict(properties),
+            workspace=self.catalog_name,
         )
 
         # Save view metadata to Firestore
@@ -794,6 +806,10 @@ class FirestoreCatalog(MetastoreCatalog):
             raise NoSuchViewError(
                 f"View metadata not found: {self.catalog_name}.{namespace}.{view_name}"
             )
+
+        # Ensure workspace is set on metadata for permissions
+        if metadata.workspace is None:
+            metadata.workspace = self.catalog_name
 
         # Return the view
         return View(

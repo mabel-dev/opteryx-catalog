@@ -442,7 +442,8 @@ def read_parquet_manifest(
         return records
 
     except FileNotFoundError:
-        logger.debug(f"Parquet manifest not found at {parquet_path}, falling back to Avro")
+        # Raise visibility when the Parquet manifest is missing so operators notice the fallback
+        logger.warning(f"Parquet manifest not found at {parquet_path}, falling back to Avro")
         return None
     except Exception as exc:
         logger.warning(
