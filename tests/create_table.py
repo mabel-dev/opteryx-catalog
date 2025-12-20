@@ -6,14 +6,8 @@ sys.path.insert(0, os.path.join(sys.path[0], ".."))  # Add parent dir for pyiceb
 sys.path.insert(1, os.path.join(sys.path[0], "../opteryx-core"))
 
 import opteryx
-print("Opteryx version:", opteryx.__version__)
 
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = (
-    "/Users/justin/Nextcloud/mabel/mabeldev-b37f651c2916.json"
-)
-os.environ["GCP_PROJECT_ID"] = "mabeldev"
-os.environ["FIRESTORE_DATABASE"] = "catalogs"
-os.environ["GCS_BUCKET"] = "opteryx_data"
+print("Opteryx version:", opteryx.__version__)
 
 import opteryx
 from pyiceberg_firestore_gcs import FirestoreCatalog
@@ -53,7 +47,9 @@ try:
 except Exception:
     pass
 
-s = catalog.create_table(f"{schema_name}.{table}", df.schema, properties={"iceberg_compatible": "false"})
+s = catalog.create_table(
+    f"{schema_name}.{table}", df.schema, properties={"iceberg_compatible": "false"}
+)
 
-#s = catalog.load_table(f"{schema_name}.{table}")
+# s = catalog.load_table(f"{schema_name}.{table}")
 s.append(df)

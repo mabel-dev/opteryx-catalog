@@ -1,7 +1,8 @@
 """Explore the full structure of opteryx data in more detail"""
 
-from google.cloud import storage
 import os
+
+from google.cloud import storage
 
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = (
     "/Users/justin/Nextcloud/mabel/mabeldev-b37f651c2916.json"
@@ -23,7 +24,7 @@ testdata_dirs = set()
 for prefix in blobs.prefixes:
     testdata_dirs.add(prefix)
     print(f"\n📁 {prefix}")
-    
+
     # List files in each subdirectory
     sub_blobs = list(bucket.list_blobs(prefix=prefix, max_results=5))
     for sub_blob in sub_blobs:
@@ -42,7 +43,7 @@ ops_dirs = set()
 for prefix in blobs.prefixes:
     ops_dirs.add(prefix)
     print(f"\n📁 {prefix}")
-    
+
     # List files in each subdirectory
     sub_blobs = list(bucket.list_blobs(prefix=prefix, max_results=5))
     for sub_blob in sub_blobs:

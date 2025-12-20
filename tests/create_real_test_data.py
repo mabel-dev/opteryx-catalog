@@ -3,11 +3,11 @@
 Create REAL test data with actual Parquet files and proper Iceberg metadata.
 This uses the actual PyIceberg write path, not fake metadata.
 """
+
 import os
 import sys
 from datetime import datetime, timedelta
 import pyarrow as pa
-import pyarrow.parquet as pq
 
 # Add local paths
 sys.path.insert(0, os.path.join(sys.path[0], ".."))
@@ -52,22 +52,30 @@ except:
     print(f"  Namespace {namespace} already exists")
 
 # Define schema
-schema = pa.schema([
-    ('id', pa.int64()),
-    ('user_id', pa.string()),
-    ('event_type', pa.string()),
-    ('event_date', pa.date32()),
-    ('event_timestamp', pa.timestamp('us')),
-    ('amount', pa.float64()),
-    ('quantity', pa.int32()),
-])
+schema = pa.schema(
+    [
+        ("id", pa.int64()),
+        ("user_id", pa.string()),
+        ("event_type", pa.string()),
+        ("event_date", pa.date32()),
+        ("event_timestamp", pa.timestamp("us")),
+        ("amount", pa.float64()),
+        ("quantity", pa.int32()),
+    ]
+)
 
-print(f"\n✓ Defined schema with 7 columns")
+print("\n✓ Defined schema with 7 columns")
 
 # Create the Iceberg table
 from pyiceberg.schema import Schema
 from pyiceberg.types import (
-    LongType, StringType, DateType, TimestampType, DoubleType, IntegerType, NestedField
+    LongType,
+    StringType,
+    DateType,
+    TimestampType,
+    DoubleType,
+    IntegerType,
+    NestedField,
 )
 
 iceberg_schema = Schema(
@@ -89,7 +97,7 @@ print(f"✓ Created Iceberg table: {namespace}.{table_name}")
 print(f"  Table location: {table.location()}")
 
 # Generate and append data for each month
-print(f"\nGenerating data for 12 months...")
+print("\nGenerating data for 12 months...")
 
 total_records = 0
 for month in range(1, 13):
@@ -98,54 +106,59 @@ for month in range(1, 13):
         month_end = datetime(2024, 12, 31, 23, 59, 59)
     else:
         month_end = datetime(2024, month + 1, 1) - timedelta(seconds=1)
-    
+
     # Determine event type by quarter
     quarter = (month - 1) // 3
     event_types = ["login", "purchase", "view", "logout"]
     event_type = event_types[quarter]
-    
+
     # Generate records for this month
     num_records = (month + 9) * 1000  # Varying record counts
-    
+
     # Create data
     ids = list(range(month * 10000, month * 10000 + num_records))
-    user_ids = [f"user_{month:03d}_{i%1000:03d}" for i in range(num_records)]
+    user_ids = [f"user_{month:03d}_{i % 1000:03d}" for i in range(num_records)]
     event_types_list = [event_type] * num_records
-    
+
     # Date range within the month
     date_range = (month_end - month_start).days + 1
     event_dates = [month_start.date() + timedelta(days=i % date_range) for i in range(num_records)]
-    
+
     # Timestamp range within the month
     timestamp_range_seconds = int((month_end - month_start).total_seconds())
     event_timestamps = [
         month_start + timedelta(seconds=(i * 7919) % timestamp_range_seconds)
         for i in range(num_records)
     ]
-    
+
     # Amount range varies by month
     amounts = [float(month * 100 + (i % 100)) for i in range(num_records)]
-    
+
     # Quantity varies by month
     quantities = [month + (i % (month * 10)) for i in range(num_records)]
-    
+
     # Create PyArrow table
-    data_table = pa.table({
-        'id': ids,
-        'user_id': user_ids,
-        'event_type': event_types_list,
-        'event_date': event_dates,
-        'event_timestamp': event_timestamps,
-        'amount': amounts,
-        'quantity': quantities,
-    }, schema=schema)
-    
+    data_table = pa.table(
+        {
+            "id": ids,
+            "user_id": user_ids,
+            "event_type": event_types_list,
+            "event_date": event_dates,
+            "event_timestamp": event_timestamps,
+            "amount": amounts,
+            "quantity": quantities,
+        },
+        schema=schema,
+    )
+
     # Append to Iceberg table (this will create actual Parquet files and Avro manifests)
     table.append(data_table)
-    
+
     total_records += num_records
-    print(f"  Month {month:2d}: {num_records:6d} records ({event_type:8s}) - "
-          f"{month_start.date()} to {month_end.date()}")
+    print(
+        f"  Month {month:2d}: {num_records:6d} records ({event_type:8s}) - "
+        f"{month_start.date()} to {month_end.date()}"
+    )
 
 print(f"\n✓ Appended {total_records:,} total records across 12 months")
 
@@ -156,11 +169,12 @@ snapshot = table.current_snapshot()
 if snapshot:
     print(f"\n✓ Current snapshot ID: {snapshot.snapshot_id}")
     print(f"  Manifest list: {snapshot.manifest_list}")
-    
+
     # Check for Parquet manifest in Firestore
     from google.cloud import firestore
+
     db = firestore.Client(project="mabeldev", database="catalogs")
-    
+
     snapshot_doc = (
         db.collection(catalog_name)
         .document(namespace)
@@ -170,23 +184,23 @@ if snapshot:
         .document(str(snapshot.snapshot_id))
         .get()
     )
-    
+
     if snapshot_doc.exists:
         data = snapshot_doc.to_dict()
         parquet_manifest = data.get("parquet-manifest")
         if parquet_manifest:
             print(f"  Parquet manifest: {parquet_manifest}")
-            print(f"\n✓ SUCCESS: Real data with Parquet manifest created!")
+            print("\n✓ SUCCESS: Real data with Parquet manifest created!")
         else:
-            print(f"  ⚠ No parquet-manifest field found in snapshot")
+            print("  ⚠ No parquet-manifest field found in snapshot")
     else:
-        print(f"  ⚠ Snapshot document not found in Firestore")
+        print("  ⚠ Snapshot document not found in Firestore")
 
-print("\n" + "="*70)
+print("\n" + "=" * 70)
 print("TEST DATA SUMMARY")
-print("="*70)
+print("=" * 70)
 print(f"Catalog: {catalog_name}")
 print(f"Table: {namespace}.{table_name}")
 print(f"Total records: {total_records:,}")
-print(f"Data files: 12 (one per month)")
+print("Data files: 12 (one per month)")
 print("\nNow run: python tests/verify_pruning.py")

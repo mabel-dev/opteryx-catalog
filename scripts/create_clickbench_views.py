@@ -8,6 +8,8 @@ making them easily accessible as named views.
 import os
 import sys
 
+from pyiceberg_firestore_gcs import FirestoreCatalog
+
 # Add local paths to sys.path to use local code instead of installed packages
 sys.path.insert(0, os.path.join(sys.path[0], ".."))
 
@@ -18,7 +20,6 @@ os.environ["GCP_PROJECT_ID"] = "mabeldev"
 os.environ["FIRESTORE_DATABASE"] = "catalogs"
 os.environ["GCS_BUCKET"] = "opteryx_data"
 
-from pyiceberg_firestore_gcs import FirestoreCatalog
 
 workspace = "benchmarks"
 
@@ -34,48 +35,72 @@ catalog = FirestoreCatalog(
 # Define the clickbench queries with formatting
 # Original queries reference testdata.clickbench_tiny, we'll update to benchmarks.clickbench.hits
 queries = [
-    ("q01", "Simple count", """
+    (
+        "q01",
+        "Simple count",
+        """
         SELECT COUNT(*) 
         FROM benchmarks.clickbench.hits
-    """),
-    
-    ("q02", "Count with filter", """
+    """,
+    ),
+    (
+        "q02",
+        "Count with filter",
+        """
         SELECT COUNT(*) 
         FROM benchmarks.clickbench.hits 
         WHERE AdvEngineID <> 0
-    """),
-    
-    ("q03", "Basic aggregations", """
+    """,
+    ),
+    (
+        "q03",
+        "Basic aggregations",
+        """
         SELECT 
             SUM(AdvEngineID), 
             COUNT(*), 
             AVG(ResolutionWidth) 
         FROM benchmarks.clickbench.hits
-    """),
-    
-    ("q04", "Average UserID", """
+    """,
+    ),
+    (
+        "q04",
+        "Average UserID",
+        """
         SELECT AVG(UserID) 
         FROM benchmarks.clickbench.hits
-    """),
-    
-    ("q05", "Count distinct users", """
+    """,
+    ),
+    (
+        "q05",
+        "Count distinct users",
+        """
         SELECT COUNT(DISTINCT UserID) 
         FROM benchmarks.clickbench.hits
-    """),
-    
-    ("q06", "Count distinct search phrases", """
+    """,
+    ),
+    (
+        "q06",
+        "Count distinct search phrases",
+        """
         SELECT COUNT(DISTINCT SearchPhrase) 
         FROM benchmarks.clickbench.hits
-    """),
-    
-    ("q07", "Date range", """
+    """,
+    ),
+    (
+        "q07",
+        "Date range",
+        """
         SELECT 
             MIN(EventDate), 
             MAX(EventDate) 
         FROM benchmarks.clickbench.hits
-    """),
-    
-    ("q08", "Group by with order", """
+    """,
+    ),
+    (
+        "q08",
+        "Group by with order",
+        """
         SELECT 
             AdvEngineID, 
             COUNT(*) 
@@ -83,9 +108,12 @@ queries = [
         WHERE AdvEngineID <> 0 
         GROUP BY AdvEngineID 
         ORDER BY COUNT(*) DESC
-    """),
-    
-    ("q09", "Top regions by users", """
+    """,
+    ),
+    (
+        "q09",
+        "Top regions by users",
+        """
         SELECT 
             RegionID, 
             COUNT(DISTINCT UserID) AS u 
@@ -93,9 +121,12 @@ queries = [
         GROUP BY RegionID 
         ORDER BY u DESC 
         LIMIT 10
-    """),
-    
-    ("q10", "Region statistics", """
+    """,
+    ),
+    (
+        "q10",
+        "Region statistics",
+        """
         SELECT 
             RegionID, 
             SUM(AdvEngineID), 
@@ -106,9 +137,12 @@ queries = [
         GROUP BY RegionID 
         ORDER BY c DESC 
         LIMIT 10
-    """),
-    
-    ("q11", "Top mobile phone models", """
+    """,
+    ),
+    (
+        "q11",
+        "Top mobile phone models",
+        """
         SELECT 
             MobilePhoneModel, 
             COUNT(DISTINCT UserID) AS u 
@@ -117,9 +151,12 @@ queries = [
         GROUP BY MobilePhoneModel 
         ORDER BY u DESC 
         LIMIT 10
-    """),
-    
-    ("q12", "Mobile phone and model combinations", """
+    """,
+    ),
+    (
+        "q12",
+        "Mobile phone and model combinations",
+        """
         SELECT 
             MobilePhone, 
             MobilePhoneModel, 
@@ -129,9 +166,12 @@ queries = [
         GROUP BY MobilePhone, MobilePhoneModel 
         ORDER BY u DESC 
         LIMIT 10
-    """),
-    
-    ("q13", "Top search phrases by count", """
+    """,
+    ),
+    (
+        "q13",
+        "Top search phrases by count",
+        """
         SELECT 
             SearchPhrase, 
             COUNT(*) AS c 
@@ -140,9 +180,12 @@ queries = [
         GROUP BY SearchPhrase 
         ORDER BY c DESC 
         LIMIT 10
-    """),
-    
-    ("q14", "Top search phrases by users", """
+    """,
+    ),
+    (
+        "q14",
+        "Top search phrases by users",
+        """
         SELECT 
             SearchPhrase, 
             COUNT(DISTINCT UserID) AS u 
@@ -151,9 +194,12 @@ queries = [
         GROUP BY SearchPhrase 
         ORDER BY u DESC 
         LIMIT 10
-    """),
-    
-    ("q15", "Search engine and phrase analysis", """
+    """,
+    ),
+    (
+        "q15",
+        "Search engine and phrase analysis",
+        """
         SELECT 
             SearchEngineID, 
             SearchPhrase, 
@@ -163,9 +209,12 @@ queries = [
         GROUP BY SearchEngineID, SearchPhrase 
         ORDER BY c DESC 
         LIMIT 10
-    """),
-    
-    ("q16", "Top users by activity", """
+    """,
+    ),
+    (
+        "q16",
+        "Top users by activity",
+        """
         SELECT 
             UserID, 
             COUNT(*) 
@@ -173,9 +222,12 @@ queries = [
         GROUP BY UserID 
         ORDER BY COUNT(*) DESC 
         LIMIT 10
-    """),
-    
-    ("q17", "User search patterns", """
+    """,
+    ),
+    (
+        "q17",
+        "User search patterns",
+        """
         SELECT 
             UserID, 
             SearchPhrase, 
@@ -184,9 +236,12 @@ queries = [
         GROUP BY UserID, SearchPhrase 
         ORDER BY COUNT(*) DESC 
         LIMIT 10
-    """),
-    
-    ("q18", "User search patterns without order", """
+    """,
+    ),
+    (
+        "q18",
+        "User search patterns without order",
+        """
         SELECT 
             UserID, 
             SearchPhrase, 
@@ -194,9 +249,12 @@ queries = [
         FROM benchmarks.clickbench.hits 
         GROUP BY UserID, SearchPhrase 
         LIMIT 10
-    """),
-    
-    ("q19", "User activity by minute", """
+    """,
+    ),
+    (
+        "q19",
+        "User activity by minute",
+        """
         SELECT 
             UserID, 
             extract(minute FROM EventTime) AS m, 
@@ -206,21 +264,30 @@ queries = [
         GROUP BY UserID, extract(minute FROM EventTime), SearchPhrase 
         ORDER BY COUNT(*) DESC 
         LIMIT 10
-    """),
-    
-    ("q20", "Find specific user", """
+    """,
+    ),
+    (
+        "q20",
+        "Find specific user",
+        """
         SELECT UserID 
         FROM benchmarks.clickbench.hits 
         WHERE UserID = 435090932899640449
-    """),
-    
-    ("q21", "Google URL pattern count", """
+    """,
+    ),
+    (
+        "q21",
+        "Google URL pattern count",
+        """
         SELECT COUNT(*) 
         FROM benchmarks.clickbench.hits 
         WHERE URL LIKE '%google%'
-    """),
-    
-    ("q22", "Google URLs with search phrases", """
+    """,
+    ),
+    (
+        "q22",
+        "Google URLs with search phrases",
+        """
         SELECT 
             SearchPhrase, 
             MIN(URL), 
@@ -230,9 +297,12 @@ queries = [
         GROUP BY SearchPhrase 
         ORDER BY c DESC 
         LIMIT 10
-    """),
-    
-    ("q23", "Google title without google domain", """
+    """,
+    ),
+    (
+        "q23",
+        "Google title without google domain",
+        """
         SELECT 
             SearchPhrase, 
             MIN(URL), 
@@ -246,41 +316,56 @@ queries = [
         GROUP BY SearchPhrase 
         ORDER BY c DESC 
         LIMIT 10
-    """),
-    
-    ("q24", "Recent google URLs", """
+    """,
+    ),
+    (
+        "q24",
+        "Recent google URLs",
+        """
         SELECT * 
         FROM benchmarks.clickbench.hits 
         WHERE URL LIKE '%google%' 
         ORDER BY EventTime 
         LIMIT 10
-    """),
-    
-    ("q25", "Recent search phrases", """
+    """,
+    ),
+    (
+        "q25",
+        "Recent search phrases",
+        """
         SELECT SearchPhrase 
         FROM benchmarks.clickbench.hits 
         WHERE SearchPhrase <> '' 
         ORDER BY EventTime 
         LIMIT 10
-    """),
-    
-    ("q26", "Alphabetical search phrases", """
+    """,
+    ),
+    (
+        "q26",
+        "Alphabetical search phrases",
+        """
         SELECT SearchPhrase 
         FROM benchmarks.clickbench.hits 
         WHERE SearchPhrase <> '' 
         ORDER BY SearchPhrase 
         LIMIT 10
-    """),
-    
-    ("q27", "Search phrases by time and phrase", """
+    """,
+    ),
+    (
+        "q27",
+        "Search phrases by time and phrase",
+        """
         SELECT SearchPhrase 
         FROM benchmarks.clickbench.hits 
         WHERE SearchPhrase <> '' 
         ORDER BY EventTime, SearchPhrase 
         LIMIT 10
-    """),
-    
-    ("q28", "Counter URL analysis", """
+    """,
+    ),
+    (
+        "q28",
+        "Counter URL analysis",
+        """
         SELECT 
             CounterID, 
             AVG(length(URL)) AS l, 
@@ -291,9 +376,12 @@ queries = [
         HAVING COUNT(*) > 100000 
         ORDER BY l DESC 
         LIMIT 25
-    """),
-    
-    ("q29", "Referer domain analysis", """
+    """,
+    ),
+    (
+        "q29",
+        "Referer domain analysis",
+        """
         SELECT 
             REGEXP_REPLACE(Referer, b'^https?://(?:www\\.)?([^/]+)/.*$', r'\\1') AS k, 
             AVG(length(Referer)) AS l, 
@@ -305,9 +393,12 @@ queries = [
         HAVING COUNT(*) > 100000 
         ORDER BY l DESC 
         LIMIT 25
-    """),
-    
-    ("q30", "Wide aggregation", """
+    """,
+    ),
+    (
+        "q30",
+        "Wide aggregation",
+        """
         SELECT 
             SUM(ResolutionWidth), SUM(ResolutionWidth + 1), SUM(ResolutionWidth + 2), 
             SUM(ResolutionWidth + 3), SUM(ResolutionWidth + 4), SUM(ResolutionWidth + 5), 
@@ -340,9 +431,12 @@ queries = [
             SUM(ResolutionWidth + 84), SUM(ResolutionWidth + 85), SUM(ResolutionWidth + 86), 
             SUM(ResolutionWidth + 87), SUM(ResolutionWidth + 88), SUM(ResolutionWidth + 89) 
         FROM benchmarks.clickbench.hits
-    """),
-    
-    ("q31", "Search engine client analysis", """
+    """,
+    ),
+    (
+        "q31",
+        "Search engine client analysis",
+        """
         SELECT 
             SearchEngineID, 
             ClientIP, 
@@ -354,9 +448,12 @@ queries = [
         GROUP BY SearchEngineID, ClientIP 
         ORDER BY c DESC 
         LIMIT 10
-    """),
-    
-    ("q32", "Watch and client analysis", """
+    """,
+    ),
+    (
+        "q32",
+        "Watch and client analysis",
+        """
         SELECT 
             WatchID, 
             ClientIP, 
@@ -368,9 +465,12 @@ queries = [
         GROUP BY WatchID, ClientIP 
         ORDER BY c DESC 
         LIMIT 10
-    """),
-    
-    ("q33", "Watch and client patterns", """
+    """,
+    ),
+    (
+        "q33",
+        "Watch and client patterns",
+        """
         SELECT 
             WatchID, 
             ClientIP, 
@@ -381,9 +481,12 @@ queries = [
         GROUP BY WatchID, ClientIP 
         ORDER BY c DESC 
         LIMIT 10
-    """),
-    
-    ("q36", "Client IP arithmetic", """
+    """,
+    ),
+    (
+        "q36",
+        "Client IP arithmetic",
+        """
         SELECT 
             ClientIP, 
             ClientIP - 1, 
@@ -394,9 +497,12 @@ queries = [
         GROUP BY ClientIP, ClientIP - 1, ClientIP - 2, ClientIP - 3 
         ORDER BY c DESC 
         LIMIT 10
-    """),
-    
-    ("q37", "Counter 62 URL pageviews July 2013", """
+    """,
+    ),
+    (
+        "q37",
+        "Counter 62 URL pageviews July 2013",
+        """
         SELECT 
             URL, 
             COUNT(*) AS PageViews 
@@ -410,9 +516,12 @@ queries = [
         GROUP BY URL 
         ORDER BY PageViews DESC 
         LIMIT 10
-    """),
-    
-    ("q38", "Counter 62 title pageviews July 2013", """
+    """,
+    ),
+    (
+        "q38",
+        "Counter 62 title pageviews July 2013",
+        """
         SELECT 
             Title, 
             COUNT(*) AS PageViews 
@@ -426,9 +535,12 @@ queries = [
         GROUP BY Title 
         ORDER BY PageViews DESC 
         LIMIT 10
-    """),
-    
-    ("q39", "Counter 62 links with offset", """
+    """,
+    ),
+    (
+        "q39",
+        "Counter 62 links with offset",
+        """
         SELECT 
             URL, 
             COUNT(*) AS PageViews 
@@ -443,9 +555,12 @@ queries = [
         ORDER BY PageViews DESC 
         LIMIT 10 
         OFFSET 1000
-    """),
-    
-    ("q40", "Traffic source analysis", """
+    """,
+    ),
+    (
+        "q40",
+        "Traffic source analysis",
+        """
         SELECT 
             TraficSourceID, 
             SearchEngineID, 
@@ -463,9 +578,12 @@ queries = [
         ORDER BY PageViews DESC 
         LIMIT 10 
         OFFSET 1000
-    """),
-    
-    ("q41", "Traffic source URL hash", """
+    """,
+    ),
+    (
+        "q41",
+        "Traffic source URL hash",
+        """
         SELECT 
             URLHash, 
             EventDate, 
@@ -481,9 +599,12 @@ queries = [
         ORDER BY PageViews DESC 
         LIMIT 10 
         OFFSET 100
-    """),
-    
-    ("q42", "Window client dimensions", """
+    """,
+    ),
+    (
+        "q42",
+        "Window client dimensions",
+        """
         SELECT 
             WindowClientWidth, 
             WindowClientHeight, 
@@ -499,9 +620,12 @@ queries = [
         ORDER BY PageViews DESC 
         LIMIT 10 
         OFFSET 10000
-    """),
-    
-    ("q43", "Pageviews by minute", """
+    """,
+    ),
+    (
+        "q43",
+        "Pageviews by minute",
+        """
         SELECT 
             DATE_TRUNC('minute', EventTime) AS M, 
             COUNT(*) AS PageViews 
@@ -515,7 +639,8 @@ queries = [
         ORDER BY M 
         LIMIT 10 
         OFFSET 1000
-    """),
+    """,
+    ),
 ]
 
 print(f"Creating {len(queries)} Clickbench query views in benchmarks.clickbench schema...")
@@ -527,13 +652,13 @@ failed = 0
 
 for view_name, description, sql in queries:
     full_name = f"clickbench.{view_name}"
-    
+
     try:
         # Drop view if it exists (recreating with bug fix)
         if catalog.view_exists(("clickbench", view_name)):
             catalog.drop_view(("clickbench", view_name))
             print(f"  ↻ {full_name} - dropped existing view")
-        
+
         # Create the view
         catalog.create_view(
             identifier=("clickbench", view_name),
@@ -541,18 +666,18 @@ for view_name, description, sql in queries:
             description=description,
             author="system",
         )
-        
+
         if catalog.view_exists(("clickbench", view_name)):
             print(f"  ✓ {full_name} - {description}")
             created += 1
         else:
             recreated += 1
-        
+
     except Exception as e:
         print(f"  ✗ {full_name} - Error: {e}")
         failed += 1
 
 print()
-print("="*80)
+print("=" * 80)
 print(f"Done! Created {created} views, failed {failed}")
-print("="*80)
+print("=" * 80)

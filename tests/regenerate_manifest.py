@@ -2,6 +2,7 @@
 """
 Regenerate Parquet manifest after fixing date decoding bug.
 """
+
 import os
 import sys
 
@@ -16,14 +17,14 @@ from pyiceberg_firestore_gcs.parquet_manifest import write_parquet_manifest
 from pyiceberg.io.pyarrow import PyArrowFileIO
 
 catalog = FirestoreCatalog(
-    'prune_testing',
-    firestore_project='mabeldev',
-    firestore_database='catalogs',
-    gcs_bucket='opteryx_data',
-    iceberg_compatible=False
+    "prune_testing",
+    firestore_project="mabeldev",
+    firestore_database="catalogs",
+    gcs_bucket="opteryx_data",
+    iceberg_compatible=False,
 )
 
-table = catalog.load_table('default.events')
+table = catalog.load_table("default.events")
 print(f"Current snapshot: {table.current_snapshot().snapshot_id}")
 
 # Regenerate the Parquet manifest with fixed date decoding

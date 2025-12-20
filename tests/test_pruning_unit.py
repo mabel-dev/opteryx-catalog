@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Unit tests for pruning logic that do not require Firestore.
-"""
+"""Unit tests for pruning logic that do not require Firestore."""
+
 from datetime import date
 
 from pyiceberg.expressions import EqualTo, GreaterThanOrEqual, And
@@ -8,7 +8,10 @@ from pyiceberg.expressions.visitors import bind
 from pyiceberg.schema import Schema
 from pyiceberg.types import NestedField, DoubleType, DateType
 
-from pyiceberg_firestore_gcs.parquet_manifest import parquet_record_to_data_file, prune_data_files_with_predicates
+from pyiceberg_firestore_gcs.parquet_manifest import (
+    parquet_record_to_data_file,
+    prune_data_files_with_predicates,
+)
 
 
 def days_since_epoch(d: date) -> int:
@@ -95,6 +98,7 @@ def test_date_after_all_prunes_everything():
     data_files = [parquet_record_to_data_file(rec)]
 
     from pyiceberg.expressions import GreaterThan
+
     expr = GreaterThan("event_date", date(9999, 12, 31))
     bound = bind(schema, expr, case_sensitive=True)
 
