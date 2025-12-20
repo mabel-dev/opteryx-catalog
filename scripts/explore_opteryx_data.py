@@ -1,7 +1,8 @@
 """Quick script to explore the structure of gs://opteryx_data/opteryx/"""
 
-from google.cloud import storage
 import os
+
+from google.cloud import storage
 
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = (
     "/Users/justin/Nextcloud/mabel/mabeldev-b37f651c2916.json"

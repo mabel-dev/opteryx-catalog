@@ -1,7 +1,3 @@
-from datetime import datetime
-
-from pyiceberg.schema import Schema
-
 from pyiceberg_firestore_gcs.view import ViewMetadata
 
 

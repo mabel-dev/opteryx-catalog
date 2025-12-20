@@ -53,7 +53,6 @@ test_cases = [
     ("String EqualTo existing value", EqualTo("name", "Earth"), 1, True),
     ("String EqualTo non-existent", EqualTo("name", "Pluto"), 0, True),
     ("String NotEqualTo", NotEqualTo("name", "Earth"), 8, False),  # Should scan all
-    
     # INTEGER TESTS
     ("Int EqualTo existing value", EqualTo("id", 3), 1, True),  # Earth
     ("Int EqualTo non-existent", EqualTo("id", 999), 0, True),
@@ -63,7 +62,6 @@ test_cases = [
     ("Int LessThanOrEqual", LessThanOrEqual("id", 1), 1, True),  # Mercury
     ("Int GreaterThan (no match)", GreaterThan("id", 100), 0, True),
     ("Int LessThan (no match)", LessThan("id", 0), 0, True),
-    
     # FLOAT TESTS
     ("Float EqualTo", EqualTo("mass", 0.815), 1, True),  # Venus
     ("Float GreaterThan", GreaterThan("mass", 300.0), 2, False),  # Jupiter, Saturn
@@ -87,41 +85,43 @@ for description, filter_expr, expected_rows, should_prune in test_cases:
     scan = s.scan(row_filter=filter_expr)
     files = list(scan.plan_files())
     file_count = len(files)
-    
+
     # Read actual rows
     reader = scan.to_arrow_batch_reader()
     rows = []
     for batch in reader:
         rows.extend(batch.to_pylist())
-    
+
     # Determine if pruning occurred
     pruned = file_count < baseline_count
-    
+
     # Check correctness
     rows_match = len(rows) == expected_rows
     pruning_match = pruned == should_prune
-    
+
     status = "✅" if (rows_match and pruning_match) else "❌"
-    
+
     # Track results by type
     filter_type = description.split()[0].lower()
     if pruned and should_prune:
         results[f"{filter_type}_prune"] += 1
     elif not pruned and not should_prune:
         results[f"{filter_type}_no_prune"] += 1
-    
+
     print(f"\n{status} {description}")
     print(f"   Filter: {filter_expr}")
-    print(f"   Files: {file_count}/{baseline_count} (pruned={pruned}, expected_prune={should_prune})")
+    print(
+        f"   Files: {file_count}/{baseline_count} (pruned={pruned}, expected_prune={should_prune})"
+    )
     print(f"   Rows: {len(rows)} (expected={expected_rows}) {'✓' if rows_match else '✗'}")
-    
+
     if not rows_match:
-        print(f"   ⚠️  Row count mismatch!")
+        print("   ⚠️  Row count mismatch!")
     if pruned != should_prune:
         if should_prune and not pruned:
-            print(f"   ⚠️  Expected pruning but scanned all files")
+            print("   ⚠️  Expected pruning but scanned all files")
         else:
-            print(f"   ⚠️  Unexpected pruning behavior")
+            print("   ⚠️  Unexpected pruning behavior")
 
 print("\n" + "=" * 80)
 print("SUMMARY")
@@ -134,7 +134,7 @@ print(f"Float filters with pruning: {results['float_prune']}")
 print(f"Float filters without pruning: {results['float_no_prune']}")
 
 # Overall assessment
-total_pruning_tests = results['string_prune'] + results['int_prune'] + results['float_prune']
+total_pruning_tests = results["string_prune"] + results["int_prune"] + results["float_prune"]
 print(f"\n🎯 Total successful pruning tests: {total_pruning_tests}")
 
 if total_pruning_tests > 0:

@@ -20,6 +20,7 @@ from pyiceberg.catalog import Identifier
 from pyiceberg.table import Table
 
 logger = get_logger()
+logger.setLevel(5)
 
 
 @dataclass

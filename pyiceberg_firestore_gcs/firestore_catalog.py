@@ -49,6 +49,7 @@ from .view import ViewAlreadyExistsError
 from .view import ViewMetadata
 
 logger = get_logger()
+logger.setLevel(5)
 
 
 def _get_firestore_client(
@@ -150,8 +151,17 @@ class FirestoreCatalog(MetastoreCatalog):
                 data = table_doc.to_dict() or {}
                 # Extract the metadata fields (exclude table management fields)
                 metadata_fields = {
-                    k: v for k, v in data.items() 
-                    if k not in ("name", "namespace", "workspace", "created_at", "updated_at", "metadata_location")
+                    k: v
+                    for k, v in data.items()
+                    if k
+                    not in (
+                        "name",
+                        "namespace",
+                        "workspace",
+                        "created_at",
+                        "updated_at",
+                        "metadata_location",
+                    )
                 }
 
                 # Load snapshots from subcollection
@@ -197,16 +207,18 @@ class FirestoreCatalog(MetastoreCatalog):
             snapshots = metadata_dict.pop("snapshots", [])
             snapshot_log = metadata_dict.pop("snapshot-log", [])
 
-            logger.debug(f"Saving metadata for {namespace}.{table_name}: {len(snapshots)} snapshots, {len(snapshot_log)} log entries")
+            logger.debug(
+                f"Saving metadata for {namespace}.{table_name}: {len(snapshots)} snapshots, {len(snapshot_log)} log entries"
+            )
 
             # Get existing table document to preserve table management fields
             existing_doc = table_doc_ref.get()
             table_data = existing_doc.to_dict() if existing_doc.exists else {}
-            
+
             # Merge metadata with existing table data, preserving table management fields
             table_data.update(metadata_dict)
             table_data["updated_at"] = firestore.SERVER_TIMESTAMP
-            
+
             # Store combined data to table document
             table_doc_ref.set(table_data)
 
@@ -319,7 +331,9 @@ class FirestoreCatalog(MetastoreCatalog):
         # Check if table has an explicit property set
         if "iceberg_compatible" not in table_properties:
             # No table-level override, inherit catalog setting (False in this case)
-            logger.debug("No iceberg_compatible property in table, inheriting catalog setting (False)")
+            logger.debug(
+                "No iceberg_compatible property in table, inheriting catalog setting (False)"
+            )
             return False
 
         # Table has explicit property, parse it
@@ -330,7 +344,7 @@ class FirestoreCatalog(MetastoreCatalog):
         else:
             # Handle boolean type
             result = bool(table_compat)
-        
+
         logger.debug(f"Table iceberg_compatible property='{table_compat}', result={result}")
         return result
 
@@ -677,7 +691,7 @@ class FirestoreCatalog(MetastoreCatalog):
             logger.info(
                 f"Wrote Parquet manifest for {self.catalog_name}.{namespace}.{table_name} at {parquet_path}"
             )
-            
+
             # Store Parquet manifest path in the current snapshot document
             current_snapshot_id = updated_staged_table.metadata.current_snapshot_id
             if current_snapshot_id is not None:

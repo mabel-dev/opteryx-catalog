@@ -16,6 +16,7 @@ from pyiceberg.schema import Schema
 
 class ViewAlreadyExistsError(Exception):
     """Raised when trying to create a view that already exists."""
+
     pass
 
 
