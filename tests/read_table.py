@@ -19,7 +19,7 @@ from pyiceberg_firestore_gcs import FirestoreCatalog
 from pyiceberg.expressions import EqualTo, In
 
 workspace = "public"
-schema_name = "space"
+schema_name = "examples"
 table = "planets"
 
 # Step 1: Create a local Iceberg catalog
@@ -56,7 +56,9 @@ catalog = FirestoreCatalog(
 s = catalog.load_table(f"{schema_name}.{table}")
 # s.append(df)
 
-# quit()
+print(s.snapshots()[-1].timestamp_ms)
+
+quit()
 
 print(f"Table format version: {s.metadata.format_version}")
 print(f"Table location: {s.metadata.location}")
