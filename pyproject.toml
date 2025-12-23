@@ -9,7 +9,7 @@ description = "A GCP opinionated pyiceberg catalog."
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
-    "google-cloud-firestore==2.21.0",
+    "google-cloud-firestore==2.22.0",
     "google-cloud-storage==3.7.0",
     "orso==0.0.226",
     "pyarrow==22.0.0",
