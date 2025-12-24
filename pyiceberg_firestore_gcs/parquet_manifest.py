@@ -763,6 +763,7 @@ class OptimizedStaticTable(StaticTable):
             snapshot_id=snapshot_id,
             options=options,
             limit=limit,
+            full_history_loaded=getattr(self, "full_history_loaded", True),
         )
 
 
@@ -770,12 +771,23 @@ class OptimizedDataScan(DataScan):
     """DataScan that uses Parquet manifests for fast file planning."""
 
     def __init__(self, *args, **kwargs):
+        self.full_history_loaded = kwargs.pop("full_history_loaded", True)
         super().__init__(*args, **kwargs)
 
     def plan_files(self) -> Iterable[FileScanTask]:
         """Plan files using Parquet manifest if available, falling back to Avro."""
         print("Attempting to plan files using Parquet manifest...")
         start_time = time.perf_counter()
+
+        # Warn if time travel is requested without full history loaded
+        snapshot_id_requested = getattr(self, "snapshot_id", None)
+        if snapshot_id_requested is not None and not self.full_history_loaded:
+            warning_msg = (
+                "Time travel requested (snapshot_id=%s) but table was opened without "
+                "include_full_history=True; metadata may be incomplete." % snapshot_id_requested
+            )
+            print(f"WARNING: {warning_msg}")
+            logger.warning(warning_msg)
 
         # Try to read from Parquet manifest first
         parquet_records = read_parquet_manifest(

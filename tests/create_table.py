@@ -3,7 +3,7 @@ import sys
 
 # Add local paths to sys.path to use local code instead of installed packages
 sys.path.insert(0, os.path.join(sys.path[0], ".."))  # Add parent dir for pyiceberg_firestore_gcs
-sys.path.insert(1, os.path.join(sys.path[0], "../opteryx-core"))
+# sys.path.insert(1, os.path.join(sys.path[0], "../opteryx-core"))
 
 import opteryx
 
@@ -16,7 +16,7 @@ from opteryx.connectors.iceberg_connector import IcebergConnector
 
 workspace = "public"
 schema_name = "examples"
-table = "planets"
+table = "sales"
 
 # Step 1: Create a local Iceberg catalog
 catalog = FirestoreCatalog(
@@ -39,7 +39,7 @@ opteryx.register_store(
 
 catalog.create_namespace_if_not_exists(schema_name, properties={"iceberg_compatible": "false"})
 
-df = opteryx.query_to_arrow("SELECT * FROM $planets")
+df = opteryx.query_to_arrow("SELECT * FROM 'sales.jsonl'")
 
 # Drop table if it exists
 try:

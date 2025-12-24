@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pyiceberg_firestore_gcs"
-version = "0.2.20"
-description = "A GCP opinionated pyiceberg catalog."
+version = "0.2.21"
+description = "Opteryx Cloud opinionated pyiceberg catalog."
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [

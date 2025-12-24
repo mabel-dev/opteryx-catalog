@@ -142,55 +142,94 @@ class FirestoreCatalog(MetastoreCatalog):
         return self._table_doc_ref(namespace, table_name).collection("snapshot_log")
 
     def _load_metadata_from_firestore(
-        self, namespace: str, table_name: str
+        self,
+        namespace: str,
+        table_name: str,
+        include_full_history: bool = False,
     ) -> Optional[TableMetadataV2]:
-        """Load metadata from Firestore if available."""
+        """Load metadata from Firestore.
+
+        By default we only fetch the current snapshot to avoid fanning out over
+        every historical snapshot document on each table open. Full history is
+        fetched only when explicitly requested (e.g., time travel paths).
+        """
         try:
             table_doc = self._table_doc_ref(namespace, table_name).get()
-            if table_doc.exists:
-                data = table_doc.to_dict() or {}
-                # Extract the metadata fields (exclude table management fields)
-                metadata_fields = {
-                    k: v
-                    for k, v in data.items()
-                    if k
-                    not in (
-                        "name",
-                        "namespace",
-                        "workspace",
-                        "created_at",
-                        "updated_at",
-                        "metadata_location",
-                    )
-                }
+            if not table_doc.exists:
+                return None
 
-                # Load snapshots from subcollection
-                # Note: PyIceberg looks up snapshots by ID rather than position, so order
-                # doesn't affect functionality. Document IDs are snapshot IDs.
-                snapshots_collection = self._snapshots_collection(namespace, table_name)
-                snapshots = []
+            data = table_doc.to_dict() or {}
+
+            # Extract the metadata fields (exclude table management fields)
+            metadata_fields = {
+                k: v
+                for k, v in data.items()
+                if k
+                not in (
+                    "name",
+                    "namespace",
+                    "workspace",
+                    "created_at",
+                    "updated_at",
+                    "metadata_location",
+                )
+            }
+
+            current_snapshot_id = metadata_fields.get("current_snapshot_id") or metadata_fields.get(
+                "current-snapshot-id"
+            )
+
+            snapshots_collection = self._snapshots_collection(namespace, table_name)
+            snapshots = []
+
+            if include_full_history:
+                # Existing behavior: pull every snapshot doc (more reads)
+                for snapshot_doc in snapshots_collection.stream():
+                    snapshot_data = snapshot_doc.to_dict()
+                    if snapshot_data:
+                        snapshots.append(snapshot_data)
+            elif current_snapshot_id is not None:
+                # Fast path: only load the current snapshot document
+                snap_doc = snapshots_collection.document(str(current_snapshot_id)).get()
+                if snap_doc.exists:
+                    snap_data = snap_doc.to_dict()
+                    if snap_data:
+                        snapshots.append(snap_data)
+                else:
+                    # Safety fallback: if the current snapshot doc is missing, fall back to full history
+                    for snapshot_doc in snapshots_collection.stream():
+                        snapshot_data = snapshot_doc.to_dict()
+                        if snapshot_data:
+                            snapshots.append(snapshot_data)
+            else:
+                # No current snapshot id present; fall back to full history to keep metadata consistent
                 for snapshot_doc in snapshots_collection.stream():
                     snapshot_data = snapshot_doc.to_dict()
                     if snapshot_data:
                         snapshots.append(snapshot_data)
 
-                if snapshots:
-                    metadata_fields["snapshots"] = snapshots
+            if snapshots:
+                metadata_fields["snapshots"] = snapshots
 
-                # Load snapshot log from subcollection
-                snapshot_log_collection = self._snapshot_log_collection(namespace, table_name)
-                snapshot_log = []
-                for log_doc in snapshot_log_collection.stream():
-                    log_data = log_doc.to_dict()
-                    if log_data:
-                        snapshot_log.append(log_data)
+            snapshot_log_collection = self._snapshot_log_collection(namespace, table_name)
 
+            if include_full_history:
+                snapshot_log = [
+                    log_doc.to_dict()
+                    for log_doc in snapshot_log_collection.stream()
+                    if log_doc.to_dict()
+                ]
                 if snapshot_log:
                     metadata_fields["snapshot-log"] = snapshot_log
+            else:
+                # For the fast path we omit snapshot-log to save reads; TableMetadataV2 tolerates its absence
+                metadata_fields.setdefault("snapshot-log", [])
 
-                if metadata_fields:
-                    logger.debug(f"Loaded metadata for {namespace}.{table_name} from Firestore")
-                    return TableMetadataV2(**metadata_fields)
+            if metadata_fields:
+                logger.debug(
+                    f"Loaded metadata for {namespace}.{table_name} from Firestore (full_history={include_full_history})"
+                )
+                return TableMetadataV2(**metadata_fields)
         except Exception as e:
             logger.warning(f"Failed to load metadata from Firestore: {e}")
         return None
@@ -483,27 +522,36 @@ class FirestoreCatalog(MetastoreCatalog):
         namespace, table_name = self._parse_identifier(identifier)
         return self._table_doc_ref(namespace, table_name).get().exists
 
-    def load_table(self, identifier: Union[str, Identifier]) -> Table:
+    def load_table(
+        self, identifier: Union[str, Identifier], include_full_history: bool = False
+    ) -> Table:
         namespace, table_name = self._parse_identifier(identifier)
         doc = self._table_doc_ref(namespace, table_name).get()
         if not doc.exists:
             raise NoSuchTableError(identifier)
 
         # metadata is stored in firestore
-        metadata = self._load_metadata_from_firestore(namespace, table_name)
+        metadata = self._load_metadata_from_firestore(
+            namespace, table_name, include_full_history=include_full_history
+        )
         if not metadata:
             raise NoSuchTableError(f"{self.catalog_name}.{namespace}.{table_name}")
 
         io = self._load_file_io({"type": "gcs", "bucket": self.bucket_name})
 
         # Return OptimizedStaticTable for fast query planning with Parquet manifests
-        return OptimizedStaticTable(
+        table = OptimizedStaticTable(
             identifier=(namespace, table_name),
             metadata=metadata,
             metadata_location=None,
             io=io,
             catalog=self,
         )
+
+        # Track whether we loaded full snapshot history for downstream checks
+        table.full_history_loaded = include_full_history
+
+        return table
 
     def drop_table(self, identifier: Union[str, Identifier]) -> None:
         namespace, table_name = self._parse_identifier(identifier)
