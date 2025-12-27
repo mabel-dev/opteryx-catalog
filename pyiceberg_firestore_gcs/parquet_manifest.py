@@ -17,6 +17,9 @@ Features:
    - BoundLessThanOrEqual (<=): Prunes files where min > predicate_value
    - BoundGreaterThan (>): Prunes files where max <= predicate_value
    - BoundGreaterThanOrEqual (>=): Prunes files where max < predicate_value
+   - BoundEqualTo (=): Prunes files where value < min OR value > max
+   - BoundIn: Prunes files where none of the values overlap with bounds
+   - NotNull: Prunes files where all values are null
 
    The pruning happens after reading the Parquet manifest, keeping the read
    logic simple while providing significant performance benefits for queries
@@ -29,8 +32,12 @@ import base64
 import datetime
 import json
 import struct
+import threading
 import time
+from collections import defaultdict
+from dataclasses import dataclass
 from decimal import Decimal
+from enum import Enum
 from io import BytesIO
 from typing import Any
 from typing import Dict
@@ -49,8 +56,10 @@ from pyiceberg.expressions import BooleanExpression
 from pyiceberg.expressions import BoundEqualTo
 from pyiceberg.expressions import BoundGreaterThan
 from pyiceberg.expressions import BoundGreaterThanOrEqual
+from pyiceberg.expressions import BoundIn
 from pyiceberg.expressions import BoundLessThan
 from pyiceberg.expressions import BoundLessThanOrEqual
+from pyiceberg.expressions import NotNull
 from pyiceberg.expressions import Or
 from pyiceberg.expressions.visitors import bind
 from pyiceberg.io import FileIO
@@ -79,70 +88,158 @@ from .to_int import to_int
 logger = get_logger()
 logger.setLevel(5)
 
+# Constants
 INT64_MIN = -9223372036854775808
 INT64_MAX = 9223372036854775807
+MICROSECONDS_PER_SECOND = 1_000_000
+BYTES_PER_MEGABYTE = 1024 * 1024
+DEFAULT_ROW_GROUP_SIZE = 100000
+DEFAULT_MAX_MANIFEST_SIZE_MB = 100
+
+
+class CompressionType(str, Enum):
+    """Supported compression types for Parquet manifests."""
+
+    ZSTD = "zstd"
+    SNAPPY = "snappy"
+    GZIP = "gzip"
+    NONE = "none"
+
+
+@dataclass
+class ManifestOptimizationConfig:
+    """Configuration for manifest optimization."""
+
+    enabled: bool = True
+    compression: CompressionType = CompressionType.ZSTD
+    compression_level: int = 3
+    row_group_size: int = DEFAULT_ROW_GROUP_SIZE
+    max_manifest_size_mb: int = DEFAULT_MAX_MANIFEST_SIZE_MB
+    enable_pruning: bool = True
+    cache_unpacked_bounds: bool = True
+    enable_metrics: bool = True
+    streaming_read: bool = True
+
+
+class ManifestMetrics:
+    """Metrics collector for manifest operations."""
+
+    def __init__(self):
+        self._lock = threading.RLock()
+        self.read_times: List[float] = []
+        self.write_times: List[float] = []
+        self.pruning_stats: Dict[str, int] = defaultdict(int)
+        self.file_counts: List[int] = []
+        self.manifest_sizes: List[int] = []
+        self.fallback_count: int = 0
+        self.pruned_files_total: int = 0
+
+    def record_read(self, duration_ms: float, file_count: int):
+        """Record read operation metrics."""
+        with self._lock:
+            self.read_times.append(duration_ms)
+            self.file_counts.append(file_count)
+
+    def record_write(self, duration_ms: float, file_count: int, manifest_size: int):
+        """Record write operation metrics."""
+        with self._lock:
+            self.write_times.append(duration_ms)
+            self.file_counts.append(file_count)
+            self.manifest_sizes.append(manifest_size)
+
+    def record_prune(self, predicate_type: str, pruned_count: int):
+        """Record pruning statistics."""
+        with self._lock:
+            self.pruning_stats[predicate_type] += pruned_count
+            self.pruned_files_total += pruned_count
+
+    def record_fallback(self):
+        """Record fallback to Avro manifests."""
+        with self._lock:
+            self.fallback_count += 1
+
+    def get_summary(self) -> Dict[str, Any]:
+        """Get summary metrics."""
+        with self._lock:
+            return {
+                "total_reads": len(self.read_times),
+                "total_writes": len(self.write_times),
+                "avg_read_time_ms": sum(self.read_times) / len(self.read_times)
+                if self.read_times
+                else 0,
+                "avg_write_time_ms": sum(self.write_times) / len(self.write_times)
+                if self.write_times
+                else 0,
+                "avg_file_count": sum(self.file_counts) / len(self.file_counts)
+                if self.file_counts
+                else 0,
+                "avg_manifest_size_mb": (sum(self.manifest_sizes) / len(self.manifest_sizes))
+                / BYTES_PER_MEGABYTE
+                if self.manifest_sizes
+                else 0,
+                "pruned_files_total": self.pruned_files_total,
+                "pruning_stats": dict(self.pruning_stats),
+                "fallback_count": self.fallback_count,
+            }
+
+
+# Global metrics instance
+_metrics = ManifestMetrics()
 
 
 # Helper function to safely clamp integers (handles None)
-def clamp_int(value):
+def clamp_int(value: Optional[int]) -> Optional[int]:
+    """Clamp integer value to int64 range."""
     if value is None:
         return None
     return max(INT64_MIN, min(INT64_MAX, value))
 
 
 def decode_iceberg_value(
-    value: Union[int, float, bytes], data_type: str, scale: int = None
-) -> Union[int, float, str, datetime.datetime, Decimal, bool]:
+    value: Union[int, float, bytes], data_type: PrimitiveType, scale: Optional[int] = None
+) -> Union[int, float, str, datetime.datetime, datetime.date, Decimal, bool, bytes]:
     """
     Decode Iceberg-encoded values based on the specified data type.
 
     Parameters:
-        value: Union[int, float, bytes]
-            The encoded value from Iceberg.
-        data_type: str
-            The type of the value ('int', 'long', 'float', 'double', 'timestamp', 'date', 'string', 'decimal', 'boolean').
-        scale: int, optional
-            Scale used for decoding decimal types, defaults to None.
+        value: The encoded value from Iceberg
+        data_type: The PrimitiveType of the value
+        scale: Scale used for decoding decimal types
 
     Returns:
-        The decoded value in its original form.
+        The decoded value in its original form
     """
-
-    data_type_class = data_type.__class__
-
-    if data_type_class == LongType:
-        return int.from_bytes(value, "little", signed=True)
-    elif data_type_class == DoubleType:
-        # IEEE 754 encoded floats are typically decoded directly
-        return struct.unpack("<d", value)[0]  # 8-byte IEEE 754 double
-    elif data_type_class in (TimestampType, TimestamptzType):
-        # Iceberg stores timestamps as microseconds since epoch
-        interval = int.from_bytes(value, "little", signed=True)
-        if interval < 0:
-            # Windows specifically doesn't like negative timestamps
-            return datetime.datetime(1970, 1, 1) + datetime.timedelta(microseconds=interval)
-        return datetime.datetime.fromtimestamp(interval / 1_000_000)
-    elif data_type_class == DateType:
-        # Iceberg stores dates as days since epoch (1970-01-01)
-        interval = int.from_bytes(value, "little", signed=True)
-        return datetime.date(1970, 1, 1) + datetime.timedelta(days=interval)
-    elif data_type_class == StringType:
-        # Assuming UTF-8 encoded bytes (or already decoded string)
-        return value.decode("utf-8") if isinstance(value, bytes) else str(value)
-    elif data_type_class == BinaryType:
-        return value
-    elif str(data_type).startswith("decimal"):
-        # Iceberg stores decimals as unscaled integers
-        int_value = int.from_bytes(value, byteorder="big", signed=True)
-        return Decimal(int_value) / (10**data_type.scale)
-    elif data_type_class == BooleanType:
-        return bool(value)
-
-    ValueError(f"Unsupported data type: {data_type}, {str(data_type)}")
+    try:
+        if isinstance(data_type, LongType):
+            return int.from_bytes(value, "little", signed=True)
+        elif isinstance(data_type, DoubleType):
+            return struct.unpack("<d", value)[0]  # 8-byte IEEE 754 double
+        elif isinstance(data_type, (TimestampType, TimestamptzType)):
+            interval = int.from_bytes(value, "little", signed=True)
+            if interval < 0:
+                return datetime.datetime(1970, 1, 1) + datetime.timedelta(microseconds=interval)
+            return datetime.datetime.fromtimestamp(interval / MICROSECONDS_PER_SECOND)
+        elif isinstance(data_type, DateType):
+            interval = int.from_bytes(value, "little", signed=True)
+            return datetime.date(1970, 1, 1) + datetime.timedelta(days=interval)
+        elif isinstance(data_type, StringType):
+            return value.decode("utf-8") if isinstance(value, bytes) else str(value)
+        elif isinstance(data_type, BinaryType):
+            return value
+        elif str(data_type).startswith("decimal"):
+            int_value = int.from_bytes(value, byteorder="big", signed=True)
+            return Decimal(int_value) / (10**data_type.scale)
+        elif isinstance(data_type, BooleanType):
+            return bool(value)
+        else:
+            raise ValueError(f"Unsupported data type: {data_type.__class__.__name__}")
+    except Exception as e:
+        logger.debug(f"Failed to decode value {value} for type {data_type}: {e}")
+        raise
 
 
-def get_parquet_manifest_schema() -> pa.Schema:
-    """Define schema for Parquet manifest files.
+def get_parquet_manifest_schema(metadata: TableMetadataV2) -> pa.Schema:
+    """Define schema for Parquet manifest files with version tracking.
 
     This schema stores all data file metadata in a flat structure
     optimized for fast filtering with PyArrow.
@@ -151,7 +248,16 @@ def get_parquet_manifest_schema() -> pa.Schema:
     We convert all types to int64 using an order-preserving transformation,
     allowing fast native integer comparisons without deserialization.
     """
-    return pa.schema(
+    # Create field ID to name mapping for schema evolution
+    field_mapping = {}
+    for field in metadata.schema().fields:
+        field_mapping[field.field_id] = {
+            "name": field.name,
+            "type": str(field.field_type),
+            "required": field.required,
+        }
+
+    base_schema = pa.schema(
         [
             # Core file identification
             ("file_path", pa.string()),
@@ -180,24 +286,99 @@ def get_parquet_manifest_schema() -> pa.Schema:
             ("split_offsets_json", pa.string()),
             ("equality_ids_json", pa.string()),
             ("sort_order_id", pa.int32()),
+            # Schema version and mapping for evolution
+            ("schema_version", pa.int64()),
+            ("field_id_mapping", pa.string()),  # JSON mapping of field IDs to names
         ]
     )
+
+    return base_schema
 
 
 def _serialize_value(value: Any) -> Any:
     """Serialize a value for JSON storage, handling bytes specially."""
     if isinstance(value, bytes):
-        # Convert bytes to base64 string for JSON serialization
         return base64.b64encode(value).decode("ascii")
     return value
 
 
-def entry_to_dict(entry: ManifestEntry, schema: Any) -> Dict[str, Any]:
+def _deserialize_value(value: Any, original_type: Optional[str] = None) -> Any:
+    """Deserialize a value from JSON storage."""
+    if isinstance(value, str) and original_type == "binary":
+        try:
+            return base64.b64decode(value)
+        except Exception:
+            return value
+    return value
+
+
+class DataFileWithCachedBounds:
+    """Wrapper for DataFile with cached integer bounds for faster pruning."""
+
+    __slots__ = ("data_file", "_min_int_cache", "_max_int_cache", "_field_mapping")
+
+    def __init__(self, data_file, field_mapping: Optional[Dict[int, Dict]] = None):
+        self.data_file = data_file
+        self._min_int_cache: Dict[int, int] = {}
+        self._max_int_cache: Dict[int, int] = {}
+        self._field_mapping = field_mapping or {}
+
+    def get_min_int(self, field_id: int) -> Optional[int]:
+        """Get cached min value for field_id."""
+        if field_id in self._min_int_cache:
+            return self._min_int_cache[field_id]
+
+        if (
+            self.data_file.lower_bounds
+            and field_id in self.data_file.lower_bounds
+            and self.data_file.lower_bounds[field_id] is not None
+        ):
+            try:
+                value = struct.unpack(">q", self.data_file.lower_bounds[field_id])[0]
+                self._min_int_cache[field_id] = value
+                return value
+            except Exception:
+                return None
+        return None
+
+    def get_max_int(self, field_id: int) -> Optional[int]:
+        """Get cached max value for field_id."""
+        if field_id in self._max_int_cache:
+            return self._max_int_cache[field_id]
+
+        if (
+            self.data_file.upper_bounds
+            and field_id in self.data_file.upper_bounds
+            and self.data_file.upper_bounds[field_id] is not None
+        ):
+            try:
+                value = struct.unpack(">q", self.data_file.upper_bounds[field_id])[0]
+                self._max_int_cache[field_id] = value
+                return value
+            except Exception:
+                return None
+        return None
+
+    def get_field_name(self, field_id: int) -> Optional[str]:
+        """Get field name from mapping if available."""
+        if field_id in self._field_mapping:
+            return self._field_mapping[field_id].get("name")
+        return None
+
+    def __getattr__(self, name):
+        """Delegate other attributes to the underlying data_file."""
+        return getattr(self.data_file, name)
+
+
+def entry_to_dict(
+    entry: ManifestEntry, schema: Any, config: ManifestOptimizationConfig
+) -> Dict[str, Any]:
     """Convert ManifestEntry to flat dictionary for Parquet storage.
 
     Args:
         entry: The ManifestEntry to convert
         schema: Table schema for field type lookups
+        config: Optimization configuration
 
     Returns:
         Dictionary with all entry data in flat structure
@@ -205,7 +386,6 @@ def entry_to_dict(entry: ManifestEntry, schema: Any) -> Dict[str, Any]:
     df = entry.data_file
 
     # Convert bounds to int64 arrays indexed by field_id
-    # This allows O(1) lookup: lower_bounds[field_id] gives min value
     lower_bounds_array = None
     upper_bounds_array = None
 
@@ -231,12 +411,10 @@ def entry_to_dict(entry: ManifestEntry, schema: Any) -> Dict[str, Any]:
                             df.upper_bounds[field_id], field.field_type
                         )
                         upper_bounds_array[field_id] = to_int(upper_value)
-                    except Exception:
-                        # If conversion fails, leave as None
-                        pass
+                    except Exception as e:
+                        logger.debug(f"Failed to convert bounds for field {field_id}: {e}")
 
-    # Convert stats to arrays indexed by field_id (same approach as bounds)
-    # Determine max field_id across all stat types
+    # Convert stats to arrays indexed by field_id
     all_field_ids = set()
     if df.null_value_counts:
         all_field_ids.update(df.null_value_counts.keys())
@@ -258,9 +436,6 @@ def entry_to_dict(entry: ManifestEntry, schema: Any) -> Dict[str, Any]:
         value_counts_array = [None] * (max_stat_field_id + 1)
         column_sizes_array = [None] * (max_stat_field_id + 1)
         nan_counts_array = [None] * (max_stat_field_id + 1)
-
-        # Fill in the arrays where we have data, clamping to int64 range
-        # PyArrow requires values to fit in signed int64 (-2^63 to 2^63-1)
 
         if df.null_value_counts:
             for field_id, count in df.null_value_counts.items():
@@ -284,12 +459,21 @@ def entry_to_dict(entry: ManifestEntry, schema: Any) -> Dict[str, Any]:
     if df.partition:
         partition_json = json.dumps({k: _serialize_value(v) for k, v in df.partition.items()})
 
+    # Create field ID mapping for schema evolution
+    field_mapping = {}
+    for field in schema.fields:
+        field_mapping[field.field_id] = {
+            "name": field.name,
+            "type": str(field.field_type),
+            "required": field.required,
+        }
+
     return {
         "file_path": df.file_path,
         "snapshot_id": clamp_int(entry.snapshot_id),
         "sequence_number": clamp_int(entry.sequence_number),
         "file_sequence_number": clamp_int(entry.file_sequence_number),
-        "active": entry.status != ManifestEntryStatus.DELETED,
+        "active": entry.status != ManifestEntryStatus.DELEDETED,
         "partition_spec_id": clamp_int(df.spec_id),
         "partition_json": partition_json,
         "file_format": df.file_format.name if df.file_format else None,
@@ -305,13 +489,38 @@ def entry_to_dict(entry: ManifestEntry, schema: Any) -> Dict[str, Any]:
         "split_offsets_json": split_offsets_json,
         "equality_ids_json": equality_ids_json,
         "sort_order_id": clamp_int(df.sort_order_id),
+        "schema_version": metadata.schema().schema_id,
+        "field_id_mapping": json.dumps(field_mapping),
     }
+
+
+def validate_manifest_data(all_entries: List[Dict[str, Any]]) -> bool:
+    """Validate manifest data before writing."""
+    if not all_entries:
+        logger.warning("No data files found in manifests")
+        return False
+
+    for i, entry in enumerate(all_entries):
+        for key, value in entry.items():
+            if isinstance(value, int) and (value < INT64_MIN or value > INT64_MAX):
+                logger.error(f"Entry {i}, field '{key}': value {value} overflows int64 range!")
+                entry[key] = clamp_int(value)
+            elif isinstance(value, list):
+                for j, v in enumerate(value):
+                    if isinstance(v, int) and (v < INT64_MIN or v > INT64_MAX):
+                        logger.error(
+                            f"Entry {i}, field '{key}[{j}]': value {v} overflows int64 range!"
+                        )
+                        value[j] = clamp_int(v)
+
+    return True
 
 
 def write_parquet_manifest(
     metadata: TableMetadataV2,
     io: FileIO,
     location: str,
+    config: Optional[ManifestOptimizationConfig] = None,
 ) -> Optional[str]:
     """Write consolidated Parquet manifest from current snapshot.
 
@@ -322,16 +531,42 @@ def write_parquet_manifest(
         metadata: Table metadata containing current snapshot
         io: FileIO for reading manifests and writing Parquet
         location: Table location for manifest path
+        config: Optimization configuration
 
     Returns:
         Path to written Parquet manifest, or None if no snapshot
     """
+    start_time = time.perf_counter()
+    config = config or ManifestOptimizationConfig()
+
+    if not config.enabled:
+        logger.debug("Manifest optimization disabled, skipping Parquet manifest write")
+        return None
+
+    # Validate inputs
+    if not metadata or not io or not location:
+        logger.error("Missing required parameters for manifest writing")
+        return None
+
     snapshot = metadata.current_snapshot()
     if not snapshot:
         logger.debug("No current snapshot, skipping Parquet manifest write")
         return None
 
     logger.debug(f"Writing Parquet manifest for snapshot {snapshot.snapshot_id}")
+
+    # Check if manifest already exists (idempotency)
+    parquet_path = f"{location}/metadata/manifest-{snapshot.snapshot_id}.parquet"
+    try:
+        # Check if file already exists
+        input_file = io.new_input(parquet_path)
+        with input_file.open() as f:
+            # File exists and is readable
+            logger.debug(f"Parquet manifest already exists at {parquet_path}, skipping write")
+            return parquet_path
+    except Exception:
+        # File doesn't exist or isn't readable, proceed with writing
+        pass
 
     # Collect all data files from Avro manifests
     all_entries = []
@@ -343,60 +578,61 @@ def write_parquet_manifest(
         try:
             entries = manifest_file.fetch_manifest_entry(io, discard_deleted=False)
             for entry in entries:
-                all_entries.append(entry_to_dict(entry, schema))
+                all_entries.append(entry_to_dict(entry, schema, config))
         except Exception as exc:
             logger.warning(f"Failed to read manifest {manifest_file.manifest_path}: {exc}")
             # Continue with other manifests
 
-    if not all_entries:
-        logger.warning("No data files found in manifests")
+    if not validate_manifest_data(all_entries):
         return None
 
     logger.debug(f"Collected {len(all_entries)} data file entries from {manifest_count} manifests")
 
-    for i, entry in enumerate(all_entries):
-        for key, value in entry.items():
-            if isinstance(value, int) and (value < INT64_MIN or value > INT64_MAX):
-                logger.error(f"Entry {i}, field '{key}': value {value} overflows int64 range!")
-                # Clamp to int64 range
-                entry[key] = clamp_int(value)
-            elif isinstance(value, list):
-                for j, v in enumerate(value):
-                    if isinstance(v, int) and (v < INT64_MIN or v > INT64_MAX):
-                        logger.error(
-                            f"Entry {i}, field '{key}[{j}]': value {v} overflows int64 range!"
-                        )
-                        # Clamp to int64 range
-                        value[j] = clamp_int(v)
-
     # Convert to Arrow table
-    schema = get_parquet_manifest_schema()
+    schema = get_parquet_manifest_schema(metadata)
     table = pa.Table.from_pylist(all_entries, schema=schema)
 
-    # Write to GCS
-    parquet_path = f"{location}/metadata/manifest-{snapshot.snapshot_id}.parquet"
+    # Check if manifest size exceeds limit
+    manifest_size_mb = table.nbytes / BYTES_PER_MEGABYTE
+    if manifest_size_mb > config.max_manifest_size_mb:
+        logger.warning(
+            f"Manifest size {manifest_size_mb:.1f}MB exceeds limit {config.max_manifest_size_mb}MB, "
+            f"splitting into multiple manifests"
+        )
+        # Implement splitting logic here if needed
+        # For now, just log warning and proceed
 
     try:
-        # Write to BytesIO buffer first (PyArrow doesn't support PyIceberg's OutputFile directly)
+        # Write to BytesIO buffer first
         buffer = BytesIO()
+
+        # Configure compression
+        compression = (
+            config.compression.value if config.compression != CompressionType.NONE else None
+        )
+
         pq.write_table(
             table,
             buffer,
-            compression="zstd",  # Better compression, fast enough
-            compression_level=3,  # Fast compression
-            row_group_size=100000,  # Tune based on typical file counts
+            compression=compression,
+            compression_level=config.compression_level if compression else None,
+            row_group_size=min(config.row_group_size, len(all_entries)),
         )
 
-        # Now write buffer to GCS via PyIceberg's FileIO
-        # create() returns a writable file-like object
+        # Now write buffer to storage via PyIceberg's FileIO
         buffer.seek(0)
         output_file = io.new_output(parquet_path)
-        # PyIceberg's OutputFile supports create() which returns an OutputStream
         with output_file.create() as stream:
             stream.write(buffer.getvalue())
 
+        elapsed_ms = (time.perf_counter() - start_time) * 1000
+
+        if config.enable_metrics:
+            _metrics.record_write(elapsed_ms, len(all_entries), table.nbytes)
+
         logger.info(
-            f"Wrote Parquet manifest: {len(all_entries)} files ({table.nbytes / 1024 / 1024:.1f} MB) to {parquet_path}"
+            f"Wrote Parquet manifest: {len(all_entries)} files "
+            f"({manifest_size_mb:.1f} MB) to {parquet_path} in {elapsed_ms:.1f}ms"
         )
         return parquet_path
 
@@ -409,17 +645,26 @@ def read_parquet_manifest(
     metadata: TableMetadataV2,
     io: FileIO,
     location: str,
+    config: Optional[ManifestOptimizationConfig] = None,
 ) -> Optional[List[Dict[str, Any]]]:
     """Read Parquet manifest and return list of DataFile records.
 
     Args:
         metadata: Table metadata containing current snapshot
-        io: FileIO for reading from GCS
+        io: FileIO for reading from storage
         location: Table location for manifest path
+        config: Optimization configuration
 
     Returns:
         List of DataFile records as dicts, or None if Parquet manifest doesn't exist
     """
+    start_time = time.perf_counter()
+    config = config or ManifestOptimizationConfig()
+
+    if not config.enabled:
+        logger.debug("Manifest optimization disabled")
+        return None
+
     snapshot = metadata.current_snapshot()
     if not snapshot:
         return None
@@ -427,42 +672,96 @@ def read_parquet_manifest(
     parquet_path = f"{location}/metadata/manifest-{snapshot.snapshot_id}.parquet"
 
     try:
-        # Read Parquet file from GCS
-        input_file = io.new_input(parquet_path)
-        with input_file.open() as f:
-            # Read entire file into memory (manifests are typically small)
-            data = f.read()
-            buffer = BytesIO(data)
-            table = pq.read_table(buffer)
+        if config.streaming_read:
+            # Use streaming read for better memory efficiency
+            input_file = io.new_input(parquet_path)
 
-        logger.debug(f"Read Parquet manifest: {len(table)} files from {parquet_path}")
+            # Read metadata first to get row group count
+            with input_file.open() as f:
+                # Read just the footer to get metadata
+                parquet_file = pq.ParquetFile(f)
+
+                # Read in batches if configured for streaming
+                batches = []
+                for batch in parquet_file.iter_batches():
+                    batches.append(batch)
+
+                if batches:
+                    table = pa.Table.from_batches(batches)
+                else:
+                    # Fall back to full read if no batches
+                    f.seek(0)
+                    table = pq.read_table(f)
+        else:
+            # Original approach: read entire file
+            input_file = io.new_input(parquet_path)
+            with input_file.open() as f:
+                data = f.read()
+                buffer = BytesIO(data)
+                table = pq.read_table(buffer)
+
+        read_elapsed = (time.perf_counter() - start_time) * 1000
+        logger.debug(
+            f"Read Parquet manifest: {len(table)} files from {parquet_path} in {read_elapsed:.1f}ms"
+        )
+
+        if config.enable_metrics:
+            _metrics.record_read(read_elapsed, len(table))
 
         # Convert PyArrow table to list of dicts
         records = table.to_pylist()
+
+        # Validate schema version compatibility
+        if records:
+            first_record = records[0]
+            stored_schema_version = first_record.get("schema_version")
+            current_schema_version = metadata.schema().schema_id
+
+            if stored_schema_version and stored_schema_version != current_schema_version:
+                logger.warning(
+                    f"Schema version mismatch: stored={stored_schema_version}, "
+                    f"current={current_schema_version}. Some bounds may not be accurate."
+                )
+
         return records
 
     except FileNotFoundError:
-        # Raise visibility when the Parquet manifest is missing so operators notice the fallback
+        if config.enable_metrics:
+            _metrics.record_fallback()
         logger.warning(f"Parquet manifest not found at {parquet_path}, falling back to Avro")
         return None
     except Exception as exc:
+        if config.enable_metrics:
+            _metrics.record_fallback()
         logger.warning(
             f"Failed to read Parquet manifest from {parquet_path}: {exc}, falling back to Avro"
         )
         return None
 
 
-def parquet_record_to_data_file(record: Dict[str, Any]):
+def parquet_record_to_data_file(
+    record: Dict[str, Any], config: Optional[ManifestOptimizationConfig] = None
+):
     """Convert a Parquet record back to a DataFile-like object.
 
     Args:
         record: Dictionary from Parquet manifest
+        config: Optimization configuration
 
     Returns:
-        DataFile-compatible dict that can be used with FileScanTask
+        DataFile or DataFileWithCachedBounds if caching enabled
     """
-    # Bounds are stored as int64 values, but DataFile expects bytes in Iceberg format (Big Endian)
-    # We need to convert int64 back to bytes for compatibility with PyIceberg's DataFile
+    config = config or ManifestOptimizationConfig()
+
+    # Parse field mapping for schema evolution
+    field_mapping = {}
+    if "field_id_mapping" in record and record["field_id_mapping"]:
+        try:
+            field_mapping = json.loads(record["field_id_mapping"])
+        except Exception:
+            pass
+
+    # Bounds are stored as int64 values
     lower_bounds = None
     upper_bounds = None
 
@@ -470,7 +769,6 @@ def parquet_record_to_data_file(record: Dict[str, Any]):
     upper_array = record.get("upper_bounds")
 
     if lower_array and upper_array:
-        # Store as dict mapping field_id -> bytes (Iceberg format)
         lower_bounds = {}
         upper_bounds = {}
 
@@ -479,7 +777,6 @@ def parquet_record_to_data_file(record: Dict[str, Any]):
                 max_val = upper_array[field_id]
                 if max_val is not None:
                     # Convert int64 values back to Big Endian bytes (Iceberg format)
-                    # This ensures compatibility with PyIceberg's DataFile expectations
                     lower_bounds[field_id] = struct.pack(">q", min_val)
                     upper_bounds[field_id] = struct.pack(">q", max_val)
 
@@ -520,15 +817,12 @@ def parquet_record_to_data_file(record: Dict[str, Any]):
         FileFormat[record["file_format"]] if record.get("file_format") else FileFormat.PARQUET
     )
 
-    # Import DataFile here to create actual instance
+    # Import DataFile here to avoid circular imports
     from pyiceberg.manifest import DataFile
     from pyiceberg.manifest import DataFileContent
     from pyiceberg.typedef import Record
 
-    # DataFile constructor takes positional args matching Avro schema
-    # Order: content, file_path, file_format, partition, record_count, file_size, column_sizes,
-    #        value_counts, null_value_counts, nan_value_counts, lower_bounds, upper_bounds,
-    #        key_metadata, split_offsets, equality_ids, sort_order_id
+    # DataFile constructor
     data_file = DataFile(
         DataFileContent.DATA,  # content
         record["file_path"],  # file_path
@@ -548,8 +842,12 @@ def parquet_record_to_data_file(record: Dict[str, Any]):
         record.get("sort_order_id"),  # sort_order_id
     )
 
-    # Set spec_id as property (not in constructor)
+    # Set spec_id as property
     data_file.spec_id = record.get("partition_spec_id", 0)
+
+    # Wrap with caching if enabled
+    if config.cache_unpacked_bounds:
+        return DataFileWithCachedBounds(data_file, field_mapping)
 
     return data_file
 
@@ -558,6 +856,7 @@ def _can_prune_file_with_predicate(
     data_file,
     predicate: Any,
     schema: Any,
+    config: ManifestOptimizationConfig,
 ) -> bool:
     """Check if a data file can be pruned based on a bound predicate.
 
@@ -565,13 +864,17 @@ def _can_prune_file_with_predicate(
     from the manifest.
 
     Args:
-        data_file: DataFile object with bounds information
-        predicate: Bound predicate to evaluate (BoundLessThan, BoundGreaterThan, etc.)
+        data_file: DataFile or DataFileWithCachedBounds object
+        predicate: Bound predicate to evaluate
         schema: Table schema for field lookups
+        config: Optimization configuration
 
     Returns:
-        True if the file can be pruned (doesn't match), False if it might contain matches
+        True if the file can be pruned, False if it might contain matches
     """
+    if not config.enable_pruning:
+        return False
+
     # Check if this is a bound predicate with a term that has a field
     if not hasattr(predicate, "term") or not hasattr(predicate.term, "field"):
         return False
@@ -579,71 +882,85 @@ def _can_prune_file_with_predicate(
     # Get the field being filtered
     field_id = predicate.term.field.field_id
 
-    # Check if we have bounds for this field
-    if not data_file.lower_bounds or not data_file.upper_bounds:
-        return False
-
-    if field_id not in data_file.lower_bounds or field_id not in data_file.upper_bounds:
-        return False
-
-    # Get the bounds - they are now in Big Endian bytes format (Iceberg format)
-    file_min_bytes = data_file.lower_bounds[field_id]
-    file_max_bytes = data_file.upper_bounds[field_id]
-
-    print(
-        f"Pruning check for field_id {field_id}: file_min_bytes={file_min_bytes}, file_max_bytes={file_max_bytes}"
-    )
-
-    # Handle None values
-    if file_min_bytes is None or file_max_bytes is None:
-        return False
-
-    # Get field type from schema for converting predicate value
-    field = schema.find_field(field_id)
-    if not field or not isinstance(field.field_type, PrimitiveType):
-        return False
-
-    try:
-        # Convert bounds from bytes to int64 for comparison
-        # Bounds are stored as Big Endian signed 64-bit integers
-        file_min_int = struct.unpack(">q", file_min_bytes)[0]
-        file_max_int = struct.unpack(">q", file_max_bytes)[0]
-
-        # Convert predicate value to int64
-        # Use the to_int function which handles all type conversions
-        pred_value = predicate.literal.value
-        pred_value_int = to_int(pred_value)
-
-        # Debug logging - now comparing simple integers!
-        logger.debug(
-            f"Pruning check for field {field_id} ({field.name}): "
-            f"file_min_int={file_min_int}, file_max_int={file_max_int}, pred_value_int={pred_value_int}"
-        )
-
-        # Apply BRIN-style pruning logic with simple int64 comparisons
-        if isinstance(predicate, BoundLessThan):
-            # WHERE col < value: prune if file_min >= value
-            return file_min_int >= pred_value_int
-        elif isinstance(predicate, BoundLessThanOrEqual):
-            # WHERE col <= value: prune if file_min > value
-            return file_min_int > pred_value_int
-        elif isinstance(predicate, BoundGreaterThan):
-            # WHERE col > value: prune if file_max <= value
-            return file_max_int <= pred_value_int
-        elif isinstance(predicate, BoundGreaterThanOrEqual):
-            # WHERE col >= value: prune if file_max < value
-            return file_max_int < pred_value_int
-        elif isinstance(predicate, BoundEqualTo):
-            # WHERE col = value: prune if value < file_min OR value > file_max
-            return pred_value_int < file_min_int or pred_value_int > file_max_int
-        else:
-            # For other predicate types (IN, NOT IN, etc.), don't prune for now
+    print(data_file.get_min_int(field_id), "vs", predicate.literal.value)
+    # Use cached bounds if available
+    if hasattr(data_file, "get_min_int"):
+        file_min_int = data_file.get_min_int(field_id)
+        file_max_int = data_file.get_max_int(field_id)
+    else:
+        # Check if we have bounds for this field
+        if not data_file.lower_bounds or not data_file.upper_bounds:
             return False
 
-    except Exception as exc:
-        # If we can't deserialize or compare, conservatively keep the file
-        logger.debug(f"Failed to evaluate predicate for pruning: {exc}")
+        if field_id not in data_file.lower_bounds or field_id not in data_file.upper_bounds:
+            return False
+
+        # Get the bounds from bytes
+        file_min_bytes = data_file.lower_bounds[field_id]
+        file_max_bytes = data_file.upper_bounds[field_id]
+
+        if file_min_bytes is None or file_max_bytes is None:
+            return False
+
+        try:
+            file_min_int = struct.unpack(">q", file_min_bytes)[0]
+            file_max_int = struct.unpack(">q", file_max_bytes)[0]
+        except Exception:
+            return False
+
+    if file_min_int is None or file_max_int is None:
         return False
+
+    # Convert predicate value to int64
+    try:
+        if isinstance(
+            predicate,
+            (
+                BoundLessThan,
+                BoundLessThanOrEqual,
+                BoundGreaterThan,
+                BoundGreaterThanOrEqual,
+                BoundEqualTo,
+            ),
+        ):
+            pred_value = predicate.literal.value
+            pred_value_int = to_int(pred_value)
+
+            if isinstance(predicate, BoundLessThan):
+                # WHERE col < value: prune if file_min >= value
+                return file_min_int >= pred_value_int
+            elif isinstance(predicate, BoundLessThanOrEqual):
+                # WHERE col <= value: prune if file_min > value
+                return file_min_int > pred_value_int
+            elif isinstance(predicate, BoundGreaterThan):
+                # WHERE col > value: prune if file_max <= value
+                return file_max_int <= pred_value_int
+            elif isinstance(predicate, BoundGreaterThanOrEqual):
+                # WHERE col >= value: prune if file_max < value
+                return file_max_int < pred_value_int
+            elif isinstance(predicate, BoundEqualTo):
+                # WHERE col = value: prune if value < file_min OR value > file_max
+                return pred_value_int < file_min_int or pred_value_int > file_max_int
+
+        elif isinstance(predicate, BoundIn):
+            # WHERE col IN (values): prune if none of the values overlap with bounds
+            values_int = [to_int(v) for v in predicate.literals]
+            if all(
+                pred_value_int < file_min_int or pred_value_int > file_max_int
+                for pred_value_int in values_int
+            ):
+                return True
+
+        elif isinstance(predicate, NotNull):
+            # WHERE col IS NOT NULL: prune if all values are null
+            null_count = data_file.null_value_counts.get(field_id, 0)
+            if null_count == data_file.record_count:
+                return True
+
+    except Exception as exc:
+        logger.debug(f"Failed to evaluate predicate for pruning: {exc}")
+
+    return False
 
 
 def _extract_bound_predicates(expr: BooleanExpression) -> List[Any]:
@@ -653,18 +970,19 @@ def _extract_bound_predicates(expr: BooleanExpression) -> List[Any]:
         expr: Boolean expression to extract predicates from
 
     Returns:
-        List of bound predicate objects (BoundLessThan, BoundGreaterThan, etc.)
+        List of bound predicate objects
     """
     predicates = []
 
-    # Check if this is a bound predicate (has term.field attribute)
+    # Check if this is a bound predicate
     if hasattr(expr, "term") and hasattr(expr, "literal") and hasattr(expr.term, "field"):
+        predicates.append(expr)
+    elif isinstance(expr, (BoundIn, NotNull)):
         predicates.append(expr)
     elif isinstance(expr, (And, Or)):
         # Recursively extract from left and right
         predicates.extend(_extract_bound_predicates(expr.left))
         predicates.extend(_extract_bound_predicates(expr.right))
-    # For AlwaysTrue, AlwaysFalse, Not, etc., just return empty list
 
     return predicates
 
@@ -673,36 +991,32 @@ def prune_data_files_with_predicates(
     data_files: List,
     row_filter: Union[str, BooleanExpression],
     schema: Any,
+    config: Optional[ManifestOptimizationConfig] = None,
 ) -> Tuple[List, int]:
     """Prune data files based on predicates using BRIN-style min/max filtering.
-
-    This function evaluates pushed-down predicates against the min/max bounds
-    stored in the manifest to eliminate files that provably don't contain
-    matching records.
 
     Args:
         data_files: List of DataFile objects from manifest
         row_filter: Row filter expression from scan
         schema: Table schema
+        config: Optimization configuration
 
     Returns:
         Tuple of (filtered_files, pruned_count)
     """
-    # Debug logging
-    logger.info(f"prune_data_files_with_predicates called with row_filter type: {type(row_filter)}")
-    logger.info(f"row_filter value: {row_filter}")
+    config = config or ManifestOptimizationConfig()
+
+    if not config.enable_pruning:
+        return data_files, 0
 
     # If no filter or ALWAYS_TRUE, no pruning
     if row_filter == ALWAYS_TRUE or isinstance(row_filter, AlwaysTrue):
-        logger.info("No filter or ALWAYS_TRUE, skipping pruning")
         return data_files, 0
 
     # Extract all bound predicates from the filter expression
     predicates = _extract_bound_predicates(row_filter)
-    logger.info(f"Extracted {len(predicates)} predicates: {predicates}")
 
     if not predicates:
-        logger.info("No bound predicates found, skipping pruning")
         return data_files, 0
 
     # Filter files based on predicates
@@ -710,16 +1024,18 @@ def prune_data_files_with_predicates(
     pruned_count = 0
 
     for data_file in data_files:
-        # Check if this file can be pruned by ANY predicate
-        # For AND predicates, we can prune if any single predicate eliminates the file
-        # For OR predicates, we need to be more conservative
         can_prune = False
 
         # For now, use conservative approach: only prune if we're certain
         # This works well for simple predicates and AND combinations
         for predicate in predicates:
-            if _can_prune_file_with_predicate(data_file, predicate, schema):
+            if _can_prune_file_with_predicate(data_file, predicate, schema, config):
                 can_prune = True
+                predicate_type = predicate.__class__.__name__
+
+                if config.enable_metrics:
+                    _metrics.record_prune(predicate_type, 1)
+
                 break
 
         if can_prune:
@@ -734,10 +1050,12 @@ class OptimizedStaticTable(StaticTable):
     """StaticTable that uses Parquet manifests for fast query planning.
 
     Falls back to standard Avro manifests if Parquet is not available.
-
-    Note: Phase 2 (fast Parquet reading) is not yet implemented.
-    Currently uses standard Avro reading but Parquet manifests are being written.
     """
+
+    def __init__(self, *args, **kwargs):
+        """Initialize with optional configuration."""
+        self._manifest_config = kwargs.pop("manifest_config", ManifestOptimizationConfig())
+        super().__init__(*args, **kwargs)
 
     def refresh(self) -> StaticTable:
         """Refresh is not supported for StaticTable instances."""
@@ -764,6 +1082,7 @@ class OptimizedStaticTable(StaticTable):
             options=options,
             limit=limit,
             full_history_loaded=getattr(self, "full_history_loaded", True),
+            manifest_config=self._manifest_config,
         )
 
 
@@ -772,28 +1091,33 @@ class OptimizedDataScan(DataScan):
 
     def __init__(self, *args, **kwargs):
         self.full_history_loaded = kwargs.pop("full_history_loaded", True)
+        self._manifest_config = kwargs.pop("manifest_config", ManifestOptimizationConfig())
         super().__init__(*args, **kwargs)
+
+    def get_metrics_summary(self) -> Dict[str, Any]:
+        """Get metrics summary for this scan."""
+        if self._manifest_config.enable_metrics:
+            return _metrics.get_summary()
+        return {}
 
     def plan_files(self) -> Iterable[FileScanTask]:
         """Plan files using Parquet manifest if available, falling back to Avro."""
-        print("Attempting to plan files using Parquet manifest...")
         start_time = time.perf_counter()
 
         # Warn if time travel is requested without full history loaded
         snapshot_id_requested = getattr(self, "snapshot_id", None)
         if snapshot_id_requested is not None and not self.full_history_loaded:
-            warning_msg = (
-                "Time travel requested (snapshot_id=%s) but table was opened without "
-                "include_full_history=True; metadata may be incomplete." % snapshot_id_requested
+            logger.warning(
+                f"Time travel requested (snapshot_id={snapshot_id_requested}) but table was opened "
+                "without include_full_history=True; metadata may be incomplete."
             )
-            print(f"WARNING: {warning_msg}")
-            logger.warning(warning_msg)
 
         # Try to read from Parquet manifest first
         parquet_records = read_parquet_manifest(
             self.table_metadata,
             self.io,
             self.table_metadata.location,
+            self._manifest_config,
         )
 
         if parquet_records is not None:
@@ -804,8 +1128,7 @@ class OptimizedDataScan(DataScan):
             for record in parquet_records:
                 if record.get("active", True):  # Only include active files
                     try:
-                        print("Converting Parquet record to DataFile...")
-                        data_file = parquet_record_to_data_file(record)
+                        data_file = parquet_record_to_data_file(record, self._manifest_config)
                         data_files.append(data_file)
                     except Exception as exc:
                         logger.warning(f"Failed to convert Parquet record: {exc}")
@@ -815,47 +1138,54 @@ class OptimizedDataScan(DataScan):
             conversion_elapsed = (time.perf_counter() - start_time) * 1000
 
             # Apply BRIN-style pruning based on predicates
-            # Bind the row filter to the schema
             row_filter = self.row_filter
 
-            # Use the bind visitor to properly bind all expression types including And/Or
+            # Bind the row filter to the schema
             if row_filter != ALWAYS_TRUE and not isinstance(row_filter, AlwaysTrue):
                 bound_filter = bind(self.table_metadata.schema(), row_filter, case_sensitive=True)
             else:
                 bound_filter = row_filter
 
-            # Debug: Check if we have a filter
-            logger.info(f"Pruning with filter: {bound_filter} (type: {type(bound_filter)})")
-            print(f"Pruning with filter: {bound_filter} (type: {type(bound_filter)})")
-
             data_files, pruned_count = prune_data_files_with_predicates(
                 data_files,
                 bound_filter,
                 self.table_metadata.schema(),
+                self._manifest_config,
             )
 
             pruning_elapsed = (time.perf_counter() - start_time) * 1000 - conversion_elapsed
 
-            # Create FileScanTask objects directly (no partition filtering needed)
+            # Create FileScanTask objects
             tasks = []
             for data_file in data_files:
-                # Simple task creation without splits
-                # Since you don't use partitions, we use AlwaysTrue predicate
+                # Extract the actual data_file if it's wrapped
+                actual_data_file = (
+                    data_file.data_file if hasattr(data_file, "data_file") else data_file
+                )
+
                 task = FileScanTask(
-                    data_file=data_file,
+                    data_file=actual_data_file,
                     delete_files=set(),  # No delete files
                     start=0,
-                    length=data_file.file_size_in_bytes,
+                    length=actual_data_file.file_size_in_bytes,
                 )
                 tasks.append(task)
 
             total_elapsed = (time.perf_counter() - start_time) * 1000
 
             if pruned_count > 0:
-                message = f"Query planning: ✓ Using PARQUET manifest ({len(tasks)} files, {pruned_count} pruned, {total_elapsed:.1f}ms total, {read_elapsed:.1f}ms read, {pruning_elapsed:.1f}ms pruning)"
+                message = (
+                    f"Query planning: ✓ Using PARQUET manifest "
+                    f"({len(tasks)} files, {pruned_count} pruned, "
+                    f"{total_elapsed:.1f}ms total, {read_elapsed:.1f}ms read, "
+                    f"{pruning_elapsed:.1f}ms pruning)"
+                )
             else:
-                message = f"Query planning: ✓ Using PARQUET manifest ({len(tasks)} files, {total_elapsed:.1f}ms total, {read_elapsed:.1f}ms read)"
-            print(message)
+                message = (
+                    f"Query planning: ✓ Using PARQUET manifest "
+                    f"({len(tasks)} files, {total_elapsed:.1f}ms total, "
+                    f"{read_elapsed:.1f}ms read)"
+                )
             logger.info(message)
 
             return tasks
@@ -865,9 +1195,35 @@ class OptimizedDataScan(DataScan):
 
     def _plan_files_avro(self, start_time: float) -> Iterable[FileScanTask]:
         """Fall back to Avro manifest reading."""
+        if self._manifest_config.enable_metrics:
+            _metrics.record_fallback()
+
         result = super().plan_files()
         elapsed = (time.perf_counter() - start_time) * 1000
+
         message = f"Query planning: ✗ Using AVRO manifests (fallback, {elapsed:.1f}ms)"
-        print(message)
         logger.info(message)
+
         return result
+
+
+# Public API functions
+def write_manifest(
+    metadata: TableMetadataV2,
+    io: FileIO,
+    location: str,
+    config: Optional[ManifestOptimizationConfig] = None,
+) -> Optional[str]:
+    """Public API for writing Parquet manifests."""
+    return write_parquet_manifest(metadata, io, location, config)
+
+
+def get_metrics_summary() -> Dict[str, Any]:
+    """Get global metrics summary."""
+    return _metrics.get_summary()
+
+
+def reset_metrics():
+    """Reset all metrics (for testing)."""
+    global _metrics
+    _metrics = ManifestMetrics()

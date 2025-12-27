@@ -46,14 +46,14 @@ def to_int(value: Any) -> int:
 
     if value_type is datetime.datetime:
         # Use timestamp method for datetime
-        return _ensure_64bit_range(int(math.trunc(value.timestamp())))
+        return _ensure_64bit_range(int(math.trunc(value.timestamp() * 1000)))
 
     if value_type is datetime.date:
         # Convert to days since epoch (1970-01-01)
         # Note: strftime("%s") is not portable; using a more robust method
         epoch = datetime.date(1970, 1, 1)
         delta = value - epoch
-        return _ensure_64bit_range(int(delta.days))
+        return _ensure_64bit_range(int(delta.days) * 1000)
 
     if value_type is datetime.time:
         result = value.hour * 3600 + value.minute * 60 + value.second

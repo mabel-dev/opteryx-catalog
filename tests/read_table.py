@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+import datetime
 
 # Add local paths to sys.path to use local code instead of installed packages
 sys.path.insert(0, os.path.join(sys.path[0], ".."))  # Add parent dir for pyiceberg_firestore_gcs
@@ -20,7 +21,7 @@ from pyiceberg.expressions import EqualTo, In
 
 workspace = "public"
 schema_name = "examples"
-table = "planets"
+table = "vulnerabilities"
 
 # Step 1: Create a local Iceberg catalog
 catalog = FirestoreCatalog(
@@ -56,7 +57,13 @@ catalog = FirestoreCatalog(
 s = catalog.load_table(f"{schema_name}.{table}")
 # s.append(df)
 
-print(s.snapshots()[-1].timestamp_ms)
+ts = s.snapshots()[-1].timestamp_ms
+print(f"Table last updated: {datetime.datetime.fromtimestamp(ts / 1000)}")
+ts = s.snapshots()[0].timestamp_ms
+print(f"Table last created: {datetime.datetime.fromtimestamp(ts / 1000)}")
+
+print(dir(s.current_snapshot()))
+print(s.current_snapshot().timestamp_ms)
 
 quit()
 
