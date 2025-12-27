@@ -473,7 +473,7 @@ def entry_to_dict(
         "snapshot_id": clamp_int(entry.snapshot_id),
         "sequence_number": clamp_int(entry.sequence_number),
         "file_sequence_number": clamp_int(entry.file_sequence_number),
-        "active": entry.status != ManifestEntryStatus.DELEDETED,
+        "active": entry.status != ManifestEntryStatus.DELETED,
         "partition_spec_id": clamp_int(df.spec_id),
         "partition_json": partition_json,
         "file_format": df.file_format.name if df.file_format else None,
