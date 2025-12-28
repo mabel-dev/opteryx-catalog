@@ -14,7 +14,7 @@ GCP-based environments.
 
 - Firestore-backed catalog and namespace storage
 - GCS-based Iceberg table metadata storage (with optional compatibility mode)
-- Configurable Iceberg compatibility flag for flexible metadata output
+ - GCS-based table metadata storage; export/import utilities provide Iceberg Avro interoperability
 - Table creation, registration, listing, loading, renaming, and deletion
 - Commit operations that write updated metadata to GCS and persist references in Firestore
 - Simple, opinionated defaults (e.g., default GCS location derived from catalog properties)
@@ -70,7 +70,7 @@ print(tbl.metadata)
 - GCP authentication: Use `GOOGLE_APPLICATION_CREDENTIALS` or Application Default Credentials
 - `firestore_project` and `firestore_database` can be supplied when creating the catalog
 - `gcs_bucket` is recommended to allow `create_table` to write metadata automatically; otherwise pass `location` explicitly to `create_table`
-- `iceberg_compatible` (default: `True`) controls whether to write standard Iceberg metadata JSON and Avro manifest files to GCS
+ - The catalog does not write Iceberg Avro/manifest-list artifacts in the hot path; use `export_to_iceberg` / `import_from_iceberg` for interoperability
 
 Example environment variables:
 
@@ -79,60 +79,17 @@ export GOOGLE_APPLICATION_CREDENTIALS="/path/to/service-account.json"
 export GOOGLE_CLOUD_PROJECT="my-gcp-project"
 ```
 
-### Iceberg Compatibility Flag
+### Iceberg interoperability
 
-The catalog supports an `iceberg_compatible` flag that controls metadata file output:
+This catalog implementation does not write Iceberg Avro manifest-list/Avro manifest files
+or Iceberg metadata JSON in the hot path. Instead, table metadata is stored in Firestore and
+the runtime writes a consolidated Parquet manifest for fast query planning.
 
-**When `iceberg_compatible=True` (default):**
-- Writes standard Iceberg metadata JSON files to GCS (e.g., `00000-*.metadata.json`)
-- Writes Avro manifest files alongside Parquet manifests
-- Ensures full compatibility with standard Iceberg tools
-- All tables in the catalog are forced to be compatible
-
-**When `iceberg_compatible=False`:**
-- Only writes metadata to Firestore (more efficient for this catalog)
-- Only writes Parquet manifests (faster query planning)
-- Reduces GCS storage costs and write operations
-- Tables inherit this setting but can individually override to be compatible
-
-Example usage:
-
-```python
-# Default behavior - fully Iceberg compatible
-catalog = create_catalog(
-    "my_catalog",
-    firestore_project="my-gcp-project",
-    gcs_bucket="my-bucket",
-    iceberg_compatible=True  # default
-)
-
-# Optimized mode - Firestore + Parquet only
-catalog = create_catalog(
-    "my_catalog",
-    firestore_project="my-gcp-project",
-    gcs_bucket="my-bucket",
-    iceberg_compatible=False
-)
-
-# With catalog in non-compatible mode, tables inherit False by default
-# But can explicitly override to True for specific tables
-table = catalog.create_table(
-    identifier=("namespace", "table_name"),
-    schema=schema,
-    properties={
-        "iceberg_compatible": "true"  # This table writes standard Iceberg files
-    }
-)
-
-# Tables without explicit property inherit catalog setting (False in this case)
-table2 = catalog.create_table(
-    identifier=("namespace", "optimized_table"),
-    schema=schema,
-    # No iceberg_compatible property - inherits catalog's False setting
-)
-```
-
-**Note:** When the catalog-level flag is `True`, all tables are forced to be compatible regardless of table-level properties. When the catalog flag is `False`, tables inherit this setting unless they explicitly override to `True`. This ensures consistency while allowing flexibility where needed.
+If you need full Iceberg-compatible artifacts for other engines or tools, use the
+`export_to_iceberg` utility to generate Avro manifests and manifest-lists from
+the Parquet-first storage layout. To ingest existing Iceberg Avro artifacts into this
+catalog, use `import_from_iceberg` which will convert Avro manifests into the
+Parquet manifest + Firestore snapshot representation used here.
 
 ## API overview 📚
 

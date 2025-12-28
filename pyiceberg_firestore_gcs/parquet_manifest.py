@@ -1,29 +1,8 @@
 """Parquet manifest optimization for fast query planning.
 
-This module provides optimized manifest handling that writes Parquet manifests
-alongside standard Iceberg Avro manifests for 10-50x faster query planning.
-
-Features:
----------
-1. Fast Parquet Manifest Reading: Reads consolidated parquet manifests instead
-   of multiple Avro manifest files for faster query planning.
-
-2. BRIN-Style Pruning: Uses min/max bounds (lower_bounds/upper_bounds) from the
-   manifest to eliminate data files that provably don't contain matching records
-   based on pushed-down predicates. This is similar to PostgreSQL's BRIN indexes.
-
-   Supported predicates for pruning:
-   - BoundLessThan (<): Prunes files where min >= predicate_value
-   - BoundLessThanOrEqual (<=): Prunes files where min > predicate_value
-   - BoundGreaterThan (>): Prunes files where max <= predicate_value
-   - BoundGreaterThanOrEqual (>=): Prunes files where max < predicate_value
-   - BoundEqualTo (=): Prunes files where value < min OR value > max
-   - BoundIn: Prunes files where none of the values overlap with bounds
-   - NotNull: Prunes files where all values are null
-
-   The pruning happens after reading the Parquet manifest, keeping the read
-   logic simple while providing significant performance benefits for queries
-   with selective predicates.
+This module provides optimized manifest handling that writes consolidated
+Parquet manifests for faster query planning and supports BRIN-style pruning
+using stored lower/upper bounds.
 """
 
 from __future__ import annotations
@@ -489,7 +468,7 @@ def entry_to_dict(
         "split_offsets_json": split_offsets_json,
         "equality_ids_json": equality_ids_json,
         "sort_order_id": clamp_int(df.sort_order_id),
-        "schema_version": metadata.schema().schema_id,
+        "schema_version": getattr(schema, "schema_id", None),
         "field_id_mapping": json.dumps(field_mapping),
     }
 
@@ -521,11 +500,12 @@ def write_parquet_manifest(
     io: FileIO,
     location: str,
     config: Optional[ManifestOptimizationConfig] = None,
+    *,
+    entries: Optional[List[Dict[str, Any]]] = None,
 ) -> Optional[str]:
     """Write consolidated Parquet manifest from current snapshot.
 
-    Reads all Avro manifests and writes a single Parquet file with all
-    data file metadata for fast query planning.
+    Write a consolidated Parquet manifest from caller-provided entries.
 
     Args:
         metadata: Table metadata containing current snapshot
@@ -568,20 +548,20 @@ def write_parquet_manifest(
         # File doesn't exist or isn't readable, proceed with writing
         pass
 
-    # Collect all data files from Avro manifests
-    all_entries = []
+    # Collect all data files. Prefer caller-supplied `entries`.
+    # IMPORTANT: We do not read Avro manifest-list/Avro manifests in the
+    # hot path. If `entries` is not provided the function is a no-op and
+    # returns None (no Parquet manifest written).
+    all_entries: List[Dict[str, Any]] = []
     manifest_count = 0
     schema = metadata.schema()
 
-    for manifest_file in snapshot.manifests(io):
-        manifest_count += 1
-        try:
-            entries = manifest_file.fetch_manifest_entry(io, discard_deleted=False)
-            for entry in entries:
-                all_entries.append(entry_to_dict(entry, schema, config))
-        except Exception as exc:
-            logger.warning(f"Failed to read manifest {manifest_file.manifest_path}: {exc}")
-            # Continue with other manifests
+    if entries is not None:
+        all_entries = list(entries)
+        manifest_count = 1
+    else:
+        logger.debug("No entries provided; skipping Parquet manifest write")
+        return None
 
     if not validate_manifest_data(all_entries):
         return None
@@ -649,13 +629,13 @@ def read_parquet_manifest(
 ) -> Optional[List[Dict[str, Any]]]:
     """Read Parquet manifest and return list of DataFile records.
 
-    Args:
-        metadata: Table metadata containing current snapshot
-        io: FileIO for reading from storage
-        location: Table location for manifest path
-        config: Optimization configuration
-
-    Returns:
+    try:
+        # Check if file already exists
+        input_file = io.new_input(parquet_path)
+        with input_file.open():
+            # File exists and is readable
+            logger.debug(f"Parquet manifest already exists at {parquet_path}, skipping write")
+            return parquet_path
         List of DataFile records as dicts, or None if Parquet manifest doesn't exist
     """
     start_time = time.perf_counter()
@@ -726,16 +706,10 @@ def read_parquet_manifest(
         return records
 
     except FileNotFoundError:
-        if config.enable_metrics:
-            _metrics.record_fallback()
-        logger.warning(f"Parquet manifest not found at {parquet_path}, falling back to Avro")
+        logger.debug(f"Parquet manifest not found at {parquet_path}")
         return None
     except Exception as exc:
-        if config.enable_metrics:
-            _metrics.record_fallback()
-        logger.warning(
-            f"Failed to read Parquet manifest from {parquet_path}: {exc}, falling back to Avro"
-        )
+        logger.warning(f"Failed to read Parquet manifest from {parquet_path}: {exc}")
         return None
 
 
@@ -1047,10 +1021,7 @@ def prune_data_files_with_predicates(
 
 
 class OptimizedStaticTable(StaticTable):
-    """StaticTable that uses Parquet manifests for fast query planning.
-
-    Falls back to standard Avro manifests if Parquet is not available.
-    """
+    """StaticTable that uses Parquet manifests for fast query planning."""
 
     def __init__(self, *args, **kwargs):
         """Initialize with optional configuration."""
@@ -1101,7 +1072,11 @@ class OptimizedDataScan(DataScan):
         return {}
 
     def plan_files(self) -> Iterable[FileScanTask]:
-        """Plan files using Parquet manifest if available, falling back to Avro."""
+        """Plan files using Parquet manifest if available; never fallback to Avro.
+
+        If no Parquet manifest exists or conversion fails, return an empty list
+        rather than attempting Avro reads.
+        """
         start_time = time.perf_counter()
 
         # Warn if time travel is requested without full history loaded
@@ -1119,7 +1094,6 @@ class OptimizedDataScan(DataScan):
             self.table_metadata.location,
             self._manifest_config,
         )
-
         if parquet_records is not None:
             read_elapsed = (time.perf_counter() - start_time) * 1000
 
@@ -1132,8 +1106,11 @@ class OptimizedDataScan(DataScan):
                         data_files.append(data_file)
                     except Exception as exc:
                         logger.warning(f"Failed to convert Parquet record: {exc}")
-                        # Fall back to Avro on any conversion error
-                        return self._plan_files_avro(start_time)
+                        # Do not perform Avro reads; return no files
+                        logger.info(
+                            "Query planning: Parquet manifest conversion failed; Avro disabled"
+                        )
+                        return []
 
             conversion_elapsed = (time.perf_counter() - start_time) * 1000
 
@@ -1189,22 +1166,19 @@ class OptimizedDataScan(DataScan):
             logger.info(message)
 
             return tasks
-        else:
-            # Fall back to standard Avro reading
-            return self._plan_files_avro(start_time)
+
+        # If we reach here, parquet_records is None or unavailable.
+        # Per catalog policy, never fall back to Avro manifests. Return
+        # an empty iterable so planning proceeds without reading Avro.
+        logger.info(
+            "Query planning: Parquet manifest unavailable; Avro disabled, returning no files"
+        )
+        return []
 
     def _plan_files_avro(self, start_time: float) -> Iterable[FileScanTask]:
-        """Fall back to Avro manifest reading."""
-        if self._manifest_config.enable_metrics:
-            _metrics.record_fallback()
-
-        result = super().plan_files()
-        elapsed = (time.perf_counter() - start_time) * 1000
-
-        message = f"Query planning: ✗ Using AVRO manifests (fallback, {elapsed:.1f}ms)"
-        logger.info(message)
-
-        return result
+        """Avro reading is disabled for this catalog; return no files."""
+        logger.debug("Avro manifest reading is disabled; returning no files")
+        return []
 
 
 # Public API functions

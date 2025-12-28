@@ -32,7 +32,6 @@ catalog = FirestoreCatalog(
     firestore_project="mabeldev",
     firestore_database="catalogs",
     gcs_bucket="opteryx_data",
-    iceberg_compatible=False,  # Use Parquet manifests
 )
 
 print(f"Creating real test data for {catalog_name}.{namespace}.{table_name}")

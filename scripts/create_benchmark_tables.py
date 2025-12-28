@@ -42,7 +42,6 @@ catalog = FirestoreCatalog(
     firestore_project="mabeldev",
     firestore_database="catalogs",
     gcs_bucket="opteryx_data",
-    iceberg_compatible=False,  # Allow table-level control
 )
 
 # Initialize GCS client for listing files
@@ -67,10 +66,10 @@ datasets = [
 
 # Create namespaces for clickbench and tpc_h
 print("Creating namespace: clickbench...")
-catalog.create_namespace_if_not_exists("clickbench", properties={"iceberg_compatible": "false"})
+catalog.create_namespace_if_not_exists("clickbench")
 
 print("Creating namespace: tpc_h...")
-catalog.create_namespace_if_not_exists("tpc_h", properties={"iceberg_compatible": "false"})
+catalog.create_namespace_if_not_exists("tpc_h")
 
 # Process each dataset
 for dataset in datasets:
@@ -116,9 +115,7 @@ for dataset in datasets:
 
         # Create the Iceberg table with the schema
         print("  Creating Iceberg table...")
-        iceberg_table = catalog.create_table(
-            (namespace, table_name), schema, properties={"iceberg_compatible": "false"}
-        )
+        iceberg_table = catalog.create_table((namespace, table_name), schema)
 
         # Add the existing Parquet files to the table
         print(f"  Adding {len(parquet_files)} files to table...")
