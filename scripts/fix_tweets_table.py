@@ -28,7 +28,6 @@ catalog = FirestoreCatalog(
     firestore_project="mabeldev",
     firestore_database="catalogs",
     gcs_bucket="opteryx_data",
-    iceberg_compatible=False,
 )
 
 gcs_client = storage.Client()

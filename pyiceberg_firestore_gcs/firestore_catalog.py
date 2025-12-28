@@ -28,11 +28,9 @@ from pyiceberg.io.pyarrow import _pyarrow_to_schema_without_ids
 from pyiceberg.partitioning import UNPARTITIONED_PARTITION_SPEC
 from pyiceberg.partitioning import PartitionSpec
 from pyiceberg.schema import Schema
-from pyiceberg.serializers import ToOutputFile
 from pyiceberg.table import CommitTableResponse
 from pyiceberg.table import StaticTable
 from pyiceberg.table import Table
-from pyiceberg.table.locations import load_location_provider
 from pyiceberg.table.metadata import TableMetadataV2
 from pyiceberg.table.metadata import new_table_metadata
 from pyiceberg.table.sorting import UNSORTED_SORT_ORDER
@@ -42,7 +40,9 @@ from pyiceberg.table.update import TableUpdate
 from pyiceberg.typedef import EMPTY_DICT
 from pyiceberg.typedef import Properties
 
+from .parquet_manifest import ManifestOptimizationConfig
 from .parquet_manifest import OptimizedStaticTable
+from .parquet_manifest import entry_to_dict
 from .parquet_manifest import write_parquet_manifest
 from .view import View
 from .view import ViewAlreadyExistsError
@@ -72,16 +72,15 @@ class FirestoreCatalog(MetastoreCatalog):
         firestore_project: Optional[str] = None,
         firestore_database: Optional[str] = None,
         gcs_bucket: Optional[str] = None,
-        iceberg_compatible: bool = True,
         **properties: str,
     ):
+        # Ensure gcs bucket info is present in properties for FileIO resolution
         properties["gcs_bucket"] = gcs_bucket
-        properties["iceberg_compatible"] = str(iceberg_compatible)
         super().__init__(catalog_name, **properties)
 
         self.catalog_name = catalog_name
         self.bucket_name = gcs_bucket
-        self.iceberg_compatible = iceberg_compatible
+
         self.firestore_client = _get_firestore_client(firestore_project, firestore_database)
         self._catalog_ref = self.firestore_client.collection(catalog_name)
         self._properties = properties
@@ -350,43 +349,6 @@ class FirestoreCatalog(MetastoreCatalog):
         except Exception as e:
             logger.warning(f"Failed to save view metadata to Firestore: {e}")
 
-    def _is_iceberg_compatible(self, table_properties: Properties = EMPTY_DICT) -> bool:
-        """Determine if a table should be Iceberg compatible.
-
-        If the catalog is iceberg_compatible=True, all tables are forced to be compatible.
-        Otherwise, tables inherit the catalog setting unless explicitly overridden.
-
-        Args:
-            table_properties: Properties from the table
-
-        Returns:
-            bool: True if the table should write Iceberg metadata JSON and Avro files
-        """
-        # If catalog is iceberg_compatible, all tables must be compatible
-        if self.iceberg_compatible:
-            logger.debug("Catalog is iceberg_compatible=True, forcing compatibility")
-            return True
-
-        # Check if table has an explicit property set
-        if "iceberg_compatible" not in table_properties:
-            # No table-level override, inherit catalog setting (False in this case)
-            logger.debug(
-                "No iceberg_compatible property in table, inheriting catalog setting (False)"
-            )
-            return False
-
-        # Table has explicit property, parse it
-        table_compat = table_properties["iceberg_compatible"]
-        # Handle various boolean string formats
-        if isinstance(table_compat, str):
-            result = table_compat.strip().lower() in ("true", "1", "yes")
-        else:
-            # Handle boolean type
-            result = bool(table_compat)
-
-        logger.debug(f"Table iceberg_compatible property='{table_compat}', result={result}")
-        return result
-
     @staticmethod
     def _parse_metadata_version(metadata_location: str) -> int:
         return 0
@@ -651,18 +613,7 @@ class FirestoreCatalog(MetastoreCatalog):
         # Now save metadata (which will merge with the existing document)
         self._save_metadata_to_firestore(namespace, table_name, metadata)
 
-        # If iceberg_compatible, also write metadata JSON to GCS
         metadata_location = None
-        if self._is_iceberg_compatible(properties):
-            # Generate metadata location for new table (version 0)
-            metadata_version = 0  # Initial version for newly created tables
-            provider = load_location_provider(location, properties)
-            metadata_location = provider.new_table_metadata_file_location(metadata_version)
-
-            # Write metadata JSON to GCS
-            io_for_write = self._load_file_io(properties, location)
-            ToOutputFile.table_metadata(metadata, io_for_write.new_output(metadata_location))
-            logger.debug(f"Wrote Iceberg metadata JSON to {metadata_location}")
 
         # Return the created table
         return StaticTable(
@@ -712,27 +663,47 @@ class FirestoreCatalog(MetastoreCatalog):
         # Save metadata to Firestore
         self._save_metadata_to_firestore(namespace, table_name, updated_staged_table.metadata)
 
-        # If iceberg_compatible, also write metadata JSON to GCS
-        if self._is_iceberg_compatible(updated_staged_table.metadata.properties):
-            # Write metadata JSON to the location determined by _update_and_stage_table
-            io_for_write = self._load_file_io(
-                updated_staged_table.metadata.properties, updated_staged_table.metadata.location
-            )
-            ToOutputFile.table_metadata(
-                updated_staged_table.metadata,
-                io_for_write.new_output(updated_staged_table.metadata_location),
-            )
-            logger.debug(f"Wrote Iceberg metadata JSON to {updated_staged_table.metadata_location}")
-
         # Write Parquet manifest for fast query planning
-        # This is in addition to the standard Avro manifests already written
         io = self._load_file_io(
             updated_staged_table.metadata.properties, updated_staged_table.metadata.location
         )
+        # Try to collect staged manifest entries from the staged table object
+        staged_entries = None
+        for attr in (
+            "staged_entries",
+            "staged_manifest_entries",
+            "staged_data_files",
+            "staged_files",
+            "new_entries",
+            "new_files",
+        ):
+            val = getattr(updated_staged_table, attr, None)
+            if val:
+                staged_entries = val
+                break
+
+        entries_to_write = None
+        if staged_entries:
+            # Convert ManifestEntry-like objects to dicts using entry_to_dict
+            try:
+                config = ManifestOptimizationConfig()
+                schema = updated_staged_table.metadata.schema()
+                converted = []
+                for e in staged_entries:
+                    if isinstance(e, dict):
+                        converted.append(e)
+                    else:
+                        converted.append(entry_to_dict(e, schema, config))
+                entries_to_write = converted
+            except Exception:
+                # If conversion fails, fall back to not writing a parquet manifest
+                entries_to_write = None
+
         parquet_path = write_parquet_manifest(
             updated_staged_table.metadata,
             io,
             updated_staged_table.metadata.location,
+            entries=entries_to_write,
         )
 
         if parquet_path:

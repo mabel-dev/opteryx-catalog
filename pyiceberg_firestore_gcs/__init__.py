@@ -11,19 +11,19 @@ def create_catalog(
     firestore_project: Optional[str] = None,
     firestore_database: Optional[str] = None,
     gcs_bucket: Optional[str] = None,
-    iceberg_compatible: bool = True,
     **properties: str,
 ) -> FirestoreCatalog:
     """Factory helper for the Firestore+GCS catalog.
+
+    This catalog implementation does not write Iceberg Avro/manifest-list
+    artifacts in the hot path. Use `export_to_iceberg` / `import_from_iceberg`
+    for interoperability when needed.
 
     Args:
         catalog_name: Name of the catalog
         firestore_project: GCP project for Firestore
         firestore_database: Firestore database name
         gcs_bucket: GCS bucket for table data and metadata
-        iceberg_compatible: If True (default), write standard Iceberg metadata JSON and Avro
-            manifests to GCS. If False, only write to Firestore and Parquet manifests.
-            When True at catalog level, all tables are forced to be compatible.
         **properties: Additional catalog properties
 
     Returns:
@@ -34,7 +34,6 @@ def create_catalog(
         firestore_project=firestore_project,
         firestore_database=firestore_database,
         gcs_bucket=gcs_bucket,
-        iceberg_compatible=iceberg_compatible,
         **properties,
     )
 
