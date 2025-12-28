@@ -676,9 +676,7 @@ def read_parquet_manifest(
             # Original approach: read entire file
             input_file = io.new_input(parquet_path)
             with input_file.open() as f:
-                data = f.read()
-                buffer = BytesIO(data)
-                table = pq.read_table(buffer)
+                table = pq.read_table(f)
 
         read_elapsed = (time.perf_counter() - start_time) * 1000
         logger.debug(

@@ -23,7 +23,6 @@ from pyiceberg.exceptions import NoSuchTableError
 from pyiceberg.exceptions import NoSuchViewError
 from pyiceberg.exceptions import TableAlreadyExistsError
 from pyiceberg.io import FileIO
-from pyiceberg.io import load_file_io
 from pyiceberg.io.pyarrow import _pyarrow_to_schema_without_ids
 from pyiceberg.partitioning import UNPARTITIONED_PARTITION_SPEC
 from pyiceberg.partitioning import PartitionSpec
@@ -740,10 +739,14 @@ class FirestoreCatalog(MetastoreCatalog):
         )
 
     def _load_file_io(self, properties: Dict[str, str], location: Optional[str] = None) -> FileIO:
-        """Load a FileIO instance for GCS."""
+        """Load a FileIO instance for GCS using optimized Opteryx FileIO."""
+        from .fileio.gcs_fileio import GcsFileIO
+
         # Merge catalog properties with provided properties
         io_props = {**self._properties, **properties}
-        return load_file_io(properties=io_props, location=location)
+
+        # Always use our optimized GCS FileIO for better performance
+        return GcsFileIO(properties=io_props)
 
     def initialize(self, catalog_properties: Properties) -> None:
         """Initialize the catalog."""
