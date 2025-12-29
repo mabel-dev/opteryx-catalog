@@ -291,12 +291,10 @@ class SimpleTable(Table):
         # truncated table for the new snapshot. Do not delete objects.
         snapshot_id = int(time.time() * 1000)
 
+        # Do NOT write an empty Parquet manifest when there are no entries.
+        # Per policy, create the snapshot without a manifest so older
+        # snapshots remain readable and we avoid creating empty manifest files.
         manifest_path = None
-        if self.catalog and hasattr(self.catalog, "write_parquet_manifest"):
-            try:
-                manifest_path = self.catalog.write_parquet_manifest(snapshot_id, [], self.metadata.location)
-            except Exception:
-                manifest_path = None
 
         # Build summary reflecting deleted files (tracked, not removed)
         deleted_count = len(removed_files)
