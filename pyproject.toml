@@ -3,9 +3,9 @@ requires = ["setuptools>=69", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "pyiceberg_firestore_gcs"
+name = "opteryx_catalog"
 version = "0.3.1"
-description = "Opteryx Cloud Iceberg Catalog"
+description = "Opteryx Cloud Catalog"
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
