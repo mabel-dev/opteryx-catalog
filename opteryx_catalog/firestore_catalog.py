@@ -209,6 +209,36 @@ class FirestoreCatalog(Metastore):
         coll = self._tables_collection(namespace)
         return [doc.id for doc in coll.stream()]
 
+    def create_namespace(self, namespace: str, properties: dict | None = None, exists_ok: bool = False) -> None:
+        """Create a namespace document under the catalog.
+
+        If `exists_ok` is False and the namespace already exists, a KeyError is raised.
+        """
+        doc_ref = self._namespace_ref(namespace)
+        if doc_ref.get().exists:
+            if exists_ok:
+                return
+            raise KeyError(f"Namespace already exists: {namespace}")
+
+        now_ms = int(time.time() * 1000)
+        author = os.environ.get("USER") or os.environ.get("USERNAME") or "unknown"
+        doc_ref.set(
+            {
+                "name": namespace,
+                "properties": properties or {},
+                "timestamp-ms": now_ms,
+                "author": author,
+            }
+        )
+
+    def create_namespace_if_not_exists(self, namespace: str, properties: dict | None = None) -> None:
+        """Convenience wrapper that creates the namespace only if missing."""
+        try:
+            self.create_namespace(namespace, properties=properties, exists_ok=True)
+        except Exception:
+            # Be conservative: surface caller-level warnings rather than failing
+            return
+
     def table_exists(self, identifier_or_namespace: str, table_name: Optional[str] = None) -> bool:
         """Return True if the table exists.
 
@@ -252,10 +282,11 @@ class FirestoreCatalog(Metastore):
         try:
             import json
 
-            print("[MANIFEST] Parquet manifest entries to write:")
-            print(json.dumps(entries, indent=2, default=str))
+            # print("[MANIFEST] Parquet manifest entries to write:")
+            # print(json.dumps(entries, indent=2, default=str))
         except Exception:
-            print("[MANIFEST] Parquet manifest entries:", entries)
+            # print("[MANIFEST] Parquet manifest entries:", entries)
+            pass
 
         parquet_path = f"{table_location}/metadata/manifest-{snapshot_id}.parquet"
 
@@ -303,7 +334,7 @@ class FirestoreCatalog(Metastore):
             return parquet_path
         except Exception as e:
             # Log and return None on failure
-            print(f"Failed to write Parquet manifest: {e}")
+            # print(f"Failed to write Parquet manifest: {e}")
             raise e
 
     def save_snapshot(self, identifier: str, snapshot: Snapshot) -> None:
@@ -433,12 +464,12 @@ class FirestoreCatalog(Metastore):
             orso_schema = orso.schema.convert_arrow_schema_to_orso_schema(schema)
             columns = orso_schema.columns
         else:
-            print(f"[DEBUG] _schema_to_columns: unsupported schema type: {type(schema)}")
+            # print(f"[DEBUG] _schema_to_columns: unsupported schema type: {type(schema)}")
             raise ValueError(
                 "Unsupported schema type, expected pyarrow.Schema or orso.RelationSchema"
             )
 
-        print(f"[DEBUG] _schema_to_columns: processing {len(columns)} columns")
+        # print(f"[DEBUG] _schema_to_columns: processing {len(columns)} columns")
 
         for idx, column in enumerate(columns, start=1):
             # If f looks like a pyarrow.Field, use its name/type
@@ -472,13 +503,13 @@ class FirestoreCatalog(Metastore):
         doc_ref = self._table_doc_ref(namespace, table_name)
         schemas_coll = doc_ref.collection("schemas")
         sid = str(uuid.uuid4())
-        print(f"[DEBUG] _write_schema called for {namespace}/{table_name} sid={sid}")
+        # print(f"[DEBUG] _write_schema called for {namespace}/{table_name} sid={sid}")
         try:
             cols = self._schema_to_columns(schema)
         except Exception as e:
-            print(
-                f"[DEBUG] _write_schema: _schema_to_columns raised: {e}; falling back to empty columns list"
-            )
+            # print(
+            #     f"[DEBUG] _write_schema: _schema_to_columns raised: {e}; falling back to empty columns list"
+            # )
             cols = []
         now_ms = int(time.time() * 1000)
         author = os.environ.get("USER") or os.environ.get("USERNAME") or "unknown"
@@ -495,9 +526,9 @@ class FirestoreCatalog(Metastore):
             new_seq = 1
 
         try:
-            print(
-                f"[DEBUG] Writing schema doc {sid} for {namespace}/{table_name} (cols={len(cols)})"
-            )
+            # print(
+            #     f"[DEBUG] Writing schema doc {sid} for {namespace}/{table_name} (cols={len(cols)})"
+            # )
             schemas_coll.document(sid).set(
                 {
                     "columns": cols,
@@ -506,7 +537,8 @@ class FirestoreCatalog(Metastore):
                     "sequence-number": new_seq,
                 }
             )
-            print(f"[DEBUG] Wrote schema doc {sid}")
+            # print(f"[DEBUG] Wrote schema doc {sid}")
         except Exception as e:
-            print(f"[DEBUG] Failed to write schema doc {sid}: {e}")
+            # print(f"[DEBUG] Failed to write schema doc {sid}: {e}")
+            pass
         return sid
