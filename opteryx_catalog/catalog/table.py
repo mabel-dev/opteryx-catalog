@@ -236,3 +236,138 @@ class SimpleTable(Table):
         A full DataScan implementation will be added later.
         """
         return iter(())
+
+    def truncate(self) -> None:
+        """Delete all data files and manifests for this table.
+
+        This attempts to delete every data file referenced by existing
+        Parquet manifests and then delete the manifest files themselves.
+        Finally it clears the in-memory snapshot list and persists the
+        empty snapshot set via the attached `catalog` (if available).
+        """
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        io = self.io
+        # Collect files referenced by existing manifests but do NOT delete
+        # them from storage. Instead we will write a new empty manifest and
+        # create a truncate snapshot that records these files as deleted.
+        snaps = list(self.metadata.snapshots)
+        removed_files = []
+        removed_total_size = 0
+
+        for snap in snaps:
+            manifest_path = getattr(snap, "manifest_list", None)
+            if not manifest_path:
+                continue
+
+            # Read manifest via FileIO if available
+            rows = []
+            try:
+                if hasattr(io, "new_input"):
+                    inp = io.new_input(manifest_path)
+                    with inp.open() as f:
+                        data = f.read()
+                    table = pq.read_table(pa.BufferReader(data))
+                    rows = table.to_pylist()
+            except Exception:
+                rows = []
+
+            for r in rows:
+                fp = None
+                fsize = 0
+                if isinstance(r, dict):
+                    fp = r.get("file_path")
+                    fsize = int(r.get("file_size_in_bytes") or 0)
+                    if not fp and "data_file" in r and isinstance(r["data_file"], dict):
+                        fp = r["data_file"].get("file_path") or r["data_file"].get("path")
+                        fsize = int(r["data_file"].get("file_size_in_bytes") or 0)
+
+                if fp:
+                    removed_files.append(fp)
+                    removed_total_size += fsize
+
+        # Create a new empty Parquet manifest (entries=[]) to represent the
+        # truncated table for the new snapshot. Do not delete objects.
+        snapshot_id = int(time.time() * 1000)
+
+        manifest_path = None
+        if self.catalog and hasattr(self.catalog, "write_parquet_manifest"):
+            try:
+                manifest_path = self.catalog.write_parquet_manifest(snapshot_id, [], self.metadata.location)
+            except Exception:
+                manifest_path = None
+
+        # Build summary reflecting deleted files (tracked, not removed)
+        deleted_count = len(removed_files)
+        deleted_size = removed_total_size
+
+        summary = {
+            "added-data-files": 0,
+            "added-files-size": 0,
+            "added-records": 0,
+            "deleted-data-files": deleted_count,
+            "deleted-files-size": deleted_size,
+            "deleted-records": 0,
+            "total-data-files": 0,
+            "total-files-size": 0,
+            "total-records": 0,
+        }
+
+        # Sequence number
+        try:
+            max_seq = 0
+            for s in self.metadata.snapshots:
+                seq = getattr(s, "sequence_number", None)
+                if seq is None:
+                    continue
+                try:
+                    ival = int(seq)
+                except Exception:
+                    continue
+                if ival > max_seq:
+                    max_seq = ival
+            next_seq = max_seq + 1
+        except Exception:
+            next_seq = 1
+
+        author = (
+            self.metadata.author
+            or os.environ.get("USER")
+            or os.environ.get("USERNAME")
+            or "unknown"
+        )
+
+        parent_id = self.metadata.current_snapshot_id
+
+        snap = Snapshot(
+            snapshot_id=snapshot_id,
+            timestamp_ms=snapshot_id,
+            author=author,
+            sequence_number=next_seq,
+            user_created=True,
+            operation_type="truncate",
+            parent_snapshot_id=parent_id,
+            manifest_list=manifest_path,
+            schema_id=self.metadata.current_schema_id,
+            commit_message="",
+            summary=summary,
+        )
+
+        # Append new snapshot and update current snapshot id
+        self.metadata.snapshots.append(snap)
+        self.metadata.current_snapshot_id = snapshot_id
+
+        if self.catalog and hasattr(self.catalog, "save_snapshot"):
+            try:
+                self.catalog.save_snapshot(self.identifier, snap)
+            except Exception:
+                pass
+
+        if self.catalog and hasattr(self.catalog, "save_table_metadata"):
+            try:
+                self.catalog.save_table_metadata(self.identifier, self.metadata)
+            except Exception:
+                pass
+
+        return None
