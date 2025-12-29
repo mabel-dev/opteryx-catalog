@@ -209,6 +209,27 @@ class FirestoreCatalog(Metastore):
         coll = self._tables_collection(namespace)
         return [doc.id for doc in coll.stream()]
 
+    def table_exists(self, identifier_or_namespace: str, table_name: Optional[str] = None) -> bool:
+        """Return True if the table exists.
+
+        Supports two call forms:
+        - table_exists("namespace.table")
+        - table_exists("namespace", "table")
+        """
+        # Normalize inputs
+        if table_name is None:
+            # Expect a single identifier like 'namespace.table'
+            if "." not in identifier_or_namespace:
+                raise ValueError("identifier must be 'namespace.table' or pass table_name separately")
+            namespace, table_name = identifier_or_namespace.rsplit(".", 1)
+
+        try:
+            doc_ref = self._table_doc_ref(namespace, table_name)
+            return doc_ref.get().exists
+        except Exception:
+            # On any error, be conservative and return False
+            return False
+
     def write_parquet_manifest(
         self, snapshot_id: int, entries: List[dict], table_location: str
     ) -> Optional[str]:
