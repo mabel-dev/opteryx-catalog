@@ -241,7 +241,11 @@ class FirestoreCatalog(Metastore):
         import pyarrow as pa
         import pyarrow.parquet as pq
 
-        if not entries:
+        # If entries is None we skip writing; if entries is empty list, write
+        # an empty Parquet manifest (represents an empty table for this
+        # snapshot). This preserves previous manifests so older snapshots
+        # remain readable.
+        if entries is None:
             return None
 
         # Print manifest entries so users can inspect the manifest when created
