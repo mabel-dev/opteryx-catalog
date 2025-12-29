@@ -7,6 +7,7 @@ connection pooling for efficiency.
 """
 
 import io
+import logging
 import os
 import urllib.parse
 from typing import Union
@@ -18,6 +19,8 @@ from pyiceberg.io import OutputFile
 from pyiceberg.io import OutputStream
 from pyiceberg.typedef import EMPTY_DICT
 from pyiceberg.typedef import Properties
+
+logger = logging.getLogger(__name__)
 
 
 def get_storage_credentials():
@@ -118,7 +121,20 @@ class GcsOutputStream(io.BytesIO):
                 f"Failed to write '{self._path}' - status {response.status_code}: {response.text}"
             )
 
+        # Log what we wrote to help debug
+        file_name = self._path.split("/")[-1]
+        if file_name.endswith(".avro"):
+            import traceback
+
+            logger.warning(f"⚠️  WROTE AVRO FILE: {self._path}")
+            logger.warning("Stack trace:")
+            for line in traceback.format_stack():
+                logger.warning(line.strip())
+        elif file_name.endswith(".metadata.json"):
+            logger.warning(f"⚠️  WROTE JSON METADATA: {self._path}")
+
         self._closed = True
+        super().close()
         super().close()
 
 
@@ -247,16 +263,114 @@ class GcsOutputFile(OutputFile):
         return GcsOutputStream(self.location, self._session, self._access_token)
 
 
+class DiscardOutputStream(io.BytesIO):
+    """BLACKHOLE: Discards writes completely (used for manifest lists)."""
+
+    def __init__(self, path: str):
+        super().__init__()
+        self._path = path
+        self._closed = False
+
+    def close(self):
+        if self._closed:
+            return
+        data_size = len(self.getvalue())
+        logger.info(f"🗑️  BLACKHOLED: {self._path} ({data_size} bytes discarded)")
+        self._closed = True
+        super().close()
+
+
+class DiscardOutputFile(OutputFile):
+    """OutputFile that returns a DiscardOutputStream (blackhole)."""
+
+    def __init__(self, location: str):
+        super().__init__(location=location)
+
+    def __len__(self) -> int:
+        return 0
+
+    def exists(self) -> bool:
+        return False
+
+    def to_input_file(self) -> InputFile:
+        raise NotImplementedError("Cannot read blackholed files")
+
+    def create(self, overwrite: bool = False) -> OutputStream:
+        return DiscardOutputStream(self.location)
+
+
+class CaptureOutputStream(io.BytesIO):
+    """Captures Avro manifest bytes in-memory; nothing is written to GCS."""
+
+    def __init__(self, path: str, sink: list[tuple[str, bytes]]):
+        super().__init__()
+        self._path = path
+        self._sink = sink
+        self._closed = False
+
+    def close(self):
+        if self._closed:
+            return
+        data = self.getvalue()
+        self._sink.append((self._path, data))
+        logger.info(f"📥 Captured Avro manifest: {self._path} ({len(data)} bytes)")
+        self._closed = True
+        super().close()
+
+
+class CaptureOutputFile(OutputFile):
+    """OutputFile that captures writes to an in-memory sink (no GCS write)."""
+
+    def __init__(self, location: str, sink: list[tuple[str, bytes]]):
+        super().__init__(location=location)
+        self._sink = sink
+
+    def __len__(self) -> int:
+        return 0
+
+    def exists(self) -> bool:
+        return False
+
+    def to_input_file(self) -> InputFile:
+        raise NotImplementedError("Cannot read captured files via InputFile")
+
+    def create(self, overwrite: bool = False) -> OutputStream:
+        return CaptureOutputStream(self.location, self._sink)
+
+
 class GcsFileIO(FileIO):
     """
     FileIO implementation for GCS using optimized HTTP access.
 
     Uses direct GCS JSON API calls for 10% better performance than SDK,
     with connection pooling for efficiency.
+
+    IMPORTANT: This FileIO implements a "blackhole" pattern for Avro manifest files.
+    PyIceberg's Transaction.commit() hardcodes writing Avro manifests before calling
+    catalog.commit_table(). We cannot override this behavior without reimplementing
+    the entire Transaction class hierarchy. Instead, we intercept at the FileIO level:
+
+    When Transaction asks to write a manifest .avro file, we simply discard the writes.
+    The data goes into a black hole - nothing is written to storage. We write Parquet
+    manifests in commit_table() using the snapshot data instead.
+
+    This is a terrible hack but is necessary because:
+    - PyIceberg doesn't expose hooks to skip manifest writes during Transaction
+    - Overriding Transaction would require maintaining a complex fork
+    - The "write.manifest.format" property only affects initial table creation
+    - We don't need the Avro files at all - we create Parquet manifests separately
+
+    The alternative approaches were all worse (deleting Avro after write, forking
+    Transaction, monkeypatching internal classes, etc.)
     """
 
     def __init__(self, properties: Properties = EMPTY_DICT):
         super().__init__(properties=properties)
+        # Track Parquet manifest files written during a transaction so the catalog
+        # can stash the manifest list contents in Firestore.
+        self.manifest_paths: list[str] = []
+        # Capture Avro manifest payloads (path, bytes) before blackholing
+        self.captured_manifests: list[tuple[str, bytes]] = []
 
         import requests
         from google.auth.transport.requests import Request
@@ -281,7 +395,40 @@ class GcsFileIO(FileIO):
         return GcsInputFile(location, self.session, self.access_token)
 
     def new_output(self, location: str) -> OutputFile:
-        """Get an OutputFile instance to write bytes to the file at the given location."""
+        """
+        Get an OutputFile instance to write bytes to the file at the given location.
+
+        BLACKHOLE HACK: Discard manifest list files (both Avro and Parquet).
+        - Manifest lists (snap-*): Contents stored in Firestore snapshot_log collection
+        - Avro manifests (*-m*.avro): PyIceberg tries to write these, we discard them
+        """
+        logger.info(f"new_output -> {location}")
+
+        # Check if this is a manifest-related file in metadata/
+        if "/metadata/" in location:
+            file_name = location.split("/")[-1]
+            logger.info(f"📂 metadata write requested: {file_name}")
+
+            # Manifest list files (Avro or Parquet): snap-{snapshot_id}-{seq}-{uuid}.[avro|parquet]
+            if file_name.startswith("snap-") and (
+                file_name.endswith(".avro") or file_name.endswith(".parquet")
+            ):
+                logger.info(f"🗑️  DISCARDING manifest list: {location}")
+                logger.info("    (Manifest list contents stored in Firestore snapshot_log)")
+                return DiscardOutputFile(location)
+
+            # Avro manifest files: {uuid}-m0.avro, {uuid}-m1.avro, etc.
+            if file_name.endswith(".avro") and "-m" in file_name:
+                logger.info(f"📥 Capturing Avro manifest: {location}")
+                return CaptureOutputFile(location, self.captured_manifests)
+
+            # Parquet manifest files: {uuid}-m0.parquet, {uuid}-m1.parquet, etc.
+            if file_name.endswith(".parquet") and "-m" in file_name:
+                logger.info(f"📦 Manifest parquet write: {location}")
+                # Remember this path so the catalog can store it as the manifest list entry
+                self.manifest_paths.append(location)
+                return GcsOutputFile(location, self.session, self.access_token)
+
         return GcsOutputFile(location, self.session, self.access_token)
 
     def delete(self, location: Union[str, InputFile, OutputFile]) -> None:

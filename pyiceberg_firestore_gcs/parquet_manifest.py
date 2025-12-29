@@ -76,6 +76,127 @@ DEFAULT_ROW_GROUP_SIZE = 100000
 DEFAULT_MAX_MANIFEST_SIZE_MB = 100
 
 
+def _clean_empty_structs(obj: Any) -> Any:
+    """
+    Recursively remove empty dict/struct fields from nested structures.
+
+    PyArrow cannot write structs with no child fields to Parquet.
+    This function recursively traverses dicts and lists to remove any
+    empty dicts (which represent empty structs in Avro).
+    """
+    if isinstance(obj, dict):
+        cleaned = {}
+        for key, value in obj.items():
+            # Recursively clean the value
+            cleaned_value = _clean_empty_structs(value)
+            # Skip empty dicts entirely
+            if isinstance(cleaned_value, dict) and len(cleaned_value) == 0:
+                continue
+            cleaned[key] = cleaned_value
+        return cleaned
+    elif isinstance(obj, list):
+        return [_clean_empty_structs(item) for item in obj]
+    else:
+        return obj
+
+
+def write_parquet_manifest_from_entries(entries: List[Dict[str, Any]]) -> bytes:
+    """
+    Write Parquet bytes from manifest entry dicts (for blackhole conversion).
+
+    This is used by the FileIO blackhole hack to convert Avro manifest writes to Parquet.
+    Takes raw entry dicts from Avro deserialization and converts to Parquet bytes.
+
+    The key challenge: PyArrow cannot write structs with no child fields to Parquet.
+    We handle this by recursively removing all empty dict/struct fields.
+
+    Args:
+        entries: List of manifest entry dicts (from Avro deserialization)
+
+    Returns:
+        Parquet-encoded bytes
+    """
+    if not entries:
+        # Return empty Parquet file
+        empty_table = pa.Table.from_pylist([])
+        buffer = BytesIO()
+        pq.write_table(empty_table, buffer, compression="zstd")
+        return buffer.getvalue()
+
+    logger.debug(f"Converting {len(entries)} entries to Parquet")
+
+    # Recursively clean all empty structs from entries
+    cleaned_entries = []
+    for entry in entries:
+        cleaned = _clean_empty_structs(entry)
+        cleaned_entries.append(cleaned)
+
+    logger.debug("Cleaned entries, creating Arrow table")
+
+    # Convert to Arrow table
+    table = pa.Table.from_pylist(cleaned_entries)
+
+    logger.debug(f"Created Arrow table with {len(table)} rows")
+
+    # Write to buffer
+    buffer = BytesIO()
+    pq.write_table(
+        table,
+        buffer,
+        compression="zstd",
+        compression_level=3,
+        row_group_size=min(DEFAULT_ROW_GROUP_SIZE, len(cleaned_entries)),
+    )
+
+    return buffer.getvalue()
+
+
+def write_parquet_manifest_raw(entries: List[Dict[str, Any]], avro_schema: Dict[str, Any]) -> bytes:
+    """
+    Write raw Parquet bytes from manifest entry dicts.
+
+    This is used by the FileIO blackhole hack to convert Avro manifest writes to Parquet.
+    Takes the raw entry dicts from Avro deserialization and converts to Parquet bytes.
+
+    Args:
+        entries: List of manifest entry dicts (from Avro deserialization)
+        avro_schema: The Avro schema (unused for now, kept for future compatibility)
+
+    Returns:
+        Parquet-encoded bytes
+    """
+    # PyArrow cannot write structs with no child fields
+    # We need to drop the 'partition' field entirely if it's empty
+    # or find another workaround
+    cleaned_entries = []
+    for entry in entries:
+        cleaned = {}
+
+        for key, value in entry.items():
+            # Skip partition if it's an empty dict
+            if key == "partition" and isinstance(value, dict) and len(value) == 0:
+                continue
+            cleaned[key] = value
+
+        cleaned_entries.append(cleaned)
+
+    # Convert entries to Arrow table
+    # We need to infer the schema from the entries since we don't have TableMetadata here
+    table = pa.Table.from_pylist(cleaned_entries)
+
+    # Write to BytesIO buffer
+    buffer = BytesIO()
+    pq.write_table(
+        table,
+        buffer,
+        compression="zstd",
+        compression_level=3,
+        row_group_size=min(DEFAULT_ROW_GROUP_SIZE, len(entries)),
+    )
+
+    return buffer.getvalue()
+
+
 class CompressionType(str, Enum):
     """Supported compression types for Parquet manifests."""
 
@@ -94,7 +215,7 @@ class ManifestOptimizationConfig:
     compression_level: int = 3
     row_group_size: int = DEFAULT_ROW_GROUP_SIZE
     max_manifest_size_mb: int = DEFAULT_MAX_MANIFEST_SIZE_MB
-    enable_pruning: bool = True
+    enable_pruning: bool = False
     cache_unpacked_bounds: bool = True
     enable_metrics: bool = True
     streaming_read: bool = True
@@ -131,11 +252,6 @@ class ManifestMetrics:
         with self._lock:
             self.pruning_stats[predicate_type] += pruned_count
             self.pruned_files_total += pruned_count
-
-    def record_fallback(self):
-        """Record fallback to Avro manifests."""
-        with self._lock:
-            self.fallback_count += 1
 
     def get_summary(self) -> Dict[str, Any]:
         """Get summary metrics."""
@@ -621,6 +737,123 @@ def write_parquet_manifest(
         return None
 
 
+def write_parquet_manifest_direct(
+    snapshot_id: int,
+    entries: List[Dict[str, Any]],
+    io: FileIO,
+    location: str,
+    config: ManifestOptimizationConfig | None = None,
+) -> str | None:
+    """Write a Parquet manifest directly from entries without metadata object.
+
+    This is used when we have snapshot information from TableUpdates but the
+    metadata hasn't been updated yet.
+
+    Args:
+        snapshot_id: Snapshot ID for the manifest filename
+        entries: List of manifest entry dicts
+        io: FileIO instance for writing
+        location: Table location
+        config: Optional manifest optimization configuration
+
+    Returns:
+        Path to written Parquet manifest, or None on failure
+    """
+    config = config or ManifestOptimizationConfig()
+
+    if not entries:
+        logger.debug("No entries provided; skipping Parquet manifest write")
+        return None
+
+    parquet_path = f"{location}/metadata/manifest-{snapshot_id}.parquet"
+
+    # Check if file already exists
+    try:
+        input_file = io.new_input(parquet_path)
+        with input_file.open() as f:
+            logger.debug(f"Parquet manifest already exists at {parquet_path}, skipping write")
+            return parquet_path
+    except Exception:
+        pass  # File doesn't exist, proceed with writing
+
+    logger.info(f"Writing Parquet manifest for snapshot {snapshot_id} with {len(entries)} entries")
+
+    if not validate_manifest_data(entries):
+        return None
+
+    # Validate that all referenced data files exist before writing the manifest.
+    missing_files = []
+    for i, rec in enumerate(entries):
+        # Support both flat records and nested `data_file` shapes
+        file_path = None
+        if isinstance(rec, dict):
+            if "file_path" in rec:
+                file_path = rec.get("file_path")
+            elif "data_file" in rec and isinstance(rec["data_file"], dict):
+                file_path = rec["data_file"].get("file_path") or rec["data_file"].get("path")
+
+        if not file_path:
+            missing_files.append((i, None))
+            continue
+
+        try:
+            input_file = io.new_input(file_path)
+            # Try opening to confirm existence/readability
+            with input_file.open():
+                pass
+        except Exception:
+            missing_files.append((i, file_path))
+
+    if missing_files:
+        for idx, path in missing_files:
+            if path:
+                logger.error(
+                    f"Parquet manifest write aborted: referenced data file missing: {path}"
+                )
+            else:
+                logger.error(f"Parquet manifest write aborted: entry {idx} missing file_path")
+        return None
+
+    # Convert to Arrow table
+    table = pa.Table.from_pylist(entries)
+
+    try:
+        # Write to BytesIO buffer first
+        buffer = BytesIO()
+
+        compression = (
+            config.compression.value if config.compression != CompressionType.NONE else None
+        )
+
+        pq.write_table(
+            table,
+            buffer,
+            compression=compression,
+            compression_level=config.compression_level if compression else None,
+            row_group_size=min(config.row_group_size, len(entries)),
+        )
+
+        # Write buffer to storage
+        buffer.seek(0)
+        output_file = io.new_output(parquet_path)
+        with output_file.create() as stream:
+            stream.write(buffer.getvalue())
+
+        file_size_mb = buffer.tell() / BYTES_PER_MEGABYTE
+        logger.info(
+            f"Wrote Parquet manifest {parquet_path} ({len(entries)} entries, {file_size_mb:.2f}MB)"
+        )
+
+        return parquet_path
+
+    except Exception as e:
+        logger.error(f"Failed to write Parquet manifest: {e}")
+        import traceback
+
+        logger.error(traceback.format_exc())
+        return None
+
+
 def read_parquet_manifest(
     metadata: TableMetadataV2,
     io: FileIO,
@@ -688,6 +921,119 @@ def read_parquet_manifest(
 
         # Convert PyArrow table to list of dicts
         records = table.to_pylist()
+
+        # Normalize records written by different code paths:
+        # - Older writer (entry_to_dict) writes a flat schema
+        # - The Avro->Parquet converter writes nested `data_file` structs
+        # Detect nested `data_file` and flatten into the expected shape.
+        from .to_int import to_int
+
+        def _kv_list_to_dict(kv_list):
+            if not kv_list:
+                return None
+            out = {}
+            for item in kv_list:
+                if not isinstance(item, dict):
+                    continue
+                k = item.get("key")
+                v = item.get("value")
+                if k is None:
+                    continue
+                out[int(k)] = v
+            return out
+
+        normalized = []
+        for rec in records:
+            # If the record already has top-level file_path, assume flat schema
+            if isinstance(rec, dict) and "file_path" in rec:
+                normalized.append(rec)
+                continue
+
+            # Handle nested data_file struct
+            if isinstance(rec, dict) and "data_file" in rec and isinstance(rec["data_file"], dict):
+                df = rec.get("data_file", {})
+
+                # Convert kv-list structures to dicts
+                lower_kv = _kv_list_to_dict(df.get("lower_bounds"))
+                upper_kv = _kv_list_to_dict(df.get("upper_bounds"))
+                nulls_kv = _kv_list_to_dict(df.get("null_value_counts")) or _kv_list_to_dict(
+                    df.get("null_counts")
+                )
+                values_kv = _kv_list_to_dict(df.get("value_counts"))
+                colsizes_kv = _kv_list_to_dict(df.get("column_sizes"))
+                nans_kv = _kv_list_to_dict(df.get("nan_value_counts")) or _kv_list_to_dict(
+                    df.get("nan_counts")
+                )
+
+                # Determine max field id
+                all_ids = set()
+                for d in (lower_kv, upper_kv, nulls_kv, values_kv, colsizes_kv, nans_kv):
+                    if d:
+                        all_ids.update(d.keys())
+                max_id = max(all_ids) if all_ids else -1
+
+                def _to_array(kv_dict):
+                    if kv_dict is None:
+                        return None
+                    arr = [None] * (max_id + 1)
+                    for k, v in kv_dict.items():
+                        try:
+                            arr[int(k)] = to_int(v) if v is not None else None
+                        except Exception:
+                            arr[int(k)] = None
+                    return arr
+
+                lower_array = _to_array(lower_kv)
+                upper_array = _to_array(upper_kv)
+                null_counts_array = _to_array(nulls_kv)
+                value_counts_array = _to_array(values_kv)
+                column_sizes_array = _to_array(colsizes_kv)
+                nan_counts_array = _to_array(nans_kv)
+
+                # Partition JSON
+                partition_json = None
+                if df.get("partition"):
+                    try:
+                        partition_json = json.dumps(
+                            {k: _serialize_value(v) for k, v in df.get("partition").items()}
+                        )
+                    except Exception:
+                        partition_json = None
+
+                flat = {
+                    "file_path": df.get("file_path") or df.get("path") or df.get("file_path"),
+                    "snapshot_id": rec.get("snapshot_id"),
+                    "sequence_number": rec.get("sequence_number"),
+                    "file_sequence_number": rec.get("file_sequence_number"),
+                    "active": (rec.get("status") != 2) if rec.get("status") is not None else True,
+                    "partition_spec_id": df.get("spec_id") or df.get("partition_spec_id"),
+                    "partition_json": partition_json,
+                    "file_format": df.get("file_format"),
+                    "record_count": df.get("record_count"),
+                    "file_size_bytes": df.get("file_size_in_bytes") or df.get("file_size_bytes"),
+                    "lower_bounds": lower_array,
+                    "upper_bounds": upper_array,
+                    "null_counts": null_counts_array,
+                    "value_counts": value_counts_array,
+                    "column_sizes": column_sizes_array,
+                    "nan_counts": nan_counts_array,
+                    "key_metadata": df.get("key_metadata"),
+                    "split_offsets_json": json.dumps(df.get("split_offsets"))
+                    if df.get("split_offsets")
+                    else None,
+                    "equality_ids_json": json.dumps(df.get("equality_ids"))
+                    if df.get("equality_ids")
+                    else None,
+                    "sort_order_id": df.get("sort_order_id"),
+                    "schema_version": rec.get("schema_version") or None,
+                    "field_id_mapping": json.dumps({}),
+                }
+                normalized.append(flat)
+            else:
+                # Unknown shape, pass through
+                normalized.append(rec)
+
+        records = normalized
 
         # Validate schema version compatibility
         if records:
@@ -855,6 +1201,26 @@ def _can_prune_file_with_predicate(
     field_id = predicate.term.field.field_id
 
     print(data_file.get_min_int(field_id), "vs", predicate.literal.value)
+    # Only perform numeric/order-preserving pruning for primitive types
+    # where our `to_int` mapping preserves order (integers, timestamps, dates, floats).
+    # Be conservative for strings and other types to avoid incorrect pruning
+    try:
+        field = schema.find_field(field_id)
+        if field is None:
+            return False
+        from pyiceberg.types import DateType
+        from pyiceberg.types import DoubleType
+        from pyiceberg.types import LongType
+        from pyiceberg.types import TimestampType
+        from pyiceberg.types import TimestamptzType
+
+        if not isinstance(
+            field.field_type, (LongType, DoubleType, DateType, TimestampType, TimestamptzType)
+        ):
+            # Do not prune on string or complex types (case-sensitive ordering issues)
+            return False
+    except Exception:
+        return False
     # Use cached bounds if available
     if hasattr(data_file, "get_min_int"):
         file_min_int = data_file.get_min_int(field_id)
@@ -1138,6 +1504,20 @@ class OptimizedDataScan(DataScan):
                     data_file.data_file if hasattr(data_file, "data_file") else data_file
                 )
 
+                # Verify the referenced data file exists before creating a scan task.
+                try:
+                    input_file = self.io.new_input(actual_data_file.file_path)
+                    if not input_file.exists():
+                        logger.warning(
+                            f"Missing data file referenced in manifest: {actual_data_file.file_path}; skipping"
+                        )
+                        continue
+                except Exception as e:
+                    logger.warning(
+                        f"Error checking existence of data file {getattr(actual_data_file, 'file_path', '<unknown>')}: {e}; skipping"
+                    )
+                    continue
+
                 task = FileScanTask(
                     data_file=actual_data_file,
                     delete_files=set(),  # No delete files
@@ -1171,11 +1551,6 @@ class OptimizedDataScan(DataScan):
         logger.info(
             "Query planning: Parquet manifest unavailable; Avro disabled, returning no files"
         )
-        return []
-
-    def _plan_files_avro(self, start_time: float) -> Iterable[FileScanTask]:
-        """Avro reading is disabled for this catalog; return no files."""
-        logger.debug("Avro manifest reading is disabled; returning no files")
         return []
 
 

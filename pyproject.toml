@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pyiceberg_firestore_gcs"
-version = "0.3.0"
+version = "0.3.1"
 description = "Opteryx Cloud Iceberg Catalog"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -12,6 +12,7 @@ dependencies = [
     "google-cloud-firestore==2.22.0",
     "google-cloud-storage==3.7.0",
     "orso==0.0.226",
+    "opteryx-core",
     "pyarrow==22.0.0",
     "pyiceberg==0.10.0",
     "requests==2.32.5"
