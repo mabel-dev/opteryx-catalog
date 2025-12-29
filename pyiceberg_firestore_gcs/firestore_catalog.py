@@ -41,8 +41,9 @@ from pyiceberg.typedef import Properties
 
 from .parquet_manifest import ManifestOptimizationConfig
 from .parquet_manifest import OptimizedStaticTable
-from .parquet_manifest import entry_to_dict
 from .parquet_manifest import write_parquet_manifest
+
+# FirestoreTable class not used by the catalog anymore; optimized table used instead
 from .view import View
 from .view import ViewAlreadyExistsError
 from .view import ViewMetadata
@@ -237,6 +238,11 @@ class FirestoreCatalog(MetastoreCatalog):
     ) -> None:
         """Save metadata to Firestore, merging with existing table document."""
         try:
+            # Ensure current_snapshot_id is persisted when snapshots exist
+            if metadata.current_snapshot_id is None and metadata.snapshots:
+                latest_snapshot_id = metadata.snapshots[-1].snapshot_id
+                metadata = metadata.model_copy(update={"current_snapshot_id": latest_snapshot_id})
+
             metadata_dict = orjson.loads(metadata.model_dump_json(exclude_none=True))
             table_doc_ref = self._table_doc_ref(namespace, table_name)
 
@@ -500,18 +506,20 @@ class FirestoreCatalog(MetastoreCatalog):
 
         io = self._load_file_io({"type": "gcs", "bucket": self.bucket_name})
 
-        # Return OptimizedStaticTable for fast query planning with Parquet manifests
+        # Return an OptimizedStaticTable which uses Parquet manifests for planning
         table = OptimizedStaticTable(
             identifier=(namespace, table_name),
             metadata=metadata,
             metadata_location=None,
             io=io,
             catalog=self,
+            manifest_config=ManifestOptimizationConfig(),
         )
 
         # Track whether we loaded full snapshot history for downstream checks
         table.full_history_loaded = include_full_history
 
+        logger.info(f"load_table() returning {type(table).__name__}: {namespace}.{table_name}")
         return table
 
     def drop_table(self, identifier: Union[str, Identifier]) -> None:
@@ -596,7 +604,12 @@ class FirestoreCatalog(MetastoreCatalog):
             partition_spec=partition_spec,
             sort_order=sort_order,
             location=location,
-            properties=properties,
+            properties={
+                **properties,
+                # Force Parquet manifests instead of Avro
+                "write.manifest.format": "parquet",
+                "write.metadata.format": "json",
+            },
         )
 
         # Register the table in Firestore first with basic info
@@ -612,19 +625,81 @@ class FirestoreCatalog(MetastoreCatalog):
         # Now save metadata (which will merge with the existing document)
         self._save_metadata_to_firestore(namespace, table_name, metadata)
 
-        metadata_location = None
+        metadata_location = f"{location}/metadata/metadata.json"
 
-        # Return the created table
-        return StaticTable(
+        # Return an OptimizedStaticTable which uses Parquet manifests
+        table = OptimizedStaticTable(
             identifier=(namespace, table_name),
             metadata=metadata,
             metadata_location=metadata_location,
             io=io,
             catalog=self,
+            manifest_config=ManifestOptimizationConfig(),
         )
+        logger.info(f"create_table() returning {type(table).__name__}: {namespace}.{table_name}")
+        return table
 
     def create_table_transaction(self, *args: Any, **kwargs: Any):
         raise NotImplementedError("FirestoreCatalog does not handle table transactions.")
+
+    @staticmethod
+    def _write_metadata(metadata: TableMetadataV2, io: FileIO, metadata_path: str) -> None:
+        """Override to prevent writing JSON metadata files to GCS.
+
+        Metadata is stored in Firestore, so we don't write .metadata.json files.
+        This is called by pyiceberg's base _update_and_stage_table.
+        """
+        # No-op: we store metadata in Firestore, not as JSON files in GCS
+        logger.debug(f"Skipping JSON metadata write to {metadata_path} (using Firestore instead)")
+        pass
+
+    def _update_and_stage_table(
+        self,
+        current_table: Optional[Table],
+        identifier: Identifier,
+        requirements: tuple[TableRequirement, ...],
+        updates: tuple[TableUpdate, ...],
+    ) -> Table:
+        """Override to prevent pyiceberg from writing JSON/Avro to GCS.
+
+        We handle metadata persistence via Firestore, not GCS JSON files.
+        This prevents pyiceberg's internal flow from creating .avro and .metadata.json.
+        """
+        from pyiceberg.table import update_table_metadata
+
+        namespace, table_name = self.identifier_to_database_and_table(identifier)
+
+        # Load current metadata from Firestore
+        if current_table is None:
+            metadata = self._load_metadata_from_firestore(namespace, table_name)
+            if not metadata:
+                raise NoSuchTableError(identifier)
+            io = self._load_file_io({})
+            current_table = StaticTable(
+                identifier=identifier,
+                metadata=metadata,
+                metadata_location=None,
+                io=io,
+                catalog=self,
+            )
+
+        # Apply updates to metadata (in-memory)
+        base_metadata = current_table.metadata
+        updated_metadata = update_table_metadata(
+            base_metadata=base_metadata,
+            updates=updates,
+        )
+
+        # Return staged table with updated metadata (no GCS writes yet)
+        metadata_location = f"{updated_metadata.location}/metadata/metadata.json"
+
+        return StaticTable(
+            identifier=identifier,
+            metadata=updated_metadata,
+            metadata_location=metadata_location,
+            io=current_table.io,
+            catalog=self,
+        )
 
     def commit_table(
         self,
@@ -659,70 +734,113 @@ class FirestoreCatalog(MetastoreCatalog):
             current_table, (namespace, table_name), requirements, updates
         )
 
-        # Save metadata to Firestore
+        logger.debug(f"commit_table updates: {[type(u).__name__ for u in updates]}")
+
+        # Extract manifest file paths and store in snapshot_log
+        # The manifest list file (snap-*.parquet/avro) is blackholed, so we store its contents
+        # (the list of manifest file paths) directly in Firestore.
+        from pyiceberg.table.update import AddSnapshotUpdate
+
+        snapshot_updates = [u for u in updates if isinstance(u, AddSnapshotUpdate)]
+        if snapshot_updates:
+            snapshot_log_collection = self._snapshot_log_collection(namespace, table_name)
+
+            # Gather manifest parquet paths captured by FileIO during the transaction
+            file_io = getattr(table, "io", None)
+            manifest_paths_written: list[str] = []
+            captured_manifests: list[tuple[str, bytes]] = []
+            if file_io and hasattr(file_io, "manifest_paths"):
+                manifest_paths_written = list(getattr(file_io, "manifest_paths", []))
+                # Clear after consuming to avoid leaking across commits
+                file_io.manifest_paths = []
+            if file_io and hasattr(file_io, "captured_manifests"):
+                captured_manifests = list(getattr(file_io, "captured_manifests", []))
+                file_io.captured_manifests = []
+
+            metadata_updated = False
+
+            for su in snapshot_updates:
+                snapshot = su.snapshot
+                snapshot_id = snapshot.snapshot_id
+                timestamp_ms = snapshot.timestamp_ms
+
+                manifest_paths = list(manifest_paths_written)
+
+                # If no Parquet manifests were written, try converting captured Avro manifest(s)
+                if not manifest_paths and captured_manifests:
+                    import io as _io
+
+                    import fastavro
+
+                    avro_path, avro_bytes = captured_manifests[0]
+                    try:
+                        reader = fastavro.reader(_io.BytesIO(avro_bytes))
+                        entries = list(reader)
+                        if entries:
+                            io = file_io or self._load_file_io(
+                                updated_staged_table.metadata.properties,
+                                updated_staged_table.metadata.location,
+                            )
+                            # Use the direct writer which validates referenced data files
+                            from .parquet_manifest import write_parquet_manifest_direct
+
+                            manifest_path = write_parquet_manifest_direct(
+                                snapshot_id, entries, io, updated_staged_table.metadata.location
+                            )
+                            if manifest_path:
+                                manifest_paths.append(manifest_path)
+                                logger.info(
+                                    f"Converted captured Avro manifest to Parquet: {manifest_path}"
+                                )
+                            else:
+                                logger.warning(
+                                    f"Conversion aborted for captured Avro manifest {avro_path}: missing data files or validation failed"
+                                )
+                        else:
+                            logger.warning(f"Captured Avro manifest {avro_path} had no entries")
+                    except Exception as e:
+                        logger.warning(f"Failed to convert captured Avro manifest {avro_path}: {e}")
+
+                # If we have a Parquet manifest path, replace the snapshot in metadata with an updated copy
+                if manifest_paths:
+                    new_snapshots = []
+                    for s in updated_staged_table.metadata.snapshots:
+                        if s.snapshot_id == snapshot_id:
+                            s = s.model_copy(update={"manifest_list": manifest_paths[0]})
+                        new_snapshots.append(s)
+                    updated_staged_table.metadata = updated_staged_table.metadata.model_copy(
+                        update={
+                            "snapshots": new_snapshots,
+                            # Explicitly set the current snapshot to the one we just committed
+                            "current_snapshot_id": snapshot_id,
+                        }
+                    )
+                    metadata_updated = True
+
+                # Store in snapshot_log with manifest file paths (the manifest list contents)
+                doc_id = f"{snapshot_id}_{timestamp_ms}"
+                snapshot_log_collection.document(doc_id).set(
+                    {
+                        "snapshot-id": snapshot_id,
+                        "timestamp-ms": timestamp_ms,
+                        "manifests": manifest_paths,  # List of manifest file paths
+                    }
+                )
+
+                logger.info(f"Snapshot {snapshot_id} created with {len(manifest_paths)} manifests")
+                logger.debug(f"   Manifest list contents stored in Firestore: {doc_id}")
+
+            # If we updated manifest_list to point to Parquet, persist the metadata change
+            if metadata_updated:
+                # Persist updated metadata (after manifests exist)
+                self._save_metadata_to_firestore(
+                    namespace, table_name, updated_staged_table.metadata
+                )
+
+        # Persist final metadata (ensure manifests are written before exposing snapshot)
         self._save_metadata_to_firestore(namespace, table_name, updated_staged_table.metadata)
 
-        # Write Parquet manifest for fast query planning
-        io = self._load_file_io(
-            updated_staged_table.metadata.properties, updated_staged_table.metadata.location
-        )
-        # Try to collect staged manifest entries from the staged table object
-        staged_entries = None
-        for attr in (
-            "staged_entries",
-            "staged_manifest_entries",
-            "staged_data_files",
-            "staged_files",
-            "new_entries",
-            "new_files",
-        ):
-            val = getattr(updated_staged_table, attr, None)
-            if val:
-                staged_entries = val
-                break
-
-        entries_to_write = None
-        if staged_entries:
-            # Convert ManifestEntry-like objects to dicts using entry_to_dict
-            try:
-                config = ManifestOptimizationConfig()
-                schema = updated_staged_table.metadata.schema()
-                converted = []
-                for e in staged_entries:
-                    if isinstance(e, dict):
-                        converted.append(e)
-                    else:
-                        converted.append(entry_to_dict(e, schema, config))
-                entries_to_write = converted
-            except Exception:
-                # If conversion fails, fall back to not writing a parquet manifest
-                entries_to_write = None
-
-        parquet_path = write_parquet_manifest(
-            updated_staged_table.metadata,
-            io,
-            updated_staged_table.metadata.location,
-            entries=entries_to_write,
-        )
-
-        if parquet_path:
-            logger.info(
-                f"Wrote Parquet manifest for {self.catalog_name}.{namespace}.{table_name} at {parquet_path}"
-            )
-
-            # Store Parquet manifest path in the current snapshot document
-            current_snapshot_id = updated_staged_table.metadata.current_snapshot_id
-            if current_snapshot_id is not None:
-                snapshot_ref = self._snapshots_collection(namespace, table_name).document(
-                    str(current_snapshot_id)
-                )
-                snapshot_ref.set(
-                    {"parquet-manifest": parquet_path},
-                    merge=True,
-                )
-                logger.debug(f"Added parquet-manifest reference to snapshot {current_snapshot_id}")
-
-        # Update Firestore
+        # Update Firestore table document timestamp
         table_ref = self._table_doc_ref(namespace, table_name)
         table_ref.set(
             {
@@ -733,9 +851,117 @@ class FirestoreCatalog(MetastoreCatalog):
         )
         logger.info(f"Committed table {self.catalog_name}.{namespace}.{table_name}")
 
+        # Provide a firestore-based metadata location (not a real GCS path)
+        metadata_location = f"firestore://{self.catalog_name}/{namespace}/{table_name}"
+
         return CommitTableResponse(
             metadata=updated_staged_table.metadata,
-            metadata_location=updated_staged_table.metadata_location,
+            metadata_location=metadata_location,
+        )
+
+    def commit_append(
+        self,
+        table: Table,
+        snapshot_id: int,
+        manifest_entries: list[dict],
+        added_records: int,
+        added_files_size: int,
+        snapshot_properties: Dict[str, str] = EMPTY_DICT,
+    ) -> None:
+        """Custom append commit that writes only Parquet manifests.
+
+        This bypasses PyIceberg's standard commit flow which writes Avro manifests.
+
+        Args:
+            table: The table being appended to
+            snapshot_id: The snapshot ID for this append
+            manifest_entries: Parquet manifest entries (already converted to dicts)
+            added_records: Number of records added
+            added_files_size: Total size in bytes of files added
+            snapshot_properties: Additional snapshot properties
+        """
+        import time
+
+        from pyiceberg.table.snapshots import Operation
+        from pyiceberg.table.snapshots import Snapshot
+        from pyiceberg.table.snapshots import SnapshotLogEntry
+        from pyiceberg.table.snapshots import Summary
+
+        namespace, table_name = table.name()
+
+        # Reload current metadata from Firestore
+        current_metadata = self._load_metadata_from_firestore(namespace, table_name)
+
+        # Write Parquet manifest
+        io = self._load_file_io(current_metadata.properties, current_metadata.location)
+        manifest_path = write_parquet_manifest(
+            current_metadata,
+            io,
+            current_metadata.location,
+            entries=manifest_entries,
+        )
+
+        logger.debug(f"Wrote Parquet manifest: {manifest_path}")
+
+        # Create snapshot summary
+        summary = Summary(
+            operation=Operation.APPEND,
+            **{
+                "added-data-files": "1",
+                "added-records": str(added_records),
+                "added-files-size": str(added_files_size),
+                **snapshot_properties,
+            },
+        )
+
+        # Create snapshot
+        timestamp_ms = int(time.time() * 1000)
+        snapshot = Snapshot(
+            snapshot_id=snapshot_id,
+            parent_snapshot_id=current_metadata.current_snapshot_id,
+            sequence_number=current_metadata.next_sequence_number(),
+            timestamp_ms=timestamp_ms,
+            manifest_list=manifest_path,  # Point to Parquet manifest
+            summary=summary,
+            schema_id=current_metadata.current_schema_id,
+        )
+
+        # Create snapshot log entry
+        snapshot_log_entry = SnapshotLogEntry(
+            snapshot_id=snapshot_id,
+            timestamp_ms=timestamp_ms,
+        )
+
+        # Update metadata with new snapshot
+        new_snapshots = list(current_metadata.snapshots) + [snapshot]
+        new_snapshot_log = list(current_metadata.snapshot_log) + [snapshot_log_entry]
+
+        from pyiceberg.table.metadata import new_table_metadata
+
+        updated_metadata = new_table_metadata(
+            location=current_metadata.location,
+            schema=current_metadata.schema(),
+            partition_spec=current_metadata.default_spec(),
+            sort_order=current_metadata.default_sort_order(),
+            properties=current_metadata.properties,
+            current_snapshot_id=snapshot_id,
+            snapshots=new_snapshots,
+            snapshot_log=new_snapshot_log,
+            last_sequence_number=current_metadata.next_sequence_number(),
+        )
+
+        # Save to Firestore
+        self._save_metadata_to_firestore(namespace, table_name, updated_metadata)
+
+        # Store Parquet manifest path in snapshot document
+        snapshot_ref = self._snapshots_collection(namespace, table_name).document(str(snapshot_id))
+        snapshot_ref.set(
+            {"parquet-manifest": manifest_path},
+            merge=True,
+        )
+
+        logger.info(
+            f"Committed append to {self.catalog_name}.{namespace}.{table_name}: {added_records} records"
         )
 
     def _load_file_io(self, properties: Dict[str, str], location: Optional[str] = None) -> FileIO:
