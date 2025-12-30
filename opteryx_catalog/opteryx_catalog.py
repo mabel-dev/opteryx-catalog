@@ -10,28 +10,28 @@ from typing import Optional
 from google.cloud import firestore
 from google.cloud import storage
 
+from .catalog.dataset import SimpleDataset
+from .catalog.metadata import DatasetMetadata
 from .catalog.metadata import Snapshot
-from .catalog.metadata import TableMetadata
 from .catalog.metastore import Metastore
-from .catalog.table import SimpleTable
-from .iops.base import FileIO
-from .exceptions import (
-    TableAlreadyExists,
-    TableNotFound,
-    NamespaceAlreadyExists,
-    ViewAlreadyExists,
-    ViewNotFound,
-)
 from .catalog.view import View as CatalogView
+from .exceptions import CollectionAlreadyExists
+from .exceptions import DatasetAlreadyExists
+from .exceptions import DatasetNotFound
+from .exceptions import ViewAlreadyExists
+from .exceptions import ViewNotFound
+from .iops.base import FileIO
 
 
 class OpteryxCatalog(Metastore):
     """Firestore-backed Metastore implementation.
 
-    Stores table documents under: /<catalog>/<namespace>/tables/<table>
-    Snapshots are stored in a `snapshots` subcollection.
-    Parquet manifests are written to GCS under the table location's
-    `metadata/manifest-<snapshot_id>.parquet` path.
+    Terminology: catalog -> workspace -> collection -> dataset|view
+
+    Stores table documents under the configured workspace in Firestore.
+    Snapshots are stored in a `snapshots` subcollection under each
+    dataset's document. Parquet manifests are written to GCS under the
+    dataset location's `metadata/manifest-<snapshot_id>.parquet` path.
     """
 
     def __init__(
@@ -50,6 +50,29 @@ class OpteryxCatalog(Metastore):
             project=firestore_project, database=firestore_database
         )
         self._catalog_ref = self.firestore_client.collection(workspace)
+        # Ensure workspace-level properties document exists in Firestore.
+        # The $properties doc records metadata for the workspace such as
+        # 'timestamp-ms', 'author', 'billing-account-id' and 'owner'.
+        try:
+            props_ref = self._catalog_ref.document("$properties")
+            if not props_ref.get().exists:
+                now_ms = int(time.time() * 1000)
+                billing = (
+                    os.environ.get("BILLING_ACCOUNT_ID")
+                    or os.environ.get("BILLING_ACCOUNT")
+                    or None
+                )
+                owner = os.environ.get("WORKSPACE_OWNER") or None
+                props_ref.set(
+                    {
+                        "timestamp-ms": now_ms,
+                        "billing-account-id": billing,
+                        "owner": owner,
+                    }
+                )
+        except Exception:
+            # Be conservative: don't fail catalog initialization on Firestore errors
+            pass
         self.gcs_bucket = gcs_bucket
         self._storage_client = storage.Client() if gcs_bucket else None
         # Default to a GCS-backed FileIO when a GCS bucket is configured and
@@ -67,36 +90,45 @@ class OpteryxCatalog(Metastore):
             else:
                 self.io = FileIO()
 
-    def _namespace_ref(self, namespace: str):
-        return self._catalog_ref.document(namespace)
+    def _collection_ref(self, collection: str):
+        """Alias for `_namespace_ref` using the preferred term `collection`.
 
-    def _tables_collection(self, namespace: str):
-        return self._namespace_ref(namespace).collection("tables")
+        Do NOT change call signatures; this helper provides a clearer name
+        for new code paths while remaining backwards-compatible.
+        """
+        return self._catalog_ref.document(collection)
 
-    def _table_doc_ref(self, namespace: str, table_name: str):
-        return self._tables_collection(namespace).document(table_name)
+    def _datasets_collection(self, collection: str):
+        # Primary subcollection for datasets.
+        return self._collection_ref(collection).collection("datasets")
 
-    def _snapshots_collection(self, namespace: str, table_name: str):
-        return self._table_doc_ref(namespace, table_name).collection("snapshots")
+    def _dataset_doc_ref(self, collection: str, dataset_name: str):
+        return self._datasets_collection(collection).document(dataset_name)
 
-    def _views_collection(self, namespace: str):
-        return self._namespace_ref(namespace).collection("views")
+    def _snapshots_collection(self, collection: str, dataset_name: str):
+        return self._dataset_doc_ref(collection, dataset_name).collection("snapshots")
 
-    def _view_doc_ref(self, namespace: str, view_name: str):
-        return self._views_collection(namespace).document(view_name)
+    def _views_collection(self, collection: str):
+        return self._namespace_ref(collection).collection("views")
 
-    def create_table(
-        self, identifier: str, schema: Any, properties: dict | None = None
-    ) -> SimpleTable:
-        namespace, table_name = identifier.split(".")
-        doc_ref = self._table_doc_ref(namespace, table_name)
+    def _view_doc_ref(self, collection: str, view_name: str):
+        return self._views_collection(collection).document(view_name)
+
+    def create_dataset(
+        self, identifier: str, schema: Any, properties: dict | None = None, author: str = None
+    ) -> SimpleDataset:
+        if author is None:
+            raise ValueError("author must be provided when creating a dataset")
+        collection, dataset_name = identifier.split(".")
+        doc_ref = self._dataset_doc_ref(collection, dataset_name)
+        # Check primary `datasets` location
         if doc_ref.get().exists:
-            raise TableAlreadyExists(f"Table already exists: {identifier}")
+            raise DatasetAlreadyExists(f"Dataset already exists: {identifier}")
 
         # Build default table metadata
-        location = f"gs://{self.gcs_bucket}/{self.workspace}/{namespace}/{table_name}"
-        metadata = TableMetadata(
-            table_identifier=identifier,
+        location = f"gs://{self.gcs_bucket}/{self.workspace}/{collection}/{dataset_name}"
+        metadata = DatasetMetadata(
+            dataset_identifier=identifier,
             schema=schema,
             location=location,
             properties=properties or {},
@@ -104,13 +136,12 @@ class OpteryxCatalog(Metastore):
 
         # Persist document with timestamp and author
         now_ms = int(time.time() * 1000)
-        author = os.environ.get("USER") or os.environ.get("USERNAME") or "unknown"
         metadata.timestamp_ms = now_ms
         metadata.author = author
         doc_ref.set(
             {
-                "name": table_name,
-                "collection": namespace,
+                "name": dataset_name,
+                "collection": collection,
                 "workspace": self.workspace,
                 "location": location,
                 "properties": metadata.properties,
@@ -121,9 +152,11 @@ class OpteryxCatalog(Metastore):
             }
         )
 
+        # Persisted in primary `datasets` collection only.
+
         # Persist initial schema into `schemas` subcollection if provided
         if schema is not None:
-            schema_id = self._write_schema(namespace, table_name, schema)
+            schema_id = self._write_schema(collection, dataset_name, schema, author=author)
             metadata.current_schema_id = schema_id
             # Read back the schema doc to capture timestamp-ms, author, sequence-number
             try:
@@ -145,21 +178,21 @@ class OpteryxCatalog(Metastore):
             # update table doc to reference current schema
             doc_ref.update({"current-schema-id": metadata.current_schema_id})
 
-        # Return SimpleTable (attach this catalog so Table.append() can persist)
-        return SimpleTable(identifier=identifier, _metadata=metadata, io=self.io, catalog=self)
+        # Return SimpleDataset (attach this catalog so append() can persist)
+        return SimpleDataset(identifier=identifier, _metadata=metadata, io=self.io, catalog=self)
 
-    def load_table(self, identifier: str) -> SimpleTable:
-        namespace, table_name = identifier.split(".")
-        doc_ref = self._table_doc_ref(namespace, table_name)
+    def load_dataset(self, identifier: str) -> SimpleDataset:
+        collection, dataset_name = identifier.split(".")
+        doc_ref = self._dataset_doc_ref(collection, dataset_name)
         doc = doc_ref.get()
         if not doc.exists:
-            raise TableNotFound(f"Table not found: {identifier}")
+            raise DatasetNotFound(f"Dataset not found: {identifier}")
 
         data = doc.to_dict() or {}
-        metadata = TableMetadata(
-            table_identifier=identifier,
+        metadata = DatasetMetadata(
+            dataset_identifier=identifier,
             location=data.get("location")
-            or f"gs://{self.gcs_bucket}/{self.workspace}/{namespace}/{table_name}",
+            or f"gs://{self.gcs_bucket}/{self.workspace}/{collection}/{dataset_name}",
             schema=data.get("schema"),
             properties=data.get("properties") or {},
         )
@@ -172,7 +205,7 @@ class OpteryxCatalog(Metastore):
 
         # Load snapshots
         snaps = []
-        for snap_doc in self._snapshots_collection(namespace, table_name).stream():
+        for snap_doc in self._snapshots_collection(collection, dataset_name).stream():
             sd = snap_doc.to_dict() or {}
             snap = Snapshot(
                 snapshot_id=sd.get("snapshot-id"),
@@ -211,77 +244,86 @@ class OpteryxCatalog(Metastore):
         except Exception:
             pass
 
-        return SimpleTable(identifier=identifier, _metadata=metadata, io=self.io, catalog=self)
+        return SimpleDataset(identifier=identifier, _metadata=metadata, io=self.io, catalog=self)
 
-    def drop_table(self, identifier: str) -> None:
-        namespace, table_name = identifier.split(".")
+    def drop_dataset(self, identifier: str) -> None:
+        collection, dataset_name = identifier.split(".")
         # Delete snapshots
-        snaps_coll = self._snapshots_collection(namespace, table_name)
+        snaps_coll = self._snapshots_collection(collection, dataset_name)
         for doc in snaps_coll.stream():
             snaps_coll.document(doc.id).delete()
-        # Delete table doc
-        self._table_doc_ref(namespace, table_name).delete()
+        # Delete dataset doc
+        self._dataset_doc_ref(collection, dataset_name).delete()
 
-    def list_tables(self, namespace: str) -> Iterable[str]:
-        coll = self._tables_collection(namespace)
+    def list_datasets(self, collection: str) -> Iterable[str]:
+        coll = self._datasets_collection(collection)
         return [doc.id for doc in coll.stream()]
 
-    def create_namespace(
-        self, namespace: str, properties: dict | None = None, exists_ok: bool = False
+    def create_collection(
+        self,
+        collection: str,
+        properties: dict | None = None,
+        exists_ok: bool = False,
+        author: str = None,
     ) -> None:
-        """Create a namespace document under the catalog.
+        """Create a collection document under the catalog.
 
-        If `exists_ok` is False and the namespace already exists, a KeyError is raised.
+        If `exists_ok` is False and the collection already exists, a KeyError is raised.
         """
-        doc_ref = self._namespace_ref(namespace)
+        doc_ref = self._namespace_ref(collection)
         if doc_ref.get().exists:
             if exists_ok:
                 return
-            raise NamespaceAlreadyExists(f"Namespace already exists: {namespace}")
+            raise CollectionAlreadyExists(f"Collection already exists: {collection}")
 
         now_ms = int(time.time() * 1000)
-        author = os.environ.get("USER") or os.environ.get("USERNAME") or "unknown"
+        if author is None:
+            raise ValueError("author must be provided when creating a collection")
         doc_ref.set(
             {
-                "name": namespace,
+                "name": collection,
                 "properties": properties or {},
                 "timestamp-ms": now_ms,
                 "author": author,
             }
         )
 
-    def create_namespace_if_not_exists(
-        self, namespace: str, properties: dict | None = None
+    def create_collection_if_not_exists(
+        self, collection: str, properties: dict | None = None, author: Optional[str] = None
     ) -> None:
-        """Convenience wrapper that creates the namespace only if missing."""
+        """Convenience wrapper that creates the collection only if missing."""
         try:
-            self.create_namespace(namespace, properties=properties, exists_ok=True)
+            self.create_collection(collection, properties=properties, exists_ok=True, author=author)
         except Exception:
             # Be conservative: surface caller-level warnings rather than failing
             return
 
-    def table_exists(self, identifier_or_namespace: str, table_name: Optional[str] = None) -> bool:
-        """Return True if the table exists.
+    def dataset_exists(
+        self, identifier_or_collection: str, dataset_name: Optional[str] = None
+    ) -> bool:
+        """Return True if the dataset exists.
 
         Supports two call forms:
-        - table_exists("namespace.table")
-        - table_exists("namespace", "table")
+        - dataset_exists("collection.dataset")
+        - dataset_exists("collection", "dataset")
         """
         # Normalize inputs
-        if table_name is None:
-            # Expect a single identifier like 'namespace.table'
-            if "." not in identifier_or_namespace:
+        if dataset_name is None:
+            # Expect a single collection like 'collection.table'
+            if "." not in identifier_or_collection:
                 raise ValueError(
-                    "identifier must be 'namespace.table' or pass table_name separately"
+                    "collection must be 'collection.table' or pass dataset_name separately"
                 )
-            namespace, table_name = identifier_or_namespace.rsplit(".", 1)
+            collection, dataset_name = collection_or_collection.rsplit(".", 1)
 
         try:
-            doc_ref = self._table_doc_ref(namespace, table_name)
+            doc_ref = self._dataset_doc_ref(collection, dataset_name)
             return doc_ref.get().exists
         except Exception:
             # On any error, be conservative and return False
             return False
+
+    # Dataset API methods have been renamed to the preferred `dataset` terminology.
 
     # --- View support -------------------------------------------------
     def create_view(
@@ -289,7 +331,7 @@ class OpteryxCatalog(Metastore):
         identifier: str | tuple,
         sql: str,
         schema: Any | None = None,
-        author: Optional[str] = None,
+        author: str = None,
         description: Optional[str] = None,
         properties: dict | None = None,
     ) -> CatalogView:
@@ -299,16 +341,17 @@ class OpteryxCatalog(Metastore):
         """
         # Normalize identifier
         if isinstance(identifier, tuple) or isinstance(identifier, list):
-            namespace, view_name = identifier[0], identifier[1]
+            collection, view_name = identifier[0], identifier[1]
         else:
-            namespace, view_name = identifier.split(".")
+            collection, view_name = identifier.split(".")
 
-        doc_ref = self._view_doc_ref(namespace, view_name)
+        doc_ref = self._view_doc_ref(collection, view_name)
         if doc_ref.get().exists:
-            raise ViewAlreadyExists(f"View already exists: {namespace}.{view_name}")
+            raise ViewAlreadyExists(f"View already exists: {collection}.{view_name}")
 
         now_ms = int(time.time() * 1000)
-        author = author or os.environ.get("USER") or os.environ.get("USERNAME") or "unknown"
+        if author is None:
+            raise ValueError("author must be provided when creating a view")
 
         # Write statement version
         statement_id = str(now_ms)
@@ -326,7 +369,7 @@ class OpteryxCatalog(Metastore):
         doc_ref.set(
             {
                 "name": view_name,
-                "collection": namespace,
+                "collection": collection,
                 "workspace": self.workspace,
                 "timestamp-ms": now_ms,
                 "author": author,
@@ -354,14 +397,14 @@ class OpteryxCatalog(Metastore):
         Raises `ViewNotFound` if the view doc is missing.
         """
         if isinstance(identifier, tuple) or isinstance(identifier, list):
-            namespace, view_name = identifier[0], identifier[1]
+            collection, view_name = identifier[0], identifier[1]
         else:
-            namespace, view_name = identifier.split(".")
+            collection, view_name = identifier.split(".")
 
-        doc_ref = self._view_doc_ref(namespace, view_name)
+        doc_ref = self._view_doc_ref(collection, view_name)
         doc = doc_ref.get()
         if not doc.exists:
-            raise ViewNotFound(f"View not found: {namespace}.{view_name}")
+            raise ViewNotFound(f"View not found: {collection}.{view_name}")
 
         data = doc.to_dict() or {}
         stmt_id = data.get("statement-id")
@@ -392,11 +435,11 @@ class OpteryxCatalog(Metastore):
 
     def drop_view(self, identifier: str | tuple) -> None:
         if isinstance(identifier, tuple) or isinstance(identifier, list):
-            namespace, view_name = identifier[0], identifier[1]
+            collection, view_name = identifier[0], identifier[1]
         else:
-            namespace, view_name = identifier.split(".")
+            collection, view_name = identifier.split(".")
 
-        doc_ref = self._view_doc_ref(namespace, view_name)
+        doc_ref = self._view_doc_ref(collection, view_name)
         # delete statement subcollection
         try:
             for d in doc_ref.collection("statement").stream():
@@ -405,40 +448,51 @@ class OpteryxCatalog(Metastore):
             pass
         doc_ref.delete()
 
-    def list_views(self, namespace: str) -> Iterable[str]:
-        coll = self._views_collection(namespace)
+    def list_views(self, collection: str) -> Iterable[str]:
+        coll = self._views_collection(collection)
         return [doc.id for doc in coll.stream()]
 
-    def view_exists(self, identifier_or_namespace: str | tuple, view_name: Optional[str] = None) -> bool:
+    def view_exists(
+        self, identifier_or_collection: str | tuple, view_name: Optional[str] = None
+    ) -> bool:
         """Return True if the view exists.
 
         Supports two call forms:
-        - view_exists("namespace.view")
-        - view_exists(("namespace", "view"))
-        - view_exists("namespace", "view")
+        - view_exists("collection.view")
+        - view_exists(("collection", "view"))
+        - view_exists("collection", "view")
         """
         # Normalize inputs
         if view_name is None:
-            if isinstance(identifier_or_namespace, tuple) or isinstance(identifier_or_namespace, list):
-                namespace, view_name = identifier_or_namespace[0], identifier_or_namespace[1]
+            if isinstance(identifier_or_collection, tuple) or isinstance(
+                identifier_or_collection, list
+            ):
+                collection, view_name = identifier_or_collection[0], identifier_or_collection[1]
             else:
-                if "." not in identifier_or_namespace:
-                    raise ValueError("identifier must be 'namespace.view' or pass view_name separately")
-                namespace, view_name = identifier_or_namespace.rsplit(".", 1)
+                if "." not in identifier_or_collection:
+                    raise ValueError(
+                        "identifier must be 'collection.view' or pass view_name separately"
+                    )
+                collection, view_name = identifier_or_collection.rsplit(".", 1)
 
         try:
-            doc_ref = self._view_doc_ref(namespace, view_name)
+            doc_ref = self._view_doc_ref(collection, view_name)
             return doc_ref.get().exists
         except Exception:
             return False
 
-    def update_view_execution_metadata(self, identifier: str | tuple, row_count: Optional[int] = None, execution_time: Optional[float] = None) -> None:
+    def update_view_execution_metadata(
+        self,
+        identifier: str | tuple,
+        row_count: Optional[int] = None,
+        execution_time: Optional[float] = None,
+    ) -> None:
         if isinstance(identifier, tuple) or isinstance(identifier, list):
-            namespace, view_name = identifier[0], identifier[1]
+            collection, view_name = identifier[0], identifier[1]
         else:
-            namespace, view_name = identifier.split(".")
+            collection, view_name = identifier.split(".")
 
-        doc_ref = self._view_doc_ref(namespace, view_name)
+        doc_ref = self._view_doc_ref(collection, view_name)
         updates = {}
         now_ms = int(time.time() * 1000)
         if row_count is not None:
@@ -531,8 +585,8 @@ class OpteryxCatalog(Metastore):
 
     def save_snapshot(self, identifier: str, snapshot: Snapshot) -> None:
         """Persist a single snapshot document for a table."""
-        namespace, table_name = identifier.split(".")
-        snaps = self._snapshots_collection(namespace, table_name)
+        namespace, dataset_name = identifier.split(".")
+        snaps = self._snapshots_collection(namespace, dataset_name)
         doc_id = str(snapshot.snapshot_id)
         # Ensure summary contains all expected keys (zero defaults applied in dataclass)
         summary = snapshot.summary or {}
@@ -565,17 +619,17 @@ class OpteryxCatalog(Metastore):
             data["schema-id"] = snapshot.schema_id
         snaps.document(doc_id).set(data)
 
-    def save_table_metadata(self, identifier: str, metadata: TableMetadata) -> None:
+    def save_dataset_metadata(self, identifier: str, metadata: DatasetMetadata) -> None:
         """Persist table-level metadata and snapshots to Firestore.
 
         This writes the table document and upserts snapshot documents.
         """
-        namespace, table_name = identifier.split(".")
-        doc_ref = self._table_doc_ref(namespace, table_name)
+        collection, dataset_name = identifier.split(".")
+        doc_ref = self._dataset_doc_ref(collection, dataset_name)
         doc_ref.set(
             {
-                "name": table_name,
-                "collection": namespace,
+                "name": dataset_name,
+                "collection": collection,
                 "workspace": self.workspace,
                 "location": metadata.location,
                 "properties": metadata.properties,
@@ -591,7 +645,9 @@ class OpteryxCatalog(Metastore):
             }
         )
 
-        snaps_coll = self._snapshots_collection(namespace, table_name)
+        # Metadata persisted in primary `datasets` collection only.
+
+        snaps_coll = self._snapshots_collection(collection, dataset_name)
         existing = {d.id for d in snaps_coll.stream()}
         new_ids = set()
         for snap in metadata.snapshots:
@@ -601,6 +657,7 @@ class OpteryxCatalog(Metastore):
                     "snapshot-id": snap.snapshot_id,
                     "timestamp-ms": snap.timestamp_ms,
                     "manifest": snap.manifest_list,
+                    "commit-message": getattr(snap, "commit_message", ""),
                     "schema-id": snap.schema_id,
                     "summary": snap.summary or {},
                     "author": getattr(snap, "author", None),
@@ -686,16 +743,16 @@ class OpteryxCatalog(Metastore):
 
         return cols
 
-    def _write_schema(self, namespace: str, table_name: str, schema: Any) -> str:
+    def _write_schema(self, namespace: str, dataset_name: str, schema: Any, author: str) -> str:
         """Persist a schema document in the table's `schemas` subcollection and
         return the new schema id.
         """
         import uuid
 
-        doc_ref = self._table_doc_ref(namespace, table_name)
+        doc_ref = self._dataset_doc_ref(namespace, dataset_name)
         schemas_coll = doc_ref.collection("schemas")
         sid = str(uuid.uuid4())
-        # print(f"[DEBUG] _write_schema called for {namespace}/{table_name} sid={sid}")
+        # print(f"[DEBUG] _write_schema called for {namespace}/{dataset_name} sid={sid}")
         try:
             cols = self._schema_to_columns(schema)
         except Exception:
@@ -704,7 +761,8 @@ class OpteryxCatalog(Metastore):
             # )
             cols = []
         now_ms = int(time.time() * 1000)
-        author = os.environ.get("USER") or os.environ.get("USERNAME") or "unknown"
+        if author is None:
+            raise ValueError("author must be provided when writing a schema")
         # Determine next sequence number by scanning existing schema docs
         try:
             max_seq = 0
@@ -719,7 +777,7 @@ class OpteryxCatalog(Metastore):
 
         try:
             # print(
-            #     f"[DEBUG] Writing schema doc {sid} for {namespace}/{table_name} (cols={len(cols)})"
+            #     f"[DEBUG] Writing schema doc {sid} for {namespace}/{dataset_name} (cols={len(cols)})"
             # )
             schemas_coll.document(sid).set(
                 {

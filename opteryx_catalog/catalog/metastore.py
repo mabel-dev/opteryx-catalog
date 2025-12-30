@@ -1,71 +1,66 @@
 from __future__ import annotations
 
-from abc import ABC
-from abc import abstractmethod
 from typing import Any
 from typing import Iterable
 from typing import Optional
 
 
-class Metastore(ABC):
-    """Abstract catalog interface (Iceberg-like).
+class Metastore:
+    """Abstract catalog interface.
 
-    Implementations should provide methods to create, load and manage tables
-    and views. Signatures are intentionally simple and similar to PyIceberg's
-    catalog API to ease future compatibility.
+    Implementations should provide methods to create, load and manage
+    datasets and views. Terminology in this project follows the mapping:
+    `catalog -> workspace -> collection -> dataset|view`.
+    Signatures are intentionally simple and similar to other catalog
+    implementations to ease future compatibility.
     """
 
-    @abstractmethod
-    def load_table(self, identifier: str) -> "Table":
+    def load_dataset(self, identifier: str) -> "Table":
         raise NotImplementedError()
 
-    @abstractmethod
-    def create_table(self, identifier: str, schema: Any, properties: dict | None = None) -> "Table":
+    def create_dataset(
+        self, identifier: str, schema: Any, properties: dict | None = None
+    ) -> "Table":
         raise NotImplementedError()
 
-    @abstractmethod
-    def drop_table(self, identifier: str) -> None:
+    def drop_dataset(self, identifier: str) -> None:
         raise NotImplementedError()
 
-    @abstractmethod
-    def list_tables(self, namespace: str) -> Iterable[str]:
+    def list_datasets(self, namespace: str) -> Iterable[str]:
         raise NotImplementedError()
 
 
-class Table(ABC):
-    """Abstract table interface.
+class Dataset:
+    """Abstract dataset interface.
 
     Minimal methods needed by the Opteryx engine and tests: access metadata,
     list snapshots, append data, and produce a data scan object.
     """
 
     @property
-    @abstractmethod
     def metadata(self) -> Any:
         raise NotImplementedError()
 
-    @abstractmethod
-    def current_snapshot(self) -> Optional[Any]:
-        raise NotImplementedError()
-
-    @abstractmethod
     def snapshots(self) -> Iterable[Any]:
         raise NotImplementedError()
 
-    @abstractmethod
+    def snapshot(self, snapshot_id: Optional[int] = None) -> Optional[Any]:
+        """Return a specific snapshot by id or the current snapshot when
+        called with `snapshot_id=None`.
+        """
+        raise NotImplementedError()
+
     def append(self, table):
         """Append data (implementations can accept pyarrow.Table or similar)."""
         raise NotImplementedError()
 
-    @abstractmethod
-    def scan(self, **kwargs) -> Any:
+    def scan(self, row_filter=None, snapshot_id: Optional[int] = None) -> Any:
         raise NotImplementedError()
 
 
-class View(ABC):
+class View:
     """Abstract view metadata representation."""
 
     @property
-    @abstractmethod
     def definition(self) -> str:
         raise NotImplementedError()

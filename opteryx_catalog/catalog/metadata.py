@@ -40,8 +40,8 @@ class Snapshot:
 
 
 @dataclass
-class TableMetadata:
-    table_identifier: str
+class DatasetMetadata:
+    dataset_identifier: str
     format_version: int = 2
     location: str = ""
     schema: Any = None
@@ -76,3 +76,6 @@ class TableMetadata:
             if s.snapshot_id == self.current_snapshot_id:
                 return s
         return None
+
+
+# Dataset terminology: TableMetadata renamed to DatasetMetadata
