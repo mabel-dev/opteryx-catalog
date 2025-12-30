@@ -314,7 +314,7 @@ class OpteryxCatalog(Metastore):
                 raise ValueError(
                     "collection must be 'collection.table' or pass dataset_name separately"
                 )
-            collection, dataset_name = collection_or_collection.rsplit(".", 1)
+            collection, dataset_name = identifier_or_collection.rsplit(".", 1)
 
         try:
             doc_ref = self._dataset_doc_ref(collection, dataset_name)
