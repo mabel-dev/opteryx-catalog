@@ -494,6 +494,292 @@ class SimpleDataset(Dataset):
         if self.catalog and hasattr(self.catalog, "save_dataset_metadata"):
             self.catalog.save_dataset_metadata(self.identifier, self.metadata)
 
+    def add_files(self, files: list[str], author: str = None, commit_message: Optional[str] = None):
+        """Add filenames to the dataset manifest without writing the files.
+
+        - `files` is a list of file paths (strings). Files are assumed to
+          already exist in storage; this method only updates the manifest.
+        - Does not add files that already appear in the current manifest
+          (deduplicates by `file_path`).
+        - Creates a cumulative manifest for the new snapshot (previous
+          entries + new unique entries).
+        """
+        if author is None:
+            raise ValueError("author must be provided when adding files to a dataset")
+
+        snapshot_id = int(time.time() * 1000)
+
+        # Gather previous summary and manifest entries
+        prev = self.snapshot(None)
+        prev_total_files = 0
+        prev_total_size = 0
+        prev_total_records = 0
+        prev_entries = []
+        if prev and prev.summary:
+            try:
+                prev_total_files = int(prev.summary.get("total-data-files", 0))
+            except Exception:
+                prev_total_files = 0
+            try:
+                prev_total_size = int(prev.summary.get("total-files-size", 0))
+            except Exception:
+                prev_total_size = 0
+            try:
+                prev_total_records = int(prev.summary.get("total-records", 0))
+            except Exception:
+                prev_total_records = 0
+
+        if prev and getattr(prev, "manifest_list", None):
+            # try to read prev manifest entries
+            try:
+                import pyarrow.parquet as pq
+                import pyarrow as pa
+
+                if self.io and hasattr(self.io, "new_input"):
+                    inp = self.io.new_input(prev.manifest_list)
+                    with inp.open() as f:
+                        data = f.read()
+                    table = pq.read_table(pa.BufferReader(data))
+                    prev_entries = table.to_pylist()
+                else:
+                    if self.catalog and getattr(self.catalog, "_storage_client", None) and getattr(self.catalog, "gcs_bucket", None):
+                        bucket = self.catalog._storage_client.bucket(self.catalog.gcs_bucket)
+                        parsed = prev.manifest_list
+                        if parsed.startswith("gs://"):
+                            parsed = parsed[5 + len(self.catalog.gcs_bucket) + 1 :]
+                        blob = bucket.blob(parsed)
+                        data = blob.download_as_bytes()
+                        table = pq.read_table(pa.BufferReader(data))
+                        prev_entries = table.to_pylist()
+            except Exception:
+                prev_entries = []
+
+        existing = {e.get("file_path") for e in prev_entries if isinstance(e, dict) and e.get("file_path")}
+
+        # Build new entries for files that don't already exist
+        new_entries = []
+        seen = set()
+        for fp in files:
+            if not fp or fp in existing or fp in seen:
+                continue
+            seen.add(fp)
+            fmt = "parquet" if fp.lower().endswith(".parquet") else None
+            new_entries.append(
+                {
+                    "file_path": fp,
+                    "file_format": fmt,
+                    "record_count": 0,
+                    "file_size_in_bytes": 0,
+                    "min_k_hashes": [],
+                    "histogram_counts": [],
+                    "histogram_bins": 0,
+                    "min_values": [],
+                    "max_values": [],
+                }
+            )
+
+        merged_entries = prev_entries + new_entries
+
+        # write cumulative manifest
+        manifest_path = None
+        if self.catalog and hasattr(self.catalog, "write_parquet_manifest"):
+            manifest_path = self.catalog.write_parquet_manifest(snapshot_id, merged_entries, self.metadata.location)
+
+        # Build summary deltas
+        added_data_files = len(new_entries)
+        added_files_size = 0
+        added_records = 0
+        deleted_data_files = 0
+        deleted_files_size = 0
+        deleted_records = 0
+
+        total_data_files = prev_total_files + added_data_files - deleted_data_files
+        total_files_size = prev_total_size + added_files_size - deleted_files_size
+        total_records = prev_total_records + added_records - deleted_records
+
+        summary = {
+            "added-data-files": added_data_files,
+            "added-files-size": added_files_size,
+            "added-records": added_records,
+            "deleted-data-files": deleted_data_files,
+            "deleted-files-size": deleted_files_size,
+            "deleted-records": deleted_records,
+            "total-data-files": total_data_files,
+            "total-files-size": total_files_size,
+            "total-records": total_records,
+        }
+
+        # Sequence number
+        try:
+            max_seq = 0
+            for s in self.metadata.snapshots:
+                seq = getattr(s, "sequence_number", None)
+                if seq is None:
+                    continue
+                try:
+                    ival = int(seq)
+                except Exception:
+                    continue
+                if ival > max_seq:
+                    max_seq = ival
+            next_seq = max_seq + 1
+        except Exception:
+            next_seq = 1
+
+        parent_id = self.metadata.current_snapshot_id
+
+        if commit_message is None:
+            commit_message = f"add files by {author}"
+
+        snap = Snapshot(
+            snapshot_id=snapshot_id,
+            timestamp_ms=snapshot_id,
+            author=author,
+            sequence_number=next_seq,
+            user_created=True,
+            operation_type="add-files",
+            parent_snapshot_id=parent_id,
+            manifest_list=manifest_path,
+            schema_id=self.metadata.current_schema_id,
+            commit_message=commit_message,
+            summary=summary,
+        )
+
+        self.metadata.snapshots.append(snap)
+        self.metadata.current_snapshot_id = snapshot_id
+
+        if self.catalog and hasattr(self.catalog, "save_snapshot"):
+            self.catalog.save_snapshot(self.identifier, snap)
+        if self.catalog and hasattr(self.catalog, "save_dataset_metadata"):
+            self.catalog.save_dataset_metadata(self.identifier, self.metadata)
+
+    def truncate_and_add_files(self, files: list[str], author: str = None, commit_message: Optional[str] = None):
+        """Truncate dataset (logical) and set manifest to provided files.
+
+        - Writes a manifest that contains exactly the unique filenames provided.
+        - Does not delete objects from storage.
+        - Useful for replace/overwrite semantics.
+        """
+        if author is None:
+            raise ValueError("author must be provided when truncating/adding files")
+
+        snapshot_id = int(time.time() * 1000)
+
+        # Read previous summary for reporting deleted counts
+        prev = self.snapshot(None)
+        prev_total_files = 0
+        prev_total_size = 0
+        prev_total_records = 0
+        if prev and prev.summary:
+            try:
+                prev_total_files = int(prev.summary.get("total-data-files", 0))
+            except Exception:
+                prev_total_files = 0
+            try:
+                prev_total_size = int(prev.summary.get("total-files-size", 0))
+            except Exception:
+                prev_total_size = 0
+            try:
+                prev_total_records = int(prev.summary.get("total-records", 0))
+            except Exception:
+                prev_total_records = 0
+
+        # Build unique new entries (ignore duplicates in input)
+        new_entries = []
+        seen = set()
+        for fp in files:
+            if not fp or fp in seen:
+                continue
+            seen.add(fp)
+            fmt = "parquet" if fp.lower().endswith(".parquet") else None
+            new_entries.append(
+                {
+                    "file_path": fp,
+                    "file_format": fmt,
+                    "record_count": 0,
+                    "file_size_in_bytes": 0,
+                    "min_k_hashes": [],
+                    "histogram_counts": [],
+                    "histogram_bins": 0,
+                    "min_values": [],
+                    "max_values": [],
+                }
+            )
+
+        manifest_path = None
+        if self.catalog and hasattr(self.catalog, "write_parquet_manifest"):
+            manifest_path = self.catalog.write_parquet_manifest(snapshot_id, new_entries, self.metadata.location)
+
+        # Build summary: previous entries become deleted
+        deleted_data_files = prev_total_files
+        deleted_files_size = prev_total_size
+        deleted_records = prev_total_records
+
+        added_data_files = len(new_entries)
+        added_files_size = 0
+        added_records = 0
+
+        total_data_files = added_data_files
+        total_files_size = added_files_size
+        total_records = added_records
+
+        summary = {
+            "added-data-files": added_data_files,
+            "added-files-size": added_files_size,
+            "added-records": added_records,
+            "deleted-data-files": deleted_data_files,
+            "deleted-files-size": deleted_files_size,
+            "deleted-records": deleted_records,
+            "total-data-files": total_data_files,
+            "total-files-size": total_files_size,
+            "total-records": total_records,
+        }
+
+        # Sequence number
+        try:
+            max_seq = 0
+            for s in self.metadata.snapshots:
+                seq = getattr(s, "sequence_number", None)
+                if seq is None:
+                    continue
+                try:
+                    ival = int(seq)
+                except Exception:
+                    continue
+                if ival > max_seq:
+                    max_seq = ival
+            next_seq = max_seq + 1
+        except Exception:
+            next_seq = 1
+
+        parent_id = self.metadata.current_snapshot_id
+
+        if commit_message is None:
+            commit_message = f"truncate and add files by {author}"
+
+        snap = Snapshot(
+            snapshot_id=snapshot_id,
+            timestamp_ms=snapshot_id,
+            author=author,
+            sequence_number=next_seq,
+            user_created=True,
+            operation_type="truncate-and-add-files",
+            parent_snapshot_id=parent_id,
+            manifest_list=manifest_path,
+            schema_id=self.metadata.current_schema_id,
+            commit_message=commit_message,
+            summary=summary,
+        )
+
+        # Replace in-memory snapshots: append snapshot and update current id
+        self.metadata.snapshots.append(snap)
+        self.metadata.current_snapshot_id = snapshot_id
+
+        if self.catalog and hasattr(self.catalog, "save_snapshot"):
+            self.catalog.save_snapshot(self.identifier, snap)
+        if self.catalog and hasattr(self.catalog, "save_dataset_metadata"):
+            self.catalog.save_dataset_metadata(self.identifier, self.metadata)
+
     def scan(self, row_filter=None, snapshot_id: Optional[int] = None) -> Iterable[Datafile]:
         """Return Datafile objects for the given snapshot.
 
