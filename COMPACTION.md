@@ -1,4 +1,4 @@
-# Compaction Strategy for PyIceberg-Firestore-GCS Catalog
+# Compaction Strategy for Firestore-GCS Catalog
 
 ## Overview
 
@@ -8,7 +8,7 @@ This document describes the compaction approaches designed for this catalog impl
 
 ### What is Compaction?
 
-Compaction in data lake systems like Iceberg involves:
+Compaction in data lake systems involves:
 
 1. **Small File Compaction**: Merging many small data files into fewer, larger files to improve read performance and reduce metadata overhead
 2. **Metadata Compaction**: Consolidating multiple metadata files/manifests into fewer files
@@ -41,7 +41,7 @@ Compaction in data lake systems like Iceberg involves:
 **Solution**: Implement a compaction service that:
 1. Identifies tables/partitions with too many small files
 2. Rewrites small files into fewer, larger files
-3. Uses Iceberg's built-in rewrite operations for ACID guarantees
+3. Uses transactional rewrite operations for ACID guarantees
 
 ## Small File Compaction Design
 
@@ -149,13 +149,13 @@ def group_files_binpack(files, target_size) -> List[List[DataFile]]:
 
 #### 3. Rewrite Execution
 
-Uses PyIceberg's native rewrite operations:
+Uses native rewrite operations:
 
 ```python
 from pyiceberg.table import Table
 
 def execute_compaction(table: Table, plan: CompactionPlan):
-    """Execute compaction using Iceberg's rewrite_data_files."""
+    """Execute compaction using a table library's rewrite_data_files or equivalent."""
     with table.update_spec() as update:
         for file_group in plan.file_groups:
             # Read data from small files
@@ -173,7 +173,7 @@ def execute_compaction(table: Table, plan: CompactionPlan):
 
 ### Safety and Correctness
 
-1. **ACID Guarantees**: Uses Iceberg's transaction system
+1. **ACID Guarantees**: Uses transactional rewrite/update operations when available
 2. **Snapshot Isolation**: Compaction operates on a snapshot, doesn't block reads
 3. **Rollback**: Failed compaction can be rolled back without data loss
 4. **Concurrent Writers**: Optimistic concurrency control handles conflicts
@@ -215,10 +215,10 @@ catalog = create_catalog(
     gcs_bucket="my-bucket"
 )
 
-# Compact a specific table
+# Compact a specific dataset
 result = compact_table(
     catalog,
-    identifier=("my_namespace", "my_table"),
+    identifier=("my_namespace", "my_dataset"),
     strategy="binpack"
 )
 
@@ -228,9 +228,9 @@ print(f"Compacted {result.files_rewritten} files")
 ### Automatic Compaction
 
 ```python
-# Enable auto-compaction when creating table
-table = catalog.create_table(
-    identifier=("my_namespace", "my_table"),
+# Enable auto-compaction when creating dataset
+dataset = catalog.create_dataset(
+    identifier=("my_namespace", "my_dataset"),
     schema=schema,
     properties={
         "compaction.enabled": "true",
@@ -260,10 +260,8 @@ scheduler.run_periodic(interval_seconds=3600)
 
 ## References
 
-- [Apache Iceberg Maintenance](https://iceberg.apache.org/docs/latest/maintenance/)
-- [Iceberg File Compaction](https://iceberg.apache.org/docs/latest/spark-writes/#compact-data-files)
-- [PyIceberg API Documentation](https://py.iceberg.apache.org/)
+<!-- External references to specific projects removed -->
 
 ## Summary
 
-This catalog implementation prioritizes **small file compaction** as the main optimization strategy. Metadata compaction is unnecessary due to the existing Parquet manifest optimization. The design provides flexible configuration, multiple strategies, and safe execution using Iceberg's built-in mechanisms.
+This catalog implementation prioritizes **small file compaction** as the main optimization strategy. Metadata compaction is unnecessary due to the existing Parquet manifest optimization. The design provides flexible configuration, multiple strategies, and safe execution using available transactional or rewrite mechanisms when supported by the target table implementation.

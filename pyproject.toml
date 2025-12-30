@@ -3,10 +3,27 @@ requires = ["setuptools>=69", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "opteryx_catalog"
-version = "0.3.5"
+name = "opteryx-catalog"
+version = "0.4.0"
 description = "Opteryx Cloud Catalog"
-readme = "README.md"
+readme = { file = "README.md", content-type = "text/markdown" }
+authors = [
+    { name = "joocer", email = "justin.joyce@joocer.com" }
+]
+license = { file = "LICENSE" }
+keywords = ["opteryx", "catalog", "firestore", "gcs"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: OS Independent",
+]
+urls = { "Homepage" = "https://github.com/mabel-dev/opteryx-catalog" }
 requires-python = ">=3.9"
 dependencies = [
     "google-cloud-firestore==2.22.0",
@@ -14,7 +31,6 @@ dependencies = [
     "orso==0.0.226",
     "opteryx-core",
     "pyarrow==22.0.0",
-    "pyiceberg==0.10.0",
     "requests==2.32.5"
 ]
 

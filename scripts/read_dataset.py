@@ -1,11 +1,18 @@
+import datetime
 import os
 import sys
 import time
-import datetime
+
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+from opteryx_catalog.opteryx_catalog import OpteryxCatalog
 
 # Add local paths to sys.path to use local code instead of installed packages
 sys.path.insert(0, os.path.join(sys.path[0], ".."))  # Add parent dir for pyiceberg_firestore_gcs
 sys.path.insert(1, os.path.join(sys.path[0], "../opteryx-core"))
+sys.path.insert(1, os.path.join(sys.path[0], "../pyiceberg-firestore-gcs"))
+
 
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = (
     "/Users/justin/Nextcloud/mabel/mabeldev-b37f651c2916.json"
@@ -14,31 +21,30 @@ os.environ["GCP_PROJECT_ID"] = "mabeldev"
 os.environ["FIRESTORE_DATABASE"] = "catalogs"
 os.environ["GCS_BUCKET"] = "opteryx_data"
 
-from opteryx_catalog.firestore_catalog import FirestoreCatalog
-import pyarrow as pa
-import pyarrow.parquet as pq
 
 # from opteryx.connectors.iceberg_connector import IcebergConnector
 # Using opteryx_catalog for manifest discovery + simple in-Python filters
 
 workspace = "opteryx"
-schema_name = "tests_temp"
+collection_name = "tests_temp"
 
 
-# Step 1: Create a local Iceberg catalog
-catalog = FirestoreCatalog(
+# Step 1: Create a local catalog
+catalog = OpteryxCatalog(
     workspace,
     firestore_project="mabeldev",
     firestore_database="catalogs",
     gcs_bucket="opteryx_data",
 )
 
-# Choose the latest table in the namespace to test against
-tables = list(catalog.list_tables(schema_name))
-if not tables:
-    raise RuntimeError(f"No tables found in namespace {schema_name}")
-tables = sorted(tables)
-table = tables[-1]
+# Choose the latest dataset in the collection to test against
+datasets = list(catalog.list_datasets(collection_name))
+if not datasets:
+    raise RuntimeError(f"No datasets found in collection {collection_name}")
+datasets = sorted(datasets)
+table = datasets[-1]
+
+table = "test_table_1_1767106177"
 
 
 # opteryx.register_store(
@@ -51,23 +57,23 @@ table = tables[-1]
 #    gcs_bucket="opteryx_data",
 # )
 
-# catalog.create_namespace_if_not_exists(schema_name, properties={"iceberg_compatible": "false"})
+# catalog.create_collection_if_not_exists(schema_name, properties={"iceberg_compatible": "false"})
 
 # df = opteryx.query_to_arrow("SELECT * FROM $planets")
 
 # Drop table if it exists
 # try:
-#    catalog.drop_table(f"{schema_name}.{table}")
+#    catalog.drop_dataset(f"{schema_name}.{table}")
 # except Exception:
 #    pass
 
-# s = catalog.create_table(f"{schema_name}.{table}", df.schema, properties={"iceberg_compatible": "false"})
+# s = catalog.create_dataset(f"{schema_name}.{table}", df.schema, properties={"iceberg_compatible": "false"})
 
 # Load table metadata using the new catalog
 # Attempt to load the requested table; if it has no manifest, fall back to
 # the most recently created table in the namespace (useful when running the
-# paired `create_table.py` script which creates new deterministic tables).
-s = catalog.load_table(f"{schema_name}.{table}")
+# paired `create_dataset.py` script which creates new deterministic datasets).
+s = catalog.load_dataset(f"{collection_name}.{table}")
 
 
 def _read_parquet_manifest(io, manifest_path: str) -> list:
@@ -112,13 +118,13 @@ for snap in s.metadata.snapshots:
     if snap.manifest_list:
         entries.extend(_read_parquet_manifest(catalog.io, snap.manifest_list))
 if not entries:
-    # Try the most recently listed table in the namespace
+    # Try the most recently listed dataset in the namespace
     try:
-        tables = list(catalog.list_tables(schema_name))
-        if tables:
-            last = tables[-1]
-            print(f"Falling back to table: {last}")
-            s = catalog.load_table(f"{schema_name}.{last}")
+        datasets = list(catalog.list_datasets(collection_name))
+        if datasets:
+            last = datasets[-1]
+            print(f"Falling back to dataset: {last}")
+            s = catalog.load_dataset(f"{collection_name}.{last}")
             # read manifests from all snapshots
             entries = []
             for snap in s.metadata.snapshots:

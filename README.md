@@ -1,24 +1,25 @@
 # pyiceberg-firestore-gcs
 
-A Firestore + Google Cloud Storage (GCS) backed implementation of the PyIceberg
-catalog interface. This package provides a straightforward, opinionated
-catalog implementation for storing table metadata documents in Firestore while
-storing the Iceberg table metadata JSON in GCS.
+A Firestore + Google Cloud Storage (GCS) backed implementation of a
+lightweight catalog interface. This package provides an opinionated
+catalog implementation for storing table metadata documents in Firestore and
+consolidated Parquet manifests in GCS.
 
-This project is intended to be used as a catalog component for PyIceberg in
-GCP-based environments.
+This project is intended to be used as a catalog component in GCP-based
+environments and provides utilities to interoperate with Avro/manifest-based
+workflows when needed.
 
 ---
 
 ## Features ✅
 
-- Firestore-backed catalog and namespace storage
-- GCS-based Iceberg table metadata storage (with optional compatibility mode)
- - GCS-based table metadata storage; export/import utilities provide Iceberg Avro interoperability
+- Firestore-backed catalog and collection storage
+ - GCS-based table metadata storage (with optional compatibility mode)
+ - GCS-based table metadata storage; export/import utilities provide Avro interoperability
 - Table creation, registration, listing, loading, renaming, and deletion
 - Commit operations that write updated metadata to GCS and persist references in Firestore
 - Simple, opinionated defaults (e.g., default GCS location derived from catalog properties)
-- Lightweight schema handling compatible with PyIceberg (supports pyarrow schemas and PyIceberg Schema)
+- Lightweight schema handling (supports pyarrow schemas)
 
 ## Quick start 💡
 
@@ -45,8 +46,8 @@ catalog = create_catalog(
 	gcs_bucket="my-default-bucket",
 )
 
-# Create a namespace
-catalog.create_namespace("example_namespace")
+# Create a collection
+catalog.create_collection("example_collection")
 
 # Create a simple PyIceberg schema
 schema = Schema(
@@ -54,14 +55,14 @@ schema = Schema(
 	NestedField(field_id=2, name="name", field_type=StringType(), required=False),
 )
 
-# Create a new table (metadata written to a GCS path derived from the bucket property)
-table = catalog.create_table(("example_namespace", "users"), schema)
+# Create a new dataset (metadata written to a GCS path derived from the bucket property)
+table = catalog.create_dataset(("example_collection", "users"), schema)
 
 # Or register a table if you already have a metadata JSON in GCS
 catalog.register_table(("example_namespace", "events"), "gs://my-bucket/path/to/events/metadata/00000001.json")
 
 # Load a table
-tbl = catalog.load_table(("example_namespace", "users"))
+tbl = catalog.load_dataset(("example_namespace", "users"))
 print(tbl.metadata)
 ```
 
@@ -69,8 +70,8 @@ print(tbl.metadata)
 
 - GCP authentication: Use `GOOGLE_APPLICATION_CREDENTIALS` or Application Default Credentials
 - `firestore_project` and `firestore_database` can be supplied when creating the catalog
-- `gcs_bucket` is recommended to allow `create_table` to write metadata automatically; otherwise pass `location` explicitly to `create_table`
- - The catalog does not write Iceberg Avro/manifest-list artifacts in the hot path; use `export_to_iceberg` / `import_from_iceberg` for interoperability
+- `gcs_bucket` is recommended to allow `create_dataset` to write metadata automatically; otherwise pass `location` explicitly to `create_dataset`
+ - The catalog does not write Avro/manifest-list artifacts in the hot path; use the provided export/import utilities for interoperability
 
 Example environment variables:
 
@@ -79,31 +80,29 @@ export GOOGLE_APPLICATION_CREDENTIALS="/path/to/service-account.json"
 export GOOGLE_CLOUD_PROJECT="my-gcp-project"
 ```
 
-### Iceberg interoperability
+### Interoperability
 
-This catalog implementation does not write Iceberg Avro manifest-list/Avro manifest files
-or Iceberg metadata JSON in the hot path. Instead, table metadata is stored in Firestore and
-the runtime writes a consolidated Parquet manifest for fast query planning.
+This catalog implementation does not write Avro manifest-list/Avro manifest files
+in the hot path. Instead, table metadata is stored in Firestore and the runtime
+writes a consolidated Parquet manifest for fast query planning.
 
-If you need full Iceberg-compatible artifacts for other engines or tools, use the
-`export_to_iceberg` utility to generate Avro manifests and manifest-lists from
-the Parquet-first storage layout. To ingest existing Iceberg Avro artifacts into this
-catalog, use `import_from_iceberg` which will convert Avro manifests into the
-Parquet manifest + Firestore snapshot representation used here.
+If you need full Avro-compatible artifacts for other engines or tools, use the
+provided export/import utilities to transform between Avro manifests and the
+Parquet-first storage layout used by this catalog.
 
 ## API overview 📚
 
 The package exports a factory helper `create_catalog` and the `FirestoreCatalog` class.
 
 Key methods include:
-- `create_namespace(namespace, properties={}, exists_ok=False)`
+- `create_collection(collection, properties={}, exists_ok=False)`
 - `drop_namespace(namespace)`
 - `list_namespaces()`
-- `create_table(identifier, schema, location=None, partition_spec=None, sort_order=None, properties={})`
+- `create_dataset(identifier, schema, location=None, partition_spec=None, sort_order=None, properties={})`
 - `register_table(identifier, metadata_location)`
-- `load_table(identifier)`
-- `list_tables(namespace)`
-- `drop_table(identifier)`
+- `load_dataset(identifier)`
+- `list_datasets(namespace)`
+- `drop_dataset(identifier)`
 - `rename_table(from_identifier, to_identifier)`
 - `commit_table(table, requirements, updates)`
 - `create_view(identifier, sql, schema=None, author=None, description=None, properties={})`
@@ -155,7 +154,7 @@ catalog.update_view_execution_metadata(
 ```
 
 Notes about behavior:
-- `create_table` will try to infer a default GCS location using the provided `gcs_bucket` property if `location` is omitted.
+- `create_dataset` will try to infer a default GCS location using the provided `gcs_bucket` property if `location` is omitted.
 - `register_table` validates that the provided `metadata_location` points to an existing GCS blob.
 - Views are stored as Firestore documents with complete metadata including SQL, schema, authorship, and execution history.
 - Table transactions are intentionally unimplemented.
@@ -190,7 +189,7 @@ from pyiceberg_firestore_gcs.compaction import compact_table, get_compaction_sta
 catalog = create_catalog(...)
 
 # Check if compaction is needed
-table = catalog.load_table(("namespace", "table_name"))
+table = catalog.load_dataset(("namespace", "dataset_name"))
 stats = get_compaction_stats(table)
 print(f"Small files: {stats['small_file_count']}")
 
@@ -204,7 +203,7 @@ print(f"Compacted {result.files_rewritten} files")
 Control compaction behavior via table properties:
 
 ```python
-table = catalog.create_table(
+table = catalog.create_dataset(
     identifier=("namespace", "table_name"),
     schema=schema,
     properties={
@@ -218,7 +217,7 @@ table = catalog.create_table(
 
 ## Limitations & KNOWN ISSUES ⚠️
 
-- No support for table-level transactions. `create_table_transaction` raises `NotImplementedError`.
+- No support for dataset-level transactions. `create_dataset_transaction` raises `NotImplementedError`.
 - The catalog stores metadata location references in Firestore; purging metadata files from GCS is not implemented.
 - This is an opinionated implementation intended for internal or controlled environments. Review for production constraints before use in multi-tenant environments.
 
