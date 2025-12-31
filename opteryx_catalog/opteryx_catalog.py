@@ -554,7 +554,136 @@ class OpteryxCatalog(Metastore):
                 ]
             )
 
-            table = pa.Table.from_pylist(entries, schema=schema)
+            try:
+                table = pa.Table.from_pylist(entries, schema=schema)
+            except Exception:
+                # Diagnostic output to help find malformed manifest entries
+                try:
+                    print(
+                        "[MANIFEST DEBUG] Failed to convert entries to Parquet manifest table. Dumping entries:"
+                    )
+                    for i, ent in enumerate(entries):
+                        print(f" Entry {i}:")
+                        if isinstance(ent, dict):
+                            for k, v in ent.items():
+                                tname = type(v).__name__
+                                try:
+                                    s = repr(v)
+                                except Exception:
+                                    s = "<unreprable>"
+                                print(f"  - {k}: type={tname} repr={s[:200]}")
+                        else:
+                            print(
+                                f"  - non-dict entry: type={type(ent).__name__} repr={repr(ent)[:200]}"
+                            )
+                except Exception:
+                    pass
+
+                # Attempt to sanitize entries and retry conversion.
+                try:
+                    print("[MANIFEST DEBUG] Attempting to sanitize entries and retry")
+                    sanitized = []
+                    for ent in entries:
+                        if not isinstance(ent, dict):
+                            sanitized.append(ent)
+                            continue
+                        e2 = dict(ent)  # copy
+                        # Ensure numeric fields
+                        for k in ("record_count", "file_size_in_bytes", "histogram_bins"):
+                            v = e2.get(k)
+                            try:
+                                e2[k] = int(v) if v is not None else 0
+                            except Exception:
+                                e2[k] = 0
+                        # Ensure min_k_hashes is list[list[int]]
+                        mk = e2.get("min_k_hashes")
+                        if not isinstance(mk, list):
+                            e2["min_k_hashes"] = []
+                        else:
+                            new_mk = []
+                            for sub in mk:
+                                if isinstance(sub, list):
+                                    try:
+                                        new_mk.append([int(x) for x in sub])
+                                    except Exception:
+                                        new_mk.append([])
+                                else:
+                                    new_mk.append([])
+                            e2["min_k_hashes"] = new_mk
+                        # Ensure histogram_counts is list[list[int]]
+                        hc = e2.get("histogram_counts")
+                        if not isinstance(hc, list):
+                            e2["histogram_counts"] = []
+                        else:
+                            new_hc = []
+                            for sub in hc:
+                                if isinstance(sub, list):
+                                    try:
+                                        new_hc.append([int(x) for x in sub])
+                                    except Exception:
+                                        new_hc.append([])
+                                else:
+                                    new_hc.append([])
+                            e2["histogram_counts"] = new_hc
+                        # Sanitize min_values / max_values: must be list[int] or None
+                        # Sanitize min_values / max_values: coerce to int64 using to_int() if available
+                        try:
+                            from opteryx.compiled.structures.relation_statistics import to_int
+                        except Exception:
+
+                            def to_int(val):
+                                # Best-effort fallback: handle numpy types, strings and numbers
+                                try:
+                                    if val is None:
+                                        return None
+                                    if hasattr(val, "item"):
+                                        val = val.item()
+                                    if isinstance(val, (bytes, bytearray)):
+                                        val = val.decode(errors="ignore")
+                                    if isinstance(val, str):
+                                        # empty strings are invalid
+                                        if val == "":
+                                            return None
+                                        try:
+                                            return int(val)
+                                        except Exception:
+                                            return None
+                                    if isinstance(val, float):
+                                        return int(val)
+                                    return int(val)
+                                except Exception:
+                                    return None
+
+                        for key in ("min_values", "max_values"):
+                            mv = e2.get(key)
+                            if not isinstance(mv, list):
+                                e2[key] = [None]
+                            else:
+                                new_mv = []
+                                for x in mv:
+                                    try:
+                                        if x is None:
+                                            new_mv.append(None)
+                                            continue
+                                        # Use to_int to coerce into int64 semantics
+                                        v = x
+                                        if hasattr(v, "item"):
+                                            v = v.item()
+                                        coerced = to_int(v)
+                                        # to_int may return None-like sentinel; accept ints only
+                                        if coerced is None:
+                                            new_mv.append(None)
+                                        else:
+                                            new_mv.append(int(coerced))
+                                    except Exception:
+                                        new_mv.append(None)
+                                e2[key] = new_mv
+                        sanitized.append(e2)
+                    table = pa.Table.from_pylist(sanitized, schema=schema)
+                    print("[MANIFEST DEBUG] Sanitized entries converted successfully")
+                except Exception:
+                    print("[MANIFEST DEBUG] Sanitization failed; re-raising original exception")
+                    raise
             buf = pa.BufferOutputStream()
             pq.write_table(table, buf, compression="zstd")
             data = buf.getvalue().to_pybytes()

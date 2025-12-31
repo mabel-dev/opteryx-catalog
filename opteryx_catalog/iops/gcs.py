@@ -9,6 +9,7 @@ import io
 import logging
 import os
 import urllib.parse
+from typing import Callable
 from typing import Union
 
 import requests
@@ -35,7 +36,9 @@ def _get_storage_credentials():
 
 
 class _GcsInputStream(io.BytesIO):
-    def __init__(self, path: str, session: requests.Session, access_token: str):
+    def __init__(
+        self, path: str, session: requests.Session, access_token_getter: Callable[[], str]
+    ):
         # Strip gs://
         if path.startswith("gs://"):
             path = path[5:]
@@ -43,24 +46,33 @@ class _GcsInputStream(io.BytesIO):
         object_full_path = urllib.parse.quote(path[(len(bucket) + 1) :], safe="")
         url = f"https://storage.googleapis.com/{bucket}/{object_full_path}"
 
+        access_token = access_token_getter()
+        headers = {"Accept-Encoding": "identity"}
+        if access_token:
+            headers["Authorization"] = f"Bearer {access_token}"
+
         response = session.get(
             url,
-            headers={"Authorization": f"Bearer {access_token}", "Accept-Encoding": "identity"},
+            headers=headers,
             timeout=30,
         )
 
         if response.status_code != 200:
-            raise FileNotFoundError(f"Unable to read '{path}' - status {response.status_code}")
+            raise FileNotFoundError(
+                f"Unable to read '{path}' - status {response.status_code}: {response.text}"
+            )
 
         super().__init__(response.content)
 
 
 class _GcsOutputStream(io.BytesIO):
-    def __init__(self, path: str, session: requests.Session, access_token: str):
+    def __init__(
+        self, path: str, session: requests.Session, access_token_getter: Callable[[], str]
+    ):
         super().__init__()
         self._path = path
         self._session = session
-        self._access_token = access_token
+        self._access_token_getter = access_token_getter
         self._closed = False
 
     def close(self):
@@ -77,14 +89,18 @@ class _GcsOutputStream(io.BytesIO):
         data = self.getvalue()
         object_name = path[(len(bucket) + 1) :]
 
+        token = self._access_token_getter()
+        headers = {
+            "Content-Type": "application/octet-stream",
+            "Content-Length": str(len(data)),
+        }
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+
         response = self._session.post(
             url,
             params={"uploadType": "media", "name": object_name},
-            headers={
-                "Authorization": f"Bearer {self._access_token}",
-                "Content-Type": "application/octet-stream",
-                "Content-Length": str(len(data)),
-            },
+            headers=headers,
             data=data,
             timeout=60,
         )
@@ -99,10 +115,12 @@ class _GcsOutputStream(io.BytesIO):
 
 
 class _GcsInputFile(InputFile):
-    def __init__(self, location: str, session: requests.Session, access_token: str):
+    def __init__(
+        self, location: str, session: requests.Session, access_token_getter: Callable[[], str]
+    ):
         # read entire bytes via optimized session
         try:
-            stream = _GcsInputStream(location, session, access_token)
+            stream = _GcsInputStream(location, session, access_token_getter)
             data = stream.read()
             super().__init__(location, data)
         except FileNotFoundError:
@@ -110,14 +128,16 @@ class _GcsInputFile(InputFile):
 
 
 class _GcsOutputFile(OutputFile):
-    def __init__(self, location: str, session: requests.Session, access_token: str):
+    def __init__(
+        self, location: str, session: requests.Session, access_token_getter: Callable[[], str]
+    ):
         super().__init__(location)
         self._location = location
         self._session = session
-        self._access_token = access_token
+        self._access_token_getter = access_token_getter
 
     def create(self):
-        return _GcsOutputStream(self._location, self._session, self._access_token)
+        return _GcsOutputStream(self._location, self._session, self._access_token_getter)
 
 
 class GcsFileIO(FileIO):
@@ -132,24 +152,40 @@ class GcsFileIO(FileIO):
         self.manifest_paths: list[str] = []
         self.captured_manifests: list[tuple[str, bytes]] = []
 
-        # Prepare requests session and access token
+        # Prepare requests session and set up credential refresh helper (token may expire)
         self._credentials = _get_storage_credentials()
-        if not self._credentials.valid:
-            req = Request()
-            self._credentials.refresh(req)
-        self._access_token = self._credentials.token
+        self._access_token = None
+
+        def _refresh_credentials():
+            try:
+                if not self._credentials.valid:
+                    req = Request()
+                    self._credentials.refresh(req)
+                self._access_token = self._credentials.token
+            except Exception as e:
+                logger.warning("Failed to refresh GCS credentials: %s", e)
+                self._access_token = None
+
+        self._refresh_credentials = _refresh_credentials
+
+        def get_access_token():
+            # Refresh credentials on demand to avoid using expired tokens
+            self._refresh_credentials()
+            return self._access_token
+
+        self.get_access_token = get_access_token
 
         self._session = requests.session()
         adapter = HTTPAdapter(pool_connections=100, pool_maxsize=100)
         self._session.mount("https://", adapter)
 
     def new_input(self, location: str) -> InputFile:
-        return _GcsInputFile(location, self._session, self._access_token)
+        return _GcsInputFile(location, self._session, self.get_access_token)
 
     def new_output(self, location: str) -> OutputFile:
         logger.info(f"new_output -> {location}")
 
-        return _GcsOutputFile(location, self._session, self._access_token)
+        return _GcsOutputFile(location, self._session, self.get_access_token)
 
     def delete(self, location: Union[str, InputFile, OutputFile]) -> None:
         if isinstance(location, (InputFile, OutputFile)):
@@ -163,9 +199,11 @@ class GcsFileIO(FileIO):
         object_full_path = urllib.parse.quote(path[(len(bucket) + 1) :], safe="")
         url = f"https://storage.googleapis.com/storage/v1/b/{bucket}/o/{object_full_path}"
 
-        response = self._session.delete(
-            url, headers={"Authorization": f"Bearer {self._access_token}"}, timeout=10
-        )
+        token = self.get_access_token()
+        headers = {}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        response = self._session.delete(url, headers=headers, timeout=10)
 
         if response.status_code not in (204, 404):
             raise IOError(f"Failed to delete '{location}' - status {response.status_code}")
@@ -179,7 +217,9 @@ class GcsFileIO(FileIO):
         object_full_path = urllib.parse.quote(path[(len(bucket) + 1) :], safe="")
         url = f"https://storage.googleapis.com/{bucket}/{object_full_path}"
 
-        response = self._session.head(
-            url, headers={"Authorization": f"Bearer {self._access_token}"}, timeout=10
-        )
+        token = self.get_access_token()
+        headers = {}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        response = self._session.head(url, headers=headers, timeout=10)
         return response.status_code == 200
