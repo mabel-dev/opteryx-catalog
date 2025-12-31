@@ -54,7 +54,9 @@ class Dataset:
         """Append data (implementations can accept pyarrow.Table or similar)."""
         raise NotImplementedError()
 
-    def scan(self, row_filter=None, snapshot_id: Optional[int] = None) -> Any:
+    def scan(
+        self, row_filter=None, snapshot_id: Optional[int] = None, row_limit: Optional[int] = None
+    ) -> Any:
         raise NotImplementedError()
 
 

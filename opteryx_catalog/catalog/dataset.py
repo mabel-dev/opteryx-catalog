@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import os
 import time
+import uuid
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any
 from typing import Iterable
 from typing import Optional
@@ -117,6 +120,14 @@ class SimpleDataset(Dataset):
 
         return None
 
+    @lru_cache(1)
+    def _get_node(self) -> str:
+        """Return a stable node identifier based on MAC and pid.
+
+        Cached to avoid repeated system calls; formatted as hex-node-hex-pid.
+        """
+        return f"{uuid.getnode():x}-{os.getpid():x}"
+
     def snapshots(self) -> Iterable[Snapshot]:
         return list(self.metadata.snapshots)
 
@@ -215,8 +226,9 @@ class SimpleDataset(Dataset):
         if not hasattr(table, "schema"):
             raise TypeError("append() expects a pyarrow.Table-like object")
 
-        # Write parquet file
-        data_path = f"{self.metadata.location}/data/data-{snapshot_id}.parquet"
+        # Write parquet file with collision-resistant name
+        fname = f"{time.time_ns():x}-{self._get_node()}.parquet"
+        data_path = f"{self.metadata.location}/data/{fname}"
         buf = pa.BufferOutputStream()
         pq.write_table(table, buf, compression="zstd")
         pdata = buf.getvalue().to_pybytes()
@@ -233,104 +245,115 @@ class SimpleDataset(Dataset):
         min_values: list[int] = []
         max_values: list[int] = []
 
-        # Use draken for efficient hashing and compression
+        # Use draken for efficient hashing and compression when available.
         import heapq
-
-        import opteryx.draken as draken  # type: ignore
 
         # canonical NULL flag for missing values
         NULL_FLAG = -(1 << 63)
 
-        num_rows = int(table.num_rows)
+        try:
+            import opteryx.draken as draken  # type: ignore
 
-        for col_idx, col in enumerate(table.columns):
-            # hash column values to 64-bit via draken (new cpdef API)
-            vec = draken.Vector.from_arrow(col)
-            hashes = list(vec.hash())
+            num_rows = int(table.num_rows)
 
-            # Decide whether to compute min-k/histogram for this column based
-            # on field type and, for strings, average length of values.
-            field_type = table.schema.field(col_idx).type
-            compute_min_k = False
-            if (
-                pa.types.is_integer(field_type)
-                or pa.types.is_floating(field_type)
-                or pa.types.is_decimal(field_type)
-            ):
-                compute_min_k = True
-            elif (
-                pa.types.is_timestamp(field_type)
-                or pa.types.is_date(field_type)
-                or pa.types.is_time(field_type)
-            ):
-                compute_min_k = True
-            elif pa.types.is_string(field_type) or pa.types.is_large_string(field_type):
-                # compute average length from non-null values; only allow
-                # min-k/histogram for short strings (avg <= 16)
-                col_py = None
-                try:
-                    col_py = col.to_pylist()
-                except Exception:
+            for col_idx, col in enumerate(table.columns):
+                # hash column values to 64-bit via draken (new cpdef API)
+                vec = draken.Vector.from_arrow(col)
+                hashes = list(vec.hash())
+
+                # Decide whether to compute min-k/histogram for this column based
+                # on field type and, for strings, average length of values.
+                field_type = table.schema.field(col_idx).type
+                compute_min_k = False
+                if (
+                    pa.types.is_integer(field_type)
+                    or pa.types.is_floating(field_type)
+                    or pa.types.is_decimal(field_type)
+                ):
+                    compute_min_k = True
+                elif (
+                    pa.types.is_timestamp(field_type)
+                    or pa.types.is_date(field_type)
+                    or pa.types.is_time(field_type)
+                ):
+                    compute_min_k = True
+                elif pa.types.is_string(field_type) or pa.types.is_large_string(field_type):
+                    # compute average length from non-null values; only allow
+                    # min-k/histogram for short strings (avg <= 16)
                     col_py = None
+                    try:
+                        col_py = col.to_pylist()
+                    except Exception:
+                        col_py = None
 
-                if col_py is not None:
-                    lens = [len(x) for x in col_py if x is not None]
-                    if lens:
-                        avg_len = sum(lens) / len(lens)
-                        if avg_len <= 16:
-                            compute_min_k = True
+                    if col_py is not None:
+                        lens = [len(x) for x in col_py if x is not None]
+                        if lens:
+                            avg_len = sum(lens) / len(lens)
+                            if avg_len <= 16:
+                                compute_min_k = True
 
-            # KMV: take K smallest hashes when allowed; otherwise store an
-            # empty list for this column.
-            if compute_min_k:
-                smallest = heapq.nsmallest(K, hashes)
-                col_min_k = sorted(smallest)
-            else:
-                col_min_k = []
+                # KMV: take K smallest hashes when allowed; otherwise store an
+                # empty list for this column.
+                if compute_min_k:
+                    smallest = heapq.nsmallest(K, hashes)
+                    col_min_k = sorted(smallest)
+                else:
+                    col_min_k = []
 
-            # For histogram decisions follow the same rule as min-k
-            compute_hist = compute_min_k
+                # For histogram decisions follow the same rule as min-k
+                compute_hist = compute_min_k
 
-            # Use draken.compress() to get canonical int64 per value
-            mapped = list(vec.compress())
-            non_nulls_mapped = [m for m in mapped if m != NULL_FLAG]
-            if non_nulls_mapped:
-                vmin = min(non_nulls_mapped)
-                vmax = max(non_nulls_mapped)
-                col_min = int(vmin)
-                col_max = int(vmax)
-                if compute_hist:
-                    if vmin == vmax:
-                        col_hist = [0] * HBINS
-                        col_hist[-1] = len(non_nulls_mapped)
+                # Use draken.compress() to get canonical int64 per value
+                mapped = list(vec.compress())
+                non_nulls_mapped = [m for m in mapped if m != NULL_FLAG]
+                if non_nulls_mapped:
+                    vmin = min(non_nulls_mapped)
+                    vmax = max(non_nulls_mapped)
+                    col_min = int(vmin)
+                    col_max = int(vmax)
+                    if compute_hist:
+                        if vmin == vmax:
+                            col_hist = [0] * HBINS
+                            col_hist[-1] = len(non_nulls_mapped)
+                        else:
+                            col_hist = [0] * HBINS
+                            span = float(vmax - vmin)
+                            for m in non_nulls_mapped:
+                                b = int(((float(m) - float(vmin)) / span) * (HBINS - 1))
+                                if b < 0:
+                                    b = 0
+                                if b >= HBINS:
+                                    b = HBINS - 1
+                                col_hist[b] += 1
                     else:
                         col_hist = [0] * HBINS
-                        span = float(vmax - vmin)
-                        for m in non_nulls_mapped:
-                            b = int(((float(m) - float(vmin)) / span) * (HBINS - 1))
-                            if b < 0:
-                                b = 0
-                            if b >= HBINS:
-                                b = HBINS - 1
+                else:
+                    # no non-null values; histogram via hash buckets
+                    col_min = NULL_FLAG
+                    col_max = NULL_FLAG
+                    if compute_hist:
+                        col_hist = [0] * HBINS
+                        for h in hashes:
+                            b = (h >> (64 - 5)) & 0x1F
                             col_hist[b] += 1
-                else:
-                    col_hist = [0] * HBINS
-            else:
-                # no non-null values; histogram via hash buckets
-                col_min = NULL_FLAG
-                col_max = NULL_FLAG
-                if compute_hist:
-                    col_hist = [0] * HBINS
-                    for h in hashes:
-                        b = (h >> (64 - 5)) & 0x1F
-                        col_hist[b] += 1
-                else:
-                    col_hist = [0] * HBINS
+                    else:
+                        col_hist = [0] * HBINS
 
-            min_k_hashes.append(col_min_k)
-            histograms.append(col_hist)
-            min_values.append(col_min)
-            max_values.append(col_max)
+                min_k_hashes.append(col_min_k)
+                histograms.append(col_hist)
+                min_values.append(col_min)
+                max_values.append(col_max)
+        except Exception:
+            # If draken or its dependencies are unavailable, fall back to
+            # conservative defaults so we can still write the manifest and
+            # snapshot without failing the append operation.
+            num_cols = table.num_columns
+            min_k_hashes = [[] for _ in range(num_cols)]
+            HBINS = 32
+            histograms = [[0] * HBINS for _ in range(num_cols)]
+            min_values = [NULL_FLAG] * num_cols
+            max_values = [NULL_FLAG] * num_cols
 
         entries = [
             {
@@ -532,8 +555,8 @@ class SimpleDataset(Dataset):
         if prev and getattr(prev, "manifest_list", None):
             # try to read prev manifest entries
             try:
-                import pyarrow.parquet as pq
                 import pyarrow as pa
+                import pyarrow.parquet as pq
 
                 if self.io and hasattr(self.io, "new_input"):
                     inp = self.io.new_input(prev.manifest_list)
@@ -542,7 +565,11 @@ class SimpleDataset(Dataset):
                     table = pq.read_table(pa.BufferReader(data))
                     prev_entries = table.to_pylist()
                 else:
-                    if self.catalog and getattr(self.catalog, "_storage_client", None) and getattr(self.catalog, "gcs_bucket", None):
+                    if (
+                        self.catalog
+                        and getattr(self.catalog, "_storage_client", None)
+                        and getattr(self.catalog, "gcs_bucket", None)
+                    ):
                         bucket = self.catalog._storage_client.bucket(self.catalog.gcs_bucket)
                         parsed = prev.manifest_list
                         if parsed.startswith("gs://"):
@@ -554,27 +581,163 @@ class SimpleDataset(Dataset):
             except Exception:
                 prev_entries = []
 
-        existing = {e.get("file_path") for e in prev_entries if isinstance(e, dict) and e.get("file_path")}
+        existing = {
+            e.get("file_path") for e in prev_entries if isinstance(e, dict) and e.get("file_path")
+        }
 
-        # Build new entries for files that don't already exist
+        # Build new entries for files that don't already exist. Only accept
+        # Parquet files and attempt to read lightweight metadata (bytes,
+        # row count, per-column min/max) from the Parquet footer when
+        # available.
         new_entries = []
         seen = set()
         for fp in files:
             if not fp or fp in existing or fp in seen:
                 continue
+            if not fp.lower().endswith(".parquet"):
+                # only accept parquet files
+                continue
             seen.add(fp)
-            fmt = "parquet" if fp.lower().endswith(".parquet") else None
+
+            # Attempt to read file bytes and parquet metadata
+            file_size = 0
+            record_count = 0
+            min_values = []
+            max_values = []
+            try:
+                import pyarrow as pa
+                import pyarrow.parquet as pq
+
+                data = None
+                if self.io and hasattr(self.io, "new_input"):
+                    inp = self.io.new_input(fp)
+                    with inp.open() as f:
+                        data = f.read()
+                else:
+                    if (
+                        self.catalog
+                        and getattr(self.catalog, "_storage_client", None)
+                        and getattr(self.catalog, "gcs_bucket", None)
+                    ):
+                        bucket = self.catalog._storage_client.bucket(self.catalog.gcs_bucket)
+                        parsed = fp
+                        if parsed.startswith("gs://"):
+                            parsed = parsed[5 + len(self.catalog.gcs_bucket) + 1 :]
+                        blob = bucket.blob(parsed)
+                        data = blob.download_as_bytes()
+
+                if data:
+                    file_size = len(data)
+                    pf = pq.ParquetFile(pa.BufferReader(data))
+                    record_count = int(pf.metadata.num_rows or 0)
+
+                    # Prefer computing min/max via draken.compress() over
+                    # relying on Parquet footer stats which may contain
+                    # heterogenous or non-numeric values. Fall back to
+                    # footer stats only if draken is unavailable.
+                    try:
+                        import opteryx.draken as draken  # type: ignore
+
+                        table = pq.read_table(pa.BufferReader(data))
+                        ncols = table.num_columns
+                        mins = [None] * ncols
+                        maxs = [None] * ncols
+
+                        NULL_FLAG = -(1 << 63)
+
+                        for ci in range(ncols):
+                            try:
+                                col = table.column(ci)
+                                # combine chunks if needed
+                                if hasattr(col, "combine_chunks"):
+                                    arr = col.combine_chunks()
+                                else:
+                                    arr = col
+                                vec = draken.Vector.from_arrow(arr)
+                                mapped = list(vec.compress())
+                                non_nulls = [m for m in mapped if m != NULL_FLAG]
+                                if non_nulls:
+                                    mins[ci] = int(min(non_nulls))
+                                    maxs[ci] = int(max(non_nulls))
+                                else:
+                                    mins[ci] = None
+                                    maxs[ci] = None
+                            except Exception:
+                                # per-column fallback: leave None
+                                mins[ci] = None
+                                maxs[ci] = None
+                    except Exception:
+                        # Draken not available; fall back to Parquet footer stats
+                        ncols = pf.metadata.num_columns
+                        mins = [None] * ncols
+                        maxs = [None] * ncols
+                        for rg in range(pf.num_row_groups):
+                            for ci in range(ncols):
+                                col_meta = pf.metadata.row_group(rg).column(ci)
+                                stats = getattr(col_meta, "statistics", None)
+                                if not stats:
+                                    continue
+                                smin = getattr(stats, "min", None)
+                                smax = getattr(stats, "max", None)
+                                if smin is None and smax is None:
+                                    continue
+
+                                def _to_py(v):
+                                    try:
+                                        return int(v)
+                                    except Exception:
+                                        try:
+                                            return float(v)
+                                        except Exception:
+                                            try:
+                                                if isinstance(v, (bytes, bytearray)):
+                                                    return v.decode("utf-8", errors="ignore")
+                                            except Exception:
+                                                pass
+                                            return v
+
+                                if smin is not None:
+                                    sval = _to_py(smin)
+                                    if mins[ci] is None:
+                                        mins[ci] = sval
+                                    else:
+                                        try:
+                                            if sval < mins[ci]:
+                                                mins[ci] = sval
+                                        except Exception:
+                                            pass
+                                if smax is not None:
+                                    sval = _to_py(smax)
+                                    if maxs[ci] is None:
+                                        maxs[ci] = sval
+                                    else:
+                                        try:
+                                            if sval > maxs[ci]:
+                                                maxs[ci] = sval
+                                        except Exception:
+                                            pass
+
+                    # normalize lists to empty lists when values missing
+                    min_values = [m for m in mins if m is not None]
+                    max_values = [m for m in maxs if m is not None]
+            except Exception:
+                # If metadata read fails, fall back to placeholders
+                file_size = 0
+                record_count = 0
+                min_values = []
+                max_values = []
+
             new_entries.append(
                 {
                     "file_path": fp,
-                    "file_format": fmt,
-                    "record_count": 0,
-                    "file_size_in_bytes": 0,
+                    "file_format": "parquet",
+                    "record_count": int(record_count),
+                    "file_size_in_bytes": int(file_size),
                     "min_k_hashes": [],
                     "histogram_counts": [],
                     "histogram_bins": 0,
-                    "min_values": [],
-                    "max_values": [],
+                    "min_values": min_values,
+                    "max_values": max_values,
                 }
             )
 
@@ -583,7 +746,9 @@ class SimpleDataset(Dataset):
         # write cumulative manifest
         manifest_path = None
         if self.catalog and hasattr(self.catalog, "write_parquet_manifest"):
-            manifest_path = self.catalog.write_parquet_manifest(snapshot_id, merged_entries, self.metadata.location)
+            manifest_path = self.catalog.write_parquet_manifest(
+                snapshot_id, merged_entries, self.metadata.location
+            )
 
         # Build summary deltas
         added_data_files = len(new_entries)
@@ -653,7 +818,9 @@ class SimpleDataset(Dataset):
         if self.catalog and hasattr(self.catalog, "save_dataset_metadata"):
             self.catalog.save_dataset_metadata(self.identifier, self.metadata)
 
-    def truncate_and_add_files(self, files: list[str], author: str = None, commit_message: Optional[str] = None):
+    def truncate_and_add_files(
+        self, files: list[str], author: str = None, commit_message: Optional[str] = None
+    ):
         """Truncate dataset (logical) and set manifest to provided files.
 
         - Writes a manifest that contains exactly the unique filenames provided.
@@ -684,31 +851,124 @@ class SimpleDataset(Dataset):
             except Exception:
                 prev_total_records = 0
 
-        # Build unique new entries (ignore duplicates in input)
+        # Build unique new entries (ignore duplicates in input). Only accept
+        # parquet files and try to read lightweight metadata from each file.
         new_entries = []
         seen = set()
         for fp in files:
             if not fp or fp in seen:
                 continue
+            if not fp.lower().endswith(".parquet"):
+                continue
             seen.add(fp)
-            fmt = "parquet" if fp.lower().endswith(".parquet") else None
+
+            file_size = 0
+            record_count = 0
+            min_values = []
+            max_values = []
+            try:
+                import pyarrow as pa
+                import pyarrow.parquet as pq
+
+                data = None
+                if self.io and hasattr(self.io, "new_input"):
+                    inp = self.io.new_input(fp)
+                    with inp.open() as f:
+                        data = f.read()
+                else:
+                    if (
+                        self.catalog
+                        and getattr(self.catalog, "_storage_client", None)
+                        and getattr(self.catalog, "gcs_bucket", None)
+                    ):
+                        bucket = self.catalog._storage_client.bucket(self.catalog.gcs_bucket)
+                        parsed = fp
+                        if parsed.startswith("gs://"):
+                            parsed = parsed[5 + len(self.catalog.gcs_bucket) + 1 :]
+                        blob = bucket.blob(parsed)
+                        data = blob.download_as_bytes()
+
+                if data:
+                    file_size = len(data)
+                    pf = pq.ParquetFile(pa.BufferReader(data))
+                    record_count = int(pf.metadata.num_rows or 0)
+
+                    ncols = pf.metadata.num_columns
+                    mins = [None] * ncols
+                    maxs = [None] * ncols
+                    for rg in range(pf.num_row_groups):
+                        for ci in range(ncols):
+                            col_meta = pf.metadata.row_group(rg).column(ci)
+                            stats = getattr(col_meta, "statistics", None)
+                            if not stats:
+                                continue
+                            smin = getattr(stats, "min", None)
+                            smax = getattr(stats, "max", None)
+                            if smin is None and smax is None:
+                                continue
+
+                            def _to_py(v):
+                                try:
+                                    return int(v)
+                                except Exception:
+                                    try:
+                                        return float(v)
+                                    except Exception:
+                                        try:
+                                            if isinstance(v, (bytes, bytearray)):
+                                                return v.decode("utf-8", errors="ignore")
+                                        except Exception:
+                                            pass
+                                        return v
+
+                            if smin is not None:
+                                sval = _to_py(smin)
+                                if mins[ci] is None:
+                                    mins[ci] = sval
+                                else:
+                                    try:
+                                        if sval < mins[ci]:
+                                            mins[ci] = sval
+                                    except Exception:
+                                        pass
+                            if smax is not None:
+                                sval = _to_py(smax)
+                                if maxs[ci] is None:
+                                    maxs[ci] = sval
+                                else:
+                                    try:
+                                        if sval > maxs[ci]:
+                                            maxs[ci] = sval
+                                    except Exception:
+                                        pass
+
+                    min_values = [m for m in mins if m is not None]
+                    max_values = [m for m in maxs if m is not None]
+            except Exception:
+                file_size = 0
+                record_count = 0
+                min_values = []
+                max_values = []
+
             new_entries.append(
                 {
                     "file_path": fp,
-                    "file_format": fmt,
-                    "record_count": 0,
-                    "file_size_in_bytes": 0,
+                    "file_format": "parquet",
+                    "record_count": int(record_count),
+                    "file_size_in_bytes": int(file_size),
                     "min_k_hashes": [],
                     "histogram_counts": [],
                     "histogram_bins": 0,
-                    "min_values": [],
-                    "max_values": [],
+                    "min_values": min_values,
+                    "max_values": max_values,
                 }
             )
 
         manifest_path = None
         if self.catalog and hasattr(self.catalog, "write_parquet_manifest"):
-            manifest_path = self.catalog.write_parquet_manifest(snapshot_id, new_entries, self.metadata.location)
+            manifest_path = self.catalog.write_parquet_manifest(
+                snapshot_id, new_entries, self.metadata.location
+            )
 
         # Build summary: previous entries become deleted
         deleted_data_files = prev_total_files
@@ -780,7 +1040,9 @@ class SimpleDataset(Dataset):
         if self.catalog and hasattr(self.catalog, "save_dataset_metadata"):
             self.catalog.save_dataset_metadata(self.identifier, self.metadata)
 
-    def scan(self, row_filter=None, snapshot_id: Optional[int] = None) -> Iterable[Datafile]:
+    def scan(
+        self, row_filter=None, row_limit=None, snapshot_id: Optional[int] = None
+    ) -> Iterable[Datafile]:
         """Return Datafile objects for the given snapshot.
 
         - If `snapshot_id` is None, use the current snapshot.
@@ -802,35 +1064,27 @@ class SimpleDataset(Dataset):
             import pyarrow as pa
             import pyarrow.parquet as pq
 
-            io = self.io
-            inp = None
             data = None
-            if io and hasattr(io, "new_input"):
-                inp = io.new_input(manifest_path)
-                with inp.open() as f:
-                    data = f.read()
-            else:
-                # No FileIO available; attempt to use catalog storage client
-                if (
-                    self.catalog
-                    and getattr(self.catalog, "_storage_client", None)
-                    and getattr(self.catalog, "gcs_bucket", None)
-                ):
-                    bucket = self.catalog._storage_client.bucket(self.catalog.gcs_bucket)
-                    # strip gs://<bucket>/ prefix if present
-                    parsed = manifest_path
-                    if parsed.startswith("gs://"):
-                        parsed = parsed[5 + len(self.catalog.gcs_bucket) + 1 :]
-                    blob = bucket.blob(parsed)
-                    data = blob.download_as_bytes()
+
+            inp = self.io.new_input(manifest_path)
+            with inp.open() as f:
+                data = f.read()
 
             if not data:
                 return iter(())
 
             table = pq.read_table(pa.BufferReader(data))
             rows = table.to_pylist()
+            cum_rows = 0
             for r in rows:
                 yield Datafile(entry=r)
+                try:
+                    rc = int(r.get("record_count") or 0)
+                except Exception:
+                    rc = 0
+                cum_rows += rc
+                if row_limit is not None and cum_rows >= row_limit:
+                    break
         except FileNotFoundError:
             return iter(())
         except Exception:
