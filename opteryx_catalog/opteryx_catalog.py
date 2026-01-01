@@ -181,7 +181,21 @@ class OpteryxCatalog(Metastore):
         # Return SimpleDataset (attach this catalog so append() can persist)
         return SimpleDataset(identifier=identifier, _metadata=metadata, io=self.io, catalog=self)
 
-    def load_dataset(self, identifier: str) -> SimpleDataset:
+    def load_dataset(self, identifier: str, load_history: bool = False) -> SimpleDataset:
+        """Load a dataset from Firestore.
+
+        Args:
+            identifier: Dataset identifier in format 'collection.dataset_name'
+            load_history: If True, load all snapshots from Firestore (expensive for
+                large histories). If False (default), only load the current snapshot,
+                which is sufficient for most write operations.
+
+        Returns:
+            SimpleDataset instance with metadata loaded from Firestore.
+
+        Raises:
+            DatasetNotFound: If the dataset does not exist in Firestore.
+        """
         collection, dataset_name = identifier.split(".")
         doc_ref = self._dataset_doc_ref(collection, dataset_name)
         doc = doc_ref.get()
@@ -203,26 +217,56 @@ class OpteryxCatalog(Metastore):
         # note: Firestore table doc stores the original collection and workspace
         # under keys `collection` and `workspace`.
 
-        # Load snapshots
+        # Load snapshots based on load_history flag
         snaps = []
-        for snap_doc in self._snapshots_collection(collection, dataset_name).stream():
-            sd = snap_doc.to_dict() or {}
-            snap = Snapshot(
-                snapshot_id=sd.get("snapshot-id"),
-                timestamp_ms=sd.get("timestamp-ms"),
-                author=sd.get("author"),
-                sequence_number=sd.get("sequence-number"),
-                user_created=sd.get("user-created"),
-                manifest_list=sd.get("manifest"),
-                schema_id=sd.get("schema-id"),
-                summary=sd.get("summary", {}),
-                operation_type=sd.get("operation-type"),
-                parent_snapshot_id=sd.get("parent-snapshot-id"),
-            )
-            snaps.append(snap)
+        if load_history:
+            # Load all snapshots from Firestore (expensive for large histories)
+            for snap_doc in self._snapshots_collection(collection, dataset_name).stream():
+                sd = snap_doc.to_dict() or {}
+                snap = Snapshot(
+                    snapshot_id=sd.get("snapshot-id"),
+                    timestamp_ms=sd.get("timestamp-ms"),
+                    author=sd.get("author"),
+                    sequence_number=sd.get("sequence-number"),
+                    user_created=sd.get("user-created"),
+                    manifest_list=sd.get("manifest"),
+                    schema_id=sd.get("schema-id"),
+                    summary=sd.get("summary", {}),
+                    operation_type=sd.get("operation-type"),
+                    parent_snapshot_id=sd.get("parent-snapshot-id"),
+                )
+                snaps.append(snap)
+            if snaps:
+                metadata.current_snapshot_id = snaps[-1].snapshot_id
+        else:
+            # Load only the current snapshot (efficient single read)
+            current_snap_id = data.get("current-snapshot-id")
+            if current_snap_id:
+                try:
+                    snap_doc = (
+                        self._snapshots_collection(collection, dataset_name)
+                        .document(str(current_snap_id))
+                        .get()
+                    )
+                    if snap_doc.exists:
+                        sd = snap_doc.to_dict() or {}
+                        snap = Snapshot(
+                            snapshot_id=sd.get("snapshot-id"),
+                            timestamp_ms=sd.get("timestamp-ms"),
+                            author=sd.get("author"),
+                            sequence_number=sd.get("sequence-number"),
+                            user_created=sd.get("user-created"),
+                            manifest_list=sd.get("manifest"),
+                            schema_id=sd.get("schema-id"),
+                            summary=sd.get("summary", {}),
+                            operation_type=sd.get("operation-type"),
+                            parent_snapshot_id=sd.get("parent-snapshot-id"),
+                        )
+                        snaps.append(snap)
+                        metadata.current_snapshot_id = current_snap_id
+                except Exception:
+                    pass
         metadata.snapshots = snaps
-        if snaps:
-            metadata.current_snapshot_id = snaps[-1].snapshot_id
 
         # Load schemas subcollection
         try:

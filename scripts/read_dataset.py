@@ -44,7 +44,7 @@ if not datasets:
 datasets = sorted(datasets)
 table = datasets[-1]
 
-table = "test_table_1_1767106177"
+table = "test_table_0_1767300842"
 
 
 # opteryx.register_store(

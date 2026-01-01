@@ -8,6 +8,9 @@ from typing import Any
 from typing import Iterable
 from typing import Optional
 
+from .manifest import ParquetManifestEntry
+from .manifest import build_parquet_manifest_entry
+from .manifest import build_parquet_manifest_minmax_entry
 from .metadata import DatasetMetadata
 from .metadata import Snapshot
 from .metastore import Dataset
@@ -69,6 +72,45 @@ class SimpleDataset(Dataset):
     def metadata(self) -> DatasetMetadata:
         return self._metadata
 
+    def _next_sequence_number(self) -> int:
+        """Calculate the next sequence number.
+
+        Uses the current snapshot's sequence number + 1. Works efficiently
+        with load_history=False since we only need the most recent snapshot,
+        not the full history.
+
+        Returns:
+            The next sequence number (current snapshot's sequence + 1, or 1 if no snapshots).
+        """
+        if not self.metadata.snapshots:
+            # No snapshots yet - this is the first one
+            return 1
+
+        # Get the current (most recent) snapshot - should have the highest sequence number
+        current = self.snapshot()
+        if current:
+            seq = getattr(current, "sequence_number", None)
+            if seq is not None:
+                try:
+                    return int(seq) + 1
+                except Exception:
+                    pass
+
+        # Fallback: iterate through all loaded snapshots to find max
+        # (only needed if current snapshot has no sequence number)
+        max_seq = 0
+        for s in self.metadata.snapshots:
+            seq = getattr(s, "sequence_number", None)
+            if seq is None:
+                continue
+            try:
+                ival = int(seq)
+            except Exception:
+                continue
+            if ival > max_seq:
+                max_seq = ival
+        return max_seq + 1
+
     def snapshot(self, snapshot_id: Optional[int] = None) -> Optional[Snapshot]:
         """Return a Snapshot.
 
@@ -95,20 +137,17 @@ class SimpleDataset(Dataset):
                 if doc.exists:
                     sd = doc.to_dict() or {}
                     snap = Snapshot(
-                        snapshot_id=int(
-                            sd.get("snapshot-id") or sd.get("snapshot_id") or snapshot_id
-                        ),
-                        timestamp_ms=int(sd.get("timestamp-ms") or sd.get("timestamp_ms") or 0),
+                        snapshot_id=int(sd.get("snapshot-id") or snapshot_id),
+                        timestamp_ms=int(sd.get("timestamp-ms", 0)),
                         author=sd.get("author"),
-                        sequence_number=sd.get("sequence-number") or sd.get("sequence_number"),
-                        user_created=sd.get("user-created") or sd.get("user_created"),
-                        manifest_list=sd.get("manifest") or sd.get("manifest_list"),
-                        schema_id=sd.get("schema-id") or sd.get("schema_id"),
+                        sequence_number=sd.get("sequence-number", 0),
+                        user_created=sd.get("user-created"),
+                        manifest_list=sd.get("manifest"),
+                        schema_id=sd.get("schema-id"),
                         summary=sd.get("summary", {}),
-                        operation_type=sd.get("operation-type") or sd.get("operation_type"),
-                        parent_snapshot_id=sd.get("parent-snapshot-id")
-                        or sd.get("parent_snapshot_id"),
-                        commit_message=sd.get("commit-message") or sd.get("commit_message"),
+                        operation_type=sd.get("operation-type"),
+                        parent_snapshot_id=sd.get("parent-snapshot-id"),
+                        commit_message=sd.get("commit-message"),
                     )
                     return snap
             except Exception:
@@ -238,137 +277,9 @@ class SimpleDataset(Dataset):
         out.write(pdata)
         out.close()
 
-        # Prepare sketches/stats
-        K = 32
-        HBINS = 32
-        min_k_hashes: list[list[int]] = []
-        histograms: list[list[int]] = []
-        min_values: list[int] = []
-        max_values: list[int] = []
-
-        # Use draken for efficient hashing and compression when available.
-        import heapq
-
-        # canonical NULL flag for missing values
-        NULL_FLAG = -(1 << 63)
-
-        try:
-            import opteryx.draken as draken  # type: ignore
-
-            num_rows = int(table.num_rows)
-
-            for col_idx, col in enumerate(table.columns):
-                # hash column values to 64-bit via draken (new cpdef API)
-                vec = draken.Vector.from_arrow(col)
-                hashes = list(vec.hash())
-
-                # Decide whether to compute min-k/histogram for this column based
-                # on field type and, for strings, average length of values.
-                field_type = table.schema.field(col_idx).type
-                compute_min_k = False
-                if (
-                    pa.types.is_integer(field_type)
-                    or pa.types.is_floating(field_type)
-                    or pa.types.is_decimal(field_type)
-                ):
-                    compute_min_k = True
-                elif (
-                    pa.types.is_timestamp(field_type)
-                    or pa.types.is_date(field_type)
-                    or pa.types.is_time(field_type)
-                ):
-                    compute_min_k = True
-                elif pa.types.is_string(field_type) or pa.types.is_large_string(field_type):
-                    # compute average length from non-null values; only allow
-                    # min-k/histogram for short strings (avg <= 16)
-                    col_py = None
-                    try:
-                        col_py = col.to_pylist()
-                    except Exception:
-                        col_py = None
-
-                    if col_py is not None:
-                        lens = [len(x) for x in col_py if x is not None]
-                        if lens:
-                            avg_len = sum(lens) / len(lens)
-                            if avg_len <= 16:
-                                compute_min_k = True
-
-                # KMV: take K smallest hashes when allowed; otherwise store an
-                # empty list for this column.
-                if compute_min_k:
-                    smallest = heapq.nsmallest(K, hashes)
-                    col_min_k = sorted(smallest)
-                else:
-                    col_min_k = []
-
-                # For histogram decisions follow the same rule as min-k
-                compute_hist = compute_min_k
-
-                # Use draken.compress() to get canonical int64 per value
-                mapped = list(vec.compress())
-                non_nulls_mapped = [m for m in mapped if m != NULL_FLAG]
-                if non_nulls_mapped:
-                    vmin = min(non_nulls_mapped)
-                    vmax = max(non_nulls_mapped)
-                    col_min = int(vmin)
-                    col_max = int(vmax)
-                    if compute_hist:
-                        if vmin == vmax:
-                            col_hist = [0] * HBINS
-                            col_hist[-1] = len(non_nulls_mapped)
-                        else:
-                            col_hist = [0] * HBINS
-                            span = float(vmax - vmin)
-                            for m in non_nulls_mapped:
-                                b = int(((float(m) - float(vmin)) / span) * (HBINS - 1))
-                                if b < 0:
-                                    b = 0
-                                if b >= HBINS:
-                                    b = HBINS - 1
-                                col_hist[b] += 1
-                    else:
-                        col_hist = [0] * HBINS
-                else:
-                    # no non-null values; histogram via hash buckets
-                    col_min = NULL_FLAG
-                    col_max = NULL_FLAG
-                    if compute_hist:
-                        col_hist = [0] * HBINS
-                        for h in hashes:
-                            b = (h >> (64 - 5)) & 0x1F
-                            col_hist[b] += 1
-                    else:
-                        col_hist = [0] * HBINS
-
-                min_k_hashes.append(col_min_k)
-                histograms.append(col_hist)
-                min_values.append(col_min)
-                max_values.append(col_max)
-        except Exception:
-            # If draken or its dependencies are unavailable, fall back to
-            # conservative defaults so we can still write the manifest and
-            # snapshot without failing the append operation.
-            num_cols = table.num_columns
-            min_k_hashes = [[] for _ in range(num_cols)]
-            HBINS = 32
-            histograms = [[0] * HBINS for _ in range(num_cols)]
-            min_values = [NULL_FLAG] * num_cols
-            max_values = [NULL_FLAG] * num_cols
-
-        entries = [
-            {
-                "file_path": data_path,
-                "file_format": "parquet",
-                "record_count": int(table.num_rows),
-                "file_size_in_bytes": len(pdata),
-                "min_k_hashes": min_k_hashes,
-                "histogram_counts": histograms,
-                "histogram_bins": HBINS,
-                "min_values": min_values,
-                "max_values": max_values,
-            }
-        ]
+        # Build manifest entry with statistics
+        manifest_entry = build_parquet_manifest_entry(table, data_path, len(pdata))
+        entries = [manifest_entry.to_dict()]
 
         # persist manifest: for append, merge previous manifest entries
         # with the new entries so the snapshot's manifest is cumulative.
@@ -384,35 +295,15 @@ class SimpleDataset(Dataset):
                 prev_manifest_path = prev_snap.manifest_list
                 try:
                     # Prefer FileIO when available
-                    if self.io and hasattr(self.io, "new_input"):
-                        inp = self.io.new_input(prev_manifest_path)
-                        with inp.open() as f:
-                            prev_data = f.read()
-                        import pyarrow as pa
-                        import pyarrow.parquet as pq
+                    inp = self.io.new_input(prev_manifest_path)
+                    with inp.open() as f:
+                        prev_data = f.read()
+                    import pyarrow as pa
+                    import pyarrow.parquet as pq
 
-                        prev_table = pq.read_table(pa.BufferReader(prev_data))
-                        prev_rows = prev_table.to_pylist()
-                        merged_entries = prev_rows + merged_entries
-                    else:
-                        # Fall back to catalog storage client (GCS)
-                        if (
-                            self.catalog
-                            and getattr(self.catalog, "_storage_client", None)
-                            and getattr(self.catalog, "gcs_bucket", None)
-                        ):
-                            bucket = self.catalog._storage_client.bucket(self.catalog.gcs_bucket)
-                            parsed = prev_manifest_path
-                            if parsed.startswith("gs://"):
-                                parsed = parsed[5 + len(self.catalog.gcs_bucket) + 1 :]
-                            blob = bucket.blob(parsed)
-                            prev_data = blob.download_as_bytes()
-                            import pyarrow as pa
-                            import pyarrow.parquet as pq
-
-                            prev_table = pq.read_table(pa.BufferReader(prev_data))
-                            prev_rows = prev_table.to_pylist()
-                            merged_entries = prev_rows + merged_entries
+                    prev_table = pq.read_table(pa.BufferReader(prev_data))
+                    prev_rows = prev_table.to_pylist()
+                    merged_entries = prev_rows + merged_entries
                 except Exception:
                     # If we can't read the previous manifest, continue with
                     # just the new entries (don't fail the append).
@@ -443,18 +334,9 @@ class SimpleDataset(Dataset):
 
         prev = self.snapshot()
         if prev and prev.summary:
-            try:
-                prev_total_files = int(prev.summary.get("total-data-files", 0))
-            except Exception:
-                prev_total_files = 0
-            try:
-                prev_total_size = int(prev.summary.get("total-files-size", 0))
-            except Exception:
-                prev_total_size = 0
-            try:
-                prev_total_records = int(prev.summary.get("total-records", 0))
-            except Exception:
-                prev_total_records = 0
+            prev_total_files = int(prev.summary.get("total-data-files", 0))
+            prev_total_size = int(prev.summary.get("total-files-size", 0))
+            prev_total_records = int(prev.summary.get("total-records", 0))
         else:
             prev_total_files = 0
             prev_total_size = 0
@@ -478,18 +360,7 @@ class SimpleDataset(Dataset):
 
         # sequence number
         try:
-            max_seq = 0
-            for s in self.metadata.snapshots:
-                seq = getattr(s, "sequence_number", None)
-                if seq is None:
-                    continue
-                try:
-                    ival = int(seq)
-                except Exception:
-                    continue
-                if ival > max_seq:
-                    max_seq = ival
-            next_seq = max_seq + 1
+            next_seq = self._next_sequence_number()
         except Exception:
             next_seq = 1
 
@@ -540,45 +411,20 @@ class SimpleDataset(Dataset):
         prev_total_records = 0
         prev_entries = []
         if prev and prev.summary:
-            try:
-                prev_total_files = int(prev.summary.get("total-data-files", 0))
-            except Exception:
-                prev_total_files = 0
-            try:
-                prev_total_size = int(prev.summary.get("total-files-size", 0))
-            except Exception:
-                prev_total_size = 0
-            try:
-                prev_total_records = int(prev.summary.get("total-records", 0))
-            except Exception:
-                prev_total_records = 0
-
+            prev_total_files = int(prev.summary.get("total-data-files", 0))
+            prev_total_size = int(prev.summary.get("total-files-size", 0))
+            prev_total_records = int(prev.summary.get("total-records", 0))
         if prev and getattr(prev, "manifest_list", None):
             # try to read prev manifest entries
             try:
                 import pyarrow as pa
                 import pyarrow.parquet as pq
 
-                if self.io and hasattr(self.io, "new_input"):
-                    inp = self.io.new_input(prev.manifest_list)
-                    with inp.open() as f:
-                        data = f.read()
-                    table = pq.read_table(pa.BufferReader(data))
-                    prev_entries = table.to_pylist()
-                else:
-                    if (
-                        self.catalog
-                        and getattr(self.catalog, "_storage_client", None)
-                        and getattr(self.catalog, "gcs_bucket", None)
-                    ):
-                        bucket = self.catalog._storage_client.bucket(self.catalog.gcs_bucket)
-                        parsed = prev.manifest_list
-                        if parsed.startswith("gs://"):
-                            parsed = parsed[5 + len(self.catalog.gcs_bucket) + 1 :]
-                        blob = bucket.blob(parsed)
-                        data = blob.download_as_bytes()
-                        table = pq.read_table(pa.BufferReader(data))
-                        prev_entries = table.to_pylist()
+                inp = self.io.new_input(prev.manifest_list)
+                with inp.open() as f:
+                    data = f.read()
+                table = pq.read_table(pa.BufferReader(data))
+                prev_entries = table.to_pylist()
             except Exception:
                 prev_entries = []
 
@@ -601,146 +447,41 @@ class SimpleDataset(Dataset):
             seen.add(fp)
 
             # Attempt to read file bytes and parquet metadata
-            file_size = 0
-            record_count = 0
-            min_values = []
-            max_values = []
+            # Use rugo's metadata reader which is much faster (microseconds per file)
             try:
-                import pyarrow as pa
-                import pyarrow.parquet as pq
-
-                data = None
-                if self.io and hasattr(self.io, "new_input"):
-                    inp = self.io.new_input(fp)
-                    with inp.open() as f:
-                        data = f.read()
-                else:
-                    if (
-                        self.catalog
-                        and getattr(self.catalog, "_storage_client", None)
-                        and getattr(self.catalog, "gcs_bucket", None)
-                    ):
-                        bucket = self.catalog._storage_client.bucket(self.catalog.gcs_bucket)
-                        parsed = fp
-                        if parsed.startswith("gs://"):
-                            parsed = parsed[5 + len(self.catalog.gcs_bucket) + 1 :]
-                        blob = bucket.blob(parsed)
-                        data = blob.download_as_bytes()
+                inp = self.io.new_input(fp)
+                with inp.open() as f:
+                    data = f.read()
 
                 if data:
-                    file_size = len(data)
-                    pf = pq.ParquetFile(pa.BufferReader(data))
-                    record_count = int(pf.metadata.num_rows or 0)
-
-                    # Prefer computing min/max via draken.compress() over
-                    # relying on Parquet footer stats which may contain
-                    # heterogenous or non-numeric values. Fall back to
-                    # footer stats only if draken is unavailable.
-                    try:
-                        import opteryx.draken as draken  # type: ignore
-
-                        table = pq.read_table(pa.BufferReader(data))
-                        ncols = table.num_columns
-                        mins = [None] * ncols
-                        maxs = [None] * ncols
-
-                        NULL_FLAG = -(1 << 63)
-
-                        for ci in range(ncols):
-                            try:
-                                col = table.column(ci)
-                                # combine chunks if needed
-                                if hasattr(col, "combine_chunks"):
-                                    arr = col.combine_chunks()
-                                else:
-                                    arr = col
-                                vec = draken.Vector.from_arrow(arr)
-                                mapped = list(vec.compress())
-                                non_nulls = [m for m in mapped if m != NULL_FLAG]
-                                if non_nulls:
-                                    mins[ci] = int(min(non_nulls))
-                                    maxs[ci] = int(max(non_nulls))
-                                else:
-                                    mins[ci] = None
-                                    maxs[ci] = None
-                            except Exception:
-                                # per-column fallback: leave None
-                                mins[ci] = None
-                                maxs[ci] = None
-                    except Exception:
-                        # Draken not available; fall back to Parquet footer stats
-                        ncols = pf.metadata.num_columns
-                        mins = [None] * ncols
-                        maxs = [None] * ncols
-                        for rg in range(pf.num_row_groups):
-                            for ci in range(ncols):
-                                col_meta = pf.metadata.row_group(rg).column(ci)
-                                stats = getattr(col_meta, "statistics", None)
-                                if not stats:
-                                    continue
-                                smin = getattr(stats, "min", None)
-                                smax = getattr(stats, "max", None)
-                                if smin is None and smax is None:
-                                    continue
-
-                                def _to_py(v):
-                                    try:
-                                        return int(v)
-                                    except Exception:
-                                        try:
-                                            return float(v)
-                                        except Exception:
-                                            try:
-                                                if isinstance(v, (bytes, bytearray)):
-                                                    return v.decode("utf-8", errors="ignore")
-                                            except Exception:
-                                                pass
-                                            return v
-
-                                if smin is not None:
-                                    sval = _to_py(smin)
-                                    if mins[ci] is None:
-                                        mins[ci] = sval
-                                    else:
-                                        try:
-                                            if sval < mins[ci]:
-                                                mins[ci] = sval
-                                        except Exception:
-                                            pass
-                                if smax is not None:
-                                    sval = _to_py(smax)
-                                    if maxs[ci] is None:
-                                        maxs[ci] = sval
-                                    else:
-                                        try:
-                                            if sval > maxs[ci]:
-                                                maxs[ci] = sval
-                                        except Exception:
-                                            pass
-
-                    # normalize lists to empty lists when values missing
-                    min_values = [m for m in mins if m is not None]
-                    max_values = [m for m in maxs if m is not None]
+                    manifest_entry = build_parquet_manifest_minmax_entry(data, fp)
+                else:
+                    # Empty file, create placeholder entry
+                    manifest_entry = ParquetManifestEntry(
+                        file_path=fp,
+                        file_format="parquet",
+                        record_count=0,
+                        file_size_in_bytes=0,
+                        min_k_hashes=[],
+                        histogram_counts=[],
+                        histogram_bins=0,
+                        min_values=[],
+                        max_values=[],
+                    )
             except Exception:
                 # If metadata read fails, fall back to placeholders
-                file_size = 0
-                record_count = 0
-                min_values = []
-                max_values = []
-
-            new_entries.append(
-                {
-                    "file_path": fp,
-                    "file_format": "parquet",
-                    "record_count": int(record_count),
-                    "file_size_in_bytes": int(file_size),
-                    "min_k_hashes": [],
-                    "histogram_counts": [],
-                    "histogram_bins": 0,
-                    "min_values": min_values,
-                    "max_values": max_values,
-                }
-            )
+                manifest_entry = ParquetManifestEntry(
+                    file_path=fp,
+                    file_format="parquet",
+                    record_count=0,
+                    file_size_in_bytes=0,
+                    min_k_hashes=[],
+                    histogram_counts=[],
+                    histogram_bins=0,
+                    min_values=[],
+                    max_values=[],
+                )
+            new_entries.append(manifest_entry.to_dict())
 
         merged_entries = prev_entries + new_entries
 
@@ -777,18 +518,7 @@ class SimpleDataset(Dataset):
 
         # Sequence number
         try:
-            max_seq = 0
-            for s in self.metadata.snapshots:
-                seq = getattr(s, "sequence_number", None)
-                if seq is None:
-                    continue
-                try:
-                    ival = int(seq)
-                except Exception:
-                    continue
-                if ival > max_seq:
-                    max_seq = ival
-            next_seq = max_seq + 1
+            next_seq = self._next_sequence_number()
         except Exception:
             next_seq = 1
 
@@ -951,19 +681,18 @@ class SimpleDataset(Dataset):
                 min_values = []
                 max_values = []
 
-            new_entries.append(
-                {
-                    "file_path": fp,
-                    "file_format": "parquet",
-                    "record_count": int(record_count),
-                    "file_size_in_bytes": int(file_size),
-                    "min_k_hashes": [],
-                    "histogram_counts": [],
-                    "histogram_bins": 0,
-                    "min_values": min_values,
-                    "max_values": max_values,
-                }
+            manifest_entry = ParquetManifestEntry(
+                file_path=fp,
+                file_format="parquet",
+                record_count=int(record_count),
+                file_size_in_bytes=int(file_size),
+                min_k_hashes=[],
+                histogram_counts=[],
+                histogram_bins=0,
+                min_values=min_values,
+                max_values=max_values,
             )
+            new_entries.append(manifest_entry.to_dict())
 
         manifest_path = None
         if self.catalog and hasattr(self.catalog, "write_parquet_manifest"):
@@ -998,18 +727,7 @@ class SimpleDataset(Dataset):
 
         # Sequence number
         try:
-            max_seq = 0
-            for s in self.metadata.snapshots:
-                seq = getattr(s, "sequence_number", None)
-                if seq is None:
-                    continue
-                try:
-                    ival = int(seq)
-                except Exception:
-                    continue
-                if ival > max_seq:
-                    max_seq = ival
-            next_seq = max_seq + 1
+            next_seq = self._next_sequence_number()
         except Exception:
             next_seq = 1
 
@@ -1118,12 +836,11 @@ class SimpleDataset(Dataset):
             # Read manifest via FileIO if available
             rows = []
             try:
-                if hasattr(io, "new_input"):
-                    inp = io.new_input(manifest_path)
-                    with inp.open() as f:
-                        data = f.read()
-                    table = pq.read_table(pa.BufferReader(data))
-                    rows = table.to_pylist()
+                inp = io.new_input(manifest_path)
+                with inp.open() as f:
+                    data = f.read()
+                table = pq.read_table(pa.BufferReader(data))
+                rows = table.to_pylist()
             except Exception:
                 rows = []
 
@@ -1168,18 +885,7 @@ class SimpleDataset(Dataset):
 
         # Sequence number
         try:
-            max_seq = 0
-            for s in self.metadata.snapshots:
-                seq = getattr(s, "sequence_number", None)
-                if seq is None:
-                    continue
-                try:
-                    ival = int(seq)
-                except Exception:
-                    continue
-                if ival > max_seq:
-                    max_seq = ival
-            next_seq = max_seq + 1
+            next_seq = self._next_sequence_number()
         except Exception:
             next_seq = 1
 
@@ -1215,7 +921,4 @@ class SimpleDataset(Dataset):
         self.metadata.current_snapshot_id = snapshot_id
 
         if self.catalog and hasattr(self.catalog, "save_snapshot"):
-            try:
-                self.catalog.save_snapshot(self.identifier, snap)
-            except Exception:
-                pass
+            self.catalog.save_snapshot(self.identifier, snap)

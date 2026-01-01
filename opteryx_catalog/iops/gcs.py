@@ -1,14 +1,12 @@
 """
 Optimized GCS FileIO for opteryx_catalog.iops
-
-Adapted from pyiceberg_firestore_gcs.fileio.gcs_fileio to provide a fast
-HTTP-backed GCS implementation without depending on pyiceberg types.
 """
 
 import io
 import logging
 import os
 import urllib.parse
+from collections import OrderedDict
 from typing import Callable
 from typing import Union
 
@@ -19,6 +17,9 @@ from requests.adapters import HTTPAdapter
 from .base import FileIO
 from .base import InputFile
 from .base import OutputFile
+
+# we keep a local cache of recently read files
+MAX_CACHE_SIZE: int = 32
 
 logger = logging.getLogger(__name__)
 
@@ -116,12 +117,32 @@ class _GcsOutputStream(io.BytesIO):
 
 class _GcsInputFile(InputFile):
     def __init__(
-        self, location: str, session: requests.Session, access_token_getter: Callable[[], str]
+        self,
+        location: str,
+        session: requests.Session,
+        access_token_getter: Callable[[], str],
+        cache: OrderedDict = None,
     ):
+        # Check cache first
+        if cache is not None and location in cache:
+            # Move to end (most recently used)
+            cache.move_to_end(location)
+            data = cache[location]
+            super().__init__(location, data)
+            return
+
         # read entire bytes via optimized session
         try:
             stream = _GcsInputStream(location, session, access_token_getter)
             data = stream.read()
+
+            # Add to cache
+            if cache is not None:
+                cache[location] = data
+                # Evict oldest if cache exceeds MAX_CACHE_SIZE entries
+                if len(cache) > MAX_CACHE_SIZE:
+                    cache.popitem(last=False)
+
             super().__init__(location, data)
         except FileNotFoundError:
             super().__init__(location, None)
@@ -152,6 +173,9 @@ class GcsFileIO(FileIO):
         self.manifest_paths: list[str] = []
         self.captured_manifests: list[tuple[str, bytes]] = []
 
+        # LRU cache for read operations (MAX_CACHE_SIZE files max)
+        self._read_cache: OrderedDict = OrderedDict()
+
         # Prepare requests session and set up credential refresh helper (token may expire)
         self._credentials = _get_storage_credentials()
         self._access_token = None
@@ -180,16 +204,22 @@ class GcsFileIO(FileIO):
         self._session.mount("https://", adapter)
 
     def new_input(self, location: str) -> InputFile:
-        return _GcsInputFile(location, self._session, self.get_access_token)
+        return _GcsInputFile(location, self._session, self.get_access_token, self._read_cache)
 
     def new_output(self, location: str) -> OutputFile:
         logger.info(f"new_output -> {location}")
+
+        # Invalidate cache entry if present
+        self._read_cache.pop(location, None)
 
         return _GcsOutputFile(location, self._session, self.get_access_token)
 
     def delete(self, location: Union[str, InputFile, OutputFile]) -> None:
         if isinstance(location, (InputFile, OutputFile)):
             location = location.location
+
+        # Invalidate cache entry if present
+        self._read_cache.pop(location, None)
 
         path = location
         if path.startswith("gs://"):

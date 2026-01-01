@@ -15,12 +15,12 @@ class Metastore:
     implementations to ease future compatibility.
     """
 
-    def load_dataset(self, identifier: str) -> "Table":
+    def load_dataset(self, identifier: str) -> "Dataset":
         raise NotImplementedError()
 
     def create_dataset(
         self, identifier: str, schema: Any, properties: dict | None = None
-    ) -> "Table":
+    ) -> "Dataset":
         raise NotImplementedError()
 
     def drop_dataset(self, identifier: str) -> None:
