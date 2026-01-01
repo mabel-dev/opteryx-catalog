@@ -4,7 +4,6 @@ import os
 import time
 import uuid
 from dataclasses import dataclass
-from functools import lru_cache
 from typing import Any
 from typing import Iterable
 from typing import Optional
@@ -12,6 +11,9 @@ from typing import Optional
 from .metadata import DatasetMetadata
 from .metadata import Snapshot
 from .metastore import Dataset
+
+# Stable node identifier for this process (hex-mac-hex-pid)
+_NODE = f"{uuid.getnode():x}-{os.getpid():x}"
 
 
 @dataclass
@@ -120,13 +122,12 @@ class SimpleDataset(Dataset):
 
         return None
 
-    @lru_cache(1)
     def _get_node(self) -> str:
-        """Return a stable node identifier based on MAC and pid.
+        """Return the stable node identifier for this process.
 
-        Cached to avoid repeated system calls; formatted as hex-node-hex-pid.
+        Uses a module-level constant to avoid per-instance hashing/caching.
         """
-        return f"{uuid.getnode():x}-{os.getpid():x}"
+        return _NODE
 
     def snapshots(self) -> Iterable[Snapshot]:
         return list(self.metadata.snapshots)
