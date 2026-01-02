@@ -36,6 +36,7 @@ class ParquetManifestEntry:
     file_format: str
     record_count: int
     file_size_in_bytes: int
+    uncompressed_size_in_bytes: int
     min_k_hashes: list[list[int]]
     histogram_counts: list[list[int]]
     histogram_bins: int
@@ -48,6 +49,7 @@ class ParquetManifestEntry:
             "file_format": self.file_format,
             "record_count": self.record_count,
             "file_size_in_bytes": self.file_size_in_bytes,
+            "uncompressed_size_in_bytes": self.uncompressed_size_in_bytes,
             "min_k_hashes": self.min_k_hashes,
             "histogram_counts": self.histogram_counts,
             "histogram_bins": self.histogram_bins,
@@ -174,11 +176,25 @@ def build_parquet_manifest_entry(
         print(f"Failed to build full manifest entry: {file_path} - {exc}")
         return build_parquet_manifest_minmax_entry(table, file_path)
 
+    # Calculate uncompressed size from table
+    uncompressed_size = 0
+    try:
+        for col in table.columns:
+            # Estimate uncompressed size by summing the size of all columns in memory
+            for chunk in col.chunks:
+                for buffer in chunk.buffers():
+                    if buffer is not None:
+                        uncompressed_size += buffer.size
+    except Exception:
+        # Fallback: use compressed size if calculation fails
+        uncompressed_size = file_size_in_bytes
+
     return ParquetManifestEntry(
         file_path=file_path,
         file_format="parquet",
         record_count=int(table.num_rows),
         file_size_in_bytes=file_size_in_bytes,
+        uncompressed_size_in_bytes=uncompressed_size,
         min_k_hashes=min_k_hashes,
         histogram_counts=histograms,
         histogram_bins=HISTOGRAM_BINS,
@@ -250,11 +266,21 @@ def build_parquet_manifest_minmax_entry(data: bytes, file_path: str) -> ParquetM
     min_values = [stats["min"] for stats in column_stats.values() if stats["min"] is not None]
     max_values = [stats["max"] for stats in column_stats.values() if stats["max"] is not None]
 
+    # Get uncompressed size from metadata
+    uncompressed_size = 0
+    try:
+        for row_group in metadata["row_groups"]:
+            uncompressed_size += row_group.get("total_byte_size", 0)
+    except Exception:
+        # Fallback to compressed size
+        uncompressed_size = file_size
+
     return ParquetManifestEntry(
         file_path=file_path,
         file_format="parquet",
         record_count=int(record_count),
         file_size_in_bytes=file_size,
+        uncompressed_size_in_bytes=uncompressed_size,
         min_k_hashes=[],
         histogram_counts=[],
         histogram_bins=0,

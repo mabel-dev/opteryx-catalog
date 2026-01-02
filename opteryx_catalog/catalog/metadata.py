@@ -46,12 +46,12 @@ class DatasetMetadata:
     location: str = ""
     schema: Any = None
     properties: dict = field(default_factory=dict)
-    # Table-level created/updated metadata
+    # Dataset-level created/updated metadata
     timestamp_ms: Optional[int] = None
     author: Optional[str] = None
     description: Optional[str] = None
     describer: Optional[str] = None
-    sort_orders: List[dict] = field(default_factory=list)
+    sort_orders: List[int] = field(default_factory=list)
     # Maintenance policy: retention settings grouped under a single block
     maintenance_policy: dict = field(
         default_factory=lambda: {

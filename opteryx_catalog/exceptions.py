@@ -1,7 +1,7 @@
 """Catalog-specific exceptions for opteryx_catalog.
 
 Exceptions mirror previous behavior (they subclass KeyError where callers
-may expect KeyError) but provide explicit types for tables, views and
+may expect KeyError) but provide explicit types for datasets, views and
 namespaces.
 """
 
