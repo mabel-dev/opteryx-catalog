@@ -1,7 +1,7 @@
 """Opteryx lightweight catalog library.
 
 This package provides base classes and simple datatypes for a custom
-catalog implementation that stores table metadata in Firestore and
+catalog implementation that stores dataset metadata in Firestore and
 consolidated Parquet manifests in GCS.
 
 Start here for building a Firestore+GCS backed catalog that writes

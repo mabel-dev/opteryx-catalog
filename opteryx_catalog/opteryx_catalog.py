@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import time
 from typing import Any
 from typing import Iterable
@@ -28,7 +27,7 @@ class OpteryxCatalog(Metastore):
 
     Terminology: catalog -> workspace -> collection -> dataset|view
 
-    Stores table documents under the configured workspace in Firestore.
+    Stores dataset documents under the configured workspace in Firestore.
     Snapshots are stored in a `snapshots` subcollection under each
     dataset's document. Parquet manifests are written to GCS under the
     dataset location's `metadata/manifest-<snapshot_id>.parquet` path.
@@ -57,12 +56,8 @@ class OpteryxCatalog(Metastore):
             props_ref = self._catalog_ref.document("$properties")
             if not props_ref.get().exists:
                 now_ms = int(time.time() * 1000)
-                billing = (
-                    os.environ.get("BILLING_ACCOUNT_ID")
-                    or os.environ.get("BILLING_ACCOUNT")
-                    or None
-                )
-                owner = os.environ.get("WORKSPACE_OWNER") or None
+                billing = None
+                owner = None
                 props_ref.set(
                     {
                         "timestamp-ms": now_ms,
@@ -81,12 +76,9 @@ class OpteryxCatalog(Metastore):
             self.io = io
         else:
             if gcs_bucket:
-                try:
-                    from .iops.gcs import GcsFileIO
+                from .iops.gcs import GcsFileIO
 
-                    self.io = GcsFileIO()
-                except Exception:
-                    self.io = FileIO()
+                self.io = GcsFileIO()
             else:
                 self.io = FileIO()
 
@@ -109,7 +101,7 @@ class OpteryxCatalog(Metastore):
         return self._dataset_doc_ref(collection, dataset_name).collection("snapshots")
 
     def _views_collection(self, collection: str):
-        return self._namespace_ref(collection).collection("views")
+        return self._collection_ref(collection).collection("views")
 
     def _view_doc_ref(self, collection: str, view_name: str):
         return self._views_collection(collection).document(view_name)
@@ -125,7 +117,7 @@ class OpteryxCatalog(Metastore):
         if doc_ref.get().exists:
             raise DatasetAlreadyExists(f"Dataset already exists: {identifier}")
 
-        # Build default table metadata
+        # Build default dataset metadata
         location = f"gs://{self.gcs_bucket}/{self.workspace}/{collection}/{dataset_name}"
         metadata = DatasetMetadata(
             dataset_identifier=identifier,
@@ -152,8 +144,6 @@ class OpteryxCatalog(Metastore):
             }
         )
 
-        # Persisted in primary `datasets` collection only.
-
         # Persist initial schema into `schemas` subcollection if provided
         if schema is not None:
             schema_id = self._write_schema(collection, dataset_name, schema, author=author)
@@ -175,7 +165,7 @@ class OpteryxCatalog(Metastore):
                 metadata.schemas = [
                     {"schema_id": schema_id, "columns": self._schema_to_columns(schema)}
                 ]
-            # update table doc to reference current schema
+            # update dataset doc to reference current schema
             doc_ref.update({"current-schema-id": metadata.current_schema_id})
 
         # Return SimpleDataset (attach this catalog so append() can persist)
@@ -211,10 +201,10 @@ class OpteryxCatalog(Metastore):
             properties=data.get("properties") or {},
         )
 
-        # Load table-level timestamp/author and collection/workspace
+        # Load dataset-level timestamp/author and collection/workspace
         metadata.timestamp_ms = data.get("timestamp-ms")
         metadata.author = data.get("author")
-        # note: Firestore table doc stores the original collection and workspace
+        # note: Firestore dataset doc stores the original collection and workspace
         # under keys `collection` and `workspace`.
 
         # Load snapshots based on load_history flag
@@ -269,9 +259,10 @@ class OpteryxCatalog(Metastore):
         metadata.snapshots = snaps
 
         # Load schemas subcollection
-        try:
+        schemas_coll = doc_ref.collection("schemas")
+        # Load all schemas if requested; otherwise load only current schema
+        if load_history:
             schemas = []
-            schemas_coll = doc_ref.collection("schemas")
             for sdoc in schemas_coll.stream():
                 sd = sdoc.to_dict() or {}
                 schemas.append(
@@ -285,9 +276,23 @@ class OpteryxCatalog(Metastore):
                 )
             metadata.schemas = schemas
             metadata.current_schema_id = doc.to_dict().get("current-schema-id")
-        except Exception:
-            pass
-
+        else:
+            # Only load the current schema document for efficiency
+            current_schema_id = doc.to_dict().get("current-schema-id")
+            if current_schema_id:
+                sdoc = schemas_coll.document(str(current_schema_id)).get()
+                if sdoc.exists:
+                    sd = sdoc.to_dict() or {}
+                    metadata.schemas = [
+                        {
+                            "schema_id": sdoc.id,
+                            "columns": sd.get("columns", []),
+                            "timestamp-ms": sd.get("timestamp-ms"),
+                            "author": sd.get("author"),
+                            "sequence-number": sd.get("sequence-number"),
+                        }
+                    ]
+                    metadata.current_schema_id = current_schema_id
         return SimpleDataset(identifier=identifier, _metadata=metadata, io=self.io, catalog=self)
 
     def drop_dataset(self, identifier: str) -> None:
@@ -314,7 +319,7 @@ class OpteryxCatalog(Metastore):
 
         If `exists_ok` is False and the collection already exists, a KeyError is raised.
         """
-        doc_ref = self._namespace_ref(collection)
+        doc_ref = self._collection_ref(collection)
         if doc_ref.get().exists:
             if exists_ok:
                 return
@@ -336,11 +341,7 @@ class OpteryxCatalog(Metastore):
         self, collection: str, properties: dict | None = None, author: Optional[str] = None
     ) -> None:
         """Convenience wrapper that creates the collection only if missing."""
-        try:
-            self.create_collection(collection, properties=properties, exists_ok=True, author=author)
-        except Exception:
-            # Be conservative: surface caller-level warnings rather than failing
-            return
+        self.create_collection(collection, properties=properties, exists_ok=True, author=author)
 
     def dataset_exists(
         self, identifier_or_collection: str, dataset_name: Optional[str] = None
@@ -353,12 +354,14 @@ class OpteryxCatalog(Metastore):
         """
         # Normalize inputs
         if dataset_name is None:
-            # Expect a single collection like 'collection.table'
+            # Expect a single collection like 'collection.dataset'
             if "." not in identifier_or_collection:
                 raise ValueError(
-                    "collection must be 'collection.table' or pass dataset_name separately"
+                    "collection must be 'collection.dataset' or pass dataset_name separately"
                 )
             collection, dataset_name = identifier_or_collection.rsplit(".", 1)
+        else:
+            collection = identifier_or_collection
 
         try:
             doc_ref = self._dataset_doc_ref(collection, dataset_name)
@@ -378,6 +381,7 @@ class OpteryxCatalog(Metastore):
         author: str = None,
         description: Optional[str] = None,
         properties: dict | None = None,
+        update_if_exists: bool = False,
     ) -> CatalogView:
         """Create a view document and a statement version in the `statement` subcollection.
 
@@ -391,7 +395,22 @@ class OpteryxCatalog(Metastore):
 
         doc_ref = self._view_doc_ref(collection, view_name)
         if doc_ref.get().exists:
-            raise ViewAlreadyExists(f"View already exists: {collection}.{view_name}")
+            if not update_if_exists:
+                raise ViewAlreadyExists(f"View already exists: {collection}.{view_name}")
+            # Update existing view - get current sequence number
+            existing_doc = doc_ref.get().to_dict()
+            current_statement_id = existing_doc.get("statement-id")
+            if current_statement_id:
+                stmt_ref = doc_ref.collection("statement").document(current_statement_id)
+                stmt_doc = stmt_ref.get()
+                if stmt_doc.exists:
+                    sequence_number = stmt_doc.to_dict().get("sequence-number", 0) + 1
+                else:
+                    sequence_number = 1
+            else:
+                sequence_number = 1
+        else:
+            sequence_number = 1
 
         now_ms = int(time.time() * 1000)
         if author is None:
@@ -405,7 +424,7 @@ class OpteryxCatalog(Metastore):
                 "sql": sql,
                 "timestamp-ms": now_ms,
                 "author": author,
-                "sequence-number": 1,
+                "sequence-number": sequence_number,
             }
         )
 
@@ -454,20 +473,9 @@ class OpteryxCatalog(Metastore):
         stmt_id = data.get("statement-id")
         sql = None
         schema = data.get("schema")
-        try:
-            if stmt_id:
-                sdoc = doc_ref.collection("statement").document(str(stmt_id)).get()
-                if sdoc.exists:
-                    sql = (sdoc.to_dict() or {}).get("sql")
-            # fallback: pick the most recent statement
-            if not sql:
-                for s in doc_ref.collection("statement").stream():
-                    sd = s.to_dict() or {}
-                    if sd.get("sql"):
-                        sql = sd.get("sql")
-                        break
-        except Exception:
-            pass
+
+        sdoc = doc_ref.collection("statement").document(str(stmt_id)).get()
+        sql = (sdoc.to_dict() or {}).get("sql")
 
         v = CatalogView(name=view_name, definition=sql or "", properties=data.get("properties", {}))
         setattr(v, "sql", sql or "")
@@ -485,11 +493,9 @@ class OpteryxCatalog(Metastore):
 
         doc_ref = self._view_doc_ref(collection, view_name)
         # delete statement subcollection
-        try:
-            for d in doc_ref.collection("statement").stream():
-                doc_ref.collection("statement").document(d.id).delete()
-        except Exception:
-            pass
+        for d in doc_ref.collection("statement").stream():
+            doc_ref.collection("statement").document(d.id).delete()
+
         doc_ref.delete()
 
     def list_views(self, collection: str) -> Iterable[str]:
@@ -518,6 +524,8 @@ class OpteryxCatalog(Metastore):
                         "identifier must be 'collection.view' or pass view_name separately"
                     )
                 collection, view_name = identifier_or_collection.rsplit(".", 1)
+        else:
+            collection = identifier_or_collection
 
         try:
             doc_ref = self._view_doc_ref(collection, view_name)
@@ -545,40 +553,27 @@ class OpteryxCatalog(Metastore):
             updates["last-execution-time-ms"] = int(execution_time * 1000)
         updates["last-execution-ms"] = now_ms
         if updates:
-            try:
-                doc_ref.update(updates)
-            except Exception:
-                pass
+            doc_ref.update(updates)
 
     def write_parquet_manifest(
-        self, snapshot_id: int, entries: List[dict], table_location: str
+        self, snapshot_id: int, entries: List[dict], dataset_location: str
     ) -> Optional[str]:
         """Write a Parquet manifest for the given snapshot id and entries.
 
         Entries should be plain dicts convertible by pyarrow.Table.from_pylist.
-        The manifest will be written to <table_location>/metadata/manifest-<snapshot_id>.parquet
+        The manifest will be written to <dataset_location>/metadata/manifest-<snapshot_id>.parquet
         """
         import pyarrow as pa
         import pyarrow.parquet as pq
 
         # If entries is None we skip writing; if entries is empty list, write
-        # an empty Parquet manifest (represents an empty table for this
+        # an empty Parquet manifest (represents an empty dataset for this
         # snapshot). This preserves previous manifests so older snapshots
         # remain readable.
         if entries is None:
             return None
 
-        # Print manifest entries so users can inspect the manifest when created
-        try:
-            pass
-
-            # print("[MANIFEST] Parquet manifest entries to write:")
-            # print(json.dumps(entries, indent=2, default=str))
-        except Exception:
-            # print("[MANIFEST] Parquet manifest entries:", entries)
-            pass
-
-        parquet_path = f"{table_location}/metadata/manifest-{snapshot_id}.parquet"
+        parquet_path = f"{dataset_location}/metadata/manifest-{snapshot_id}.parquet"
 
         # Use provided FileIO if it supports writing; otherwise write to GCS
         try:
@@ -590,6 +585,7 @@ class OpteryxCatalog(Metastore):
                     ("file_format", pa.string()),
                     ("record_count", pa.int64()),
                     ("file_size_in_bytes", pa.int64()),
+                    ("uncompressed_size_in_bytes", pa.int64()),
                     ("min_k_hashes", pa.list_(pa.list_(pa.uint64()))),
                     ("histogram_counts", pa.list_(pa.list_(pa.int64()))),
                     ("histogram_bins", pa.int32()),
@@ -600,134 +596,28 @@ class OpteryxCatalog(Metastore):
 
             try:
                 table = pa.Table.from_pylist(entries, schema=schema)
-            except Exception:
+            except Exception as exc:
                 # Diagnostic output to help find malformed manifest entries
-                try:
-                    print(
-                        "[MANIFEST DEBUG] Failed to convert entries to Parquet manifest table. Dumping entries:"
-                    )
-                    for i, ent in enumerate(entries):
-                        print(f" Entry {i}:")
-                        if isinstance(ent, dict):
-                            for k, v in ent.items():
-                                tname = type(v).__name__
-                                try:
-                                    s = repr(v)
-                                except Exception:
-                                    s = "<unreprable>"
-                                print(f"  - {k}: type={tname} repr={s[:200]}")
-                        else:
-                            print(
-                                f"  - non-dict entry: type={type(ent).__name__} repr={repr(ent)[:200]}"
-                            )
-                except Exception:
-                    pass
 
-                # Attempt to sanitize entries and retry conversion.
-                try:
-                    print("[MANIFEST DEBUG] Attempting to sanitize entries and retry")
-                    sanitized = []
-                    for ent in entries:
-                        if not isinstance(ent, dict):
-                            sanitized.append(ent)
-                            continue
-                        e2 = dict(ent)  # copy
-                        # Ensure numeric fields
-                        for k in ("record_count", "file_size_in_bytes", "histogram_bins"):
-                            v = e2.get(k)
+                print(
+                    "[MANIFEST DEBUG] Failed to convert entries to Parquet manifest table. Dumping entries:"
+                )
+                for i, ent in enumerate(entries):
+                    print(f" Entry {i}:")
+                    if isinstance(ent, dict):
+                        for k, v in ent.items():
+                            tname = type(v).__name__
                             try:
-                                e2[k] = int(v) if v is not None else 0
+                                s = repr(v)
                             except Exception:
-                                e2[k] = 0
-                        # Ensure min_k_hashes is list[list[int]]
-                        mk = e2.get("min_k_hashes")
-                        if not isinstance(mk, list):
-                            e2["min_k_hashes"] = []
-                        else:
-                            new_mk = []
-                            for sub in mk:
-                                if isinstance(sub, list):
-                                    try:
-                                        new_mk.append([int(x) for x in sub])
-                                    except Exception:
-                                        new_mk.append([])
-                                else:
-                                    new_mk.append([])
-                            e2["min_k_hashes"] = new_mk
-                        # Ensure histogram_counts is list[list[int]]
-                        hc = e2.get("histogram_counts")
-                        if not isinstance(hc, list):
-                            e2["histogram_counts"] = []
-                        else:
-                            new_hc = []
-                            for sub in hc:
-                                if isinstance(sub, list):
-                                    try:
-                                        new_hc.append([int(x) for x in sub])
-                                    except Exception:
-                                        new_hc.append([])
-                                else:
-                                    new_hc.append([])
-                            e2["histogram_counts"] = new_hc
-                        # Sanitize min_values / max_values: must be list[int] or None
-                        # Sanitize min_values / max_values: coerce to int64 using to_int() if available
-                        try:
-                            from opteryx.compiled.structures.relation_statistics import to_int
-                        except Exception:
+                                s = "<unreprable>"
+                            print(f"  - {k}: type={tname} repr={s[:200]}")
+                    else:
+                        print(
+                            f"  - non-dict entry: type={type(ent).__name__} repr={repr(ent)[:200]}"
+                        )
+                raise exc
 
-                            def to_int(val):
-                                # Best-effort fallback: handle numpy types, strings and numbers
-                                try:
-                                    if val is None:
-                                        return None
-                                    if hasattr(val, "item"):
-                                        val = val.item()
-                                    if isinstance(val, (bytes, bytearray)):
-                                        val = val.decode(errors="ignore")
-                                    if isinstance(val, str):
-                                        # empty strings are invalid
-                                        if val == "":
-                                            return None
-                                        try:
-                                            return int(val)
-                                        except Exception:
-                                            return None
-                                    if isinstance(val, float):
-                                        return int(val)
-                                    return int(val)
-                                except Exception:
-                                    return None
-
-                        for key in ("min_values", "max_values"):
-                            mv = e2.get(key)
-                            if not isinstance(mv, list):
-                                e2[key] = [None]
-                            else:
-                                new_mv = []
-                                for x in mv:
-                                    try:
-                                        if x is None:
-                                            new_mv.append(None)
-                                            continue
-                                        # Use to_int to coerce into int64 semantics
-                                        v = x
-                                        if hasattr(v, "item"):
-                                            v = v.item()
-                                        coerced = to_int(v)
-                                        # to_int may return None-like sentinel; accept ints only
-                                        if coerced is None:
-                                            new_mv.append(None)
-                                        else:
-                                            new_mv.append(int(coerced))
-                                    except Exception:
-                                        new_mv.append(None)
-                                e2[key] = new_mv
-                        sanitized.append(e2)
-                    table = pa.Table.from_pylist(sanitized, schema=schema)
-                    print("[MANIFEST DEBUG] Sanitized entries converted successfully")
-                except Exception:
-                    print("[MANIFEST DEBUG] Sanitization failed; re-raising original exception")
-                    raise
             buf = pa.BufferOutputStream()
             pq.write_table(table, buf, compression="zstd")
             data = buf.getvalue().to_pybytes()
@@ -740,15 +630,6 @@ class OpteryxCatalog(Metastore):
                     out.close()
                 except Exception:
                     pass
-            elif self._storage_client and self.gcs_bucket:
-                # Write to GCS bucket
-                bucket = self._storage_client.bucket(self.gcs_bucket)
-                # object path: remove gs://bucket/ prefix
-                parsed = parquet_path
-                if parsed.startswith("gs://"):
-                    parsed = parsed[5 + len(self.gcs_bucket) + 1 :]
-                blob = bucket.blob(parsed)
-                blob.upload_from_string(data)
 
             return parquet_path
         except Exception as e:
@@ -757,7 +638,7 @@ class OpteryxCatalog(Metastore):
             raise e
 
     def save_snapshot(self, identifier: str, snapshot: Snapshot) -> None:
-        """Persist a single snapshot document for a table."""
+        """Persist a single snapshot document for a dataset."""
         namespace, dataset_name = identifier.split(".")
         snaps = self._snapshots_collection(namespace, dataset_name)
         doc_id = str(snapshot.snapshot_id)
@@ -793,9 +674,9 @@ class OpteryxCatalog(Metastore):
         snaps.document(doc_id).set(data)
 
     def save_dataset_metadata(self, identifier: str, metadata: DatasetMetadata) -> None:
-        """Persist table-level metadata and snapshots to Firestore.
+        """Persist dataset-level metadata and snapshots to Firestore.
 
-        This writes the table document and upserts snapshot documents.
+        This writes the dataset document and upserts snapshot documents.
         """
         collection, dataset_name = identifier.split(".")
         doc_ref = self._dataset_doc_ref(collection, dataset_name)
@@ -917,7 +798,7 @@ class OpteryxCatalog(Metastore):
         return cols
 
     def _write_schema(self, namespace: str, dataset_name: str, schema: Any, author: str) -> str:
-        """Persist a schema document in the table's `schemas` subcollection and
+        """Persist a schema document in the dataset's `schemas` subcollection and
         return the new schema id.
         """
         import uuid

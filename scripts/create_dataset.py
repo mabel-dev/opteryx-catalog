@@ -34,7 +34,7 @@ def create_parquet_only_tables(count: int = 2) -> list:
 
     for i in range(count):
         table_name = f"test_table_{i}_{int(time.time())}"
-        location = f"gs://{os.environ.get('GCS_BUCKET')}/{workspace}/{collection}/{table_name}"
+        # location = f"gs://{os.environ.get('GCS_BUCKET')}/{workspace}/{collection}/{table_name}"
 
         # Use fixed test author
         author = "me"
