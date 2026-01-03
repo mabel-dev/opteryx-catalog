@@ -247,19 +247,8 @@ class SimpleDataset(Dataset):
         if not hasattr(table, "schema"):
             raise TypeError("append() expects a pyarrow.Table-like object")
 
-        # Write parquet file with collision-resistant name
-        fname = f"{time.time_ns():x}-{self._get_node()}.parquet"
-        data_path = f"{self.metadata.location}/data/{fname}"
-        buf = pa.BufferOutputStream()
-        pq.write_table(table, buf, compression="zstd")
-        pdata = buf.getvalue().to_pybytes()
-
-        out = self.io.new_output(data_path).create()
-        out.write(pdata)
-        out.close()
-
-        # Build manifest entry with statistics
-        manifest_entry = build_parquet_manifest_entry(table, data_path, len(pdata))
+        # Write table and build manifest entry
+        manifest_entry = self._write_table_and_build_entry(table)
         entries = [manifest_entry.to_dict()]
 
         # persist manifest: for append, merge previous manifest entries
@@ -305,7 +294,7 @@ class SimpleDataset(Dataset):
             commit_message = f"commit by {author}"
 
         recs = int(table.num_rows)
-        fsize = len(pdata)
+        fsize = int(getattr(manifest_entry, "file_size_in_bytes", 0))
         # Calculate uncompressed size from the manifest entry
         added_data_size = manifest_entry.uncompressed_size_in_bytes
         added_data_files = 1
@@ -374,6 +363,136 @@ class SimpleDataset(Dataset):
         self.metadata.current_snapshot_id = snapshot_id
 
         # persist metadata (let errors propagate)
+        if self.catalog and hasattr(self.catalog, "save_snapshot"):
+            self.catalog.save_snapshot(self.identifier, snap)
+        if self.catalog and hasattr(self.catalog, "save_dataset_metadata"):
+            self.catalog.save_dataset_metadata(self.identifier, self.metadata)
+
+    def _write_table_and_build_entry(self, table: Any):
+        """Write a PyArrow table to storage and return a ParquetManifestEntry.
+
+        This centralizes the IO and manifest construction so other operations
+        (e.g. `overwrite`) can reuse the same behavior as `append`.
+        """
+        # Write parquet file with collision-resistant name
+        fname = f"{time.time_ns():x}-{self._get_node()}.parquet"
+        data_path = f"{self.metadata.location}/data/{fname}"
+
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        buf = pa.BufferOutputStream()
+        pq.write_table(table, buf, compression="zstd")
+        pdata = buf.getvalue().to_pybytes()
+
+        out = self.io.new_output(data_path).create()
+        out.write(pdata)
+        out.close()
+
+        # Build manifest entry with statistics
+        manifest_entry = build_parquet_manifest_entry(table, data_path, len(pdata))
+        return manifest_entry
+
+    def overwrite(self, table: Any, author: str = None, commit_message: Optional[str] = None):
+        """Replace the dataset entirely with `table` in a single snapshot.
+
+        Semantics:
+        - Write the provided table as new data file(s)
+        - Create a new parquet manifest that contains only the new entries
+        - Create a snapshot that records previous files as deleted and the
+          new files as added (logical replace)
+        """
+        # Similar validation as append
+        snapshot_id = int(time.time() * 1000)
+
+        if not hasattr(table, "schema"):
+            raise TypeError("overwrite() expects a pyarrow.Table-like object")
+
+        if author is None:
+            raise ValueError("author must be provided when overwriting a dataset")
+
+        # Write new data and build manifest entries (single table -> single entry)
+        manifest_entry = self._write_table_and_build_entry(table)
+        new_entries = [manifest_entry.to_dict()]
+
+        # Write manifest containing only the new entries
+        manifest_path = None
+        if self.catalog and hasattr(self.catalog, "write_parquet_manifest"):
+            manifest_path = self.catalog.write_parquet_manifest(
+                snapshot_id, new_entries, self.metadata.location
+            )
+
+        # Compute deltas: previous manifest becomes deleted
+        prev = self.snapshot(None)
+        prev_total_files = 0
+        prev_total_size = 0
+        prev_total_data_size = 0
+        prev_total_records = 0
+        if prev and prev.summary:
+            prev_total_files = int(prev.summary.get("total-data-files", 0))
+            prev_total_size = int(prev.summary.get("total-files-size", 0))
+            prev_total_data_size = int(prev.summary.get("total-data-size", 0))
+            prev_total_records = int(prev.summary.get("total-records", 0))
+
+        deleted_data_files = prev_total_files
+        deleted_files_size = prev_total_size
+        deleted_data_size = prev_total_data_size
+        deleted_records = prev_total_records
+
+        added_data_files = len(new_entries)
+        added_files_size = sum(e.get("file_size_in_bytes", 0) for e in new_entries)
+        added_data_size = sum(e.get("uncompressed_size_in_bytes", 0) for e in new_entries)
+        added_records = sum(e.get("record_count", 0) for e in new_entries)
+
+        total_data_files = added_data_files
+        total_files_size = added_files_size
+        total_data_size = added_data_size
+        total_records = added_records
+
+        summary = {
+            "added-data-files": added_data_files,
+            "added-files-size": added_files_size,
+            "added-data-size": added_data_size,
+            "added-records": added_records,
+            "deleted-data-files": deleted_data_files,
+            "deleted-files-size": deleted_files_size,
+            "deleted-data-size": deleted_data_size,
+            "deleted-records": deleted_records,
+            "total-data-files": total_data_files,
+            "total-files-size": total_files_size,
+            "total-data-size": total_data_size,
+            "total-records": total_records,
+        }
+
+        # sequence number
+        try:
+            next_seq = self._next_sequence_number()
+        except Exception:
+            next_seq = 1
+
+        parent_id = self.metadata.current_snapshot_id
+
+        if commit_message is None:
+            commit_message = f"overwrite by {author}"
+
+        snap = Snapshot(
+            snapshot_id=snapshot_id,
+            timestamp_ms=snapshot_id,
+            author=author,
+            sequence_number=next_seq,
+            user_created=True,
+            operation_type="overwrite",
+            parent_snapshot_id=parent_id,
+            manifest_list=manifest_path,
+            schema_id=self.metadata.current_schema_id,
+            commit_message=commit_message,
+            summary=summary,
+        )
+
+        # Replace in-memory snapshots
+        self.metadata.snapshots.append(snap)
+        self.metadata.current_snapshot_id = snapshot_id
+
         if self.catalog and hasattr(self.catalog, "save_snapshot"):
             self.catalog.save_snapshot(self.identifier, snap)
         if self.catalog and hasattr(self.catalog, "save_dataset_metadata"):
