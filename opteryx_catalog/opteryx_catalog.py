@@ -481,8 +481,17 @@ class OpteryxCatalog(Metastore):
         setattr(v, "sql", sql or "")
         setattr(v, "metadata", type("M", (), {})())
         v.metadata.schema = schema
+        # Populate metadata fields from the stored view document so callers
+        # expecting attributes like `timestamp_ms` won't fail.
         v.metadata.author = data.get("author")
         v.metadata.description = data.get("description")
+        v.metadata.timestamp_ms = data.get("timestamp-ms")
+        # Execution/operational fields (may be None)
+        v.metadata.last_execution_ms = data.get("last-execution-ms")
+        v.metadata.last_execution_data_size = data.get("last-execution-data-size")
+        v.metadata.last_execution_records = data.get("last-execution-records")
+        # Optional describer (used to flag LLM-generated descriptions)
+        v.metadata.describer = data.get("describer")
         return v
 
     def drop_view(self, identifier: str | tuple) -> None:
