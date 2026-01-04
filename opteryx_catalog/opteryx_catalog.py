@@ -595,16 +595,46 @@ class OpteryxCatalog(Metastore):
                     ("record_count", pa.int64()),
                     ("file_size_in_bytes", pa.int64()),
                     ("uncompressed_size_in_bytes", pa.int64()),
+                    ("column_uncompressed_sizes_in_bytes", pa.list_(pa.int64())),
                     ("min_k_hashes", pa.list_(pa.list_(pa.uint64()))),
                     ("histogram_counts", pa.list_(pa.list_(pa.int64()))),
                     ("histogram_bins", pa.int32()),
-                    ("min_values", pa.list_(pa.int64())),
-                    ("max_values", pa.list_(pa.int64())),
+                    # Store min/max as strings to accommodate legacy values
+                    # (strings, datetimes, or integers). Convert entries
+                    # to string representations prior to table construction.
+                    ("min_values", pa.list_(pa.string())),
+                    ("max_values", pa.list_(pa.string())),
                 ]
             )
 
+            # Normalize entries to match schema expectations:
+            normalized = []
+            for ent in entries:
+                if not isinstance(ent, dict):
+                    normalized.append(ent)
+                    continue
+                e = dict(ent)
+                # Ensure list fields exist
+                e.setdefault("min_k_hashes", [])
+                e.setdefault("histogram_counts", [])
+                e.setdefault("histogram_bins", 0)
+                e.setdefault("column_uncompressed_sizes_in_bytes", [])
+                # Convert min/max values to string representations to
+                # avoid type-mismatch when writing the Parquet manifest.
+                mv = e.get("min_values") or []
+                xv = e.get("max_values") or []
+                try:
+                    e["min_values"] = [None if v is None else str(v) for v in mv]
+                except Exception:
+                    e["min_values"] = [str(v) for v in mv]
+                try:
+                    e["max_values"] = [None if v is None else str(v) for v in xv]
+                except Exception:
+                    e["max_values"] = [str(v) for v in xv]
+                normalized.append(e)
+
             try:
-                table = pa.Table.from_pylist(entries, schema=schema)
+                table = pa.Table.from_pylist(normalized, schema=schema)
             except Exception as exc:
                 # Diagnostic output to help find malformed manifest entries
 
