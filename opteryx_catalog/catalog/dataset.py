@@ -572,6 +572,7 @@ class SimpleDataset(Dataset):
                         record_count=0,
                         file_size_in_bytes=0,
                         uncompressed_size_in_bytes=0,
+                        column_uncompressed_sizes_in_bytes=[],
                         min_k_hashes=[],
                         histogram_counts=[],
                         histogram_bins=0,
@@ -586,6 +587,7 @@ class SimpleDataset(Dataset):
                     record_count=0,
                     file_size_in_bytes=0,
                     uncompressed_size_in_bytes=0,
+                    column_uncompressed_sizes_in_bytes=[],
                     min_k_hashes=[],
                     histogram_counts=[],
                     histogram_bins=0,
@@ -811,6 +813,7 @@ class SimpleDataset(Dataset):
                 record_count=int(record_count),
                 file_size_in_bytes=int(file_size),
                 uncompressed_size_in_bytes=int(file_size),  # Use compressed size as estimate
+                column_uncompressed_sizes_in_bytes=[],
                 min_k_hashes=[],
                 histogram_counts=[],
                 histogram_bins=0,

@@ -37,6 +37,7 @@ class ParquetManifestEntry:
     record_count: int
     file_size_in_bytes: int
     uncompressed_size_in_bytes: int
+    column_uncompressed_sizes_in_bytes: list[int]
     min_k_hashes: list[list[int]]
     histogram_counts: list[list[int]]
     histogram_bins: int
@@ -50,6 +51,7 @@ class ParquetManifestEntry:
             "record_count": self.record_count,
             "file_size_in_bytes": self.file_size_in_bytes,
             "uncompressed_size_in_bytes": self.uncompressed_size_in_bytes,
+            "column_uncompressed_sizes_in_bytes": self.column_uncompressed_sizes_in_bytes,
             "min_k_hashes": self.min_k_hashes,
             "histogram_counts": self.histogram_counts,
             "histogram_bins": self.histogram_bins,
@@ -81,6 +83,7 @@ def build_parquet_manifest_entry(
     # Use draken for efficient hashing and compression when available.
     import heapq
 
+    # Try to compute additional per-column statistics when draken is available.
     try:
         import opteryx.draken as draken  # type: ignore
 
@@ -172,22 +175,51 @@ def build_parquet_manifest_entry(
             histograms.append(col_hist)
             min_values.append(col_min)
             max_values.append(col_max)
-    except Exception as exc:
-        print(f"Failed to build full manifest entry: {file_path} - {exc}")
-        return build_parquet_manifest_minmax_entry(table, file_path)
-
-    # Calculate uncompressed size from table
-    uncompressed_size = 0
-    try:
-        for col in table.columns:
-            # Estimate uncompressed size by summing the size of all columns in memory
-            for chunk in col.chunks:
-                for buffer in chunk.buffers():
-                    if buffer is not None:
-                        uncompressed_size += buffer.size
     except Exception:
-        # Fallback: use compressed size if calculation fails
-        uncompressed_size = file_size_in_bytes
+        # Draken not available or failed; leave min_k_hashes/histograms empty
+        min_k_hashes = [[] for _ in table.columns]
+        histograms = [[] for _ in table.columns]
+        # Attempt to compute per-column min/max from the table directly
+        try:
+            for col in table.columns:
+                try:
+                    col_py = col.to_pylist()
+                    non_nulls = [v for v in col_py if v is not None]
+                    if non_nulls:
+                        try:
+                            min_values.append(min(non_nulls))
+                            max_values.append(max(non_nulls))
+                        except Exception:
+                            min_values.append(None)
+                            max_values.append(None)
+                    else:
+                        min_values.append(None)
+                        max_values.append(None)
+                except Exception:
+                    min_values.append(None)
+                    max_values.append(None)
+        except Exception:
+            # If even direct inspection fails, ensure lists lengths match
+            min_values = [None] * len(table.columns)
+            max_values = [None] * len(table.columns)
+
+    # Calculate uncompressed size from table buffers — must be accurate.
+    column_uncompressed: list[int] = []
+    uncompressed_size = 0
+    for col in table.columns:
+        col_total = 0
+        for chunk in col.chunks:
+            try:
+                buffs = chunk.buffers()
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Unable to access chunk buffers to calculate uncompressed size for {file_path}: {exc}"
+                ) from exc
+            for buffer in buffs:
+                if buffer is not None:
+                    col_total += buffer.size
+        column_uncompressed.append(int(col_total))
+        uncompressed_size += col_total
 
     return ParquetManifestEntry(
         file_path=file_path,
@@ -195,6 +227,7 @@ def build_parquet_manifest_entry(
         record_count=int(table.num_rows),
         file_size_in_bytes=file_size_in_bytes,
         uncompressed_size_in_bytes=uncompressed_size,
+        column_uncompressed_sizes_in_bytes=column_uncompressed,
         min_k_hashes=min_k_hashes,
         histogram_counts=histograms,
         histogram_bins=HISTOGRAM_BINS,
@@ -216,20 +249,57 @@ def build_parquet_manifest_minmax_entry(data: bytes, file_path: str) -> ParquetM
     Returns:
         ParquetManifestEntry with min/max statistics only (no histograms or k-hashes)
     """
-    import opteryx.rugo.parquet as parquet_meta
-    from opteryx.compiled.structures.relation_statistics import to_int
-
     file_size = len(data)
 
-    # Use rugo's fast metadata reader
-    if isinstance(data, memoryview):
-        metadata = parquet_meta.read_metadata_from_memoryview(data, include_statistics=True)
-    else:
-        metadata = parquet_meta.read_metadata_from_memoryview(
-            memoryview(data), include_statistics=True
-        )
+    # Prefer rugo fast metadata reader when available, otherwise fall back
+    # to pyarrow ParquetFile to extract row-group statistics.
+    try:
+        import opteryx.rugo.parquet as parquet_meta
+        from opteryx.compiled.structures.relation_statistics import to_int
 
-    record_count = metadata["num_rows"]
+        if isinstance(data, memoryview):
+            metadata = parquet_meta.read_metadata_from_memoryview(data, include_statistics=True)
+        else:
+            metadata = parquet_meta.read_metadata_from_memoryview(
+                memoryview(data), include_statistics=True
+            )
+
+        record_count = metadata["num_rows"]
+    except ImportError:
+        # Fallback: use pyarrow to read Parquet metadata
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        pf = pq.ParquetFile(pa.BufferReader(data))
+        record_count = int(pf.metadata.num_rows or 0)
+
+        # Construct minimal metadata structure compatible with expected shape
+        metadata = {"num_rows": record_count, "row_groups": []}
+        for rg in range(pf.num_row_groups):
+            rg_entry = {"columns": []}
+            for ci in range(pf.metadata.num_columns):
+                col_meta = pf.metadata.row_group(rg).column(ci)
+                col_entry = {"name": pf.schema.names[ci]}
+                stats = getattr(col_meta, "statistics", None)
+                if stats:
+                    col_entry["min"] = getattr(stats, "min", None)
+                    col_entry["max"] = getattr(stats, "max", None)
+                rg_entry["columns"].append(col_entry)
+            # total_byte_size may not be available; leave out to trigger full-table calculation later
+            metadata["row_groups"].append(rg_entry)
+
+        # Define a simple to_int fallback for the pyarrow path
+        def to_int(v: object) -> int:
+            try:
+                return int(v)
+            except Exception:
+                try:
+                    if isinstance(v, (bytes, bytearray)):
+                        s = v.decode("utf-8", errors="ignore")
+                        return int(float(s)) if s else 0
+                    return int(float(v))
+                except Exception:
+                    return 0
 
     # Gather min/max per column across all row groups
     column_stats = {}
@@ -266,14 +336,38 @@ def build_parquet_manifest_minmax_entry(data: bytes, file_path: str) -> ParquetM
     min_values = [stats["min"] for stats in column_stats.values() if stats["min"] is not None]
     max_values = [stats["max"] for stats in column_stats.values() if stats["max"] is not None]
 
-    # Get uncompressed size from metadata
+    # Get uncompressed size from metadata; if missing, read full table and
+    # compute accurate uncompressed size from buffers. Also attempt to
+    # compute per-column uncompressed byte counts when reading the table.
     uncompressed_size = 0
-    try:
-        for row_group in metadata["row_groups"]:
-            uncompressed_size += row_group.get("total_byte_size", 0)
-    except Exception:
-        # Fallback to compressed size
-        uncompressed_size = file_size
+    column_uncompressed: list[int] = []
+    missing = False
+    for row_group in metadata["row_groups"]:
+        v = row_group.get("total_byte_size", None)
+        if v is None:
+            missing = True
+            break
+        uncompressed_size += v
+
+    if missing or uncompressed_size == 0:
+        try:
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+
+            table = pq.read_table(pa.BufferReader(data))
+            uncompressed_size = 0
+            for col in table.columns:
+                col_total = 0
+                for chunk in col.chunks:
+                    for buffer in chunk.buffers():
+                        if buffer is not None:
+                            col_total += buffer.size
+                column_uncompressed.append(int(col_total))
+                uncompressed_size += col_total
+        except Exception as exc:
+            raise RuntimeError(
+                f"Unable to determine uncompressed size for {file_path}: {exc}"
+            ) from exc
 
     return ParquetManifestEntry(
         file_path=file_path,
@@ -281,6 +375,7 @@ def build_parquet_manifest_minmax_entry(data: bytes, file_path: str) -> ParquetM
         record_count=int(record_count),
         file_size_in_bytes=file_size,
         uncompressed_size_in_bytes=uncompressed_size,
+        column_uncompressed_sizes_in_bytes=column_uncompressed,
         min_k_hashes=[],
         histogram_counts=[],
         histogram_bins=0,
