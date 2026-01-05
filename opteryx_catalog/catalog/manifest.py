@@ -38,6 +38,7 @@ class ParquetManifestEntry:
     file_size_in_bytes: int
     uncompressed_size_in_bytes: int
     column_uncompressed_sizes_in_bytes: list[int]
+    null_counts: list[int]
     min_k_hashes: list[list[int]]
     histogram_counts: list[list[int]]
     histogram_bins: int
@@ -52,6 +53,7 @@ class ParquetManifestEntry:
             "file_size_in_bytes": self.file_size_in_bytes,
             "uncompressed_size_in_bytes": self.uncompressed_size_in_bytes,
             "column_uncompressed_sizes_in_bytes": self.column_uncompressed_sizes_in_bytes,
+            "null_counts": self.null_counts,
             "min_k_hashes": self.min_k_hashes,
             "histogram_counts": self.histogram_counts,
             "histogram_bins": self.histogram_bins,
@@ -78,6 +80,7 @@ def build_parquet_manifest_entry(
     min_k_hashes: list[list[int]] = []
     histograms: list[list[int]] = []
     min_values: list[int] = []
+    null_counts: list[int] = []
     max_values: list[int] = []
 
     # Use draken for efficient hashing and compression when available.
@@ -124,10 +127,13 @@ def build_parquet_manifest_entry(
                         if avg_len <= 16:
                             compute_min_k = True
 
-            # KMV: take K smallest hashes when allowed; otherwise store an
-            # empty list for this column.
+            # KMV: take K smallest unique hashes when allowed; otherwise
+            # store an empty list for this column. Deduplicate hashes so
+            # the KMV sketch contains unique hashes (avoids duplicates
+            # skewing cardinality estimates).
             if compute_min_k:
-                smallest = heapq.nsmallest(MIN_K_HASHES, hashes)
+                unique_hashes = set(hashes)
+                smallest = heapq.nsmallest(MIN_K_HASHES, unique_hashes)
                 col_min_k = sorted(smallest)
             else:
                 col_min_k = []
@@ -137,6 +143,9 @@ def build_parquet_manifest_entry(
 
             # Use draken.compress() to get canonical int64 per value
             mapped = list(vec.compress())
+            # Compute null count from compressed representation
+            null_count = sum(1 for m in mapped if m == NULL_FLAG)
+            null_counts.append(int(null_count))
             non_nulls_mapped = [m for m in mapped if m != NULL_FLAG]
             if non_nulls_mapped:
                 vmin = min(non_nulls_mapped)
@@ -175,6 +184,7 @@ def build_parquet_manifest_entry(
             histograms.append(col_hist)
             min_values.append(col_min)
             max_values.append(col_max)
+        # end for
     except Exception:
         # Draken not available or failed; leave min_k_hashes/histograms empty
         min_k_hashes = [[] for _ in table.columns]
@@ -185,6 +195,8 @@ def build_parquet_manifest_entry(
                 try:
                     col_py = col.to_pylist()
                     non_nulls = [v for v in col_py if v is not None]
+                    null_count = len(col_py) - len(non_nulls)
+                    null_counts.append(int(null_count))
                     if non_nulls:
                         try:
                             min_values.append(min(non_nulls))
@@ -198,10 +210,13 @@ def build_parquet_manifest_entry(
                 except Exception:
                     min_values.append(None)
                     max_values.append(None)
+                    # If we couldn't introspect column values, assume 0 nulls
+                    null_counts.append(0)
         except Exception:
             # If even direct inspection fails, ensure lists lengths match
             min_values = [None] * len(table.columns)
             max_values = [None] * len(table.columns)
+            null_counts = [0] * len(table.columns)
 
     # Calculate uncompressed size from table buffers — must be accurate.
     column_uncompressed: list[int] = []
@@ -228,6 +243,7 @@ def build_parquet_manifest_entry(
         file_size_in_bytes=file_size_in_bytes,
         uncompressed_size_in_bytes=uncompressed_size,
         column_uncompressed_sizes_in_bytes=column_uncompressed,
+        null_counts=null_counts,
         min_k_hashes=min_k_hashes,
         histogram_counts=histograms,
         histogram_bins=HISTOGRAM_BINS,
@@ -336,6 +352,25 @@ def build_parquet_manifest_minmax_entry(data: bytes, file_path: str) -> ParquetM
     min_values = [stats["min"] for stats in column_stats.values() if stats["min"] is not None]
     max_values = [stats["max"] for stats in column_stats.values() if stats["max"] is not None]
 
+    # Attempt to gather null counts from metadata row groups if available
+    column_nulls: dict = {}
+    for row_group in metadata["row_groups"]:
+        for column in row_group["columns"]:
+            cname = column["name"]
+            if cname not in column_nulls:
+                column_nulls[cname] = 0
+            nc = column.get("null_count")
+            if nc is not None:
+                try:
+                    column_nulls[cname] += int(nc)
+                except Exception:
+                    pass
+
+    if column_nulls:
+        null_counts = [column_nulls.get(n, 0) for n in column_stats.keys()]
+    else:
+        null_counts = []
+
     # Get uncompressed size from metadata; if missing, read full table and
     # compute accurate uncompressed size from buffers. Also attempt to
     # compute per-column uncompressed byte counts when reading the table.
@@ -356,18 +391,36 @@ def build_parquet_manifest_minmax_entry(data: bytes, file_path: str) -> ParquetM
 
             table = pq.read_table(pa.BufferReader(data))
             uncompressed_size = 0
+            # Compute per-column uncompressed sizes and null counts from the table
             for col in table.columns:
                 col_total = 0
+                null_total = 0
                 for chunk in col.chunks:
                     for buffer in chunk.buffers():
                         if buffer is not None:
                             col_total += buffer.size
+                    try:
+                        null_total += int(chunk.null_count)
+                    except Exception:
+                        # Fallback to slow python inspection
+                        try:
+                            col_py = col.to_pylist()
+                            null_total = len(col_py) - len([v for v in col_py if v is not None])
+                        except Exception:
+                            null_total = 0
+
                 column_uncompressed.append(int(col_total))
                 uncompressed_size += col_total
+                null_counts = null_counts or []
+                null_counts.append(int(null_total))
         except Exception as exc:
             raise RuntimeError(
                 f"Unable to determine uncompressed size for {file_path}: {exc}"
             ) from exc
+    else:
+        # If we didn't read the table and null_counts is still empty, default to zeros
+        if not null_counts:
+            null_counts = [0] * len(column_stats)
 
     return ParquetManifestEntry(
         file_path=file_path,
@@ -376,6 +429,7 @@ def build_parquet_manifest_minmax_entry(data: bytes, file_path: str) -> ParquetM
         file_size_in_bytes=file_size,
         uncompressed_size_in_bytes=uncompressed_size,
         column_uncompressed_sizes_in_bytes=column_uncompressed,
+        null_counts=null_counts,
         min_k_hashes=[],
         histogram_counts=[],
         histogram_bins=0,

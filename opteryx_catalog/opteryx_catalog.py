@@ -452,6 +452,9 @@ class OpteryxCatalog(Metastore):
         setattr(v, "sql", sql)
         setattr(v, "metadata", type("M", (), {})())
         v.metadata.schema = schema
+        # Attach catalog and identifier for describe() method
+        setattr(v, "_catalog", self)
+        setattr(v, "_identifier", f"{collection}.{view_name}")
         return v
 
     def load_view(self, identifier: str | tuple) -> CatalogView:
@@ -492,6 +495,9 @@ class OpteryxCatalog(Metastore):
         v.metadata.last_execution_records = data.get("last-execution-records")
         # Optional describer (used to flag LLM-generated descriptions)
         v.metadata.describer = data.get("describer")
+        # Attach catalog and identifier for describe() method
+        setattr(v, "_catalog", self)
+        setattr(v, "_identifier", f"{collection}.{view_name}")
         return v
 
     def drop_view(self, identifier: str | tuple) -> None:
@@ -564,6 +570,54 @@ class OpteryxCatalog(Metastore):
         if updates:
             doc_ref.update(updates)
 
+    def update_view_description(
+        self,
+        identifier: str | tuple,
+        description: str,
+        describer: Optional[str] = None,
+    ) -> None:
+        """Update the description for a view.
+
+        Args:
+            identifier: View identifier ('collection.view' or tuple)
+            description: The new description text
+            describer: Optional identifier for who/what created the description
+        """
+        if isinstance(identifier, tuple) or isinstance(identifier, list):
+            collection, view_name = identifier[0], identifier[1]
+        else:
+            collection, view_name = identifier.split(".")
+
+        doc_ref = self._view_doc_ref(collection, view_name)
+        updates = {
+            "description": description,
+        }
+        if describer is not None:
+            updates["describer"] = describer
+        doc_ref.update(updates)
+
+    def update_dataset_description(
+        self,
+        identifier: str,
+        description: str,
+        describer: Optional[str] = None,
+    ) -> None:
+        """Update the description for a dataset.
+
+        Args:
+            identifier: Dataset identifier in format 'collection.dataset_name'
+            description: The new description text
+            describer: Optional identifier for who/what created the description
+        """
+        collection, dataset_name = identifier.split(".")
+        doc_ref = self._dataset_doc_ref(collection, dataset_name)
+        updates = {
+            "description": description,
+        }
+        if describer is not None:
+            updates["describer"] = describer
+        doc_ref.update(updates)
+
     def write_parquet_manifest(
         self, snapshot_id: int, entries: List[dict], dataset_location: str
     ) -> Optional[str]:
@@ -596,14 +650,12 @@ class OpteryxCatalog(Metastore):
                     ("file_size_in_bytes", pa.int64()),
                     ("uncompressed_size_in_bytes", pa.int64()),
                     ("column_uncompressed_sizes_in_bytes", pa.list_(pa.int64())),
+                    ("null_counts", pa.list_(pa.int64())),
                     ("min_k_hashes", pa.list_(pa.list_(pa.uint64()))),
                     ("histogram_counts", pa.list_(pa.list_(pa.int64()))),
                     ("histogram_bins", pa.int32()),
-                    # Store min/max as strings to accommodate legacy values
-                    # (strings, datetimes, or integers). Convert entries
-                    # to string representations prior to table construction.
-                    ("min_values", pa.list_(pa.string())),
-                    ("max_values", pa.list_(pa.string())),
+                    ("min_values", pa.list_(pa.binary())),
+                    ("max_values", pa.list_(pa.binary())),
                 ]
             )
 
@@ -619,18 +671,28 @@ class OpteryxCatalog(Metastore):
                 e.setdefault("histogram_counts", [])
                 e.setdefault("histogram_bins", 0)
                 e.setdefault("column_uncompressed_sizes_in_bytes", [])
-                # Convert min/max values to string representations to
-                # avoid type-mismatch when writing the Parquet manifest.
+                e.setdefault("null_counts", [])
+                
+                # Process min/max values: truncate to 16 bytes with ellipsis marker if longer
                 mv = e.get("min_values") or []
                 xv = e.get("max_values") or []
-                try:
-                    e["min_values"] = [None if v is None else str(v) for v in mv]
-                except Exception:
-                    e["min_values"] = [str(v) for v in mv]
-                try:
-                    e["max_values"] = [None if v is None else str(v) for v in xv]
-                except Exception:
-                    e["max_values"] = [str(v) for v in xv]
+                
+                def truncate_value(v):
+                    """Convert value to binary and truncate to 16 bytes with marker if needed."""
+                    if v is None:
+                        return None
+                    # Convert to bytes
+                    if isinstance(v, bytes):
+                        b = v
+                    else:
+                        b = str(v).encode('utf-8')
+                    # Truncate if longer than 16 bytes, add 0xFF as 17th byte to indicate truncation
+                    if len(b) > 16:
+                        return b[:16] + b'\xff'
+                    return b
+                
+                e["min_values"] = [truncate_value(v) for v in mv]
+                e["max_values"] = [truncate_value(v) for v in xv]
                 normalized.append(e)
 
             try:
