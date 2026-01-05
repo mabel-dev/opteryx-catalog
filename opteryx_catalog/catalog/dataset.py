@@ -570,6 +570,7 @@ class SimpleDataset(Dataset):
                         file_path=fp,
                         file_format="parquet",
                         record_count=0,
+                        null_counts=[],
                         file_size_in_bytes=0,
                         uncompressed_size_in_bytes=0,
                         column_uncompressed_sizes_in_bytes=[],
@@ -585,6 +586,7 @@ class SimpleDataset(Dataset):
                     file_path=fp,
                     file_format="parquet",
                     record_count=0,
+                    null_counts=[],
                     file_size_in_bytes=0,
                     uncompressed_size_in_bytes=0,
                     column_uncompressed_sizes_in_bytes=[],
@@ -753,6 +755,7 @@ class SimpleDataset(Dataset):
                     ncols = pf.metadata.num_columns
                     mins = [None] * ncols
                     maxs = [None] * ncols
+                    null_counts = [0] * ncols
                     for rg in range(pf.num_row_groups):
                         for ci in range(ncols):
                             col_meta = pf.metadata.row_group(rg).column(ci)
@@ -761,7 +764,8 @@ class SimpleDataset(Dataset):
                                 continue
                             smin = getattr(stats, "min", None)
                             smax = getattr(stats, "max", None)
-                            if smin is None and smax is None:
+                            snull_count = getattr(stats, "null_count", None)
+                            if smin is None and smax is None and snull_count is None:
                                 continue
 
                             def _to_py(v):
@@ -798,6 +802,11 @@ class SimpleDataset(Dataset):
                                             maxs[ci] = sval
                                     except Exception:
                                         pass
+                            if snull_count is not None:
+                                try:
+                                    null_counts[ci] += int(snull_count)
+                                except Exception:
+                                    pass
 
                     min_values = [m for m in mins if m is not None]
                     max_values = [m for m in maxs if m is not None]
@@ -806,11 +815,13 @@ class SimpleDataset(Dataset):
                 record_count = 0
                 min_values = []
                 max_values = []
+                null_counts = []
 
             manifest_entry = ParquetManifestEntry(
                 file_path=fp,
                 file_format="parquet",
                 record_count=int(record_count),
+                null_counts=null_counts,
                 file_size_in_bytes=int(file_size),
                 uncompressed_size_in_bytes=int(file_size),  # Use compressed size as estimate
                 column_uncompressed_sizes_in_bytes=[],
@@ -899,13 +910,11 @@ class SimpleDataset(Dataset):
             self.catalog.save_dataset_metadata(self.identifier, self.metadata)
 
     def scan(
-        self, row_filter=None, row_limit=None, snapshot_id: Optional[int] = None
+        self, row_filter=None, snapshot_id: Optional[int] = None
     ) -> Iterable[Datafile]:
         """Return Datafile objects for the given snapshot.
 
         - If `snapshot_id` is None, use the current snapshot.
-        - Ignore `row_filter` for now and return all files listed in the
-          snapshot's parquet manifest (if present).
         """
         # Determine snapshot to read using the dataset-level helper which
         # prefers the in-memory current snapshot and otherwise performs a
@@ -931,16 +940,8 @@ class SimpleDataset(Dataset):
 
             table = pq.read_table(pa.BufferReader(data))
             rows = table.to_pylist()
-            cum_rows = 0
             for r in rows:
                 yield Datafile(entry=r)
-                try:
-                    rc = int(r.get("record_count") or 0)
-                except Exception:
-                    rc = 0
-                cum_rows += rc
-                if row_limit is not None and cum_rows >= row_limit:
-                    break
         except FileNotFoundError:
             return iter(())
         except Exception:
