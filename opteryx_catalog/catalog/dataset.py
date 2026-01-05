@@ -909,9 +909,7 @@ class SimpleDataset(Dataset):
         if self.catalog and hasattr(self.catalog, "save_dataset_metadata"):
             self.catalog.save_dataset_metadata(self.identifier, self.metadata)
 
-    def scan(
-        self, row_filter=None, snapshot_id: Optional[int] = None
-    ) -> Iterable[Datafile]:
+    def scan(self, row_filter=None, snapshot_id: Optional[int] = None) -> Iterable[Datafile]:
         """Return Datafile objects for the given snapshot.
 
         - If `snapshot_id` is None, use the current snapshot.

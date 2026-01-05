@@ -204,8 +204,8 @@ class OpteryxCatalog(Metastore):
         # Load dataset-level timestamp/author and collection/workspace
         metadata.timestamp_ms = data.get("timestamp-ms")
         metadata.author = data.get("author")
-        # note: Firestore dataset doc stores the original collection and workspace
-        # under keys `collection` and `workspace`.
+        metadata.description = data.get("description")
+        metadata.describer = data.get("describer")
 
         # Load snapshots based on load_history flag
         snaps = []
@@ -598,7 +598,7 @@ class OpteryxCatalog(Metastore):
 
     def update_dataset_description(
         self,
-        identifier: str,
+        identifier: str | tuple,
         description: str,
         describer: Optional[str] = None,
     ) -> None:
@@ -609,7 +609,12 @@ class OpteryxCatalog(Metastore):
             description: The new description text
             describer: Optional identifier for who/what created the description
         """
-        collection, dataset_name = identifier.split(".")
+
+        if isinstance(identifier, tuple) or isinstance(identifier, list):
+            collection, dataset_name = identifier[0], identifier[1]
+        else:
+            collection, dataset_name = identifier.split(".")
+
         doc_ref = self._dataset_doc_ref(collection, dataset_name)
         updates = {
             "description": description,
@@ -672,11 +677,11 @@ class OpteryxCatalog(Metastore):
                 e.setdefault("histogram_bins", 0)
                 e.setdefault("column_uncompressed_sizes_in_bytes", [])
                 e.setdefault("null_counts", [])
-                
+
                 # Process min/max values: truncate to 16 bytes with ellipsis marker if longer
                 mv = e.get("min_values") or []
                 xv = e.get("max_values") or []
-                
+
                 def truncate_value(v):
                     """Convert value to binary and truncate to 16 bytes with marker if needed."""
                     if v is None:
@@ -685,12 +690,12 @@ class OpteryxCatalog(Metastore):
                     if isinstance(v, bytes):
                         b = v
                     else:
-                        b = str(v).encode('utf-8')
+                        b = str(v).encode("utf-8")
                     # Truncate if longer than 16 bytes, add 0xFF as 17th byte to indicate truncation
                     if len(b) > 16:
-                        return b[:16] + b'\xff'
+                        return b[:16] + b"\xff"
                     return b
-                
+
                 e["min_values"] = [truncate_value(v) for v in mv]
                 e["max_values"] = [truncate_value(v) for v in xv]
                 normalized.append(e)
