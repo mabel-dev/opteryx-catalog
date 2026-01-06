@@ -20,6 +20,9 @@ from .exceptions import DatasetNotFound
 from .exceptions import ViewAlreadyExists
 from .exceptions import ViewNotFound
 from .iops.base import FileIO
+from .webhooks import send_webhook
+from .webhooks.events import dataset_created_payload
+from .webhooks.events import view_created_payload
 
 
 class OpteryxCatalog(Metastore):
@@ -167,6 +170,20 @@ class OpteryxCatalog(Metastore):
                 ]
             # update dataset doc to reference current schema
             doc_ref.update({"current-schema-id": metadata.current_schema_id})
+
+        # Send webhook notification
+        send_webhook(
+            action="create",
+            workspace=self.workspace,
+            collection=collection,
+            resource_type="dataset",
+            resource_name=dataset_name,
+            payload=dataset_created_payload(
+                schema=schema,
+                location=location,
+                properties=properties,
+            ),
+        )
 
         # Return SimpleDataset (attach this catalog so append() can persist)
         return SimpleDataset(identifier=identifier, _metadata=metadata, io=self.io, catalog=self)
@@ -444,6 +461,19 @@ class OpteryxCatalog(Metastore):
                 "statement-id": statement_id,
                 "properties": properties or {},
             }
+        )
+
+        # Send webhook notification
+        send_webhook(
+            action="create" if not update_if_exists else "update",
+            workspace=self.workspace,
+            collection=collection,
+            resource_type="view",
+            resource_name=view_name,
+            payload=view_created_payload(
+                definition=sql,
+                properties=properties,
+            ),
         )
 
         # Return a simple CatalogView wrapper
@@ -808,10 +838,9 @@ class OpteryxCatalog(Metastore):
         # Metadata persisted in primary `datasets` collection only.
 
         snaps_coll = self._snapshots_collection(collection, dataset_name)
-        existing = {d.id for d in snaps_coll.stream()}
-        new_ids = set()
+        # Upsert snapshot documents. Do NOT delete existing snapshot documents
+        # here to avoid accidental removal of historical snapshots on save.
         for snap in metadata.snapshots:
-            new_ids.add(str(snap.snapshot_id))
             snaps_coll.document(str(snap.snapshot_id)).set(
                 {
                     "snapshot-id": snap.snapshot_id,
@@ -825,10 +854,6 @@ class OpteryxCatalog(Metastore):
                     "user-created": getattr(snap, "user_created", None),
                 }
             )
-
-        # Delete stale snapshots
-        for stale in existing - new_ids:
-            snaps_coll.document(stale).delete()
 
         # Persist schemas subcollection
         schemas_coll = doc_ref.collection("schemas")

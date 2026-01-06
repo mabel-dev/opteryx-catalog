@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "opteryx-catalog"
-version = "0.4.12"
+version = "0.4.13"
 description = "Opteryx Cloud Catalog"
 readme = { file = "README.md", content-type = "text/markdown" }
 authors = [
@@ -32,6 +32,11 @@ dependencies = [
     "opteryx-core",
     "pyarrow==22.0.0",
     "requests==2.32.5"
+]
+
+[project.optional-dependencies]
+webhooks = [
+    "google-cloud-tasks>=2.16.0"
 ]
 
 [tool.setuptools.package-dir]
