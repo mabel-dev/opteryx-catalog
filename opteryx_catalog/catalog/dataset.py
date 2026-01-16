@@ -10,7 +10,6 @@ from typing import Optional
 
 from .manifest import ParquetManifestEntry
 from .manifest import build_parquet_manifest_entry
-from .manifest import build_parquet_manifest_minmax_entry
 from .metadata import DatasetMetadata
 from .metadata import Snapshot
 from .metastore import Dataset
@@ -542,9 +541,7 @@ class SimpleDataset(Dataset):
         }
 
         # Build new entries for files that don't already exist. Only accept
-        # Parquet files and attempt to read lightweight metadata (bytes,
-        # row count, per-column min/max) from the Parquet footer when
-        # available.
+        # Parquet files and compute full statistics for each file.
         new_entries = []
         seen = set()
         for fp in files:
@@ -555,15 +552,21 @@ class SimpleDataset(Dataset):
                 continue
             seen.add(fp)
 
-            # Attempt to read file bytes and parquet metadata
-            # Use rugo's metadata reader which is much faster (microseconds per file)
+            # Read file and compute full statistics
             try:
+                import pyarrow as pa
+                import pyarrow.parquet as pq
+
                 inp = self.io.new_input(fp)
                 with inp.open() as f:
                     data = f.read()
 
                 if data:
-                    manifest_entry = build_parquet_manifest_minmax_entry(data, fp)
+                    # Read full table to compute complete statistics
+                    table = pq.read_table(pa.BufferReader(data))
+                    file_size = len(data)
+                    # Use build_parquet_manifest_entry which computes full statistics
+                    manifest_entry = build_parquet_manifest_entry(table, fp, file_size)
                 else:
                     # Empty file, create placeholder entry
                     manifest_entry = ParquetManifestEntry(
@@ -581,7 +584,7 @@ class SimpleDataset(Dataset):
                         max_values=[],
                     )
             except Exception:
-                # If metadata read fails, fall back to placeholders
+                # If read fails, fall back to placeholders
                 manifest_entry = ParquetManifestEntry(
                     file_path=fp,
                     file_format="parquet",
@@ -612,9 +615,10 @@ class SimpleDataset(Dataset):
         added_files_size = 0
         added_data_size = 0
         added_records = 0
-        # Sum uncompressed sizes from new entries
+        # Sum statistics from new entries
         for entry in new_entries:
             added_data_size += entry.get("uncompressed_size_in_bytes", 0)
+            added_records += entry.get("record_count", 0)
         deleted_data_files = 0
         deleted_files_size = 0
         deleted_data_size = 0
@@ -711,7 +715,7 @@ class SimpleDataset(Dataset):
                 prev_total_records = 0
 
         # Build unique new entries (ignore duplicates in input). Only accept
-        # parquet files and try to read lightweight metadata from each file.
+        # parquet files and compute full statistics for each file.
         new_entries = []
         seen = set()
         for fp in files:
@@ -721,10 +725,6 @@ class SimpleDataset(Dataset):
                 continue
             seen.add(fp)
 
-            file_size = 0
-            record_count = 0
-            min_values = []
-            max_values = []
             try:
                 import pyarrow as pa
                 import pyarrow.parquet as pq
@@ -748,89 +748,43 @@ class SimpleDataset(Dataset):
                         data = blob.download_as_bytes()
 
                 if data:
+                    # Read full table to compute complete statistics
+                    table = pq.read_table(pa.BufferReader(data))
                     file_size = len(data)
-                    pf = pq.ParquetFile(pa.BufferReader(data))
-                    record_count = int(pf.metadata.num_rows or 0)
-
-                    ncols = pf.metadata.num_columns
-                    mins = [None] * ncols
-                    maxs = [None] * ncols
-                    null_counts = [0] * ncols
-                    for rg in range(pf.num_row_groups):
-                        for ci in range(ncols):
-                            col_meta = pf.metadata.row_group(rg).column(ci)
-                            stats = getattr(col_meta, "statistics", None)
-                            if not stats:
-                                continue
-                            smin = getattr(stats, "min", None)
-                            smax = getattr(stats, "max", None)
-                            snull_count = getattr(stats, "null_count", None)
-                            if smin is None and smax is None and snull_count is None:
-                                continue
-
-                            def _to_py(v):
-                                try:
-                                    return int(v)
-                                except Exception:
-                                    try:
-                                        return float(v)
-                                    except Exception:
-                                        try:
-                                            if isinstance(v, (bytes, bytearray)):
-                                                return v.decode("utf-8", errors="ignore")
-                                        except Exception:
-                                            pass
-                                        return v
-
-                            if smin is not None:
-                                sval = _to_py(smin)
-                                if mins[ci] is None:
-                                    mins[ci] = sval
-                                else:
-                                    try:
-                                        if sval < mins[ci]:
-                                            mins[ci] = sval
-                                    except Exception:
-                                        pass
-                            if smax is not None:
-                                sval = _to_py(smax)
-                                if maxs[ci] is None:
-                                    maxs[ci] = sval
-                                else:
-                                    try:
-                                        if sval > maxs[ci]:
-                                            maxs[ci] = sval
-                                    except Exception:
-                                        pass
-                            if snull_count is not None:
-                                try:
-                                    null_counts[ci] += int(snull_count)
-                                except Exception:
-                                    pass
-
-                    min_values = [m for m in mins if m is not None]
-                    max_values = [m for m in maxs if m is not None]
+                    # Use build_parquet_manifest_entry which computes full statistics
+                    manifest_entry = build_parquet_manifest_entry(table, fp, file_size)
+                else:
+                    # Empty file, create placeholder entry
+                    manifest_entry = ParquetManifestEntry(
+                        file_path=fp,
+                        file_format="parquet",
+                        record_count=0,
+                        null_counts=[],
+                        file_size_in_bytes=0,
+                        uncompressed_size_in_bytes=0,
+                        column_uncompressed_sizes_in_bytes=[],
+                        min_k_hashes=[],
+                        histogram_counts=[],
+                        histogram_bins=0,
+                        min_values=[],
+                        max_values=[],
+                    )
             except Exception:
-                file_size = 0
-                record_count = 0
-                min_values = []
-                max_values = []
-                null_counts = []
-
-            manifest_entry = ParquetManifestEntry(
-                file_path=fp,
-                file_format="parquet",
-                record_count=int(record_count),
-                null_counts=null_counts,
-                file_size_in_bytes=int(file_size),
-                uncompressed_size_in_bytes=int(file_size),  # Use compressed size as estimate
-                column_uncompressed_sizes_in_bytes=[],
-                min_k_hashes=[],
-                histogram_counts=[],
-                histogram_bins=0,
-                min_values=min_values,
-                max_values=max_values,
-            )
+                # If read fails, create placeholder entry
+                manifest_entry = ParquetManifestEntry(
+                    file_path=fp,
+                    file_format="parquet",
+                    record_count=0,
+                    null_counts=[],
+                    file_size_in_bytes=0,
+                    uncompressed_size_in_bytes=0,
+                    column_uncompressed_sizes_in_bytes=[],
+                    min_k_hashes=[],
+                    histogram_counts=[],
+                    histogram_bins=0,
+                    min_values=[],
+                    max_values=[],
+                )
             new_entries.append(manifest_entry.to_dict())
 
         manifest_path = None
@@ -850,10 +804,11 @@ class SimpleDataset(Dataset):
         added_data_files = len(new_entries)
         added_files_size = 0
         added_data_size = 0
-        # Sum uncompressed sizes from new entries
+        added_records = 0
+        # Sum statistics from new entries
         for entry in new_entries:
             added_data_size += entry.get("uncompressed_size_in_bytes", 0)
-        added_records = 0
+            added_records += entry.get("record_count", 0)
 
         total_data_files = added_data_files
         total_files_size = added_files_size
