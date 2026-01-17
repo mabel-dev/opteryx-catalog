@@ -900,6 +900,305 @@ class SimpleDataset(Dataset):
         except Exception:
             return iter(())
 
+    def describe(self, snapshot_id: Optional[int] = None, bins: int = 10) -> dict:
+        """Describe all schema columns for the given snapshot.
+
+        Returns a dict mapping column name -> statistics (same shape as
+        the previous `describe` per-column output).
+        """
+        import heapq
+
+        snap = self.snapshot(snapshot_id)
+        if snap is None or not getattr(snap, "manifest_list", None):
+            raise ValueError("No manifest available for this dataset/snapshot")
+
+        manifest_path = snap.manifest_list
+
+        # Read manifest once
+        try:
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+
+            inp = self.io.new_input(manifest_path)
+            with inp.open() as f:
+                data = f.read()
+
+            if not data:
+                raise ValueError("Empty manifest data")
+
+            table = pq.read_table(pa.BufferReader(data))
+            entries = table.to_pylist()
+        except Exception:
+            raise
+
+        # Resolve schema and describe all columns
+        orso_schema = None
+        try:
+            orso_schema = self.schema()
+        except Exception:
+            orso_schema = None
+
+        if orso_schema is None:
+            raise ValueError("Schema unavailable; cannot describe all columns")
+
+        # Map column name -> index for every schema column
+        col_to_idx: dict[str, int] = {c.name: i for i, c in enumerate(orso_schema.columns)}
+
+        # Initialize accumulators per column
+        stats: dict[str, dict] = {}
+        for name in col_to_idx:
+            stats[name] = {
+                "null_count": 0,
+                "mins": [],
+                "maxs": [],
+                "hashes": set(),
+                "file_hist_infos": [],
+            }
+
+        total_rows = 0
+
+        def _decode_minmax(v):
+            if v is None:
+                return None
+            if isinstance(v, (int, float)):
+                return v
+            try:
+                if isinstance(v, (bytes, bytearray, memoryview)):
+                    b = bytes(v)
+                    if b and b[-1] == 0xFF:
+                        b = b[:-1]
+                    s = b.decode("utf-8")
+                    try:
+                        return int(s)
+                    except Exception:
+                        try:
+                            return float(s)
+                        except Exception:
+                            return None
+            except Exception:
+                pass
+            if isinstance(v, str):
+                try:
+                    return int(v)
+                except Exception:
+                    try:
+                        return float(v)
+                    except Exception:
+                        return None
+            return None
+
+        # Single pass through entries updating per-column accumulators
+        for ent in entries:
+            if not isinstance(ent, dict):
+                continue
+            total_rows += int(ent.get("record_count") or 0)
+
+            # prefetch lists
+            ncounts = ent.get("null_counts") or []
+            mks = ent.get("min_k_hashes") or []
+            hists = ent.get("histogram_counts") or []
+            mv = ent.get("min_values") or []
+            xv = ent.get("max_values") or []
+
+            for cname, cidx in col_to_idx.items():
+                # nulls
+                try:
+                    stats[cname]["null_count"] += int((ncounts or [0])[cidx])
+                except Exception:
+                    pass
+
+                # mins/maxs
+                try:
+                    raw_min = mv[cidx]
+                except Exception:
+                    raw_min = None
+                try:
+                    raw_max = xv[cidx]
+                except Exception:
+                    raw_max = None
+                dmin = _decode_minmax(raw_min)
+                dmax = _decode_minmax(raw_max)
+                if dmin is not None:
+                    stats[cname]["mins"].append(dmin)
+                if dmax is not None:
+                    stats[cname]["maxs"].append(dmax)
+
+                # min-k hashes
+                try:
+                    col_mk = mks[cidx] or []
+                except Exception:
+                    col_mk = []
+                for h in col_mk:
+                    try:
+                        stats[cname]["hashes"].add(int(h))
+                    except Exception:
+                        pass
+
+                # histograms
+                try:
+                    col_hist = hists[cidx]
+                except Exception:
+                    col_hist = []
+                if col_hist:
+                    try:
+                        if dmin is not None and dmax is not None and dmin != dmax:
+                            stats[cname]["file_hist_infos"].append(
+                                (float(dmin), float(dmax), list(col_hist))
+                            )
+                    except Exception:
+                        pass
+
+        # Build results per column
+        results: dict[str, dict] = {}
+        for cname, cidx in col_to_idx.items():
+            s = stats[cname]
+            global_min = min(s["mins"]) if s["mins"] else None
+            global_max = max(s["maxs"]) if s["maxs"] else None
+
+            # kmv approx
+            approx_cardinality = 0
+            try:
+                collected = s["hashes"]
+                if collected:
+                    smallest = heapq.nsmallest(32, collected)
+                    k = len(smallest)
+                    if k <= 1:
+                        approx_cardinality = len(set(smallest))
+                    else:
+                        MAX_HASH = (1 << 64) - 1
+                        R = max(smallest)
+                        if R == 0:
+                            approx_cardinality = len(set(smallest))
+                        else:
+                            approx_cardinality = int((k - 1) * (MAX_HASH + 1) / (R + 1))
+            except Exception:
+                approx_cardinality = 0
+
+            # distribution via distogram
+            distribution = None
+            if (
+                s["file_hist_infos"]
+                and global_min is not None
+                and global_max is not None
+                and global_max > global_min
+            ):
+                try:
+                    from opteryx_catalog.maki_nage.distogram import Distogram
+                    from opteryx_catalog.maki_nage.distogram import count as _count_dist
+                    from opteryx_catalog.maki_nage.distogram import count_up_to as _count_up_to
+                    from opteryx_catalog.maki_nage.distogram import merge as _merge_distogram
+                    from opteryx_catalog.maki_nage.distogram import update as _update_distogram
+
+                    dist_bin_count = max(50, bins * 5)
+                    global_d = Distogram(bin_count=dist_bin_count)
+                    for fmin, fmax, counts in s["file_hist_infos"]:
+                        fbins = len(counts)
+                        if fbins <= 0:
+                            continue
+                        temp = Distogram(bin_count=dist_bin_count)
+                        span = float(fmax - fmin) if fmax != fmin else 0.0
+                        for bi, cnt in enumerate(counts):
+                            if cnt <= 0:
+                                continue
+                            if span == 0.0:
+                                rep = float(fmin)
+                            else:
+                                rep = fmin + (bi + 0.5) * span / fbins
+                            _update_distogram(temp, float(rep), int(cnt))
+                        global_d = _merge_distogram(global_d, temp)
+
+                    distribution = [0] * bins
+                    total = int(_count_dist(global_d) or 0)
+                    if total == 0:
+                        distribution = [0] * bins
+                    else:
+                        prev = 0.0
+                        gmin = float(global_min)
+                        gmax = float(global_max)
+                        for i in range(1, bins + 1):
+                            edge = gmin + (i / bins) * (gmax - gmin)
+                            cum = _count_up_to(global_d, edge) or 0.0
+                            distribution[i - 1] = int(round(cum - prev))
+                            prev = cum
+                        diff = total - sum(distribution)
+                        if diff != 0:
+                            distribution[-1] += diff
+                except Exception:
+                    distribution = [0] * bins
+                    gspan = float(global_max - global_min)
+                    for fmin, fmax, counts in s["file_hist_infos"]:
+                        fbins = len(counts)
+                        if fbins <= 0:
+                            continue
+                        for bi, cnt in enumerate(counts):
+                            if cnt <= 0:
+                                continue
+                            rep = fmin + (bi + 0.5) * (fmax - fmin) / fbins
+                            gi = int((rep - global_min) / gspan * bins)
+                            if gi < 0:
+                                gi = 0
+                            if gi >= bins:
+                                gi = bins - 1
+                            distribution[gi] += int(cnt)
+
+            res = {
+                "dataset": self.identifier,
+                "description": getattr(self.metadata, "description", None),
+                "row_count": total_rows,
+                "column": cname,
+                "min": global_min,
+                "max": global_max,
+                "null_count": s["null_count"],
+                "approx_cardinality": approx_cardinality,
+                "distribution": distribution,
+            }
+
+            # If textual, attempt display prefixes like describe()
+            try:
+                is_text = False
+                if orso_schema is not None:
+                    col = orso_schema.columns[cidx]
+                    ctype = getattr(col, "type", None)
+                    if ctype is not None:
+                        sctype = str(ctype).lower()
+                        if "char" in sctype or "string" in sctype or "varchar" in sctype:
+                            is_text = True
+            except Exception:
+                is_text = False
+
+            def _int_to_prefix(v, max_chars=16):
+                try:
+                    if not isinstance(v, int):
+                        return None
+                    if v == 0:
+                        return None
+                    blen = (v.bit_length() + 7) // 8
+                    blen = max(blen, 1)
+                    b = v.to_bytes(blen, "big")
+                    b = b.strip(b"\x00")
+                    if not b:
+                        return None
+                    s = b.decode("utf-8", errors="replace")
+                    s = s.rstrip("\x00")
+                    return s[:16]
+                except Exception:
+                    return None
+
+            if is_text and res["min"] is not None and res["max"] is not None:
+                min_disp = None
+                max_disp = None
+                if isinstance(res["min"], int):
+                    min_disp = _int_to_prefix(res["min"])
+                if isinstance(res["max"], int):
+                    max_disp = _int_to_prefix(res["max"])
+                if min_disp is not None or max_disp is not None:
+                    res["min_display"] = min_disp
+                    res["max_display"] = max_disp
+
+            results[cname] = res
+
+        return results
+
     def refresh_manifest(self, agent: str, author: Optional[str] = None) -> Optional[int]:
         """Refresh manifest statistics and create a new snapshot.
 
