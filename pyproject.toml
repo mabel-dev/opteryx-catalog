@@ -26,11 +26,11 @@ classifiers = [
 urls = { "Homepage" = "https://github.com/mabel-dev/opteryx-catalog" }
 requires-python = ">=3.9"
 dependencies = [
-    "google-cloud-firestore==2.22.0",
-    "google-cloud-storage==3.7.0",
+    "google-cloud-firestore==2.23.0",
+    "google-cloud-storage==3.8.0",
     "orso==0.0.226",
     "opteryx-core",
-    "pyarrow==22.0.0",
+    "pyarrow==23.0.0",
     "requests==2.32.5"
 ]
 
