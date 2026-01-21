@@ -953,6 +953,8 @@ class SimpleDataset(Dataset):
                 "maxs": [],
                 "hashes": set(),
                 "file_hist_infos": [],
+                "min_displays": [],
+                "max_displays": [],
             }
 
         total_rows = 0
@@ -962,6 +964,17 @@ class SimpleDataset(Dataset):
                 return None
             if isinstance(v, (int, float)):
                 return v
+            # For strings stored as string values (not bytes), return as-is
+            if isinstance(v, str):
+                # Try to parse as number for backward compatibility
+                try:
+                    return int(v)
+                except Exception:
+                    try:
+                        return float(v)
+                    except Exception:
+                        # Not a number, return the string itself for display
+                        return v
             try:
                 if isinstance(v, (bytes, bytearray, memoryview)):
                     b = bytes(v)
@@ -974,17 +987,10 @@ class SimpleDataset(Dataset):
                         try:
                             return float(s)
                         except Exception:
-                            return None
+                            # Decoded bytes that aren't numbers, return as string
+                            return s
             except Exception:
                 pass
-            if isinstance(v, str):
-                try:
-                    return int(v)
-                except Exception:
-                    try:
-                        return float(v)
-                    except Exception:
-                        return None
             return None
 
         # Single pass through entries updating per-column accumulators
@@ -999,6 +1005,8 @@ class SimpleDataset(Dataset):
             hists = ent.get("histogram_counts") or []
             mv = ent.get("min_values") or []
             xv = ent.get("max_values") or []
+            mv_disp = ent.get("min_values_display") or []
+            xv_disp = ent.get("max_values_display") or []
 
             for cname, cidx in col_to_idx.items():
                 # nulls
@@ -1022,6 +1030,41 @@ class SimpleDataset(Dataset):
                     stats[cname]["mins"].append(dmin)
                 if dmax is not None:
                     stats[cname]["maxs"].append(dmax)
+
+                # collect textual display values when present
+                try:
+                    try:
+                        raw_min_disp = mv_disp[cidx]
+                    except Exception:
+                        raw_min_disp = None
+                    try:
+                        raw_max_disp = xv_disp[cidx]
+                    except Exception:
+                        raw_max_disp = None
+
+                    def _decode_display(v):
+                        if v is None:
+                            return None
+                        try:
+                            if isinstance(v, (bytes, bytearray, memoryview)):
+                                b = bytes(v)
+                                if b and b[-1] == 0xFF:
+                                    b = b[:-1]
+                                return b.decode("utf-8", errors="replace")
+                            if isinstance(v, str):
+                                return v
+                        except Exception:
+                            return None
+                        return None
+
+                    md = _decode_display(raw_min_disp)
+                    xd = _decode_display(raw_max_disp)
+                    if md is not None:
+                        stats[cname]["min_displays"].append(md)
+                    if xd is not None:
+                        stats[cname]["max_displays"].append(xd)
+                except Exception:
+                    pass
 
                 # min-k hashes
                 try:
@@ -1184,13 +1227,44 @@ class SimpleDataset(Dataset):
                 except Exception:
                     return None
 
-            if is_text and res["min"] is not None and res["max"] is not None:
+            if is_text:
+                # Use only textual display values collected from manifests.
+                # Decode bytes and strip truncation marker (0xFF) if present.
+                def _decode_display_raw(v):
+                    if v is None:
+                        return None
+                    try:
+                        if isinstance(v, (bytes, bytearray, memoryview)):
+                            b = bytes(v)
+                            if b and b[-1] == 0xFF:
+                                b = b[:-1]
+                            s_val = b.decode("utf-8", errors="replace")
+                            return s_val[:16]
+                        if isinstance(v, str):
+                            return v[:16]
+                    except Exception:
+                        return None
+                    return None
+
                 min_disp = None
                 max_disp = None
-                if isinstance(res["min"], int):
-                    min_disp = _int_to_prefix(res["min"])
-                if isinstance(res["max"], int):
-                    max_disp = _int_to_prefix(res["max"])
+                try:
+                    if s.get("min_displays"):
+                        for v in s.get("min_displays"):
+                            dv = _decode_display_raw(v)
+                            if dv:
+                                min_disp = dv
+                                break
+                    if s.get("max_displays"):
+                        for v in s.get("max_displays"):
+                            dv = _decode_display_raw(v)
+                            if dv:
+                                max_disp = dv
+                                break
+                except Exception:
+                    min_disp = None
+                    max_disp = None
+
                 if min_disp is not None or max_disp is not None:
                     res["min_display"] = min_disp
                     res["max_display"] = max_disp
