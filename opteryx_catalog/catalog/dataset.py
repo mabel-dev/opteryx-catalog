@@ -1095,8 +1095,28 @@ class SimpleDataset(Dataset):
         results: dict[str, dict] = {}
         for cname, cidx in col_to_idx.items():
             s = stats[cname]
-            global_min = min(s["mins"]) if s["mins"] else None
-            global_max = max(s["maxs"]) if s["maxs"] else None
+            # Handle mixed types: separate strings from numbers
+            mins_filtered = [v for v in s["mins"] if v is not None]
+            maxs_filtered = [v for v in s["maxs"] if v is not None]
+            
+            # Group by type: strings vs numbers
+            str_mins = [v for v in mins_filtered if isinstance(v, str)]
+            num_mins = [v for v in mins_filtered if not isinstance(v, str)]
+            str_maxs = [v for v in maxs_filtered if isinstance(v, str)]
+            num_maxs = [v for v in maxs_filtered if not isinstance(v, str)]
+            
+            # Use whichever type has values (strings take precedence for text columns)
+            global_min = None
+            global_max = None
+            if str_mins:
+                global_min = min(str_mins)
+            elif num_mins:
+                global_min = min(num_mins)
+            
+            if str_maxs:
+                global_max = max(str_maxs)
+            elif num_maxs:
+                global_max = max(num_maxs)
 
             # kmv approx
             approx_cardinality = 0
