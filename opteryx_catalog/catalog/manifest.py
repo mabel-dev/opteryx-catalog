@@ -44,6 +44,8 @@ class ParquetManifestEntry:
     histogram_bins: int
     min_values: list
     max_values: list
+    min_values_display: list
+    max_values_display: list
 
     def to_dict(self) -> dict:
         return {
@@ -59,6 +61,8 @@ class ParquetManifestEntry:
             "histogram_bins": self.histogram_bins,
             "min_values": self.min_values,
             "max_values": self.max_values,
+            "min_values_display": self.min_values_display,
+            "max_values_display": self.max_values_display,
         }
 
 
@@ -82,6 +86,8 @@ def build_parquet_manifest_entry(
     min_values: list[int] = []
     null_counts: list[int] = []
     max_values: list[int] = []
+    min_values_display: list = []
+    max_values_display: list = []
 
     # Use draken for efficient hashing and compression when available.
     import heapq
@@ -91,6 +97,7 @@ def build_parquet_manifest_entry(
         import opteryx.draken as draken  # type: ignore
 
         for col_idx, col in enumerate(table.columns):
+            col_py = None
             # hash column values to 64-bit via draken (new cpdef API)
             vec = draken.Vector.from_arrow(col)
             hashes = list(vec.hash())
@@ -182,8 +189,43 @@ def build_parquet_manifest_entry(
 
             min_k_hashes.append(col_min_k)
             histograms.append(col_hist)
-            min_values.append(col_min)
-            max_values.append(col_max)
+            # For string columns, store actual string min/max; for numeric, store compressed int64
+            try:
+                if pa.types.is_string(field_type) or pa.types.is_large_string(field_type):
+                    if col_py is None:
+                        try:
+                            col_py = col.to_pylist()
+                        except Exception:
+                            col_py = None
+                    if col_py is not None:
+                        non_nulls_str = [x for x in col_py if x is not None]
+                        if non_nulls_str:
+                            str_min = min(non_nulls_str)
+                            str_max = max(non_nulls_str)
+                            min_values.append(str_min)
+                            max_values.append(str_max)
+                            min_values_display.append(str_min)
+                            max_values_display.append(str_max)
+                        else:
+                            min_values.append(None)
+                            max_values.append(None)
+                            min_values_display.append(None)
+                            max_values_display.append(None)
+                    else:
+                        min_values.append(col_min)
+                        max_values.append(col_max)
+                        min_values_display.append(None)
+                        max_values_display.append(None)
+                else:
+                    min_values.append(col_min)
+                    max_values.append(col_max)
+                    min_values_display.append(None)
+                    max_values_display.append(None)
+            except Exception:
+                min_values.append(col_min)
+                max_values.append(col_max)
+                min_values_display.append(None)
+                max_values_display.append(None)
         # end for
     except Exception:
         # Draken not available or failed; leave min_k_hashes/histograms empty
@@ -201,21 +243,36 @@ def build_parquet_manifest_entry(
                         try:
                             min_values.append(min(non_nulls))
                             max_values.append(max(non_nulls))
+                            # preserve textual display when possible
+                            try:
+                                min_values_display.append(min(non_nulls))
+                                max_values_display.append(max(non_nulls))
+                            except Exception:
+                                min_values_display.append(None)
+                                max_values_display.append(None)
                         except Exception:
                             min_values.append(None)
                             max_values.append(None)
+                            min_values_display.append(None)
+                            max_values_display.append(None)
                     else:
                         min_values.append(None)
                         max_values.append(None)
+                        min_values_display.append(None)
+                        max_values_display.append(None)
                 except Exception:
                     min_values.append(None)
                     max_values.append(None)
+                    min_values_display.append(None)
+                    max_values_display.append(None)
                     # If we couldn't introspect column values, assume 0 nulls
                     null_counts.append(0)
         except Exception:
             # If even direct inspection fails, ensure lists lengths match
             min_values = [None] * len(table.columns)
             max_values = [None] * len(table.columns)
+            min_values_display = [None] * len(table.columns)
+            max_values_display = [None] * len(table.columns)
             null_counts = [0] * len(table.columns)
 
     # Calculate uncompressed size from table buffers — must be accurate.
@@ -249,4 +306,6 @@ def build_parquet_manifest_entry(
         histogram_bins=HISTOGRAM_BINS,
         min_values=min_values,
         max_values=max_values,
+        min_values_display=min_values_display,
+        max_values_display=max_values_display,
     )

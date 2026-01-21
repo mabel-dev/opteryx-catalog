@@ -144,6 +144,7 @@ class OpteryxCatalog(Metastore):
                 "timestamp-ms": now_ms,
                 "author": author,
                 "maintenance-policy": metadata.maintenance_policy,
+                "annotations": metadata.annotations,
             }
         )
 
@@ -223,6 +224,7 @@ class OpteryxCatalog(Metastore):
         metadata.author = data.get("author")
         metadata.description = data.get("description")
         metadata.describer = data.get("describer")
+        metadata.annotations = data.get("annotations") or []
 
         # Load snapshots based on load_history flag
         snaps = []
@@ -351,6 +353,7 @@ class OpteryxCatalog(Metastore):
                 "properties": properties or {},
                 "timestamp-ms": now_ms,
                 "author": author,
+                "annotations": [],
             }
         )
 
@@ -691,6 +694,8 @@ class OpteryxCatalog(Metastore):
                     ("histogram_bins", pa.int32()),
                     ("min_values", pa.list_(pa.binary())),
                     ("max_values", pa.list_(pa.binary())),
+                    ("min_values_display", pa.list_(pa.binary())),
+                    ("max_values_display", pa.list_(pa.binary())),
                 ]
             )
 
@@ -707,10 +712,14 @@ class OpteryxCatalog(Metastore):
                 e.setdefault("histogram_bins", 0)
                 e.setdefault("column_uncompressed_sizes_in_bytes", [])
                 e.setdefault("null_counts", [])
+                e.setdefault("min_values_display", [])
+                e.setdefault("max_values_display", [])
 
                 # Process min/max values: truncate to 16 bytes with ellipsis marker if longer
                 mv = e.get("min_values") or []
                 xv = e.get("max_values") or []
+                mv_disp = e.get("min_values_display") or []
+                xv_disp = e.get("max_values_display") or []
 
                 def truncate_value(v):
                     """Convert value to binary and truncate to 16 bytes with marker if needed."""
@@ -728,6 +737,8 @@ class OpteryxCatalog(Metastore):
 
                 e["min_values"] = [truncate_value(v) for v in mv]
                 e["max_values"] = [truncate_value(v) for v in xv]
+                e["min_values_display"] = [truncate_value(v) for v in mv_disp]
+                e["max_values_display"] = [truncate_value(v) for v in xv_disp]
                 normalized.append(e)
 
             try:
@@ -824,6 +835,7 @@ class OpteryxCatalog(Metastore):
                 "location": metadata.location,
                 "properties": metadata.properties,
                 "format-version": metadata.format_version,
+                "annotations": metadata.annotations,
                 "current-snapshot-id": metadata.current_snapshot_id,
                 "current-schema-id": metadata.current_schema_id,
                 "timestamp-ms": metadata.timestamp_ms,
@@ -922,6 +934,7 @@ class OpteryxCatalog(Metastore):
                 "scale": scale,
                 "precision": precision,
                 "expectation-policies": [],
+                "annotations": [],
             }
 
             cols.append(typed)

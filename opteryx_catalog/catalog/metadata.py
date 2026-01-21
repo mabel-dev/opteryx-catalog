@@ -68,6 +68,9 @@ class DatasetMetadata:
     # Each schema dict may also include `timestamp-ms` and `author`.
     schemas: List[dict] = field(default_factory=list)
     current_schema_id: Optional[str] = None
+    # Annotations: list of annotation objects attached to this dataset
+    # Each annotation is a dict with keys like 'key' and 'value'.
+    annotations: List[dict] = field(default_factory=list)
 
     def current_snapshot(self) -> Optional[Snapshot]:
         if self.current_snapshot_id is None:
