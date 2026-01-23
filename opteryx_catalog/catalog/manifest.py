@@ -189,7 +189,10 @@ def build_parquet_manifest_entry(
 
             min_k_hashes.append(col_min_k)
             histograms.append(col_hist)
-            # For string columns, store actual string min/max; for numeric, store compressed int64
+            # Store compressed int64 for all column types via draken.compress()
+            min_values.append(col_min)
+            max_values.append(col_max)
+            # For display: try to get human-readable representation
             try:
                 if pa.types.is_string(field_type) or pa.types.is_large_string(field_type):
                     if col_py is None:
@@ -200,30 +203,18 @@ def build_parquet_manifest_entry(
                     if col_py is not None:
                         non_nulls_str = [x for x in col_py if x is not None]
                         if non_nulls_str:
-                            str_min = min(non_nulls_str)
-                            str_max = max(non_nulls_str)
-                            min_values.append(str_min)
-                            max_values.append(str_max)
-                            min_values_display.append(str_min)
-                            max_values_display.append(str_max)
+                            min_values_display.append(min(non_nulls_str))
+                            max_values_display.append(max(non_nulls_str))
                         else:
-                            min_values.append(None)
-                            max_values.append(None)
                             min_values_display.append(None)
                             max_values_display.append(None)
                     else:
-                        min_values.append(col_min)
-                        max_values.append(col_max)
                         min_values_display.append(None)
                         max_values_display.append(None)
                 else:
-                    min_values.append(col_min)
-                    max_values.append(col_max)
                     min_values_display.append(None)
                     max_values_display.append(None)
             except Exception:
-                min_values.append(col_min)
-                max_values.append(col_max)
                 min_values_display.append(None)
                 max_values_display.append(None)
         # end for
@@ -232,7 +223,19 @@ def build_parquet_manifest_entry(
         min_k_hashes = [[] for _ in table.columns]
         histograms = [[] for _ in table.columns]
         # Attempt to compute per-column min/max from the table directly
+        # Store as int64 hashes for consistency with the Draken path
         try:
+            import hashlib
+
+            def compress_value_fallback(v):
+                """Hash a value to int64 for storage consistency with Draken."""
+                if v is None:
+                    return NULL_FLAG
+                s = str(v)
+                h = hashlib.sha256(s.encode("utf-8")).digest()
+                # Take first 8 bytes and interpret as signed int64
+                return int.from_bytes(h[:8], byteorder="big", signed=True)
+
             for col in table.columns:
                 try:
                     col_py = col.to_pylist()
@@ -241,8 +244,12 @@ def build_parquet_manifest_entry(
                     null_counts.append(int(null_count))
                     if non_nulls:
                         try:
-                            min_values.append(min(non_nulls))
-                            max_values.append(max(non_nulls))
+                            # Store compressed int64 values
+                            non_nulls_compressed = [compress_value_fallback(v) for v in non_nulls]
+                            col_min = min(non_nulls_compressed)
+                            col_max = max(non_nulls_compressed)
+                            min_values.append(col_min)
+                            max_values.append(col_max)
                             # preserve textual display when possible
                             try:
                                 min_values_display.append(min(non_nulls))
