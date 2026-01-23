@@ -692,10 +692,10 @@ class OpteryxCatalog(Metastore):
                     ("min_k_hashes", pa.list_(pa.list_(pa.uint64()))),
                     ("histogram_counts", pa.list_(pa.list_(pa.int64()))),
                     ("histogram_bins", pa.int32()),
-                    ("min_values", pa.list_(pa.binary())),
-                    ("max_values", pa.list_(pa.binary())),
-                    ("min_values_display", pa.list_(pa.binary())),
-                    ("max_values_display", pa.list_(pa.binary())),
+                    ("min_values", pa.list_(pa.int64())),
+                    ("max_values", pa.list_(pa.int64())),
+                    ("min_values_display", pa.list_(pa.string())),
+                    ("max_values_display", pa.list_(pa.string())),
                 ]
             )
 
@@ -715,30 +715,28 @@ class OpteryxCatalog(Metastore):
                 e.setdefault("min_values_display", [])
                 e.setdefault("max_values_display", [])
 
-                # Process min/max values: truncate to 16 bytes with ellipsis marker if longer
+                # min/max values are stored as compressed int64 values
+                # display values are string representations for human readability
                 mv = e.get("min_values") or []
                 xv = e.get("max_values") or []
                 mv_disp = e.get("min_values_display") or []
                 xv_disp = e.get("max_values_display") or []
 
-                def truncate_value(v):
-                    """Convert value to binary and truncate to 16 bytes with marker if needed."""
+                def truncate_display(v, max_len=32):
+                    """Truncate display value to max_len characters, adding '...' if longer."""
                     if v is None:
                         return None
-                    # Convert to bytes
-                    if isinstance(v, bytes):
-                        b = v
-                    else:
-                        b = str(v).encode("utf-8")
-                    # Truncate if longer than 16 bytes, add 0xFF as 17th byte to indicate truncation
-                    if len(b) > 16:
-                        return b[:16] + b"\xff"
-                    return b
+                    s = str(v)
+                    if len(s) > max_len:
+                        return s[:max_len] + "..."
+                    return s
 
-                e["min_values"] = [truncate_value(v) for v in mv]
-                e["max_values"] = [truncate_value(v) for v in xv]
-                e["min_values_display"] = [truncate_value(v) for v in mv_disp]
-                e["max_values_display"] = [truncate_value(v) for v in xv_disp]
+                # Ensure int64 values are properly typed for min/max
+                e["min_values"] = [int(v) if v is not None else None for v in mv]
+                e["max_values"] = [int(v) if v is not None else None for v in xv]
+                # Display values truncated to 32 chars with '...' suffix if longer
+                e["min_values_display"] = [truncate_display(v) for v in mv_disp]
+                e["max_values_display"] = [truncate_display(v) for v in xv_disp]
                 normalized.append(e)
 
             try:
