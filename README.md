@@ -5,17 +5,18 @@ lightweight catalog interface. This package provides an opinionated
 catalog implementation for storing table metadata documents in Firestore and
 consolidated Parquet manifests in GCS.
 
-This project is intended to be used as a catalog component in GCP-based
-environments and provides utilities to interoperate with Avro/manifest-based
-workflows when needed.
+**Important:** This library is *modelled after* Apache Iceberg but is **not
+compatible** with Iceberg; it is a separate implementation with different
+storage conventions and metadata layout. This library is the catalog and
+metastore used by [opteryx.app](https://opteryx.app/) and uses **Firestore** as the primary
+metastore and **GCS** for data and manifest storage.
 
 ---
 
 ## Features ✅
 
 - Firestore-backed catalog and collection storage
- - GCS-based table metadata storage (with optional compatibility mode)
- - GCS-based table metadata storage; export/import utilities provide Avro interoperability
+- GCS-based table metadata storage; export/import utilities available for artifact conversion
 - Table creation, registration, listing, loading, renaming, and deletion
 - Commit operations that write updated metadata to GCS and persist references in Firestore
 - Simple, opinionated defaults (e.g., default GCS location derived from catalog properties)
@@ -71,7 +72,7 @@ print(tbl.metadata)
 - GCP authentication: Use `GOOGLE_APPLICATION_CREDENTIALS` or Application Default Credentials
 - `firestore_project` and `firestore_database` can be supplied when creating the catalog
 - `gcs_bucket` is recommended to allow `create_dataset` to write metadata automatically; otherwise pass `location` explicitly to `create_dataset`
- - The catalog does not write Avro/manifest-list artifacts in the hot path; use the provided export/import utilities for interoperability
+ - The catalog writes consolidated Parquet manifests and does not write manifest-list artifacts in the hot path. Use the provided export/import utilities for artifact conversion when necessary.
 
 Example environment variables:
 
@@ -80,15 +81,9 @@ export GOOGLE_APPLICATION_CREDENTIALS="/path/to/service-account.json"
 export GOOGLE_CLOUD_PROJECT="my-gcp-project"
 ```
 
-### Interoperability
+### Manifest format
 
-This catalog implementation does not write Avro manifest-list/Avro manifest files
-in the hot path. Instead, table metadata is stored in Firestore and the runtime
-writes a consolidated Parquet manifest for fast query planning.
-
-If you need full Avro-compatible artifacts for other engines or tools, use the
-provided export/import utilities to transform between Avro manifests and the
-Parquet-first storage layout used by this catalog.
+This catalog writes consolidated Parquet manifests for fast query planning and stores table metadata in Firestore. Manifests and data files are stored in GCS. If you need different artifact formats, use the provided export/import utilities to convert manifests outside the hot path.
 
 ## API overview 📚
 
