@@ -118,21 +118,22 @@ def build_parquet_manifest_entry(
                 or pa.types.is_time(field_type)
             ):
                 compute_min_k = True
-            elif pa.types.is_string(field_type) or pa.types.is_large_string(field_type):
-                # compute average length from non-null values; only allow
-                # min-k/histogram for short strings (avg <= 16)
+            elif (
+                pa.types.is_string(field_type)
+                or pa.types.is_large_string(field_type)
+                or pa.types.is_binary(field_type)
+                or pa.types.is_large_binary(field_type)
+            ):
+                # Compute min-k for string and binary columns unconditionally
+                # (removed previous average length restriction).
                 col_py = None
                 try:
                     col_py = col.to_pylist()
                 except Exception:
                     col_py = None
 
-                if col_py is not None:
-                    lens = [len(x) for x in col_py if x is not None]
-                    if lens:
-                        avg_len = sum(lens) / len(lens)
-                        if avg_len <= 16:
-                            compute_min_k = True
+                # Always allow min-k/histogram for these types
+                compute_min_k = True
 
             # KMV: take K smallest unique hashes when allowed; otherwise
             # store an empty list for this column. Deduplicate hashes so
@@ -147,6 +148,10 @@ def build_parquet_manifest_entry(
 
             # For histogram decisions follow the same rule as min-k
             compute_hist = compute_min_k
+            # Booleans should always compute histograms even when min-k is not used
+            import pyarrow as pa
+            if pa.types.is_boolean(field_type):
+                compute_hist = True
 
             # Use draken.compress() to get canonical int64 per value
             mapped = list(vec.compress())
@@ -160,19 +165,43 @@ def build_parquet_manifest_entry(
                 col_min = int(vmin)
                 col_max = int(vmax)
                 if compute_hist:
-                    if vmin == vmax:
+                    # Special-case boolean histograms: use true/false counts
+                    if pa.types.is_boolean(field_type):
+                        try:
+                            if col_py is None:
+                                try:
+                                    col_py = col.to_pylist()
+                                except Exception:
+                                    col_py = None
+                            if col_py is not None:
+                                non_nulls_bool = [v for v in col_py if v is not None]
+                                false_count = sum(1 for v in non_nulls_bool if v is False)
+                                true_count = sum(1 for v in non_nulls_bool if v is True)
+                            else:
+                                # Fallback: infer from compressed mapping (assume 0/1)
+                                false_count = sum(1 for m in non_nulls_mapped if m == 0)
+                                true_count = sum(1 for m in non_nulls_mapped if m != 0)
+                        except Exception:
+                            false_count = 0
+                            true_count = 0
+
                         col_hist = [0] * HISTOGRAM_BINS
-                        col_hist[-1] = len(non_nulls_mapped)
+                        col_hist[0] = int(false_count)
+                        col_hist[-1] = int(true_count)
                     else:
-                        col_hist = [0] * HISTOGRAM_BINS
-                        span = float(vmax - vmin)
-                        for m in non_nulls_mapped:
-                            b = int(((float(m) - float(vmin)) / span) * (HISTOGRAM_BINS - 1))
-                            if b < 0:
-                                b = 0
-                            if b >= HISTOGRAM_BINS:
-                                b = HISTOGRAM_BINS - 1
-                            col_hist[b] += 1
+                        if vmin == vmax:
+                            col_hist = [0] * HISTOGRAM_BINS
+                            col_hist[-1] = len(non_nulls_mapped)
+                        else:
+                            col_hist = [0] * HISTOGRAM_BINS
+                            span = float(vmax - vmin)
+                            for m in non_nulls_mapped:
+                                b = int(((float(m) - float(vmin)) / span) * (HISTOGRAM_BINS - 1))
+                                if b < 0:
+                                    b = 0
+                                if b >= HISTOGRAM_BINS:
+                                    b = HISTOGRAM_BINS - 1
+                                col_hist[b] += 1
                 else:
                     col_hist = [0] * HISTOGRAM_BINS
             else:
@@ -211,6 +240,24 @@ def build_parquet_manifest_entry(
                     else:
                         min_values_display.append(None)
                         max_values_display.append(None)
+                elif pa.types.is_binary(field_type) or pa.types.is_large_binary(field_type):
+                    if col_py is None:
+                        try:
+                            col_py = col.to_pylist()
+                        except Exception:
+                            col_py = None
+                    if col_py is not None:
+                        non_nulls = [x for x in col_py if x is not None]
+                        if non_nulls:
+                            # show hex display for binary data
+                            min_values_display.append(min(non_nulls).hex())
+                            max_values_display.append(max(non_nulls).hex())
+                        else:
+                            min_values_display.append(None)
+                            max_values_display.append(None)
+                    else:
+                        min_values_display.append(None)
+                        max_values_display.append(None)
                 else:
                     min_values_display.append(None)
                     max_values_display.append(None)
@@ -219,9 +266,11 @@ def build_parquet_manifest_entry(
                 max_values_display.append(None)
         # end for
     except Exception:
-        # Draken not available or failed; leave min_k_hashes/histograms empty
+        # Draken not available or failed; leave min_k_hashes empty but
+        # compute simple histograms for boolean columns so we still surface
+        # useful statistics.
         min_k_hashes = [[] for _ in table.columns]
-        histograms = [[] for _ in table.columns]
+        histograms = []
         # Attempt to compute per-column min/max from the table directly
         # Store as int64 hashes for consistency with the Draken path
         try:
@@ -236,7 +285,9 @@ def build_parquet_manifest_entry(
                 # Take first 8 bytes and interpret as signed int64
                 return int.from_bytes(h[:8], byteorder="big", signed=True)
 
-            for col in table.columns:
+            import pyarrow as pa
+            for col_idx, col in enumerate(table.columns):
+                ty = table.schema.field(col_idx).type
                 try:
                     col_py = col.to_pylist()
                     non_nulls = [v for v in col_py if v is not None]
@@ -252,8 +303,13 @@ def build_parquet_manifest_entry(
                             max_values.append(col_max)
                             # preserve textual display when possible
                             try:
-                                min_values_display.append(min(non_nulls))
-                                max_values_display.append(max(non_nulls))
+                                if pa.types.is_binary(ty) or pa.types.is_large_binary(ty):
+                                    # show hex for binary
+                                    min_values_display.append(min(non_nulls).hex())
+                                    max_values_display.append(max(non_nulls).hex())
+                                else:
+                                    min_values_display.append(min(non_nulls))
+                                    max_values_display.append(max(non_nulls))
                             except Exception:
                                 min_values_display.append(None)
                                 max_values_display.append(None)
@@ -274,6 +330,30 @@ def build_parquet_manifest_entry(
                     max_values_display.append(None)
                     # If we couldn't introspect column values, assume 0 nulls
                     null_counts.append(0)
+
+                # boolean histogram fallback: map false->bin0 true->last_bin
+                try:
+                    if pa.types.is_boolean(ty):
+                        if col_py is None:
+                            try:
+                                col_py = col.to_pylist()
+                            except Exception:
+                                col_py = None
+                        if col_py is not None:
+                            non_nulls_bool = [v for v in col_py if v is not None]
+                            false_count = sum(1 for v in non_nulls_bool if v is False)
+                            true_count = sum(1 for v in non_nulls_bool if v is True)
+                        else:
+                            false_count = 0
+                            true_count = 0
+                        b_hist = [0] * HISTOGRAM_BINS
+                        b_hist[0] = int(false_count)
+                        b_hist[-1] = int(true_count)
+                        histograms.append(b_hist)
+                    else:
+                        histograms.append([0] * HISTOGRAM_BINS)
+                except Exception:
+                    histograms.append([0] * HISTOGRAM_BINS)
         except Exception:
             # If even direct inspection fails, ensure lists lengths match
             min_values = [None] * len(table.columns)
@@ -281,6 +361,7 @@ def build_parquet_manifest_entry(
             min_values_display = [None] * len(table.columns)
             max_values_display = [None] * len(table.columns)
             null_counts = [0] * len(table.columns)
+            histograms = [[0] * HISTOGRAM_BINS for _ in table.columns]
 
     # Calculate uncompressed size from table buffers — must be accurate.
     column_uncompressed: list[int] = []
