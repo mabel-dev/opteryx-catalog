@@ -955,6 +955,7 @@ class SimpleDataset(Dataset):
                 "file_hist_infos": [],
                 "min_displays": [],
                 "max_displays": [],
+                "uncompressed_bytes": 0,
             }
 
         total_rows = 0
@@ -1007,6 +1008,7 @@ class SimpleDataset(Dataset):
             xv = ent.get("max_values") or []
             mv_disp = ent.get("min_values_display") or []
             xv_disp = ent.get("max_values_display") or []
+            col_sizes = ent.get("column_uncompressed_sizes_in_bytes") or []
 
             for cname, cidx in col_to_idx.items():
                 # nulls
@@ -1090,6 +1092,12 @@ class SimpleDataset(Dataset):
                             )
                     except Exception:
                         pass
+
+                # uncompressed bytes for this column (sum across files)
+                try:
+                    stats[cname]["uncompressed_bytes"] += int((col_sizes or [0])[cidx])
+                except Exception:
+                    pass
 
         # Build results per column
         results: dict[str, dict] = {}
@@ -1212,6 +1220,7 @@ class SimpleDataset(Dataset):
                 "min": global_min,
                 "max": global_max,
                 "null_count": s["null_count"],
+                "uncompressed_bytes": s["uncompressed_bytes"],
                 "approx_cardinality": approx_cardinality,
                 "distribution": distribution,
             }
@@ -1228,24 +1237,6 @@ class SimpleDataset(Dataset):
                             is_text = True
             except Exception:
                 is_text = False
-
-            def _int_to_prefix(v, max_chars=16):
-                try:
-                    if not isinstance(v, int):
-                        return None
-                    if v == 0:
-                        return None
-                    blen = (v.bit_length() + 7) // 8
-                    blen = max(blen, 1)
-                    b = v.to_bytes(blen, "big")
-                    b = b.strip(b"\x00")
-                    if not b:
-                        return None
-                    s = b.decode("utf-8", errors="replace")
-                    s = s.rstrip("\x00")
-                    return s[:16]
-                except Exception:
-                    return None
 
             if is_text:
                 # Use only textual display values collected from manifests.
@@ -1325,8 +1316,9 @@ class SimpleDataset(Dataset):
             import pyarrow as pa
             import pyarrow.parquet as pq
 
-            prev_table = pq.read_table(pa.BufferReader(prev_data))
-            prev_rows = prev_table.to_pylist()
+            # the manifest is a parquet file, read into a pyarrow Table
+            prev_manifest = pq.read_table(pa.BufferReader(prev_data))
+            prev_rows = prev_manifest.to_pylist()
         except Exception:
             prev_rows = []
 
