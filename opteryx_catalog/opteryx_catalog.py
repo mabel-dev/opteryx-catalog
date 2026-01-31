@@ -327,6 +327,13 @@ class OpteryxCatalog(Metastore):
         coll = self._datasets_collection(collection)
         return [doc.id for doc in coll.stream()]
 
+    def list_collections(self) -> Iterable[str]:
+        """List top-level collections (documents) in this workspace."""
+        try:
+            return [col.id for col in self._catalog_ref.list_documents() if col.id[0] != "$"]
+        except:
+            return []
+
     def create_collection(
         self,
         collection: str,
