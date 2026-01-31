@@ -6,12 +6,15 @@ Usage:
 Example:
   python scripts/inspect_single_file_gcs.py opteryx_data opteryx/ops/audit_log/metadata/ gs://opteryx_data/opteryx/ops/audit_log/data/188f... artifacts/out.jsonl
 """
+
 import json
-import sys
 import os
+import sys
 import time
+
 import pyarrow.parquet as pq
 from google.cloud import storage
+
 from opteryx_catalog.catalog.manifest import build_parquet_manifest_entry
 
 
@@ -27,7 +30,9 @@ def _preview(lst, n=6):
 
 if __name__ == "__main__":
     if len(sys.argv) < 5:
-        print("Usage: python scripts/inspect_single_file_gcs.py <bucket> <manifest_prefix> <target_gs_path> <output_jsonl>")
+        print(
+            "Usage: python scripts/inspect_single_file_gcs.py <bucket> <manifest_prefix> <target_gs_path> <output_jsonl>"
+        )
         sys.exit(2)
 
     bucket_name = sys.argv[1]
@@ -95,10 +100,26 @@ if __name__ == "__main__":
     }
     man_k = ent.get("min_k_hashes") or []
     rec_k = recomputed.get("min_k_hashes") or []
-    rec["diffs"] = {"min_k_hashes_nonempty_counts": {"manifest_nonempty": sum(1 for x in man_k if x), "recomputed_nonempty": sum(1 for x in rec_k if x)}}
+    rec["diffs"] = {
+        "min_k_hashes_nonempty_counts": {
+            "manifest_nonempty": sum(1 for x in man_k if x),
+            "recomputed_nonempty": sum(1 for x in rec_k if x),
+        }
+    }
 
     with open(out_path, "w", encoding="utf-8") as of:
-        of.write(json.dumps({"_meta": {"source": "gcs-manifest-scan", "manifest_blob": match_manifest.name, "timestamp": int(time.time() * 1000)}}) + "\n")
+        of.write(
+            json.dumps(
+                {
+                    "_meta": {
+                        "source": "gcs-manifest-scan",
+                        "manifest_blob": match_manifest.name,
+                        "timestamp": int(time.time() * 1000),
+                    }
+                }
+            )
+            + "\n"
+        )
         of.write(json.dumps(rec) + "\n")
 
     print("WROTE", out_path)

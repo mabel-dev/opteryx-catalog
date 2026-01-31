@@ -14,13 +14,12 @@ and a dataset-level summary to the output JSON-lines file.
 import json
 import sys
 import time
-from typing import Any
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from opteryx_catalog.opteryx_catalog import OpteryxCatalog
 from opteryx_catalog.catalog.manifest import build_parquet_manifest_entry
+from opteryx_catalog.opteryx_catalog import OpteryxCatalog
 
 
 def safe_read_manifest(ds) -> list:
@@ -139,7 +138,9 @@ def inspect_dataset(dataset_identifier: str, output_path: str, catalog_kwargs: d
             # Build a compact summary for output
             recomputed_summary = {
                 "uncompressed_size": int(recomputed_entry.get("uncompressed_size_in_bytes") or 0),
-                "column_uncompressed_sizes": _preview(recomputed_entry.get("column_uncompressed_sizes_in_bytes")),
+                "column_uncompressed_sizes": _preview(
+                    recomputed_entry.get("column_uncompressed_sizes_in_bytes")
+                ),
                 "null_counts": _preview(recomputed_entry.get("null_counts")),
                 "min_values": _preview(recomputed_entry.get("min_values")),
                 "max_values": _preview(recomputed_entry.get("max_values")),
@@ -157,13 +158,16 @@ def inspect_dataset(dataset_identifier: str, output_path: str, catalog_kwargs: d
                 manifest_us = int(ent.get("uncompressed_size_in_bytes") or 0)
                 recomputed_us = recomputed_summary["uncompressed_size"]
                 if manifest_us != recomputed_us:
-                    diffs["uncompressed_size_mismatch"] = {"manifest": manifest_us, "recomputed": recomputed_us}
+                    diffs["uncompressed_size_mismatch"] = {
+                        "manifest": manifest_us,
+                        "recomputed": recomputed_us,
+                    }
             except Exception:
                 pass
 
             try:
                 manifest_cols = len(ent.get("column_uncompressed_sizes_in_bytes") or [])
-                recomputed_cols = (recomputed_entry.get("column_uncompressed_sizes_in_bytes") or [])
+                recomputed_cols = recomputed_entry.get("column_uncompressed_sizes_in_bytes") or []
                 if manifest_cols != len(recomputed_cols):
                     diffs["column_uncompressed_length_mismatch"] = {
                         "manifest_len": manifest_cols,
@@ -179,7 +183,9 @@ def inspect_dataset(dataset_identifier: str, output_path: str, catalog_kwargs: d
                 mismatches = []
                 for idx in range(min(len(man_list), len(rec_list))):
                     if man_list[idx] != rec_list[idx]:
-                        mismatches.append({"index": idx, "manifest": man_list[idx], "recomputed": rec_list[idx]})
+                        mismatches.append(
+                            {"index": idx, "manifest": man_list[idx], "recomputed": rec_list[idx]}
+                        )
                         if len(mismatches) >= max_samples:
                             break
                 if mismatches or len(man_list) != len(rec_list):
@@ -191,7 +197,13 @@ def inspect_dataset(dataset_identifier: str, output_path: str, catalog_kwargs: d
                     }
                 return None
 
-            for field in ("null_counts", "min_values", "max_values", "min_values_display", "max_values_display"):
+            for field in (
+                "null_counts",
+                "min_values",
+                "max_values",
+                "min_values_display",
+                "max_values_display",
+            ):
                 cmp_res = _cmp_lists(ent, recomputed_entry, field)
                 if cmp_res:
                     diffs[f"{field}_mismatch"] = cmp_res
@@ -203,11 +215,22 @@ def inspect_dataset(dataset_identifier: str, output_path: str, catalog_kwargs: d
                 col_mismatches = []
                 for idx in range(min(len(man_cols), len(rec_cols))):
                     if int(man_cols[idx]) != int(rec_cols[idx]):
-                        col_mismatches.append({"index": idx, "manifest": int(man_cols[idx]), "recomputed": int(rec_cols[idx])})
+                        col_mismatches.append(
+                            {
+                                "index": idx,
+                                "manifest": int(man_cols[idx]),
+                                "recomputed": int(rec_cols[idx]),
+                            }
+                        )
                         if len(col_mismatches) >= 5:
                             break
                 if col_mismatches or len(man_cols) != len(rec_cols):
-                    diffs["column_uncompressed_size_mismatch"] = {"count": len(col_mismatches), "sample": col_mismatches, "manifest_len": len(man_cols), "recomputed_len": len(rec_cols)}
+                    diffs["column_uncompressed_size_mismatch"] = {
+                        "count": len(col_mismatches),
+                        "sample": col_mismatches,
+                        "manifest_len": len(man_cols),
+                        "recomputed_len": len(rec_cols),
+                    }
             except Exception:
                 pass
 
@@ -228,7 +251,9 @@ def inspect_dataset(dataset_identifier: str, output_path: str, catalog_kwargs: d
         out_file.write(json.dumps(rec) + "\n")
 
     # Write recomputed per-column summary
-    out_file.write(json.dumps({"recomputed_column_uncompressed_bytes": recomputed_col_bytes}) + "\n")
+    out_file.write(
+        json.dumps({"recomputed_column_uncompressed_bytes": recomputed_col_bytes}) + "\n"
+    )
 
     # Attempt to build a recomputed describe-like summary for comparison
     recompute_describe = {}
@@ -246,7 +271,9 @@ def inspect_dataset(dataset_identifier: str, output_path: str, catalog_kwargs: d
 if __name__ == "__main__":
     # Usage: second arg optional; if omitted or outside the repo we write into ./artifacts/
     if len(sys.argv) < 2:
-        print("Usage: python scripts/inspect_manifest_dryrun.py <dataset_identifier> [output_jsonl_path]")
+        print(
+            "Usage: python scripts/inspect_manifest_dryrun.py <dataset_identifier> [output_jsonl_path]"
+        )
         sys.exit(2)
     dataset_identifier = sys.argv[1]
     out_arg = sys.argv[2] if len(sys.argv) >= 3 else ""
@@ -277,11 +304,17 @@ if __name__ == "__main__":
         if candidate.startswith(repo_root):
             output_path = candidate
         else:
-            output_path = os.path.join(artifacts_dir, f"{dataset_identifier.replace('.', '_')}_manifest_dryrun.jsonl")
+            output_path = os.path.join(
+                artifacts_dir, f"{dataset_identifier.replace('.', '_')}_manifest_dryrun.jsonl"
+            )
             print(f"Provided output path {out_arg} is outside the repo; writing to {output_path}")
     else:
-        output_path = os.path.join(artifacts_dir, f"{dataset_identifier.replace('.', '_')}_manifest_dryrun.jsonl")
+        output_path = os.path.join(
+            artifacts_dir, f"{dataset_identifier.replace('.', '_')}_manifest_dryrun.jsonl"
+        )
 
-    print(f"Using catalog workspace={catalog_kwargs['workspace']} firestore_project={catalog_kwargs['firestore_project']} gcs_bucket={catalog_kwargs['gcs_bucket']}")
+    print(
+        f"Using catalog workspace={catalog_kwargs['workspace']} firestore_project={catalog_kwargs['firestore_project']} gcs_bucket={catalog_kwargs['gcs_bucket']}"
+    )
     print(f"Writing results to {output_path}")
     inspect_dataset(dataset_identifier, output_path, catalog_kwargs)

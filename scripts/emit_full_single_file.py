@@ -1,47 +1,47 @@
 import json
 import os
+import sys
 import time
+
+# Recursively convert non-JSON types (bytes, pyarrow Buffers, etc.) to hex or JSON-safe types
+import pyarrow as pa
 import pyarrow.parquet as pq
 from google.cloud import storage
 
-import os
-import sys
+from opteryx_catalog.catalog.manifest import build_parquet_manifest_entry
 
 # Add local paths to sys.path to use local code instead of installed packages
 sys.path.insert(0, os.path.join(sys.path[0], ".."))  # Add parent dir for pyiceberg_firestore_gcs
 sys.path.insert(1, os.path.join(sys.path[0], "../opteryx-core"))
 sys.path.insert(1, os.path.join(sys.path[0], "../pyiceberg-firestore-gcs"))
 
-from opteryx.draken import Vector  # type: ignore
 
+TARGET = "gs://opteryx_data/opteryx/ops/audit_log/data/188fa239430f10c3-59275747aed0-2.parquet"
+OUT = "artifacts/single_file_188fa239430f10c3_full.json"
 
-from opteryx_catalog.catalog.manifest import build_parquet_manifest_entry
-
-TARGET = 'gs://opteryx_data/opteryx/ops/audit_log/data/188fa239430f10c3-59275747aed0-2.parquet'
-OUT = 'artifacts/single_file_188fa239430f10c3_full.json'
-
-_, rest = TARGET.split('://', 1)
-bucket_name, path = rest.split('/', 1)
+_, rest = TARGET.split("://", 1)
+bucket_name, path = rest.split("/", 1)
 client = storage.Client()
 blob = client.bucket(bucket_name).blob(path)
-print('Downloading', TARGET)
+print("Downloading", TARGET)
 data = blob.download_as_bytes()
-print('Downloaded bytes:', len(data))
+print("Downloaded bytes:", len(data))
 
-import pyarrow as pa
 
 # read parquet bytes via a BufferReader
 table = pq.read_table(pa.BufferReader(data))
 entry = build_parquet_manifest_entry(table, TARGET, len(data)).to_dict()
 
 out = {
-    '_meta': {'dataset': 'opteryx.ops.audit_log', 'timestamp': int(time.time() * 1000), 'source': 'single-file-full-json'},
-    'file_path': TARGET,
-    'recomputed_full': entry,
+    "_meta": {
+        "dataset": "opteryx.ops.audit_log",
+        "timestamp": int(time.time() * 1000),
+        "source": "single-file-full-json",
+    },
+    "file_path": TARGET,
+    "recomputed_full": entry,
 }
 
-# Recursively convert non-JSON types (bytes, pyarrow Buffers, etc.) to hex or JSON-safe types
-import pyarrow as pa
 
 def _hexify(obj):
     # raw bytes-like
@@ -74,10 +74,11 @@ def _hexify(obj):
     except Exception:
         return None
 
+
 safe_out = _hexify(out)
 
 os.makedirs(os.path.dirname(OUT), exist_ok=True)
-with open(OUT, 'w', encoding='utf-8') as of:
+with open(OUT, "w", encoding="utf-8") as of:
     json.dump(safe_out, of, indent=2, ensure_ascii=False)
 
-print('WROTE', OUT)
+print("WROTE", OUT)

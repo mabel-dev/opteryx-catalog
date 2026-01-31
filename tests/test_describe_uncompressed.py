@@ -99,9 +99,7 @@ def test_describe_includes_uncompressed_bytes():
     )
 
     # Add a schema with two columns so describe() can map names -> indices
-    meta.schemas.append(
-        {"schema_id": "s1", "columns": [{"name": "a"}, {"name": "b"}]}
-    )
+    meta.schemas.append({"schema_id": "s1", "columns": [{"name": "a"}, {"name": "b"}]})
     meta.current_schema_id = "s1"
 
     # Prepare snapshot referencing our in-memory manifest
