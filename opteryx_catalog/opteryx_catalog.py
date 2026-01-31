@@ -739,29 +739,7 @@ class OpteryxCatalog(Metastore):
                 e["max_values_display"] = [truncate_display(v) for v in xv_disp]
                 normalized.append(e)
 
-            try:
-                table = pa.Table.from_pylist(normalized, schema=schema)
-            except Exception as exc:
-                # Diagnostic output to help find malformed manifest entries
-
-                print(
-                    "[MANIFEST DEBUG] Failed to convert entries to Parquet manifest table. Dumping entries:"
-                )
-                for i, ent in enumerate(entries):
-                    print(f" Entry {i}:")
-                    if isinstance(ent, dict):
-                        for k, v in ent.items():
-                            tname = type(v).__name__
-                            try:
-                                s = repr(v)
-                            except Exception:
-                                s = "<unreprable>"
-                            print(f"  - {k}: type={tname} repr={s[:200]}")
-                    else:
-                        print(
-                            f"  - non-dict entry: type={type(ent).__name__} repr={repr(ent)[:200]}"
-                        )
-                raise exc
+            table = pa.Table.from_pylist(normalized, schema=schema)
 
             buf = pa.BufferOutputStream()
             pq.write_table(table, buf, compression="zstd")
