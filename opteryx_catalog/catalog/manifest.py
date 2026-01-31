@@ -334,7 +334,4 @@ def build_parquet_manifest_entry(
         min_values_display=min_values_display,
         max_values_display=max_values_display,
     )
-
-    print(entry.to_dict())
-
     return entry

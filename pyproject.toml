@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "opteryx-catalog"
-version = "0.4.23"
+version = "0.4.24"
 description = "Opteryx Cloud Catalog"
 readme = { file = "README.md", content-type = "text/markdown" }
 authors = [
