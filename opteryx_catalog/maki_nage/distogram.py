@@ -508,7 +508,7 @@ def frequency_density_distribution(
     bin_bounds = [float(i[0]) for i in h.bins]
     bin_widths = [(bin_bounds[i] - bin_bounds[i - 1]) for i in range(1, len(bin_bounds))]
     counts = [0]
-    counts.extend([count_at(h, e) for e in bin_bounds[1:]])
+    counts.extend([count_up_to(h, e) for e in bin_bounds[1:]])
     densities = [
         (new - last) / delta for new, last, delta in zip(counts[1:], counts[:-1], bin_widths)
     ]

@@ -1106,13 +1106,13 @@ class SimpleDataset(Dataset):
             # Handle mixed types: separate strings from numbers
             mins_filtered = [v for v in s["mins"] if v is not None]
             maxs_filtered = [v for v in s["maxs"] if v is not None]
-            
+
             # Group by type: strings vs numbers
             str_mins = [v for v in mins_filtered if isinstance(v, str)]
             num_mins = [v for v in mins_filtered if not isinstance(v, str)]
             str_maxs = [v for v in maxs_filtered if isinstance(v, str)]
             num_maxs = [v for v in maxs_filtered if not isinstance(v, str)]
-            
+
             # Use whichever type has values (strings take precedence for text columns)
             global_min = None
             global_max = None
@@ -1120,7 +1120,7 @@ class SimpleDataset(Dataset):
                 global_min = min(str_mins)
             elif num_mins:
                 global_min = min(num_mins)
-            
+
             if str_maxs:
                 global_max = max(str_maxs)
             elif num_maxs:

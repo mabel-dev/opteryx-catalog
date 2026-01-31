@@ -38,7 +38,7 @@ def test_histogram_on_too_small_distribution():
     for i in range(5):
         distogram.update(h, i)
 
-    assert distogram.histogram(h, 10) == None
+    assert distogram.histogram(h, 10) is None
 
 
 def test_format_histogram():

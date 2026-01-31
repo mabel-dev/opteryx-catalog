@@ -21,18 +21,19 @@ import pytest
 
 def test_min_k_hashes_for_string_and_binary():
     try:
-        import opteryx.draken as draken  # type: ignore
+        pass  # type: ignore
     except Exception:
         pytest.skip("opteryx.draken not available")
 
     import pyarrow as pa
 
     # short binary and short string columns should get min-k
-    t = _make_parquet_table([("bin", pa.binary()), ("s", pa.string())], [(b'a', 'x'), (b'b', 'y'), (b'c', 'z')])
+    t = _make_parquet_table(
+        [("bin", pa.binary()), ("s", pa.string())], [(b"a", "x"), (b"b", "y"), (b"c", "z")]
+    )
     e = build_parquet_manifest_entry(t, "mem://f", 0)
     assert len(e.min_k_hashes[0]) > 0
     assert len(e.min_k_hashes[1]) > 0
-
 
 
 # Step 1: Create a local catalog
@@ -44,6 +45,7 @@ catalog = OpteryxCatalog(
 )
 
 # print(catalog.load_dataset("ops.stdout_log").describe())
+
 
 class _MemInput:
     def __init__(self, data: bytes):
@@ -83,7 +85,9 @@ class _FakeCatalog:
     def __init__(self, io):
         self.io = io
 
-    def write_parquet_manifest(self, snapshot_id: int, entries: list[dict], dataset_location: str) -> str:
+    def write_parquet_manifest(
+        self, snapshot_id: int, entries: list[dict], dataset_location: str
+    ) -> str:
         # Minimal manifest writer using same schema as production
         schema = pa.schema(
             [
@@ -171,15 +175,20 @@ def test_refresh_manifest_with_single_file():
 
     # Persist the single-file manifest as JSON for quick inspection during
     # iterative debugging (writes to repo `artifacts/` so you can open it).
-    import os, json
+    import os
+    import json
 
     artifacts_dir = os.path.join(os.getcwd(), "artifacts")
     os.makedirs(artifacts_dir, exist_ok=True)
-    with open(os.path.join(artifacts_dir, "single_file_manifest.json"), "w", encoding="utf-8") as fh:
+    with open(
+        os.path.join(artifacts_dir, "single_file_manifest.json"), "w", encoding="utf-8"
+    ) as fh:
         json.dump(e1, fh, indent=2, default=str)
 
     # Create metadata and snapshot
-    meta = DatasetMetadata(dataset_identifier="tests_temp.test", location="mem://", schema=None, properties={})
+    meta = DatasetMetadata(
+        dataset_identifier="tests_temp.test", location="mem://", schema=None, properties={}
+    )
     meta.schemas.append({"schema_id": "s1", "columns": [{"name": "a"}, {"name": "b"}]})
     meta.current_schema_id = "s1"
     snap = Snapshot(snapshot_id=1, timestamp_ms=1, manifest_list=manifest_path)

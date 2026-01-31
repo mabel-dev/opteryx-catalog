@@ -8,13 +8,14 @@ Example:
 """
 
 import json
+import os
 import sys
 import time
-import os
+
 import pyarrow.parquet as pq
 
-from opteryx_catalog.opteryx_catalog import OpteryxCatalog
 from opteryx_catalog.catalog.manifest import build_parquet_manifest_entry
+from opteryx_catalog.opteryx_catalog import OpteryxCatalog
 
 
 def _preview(lst, n=6):
@@ -29,7 +30,9 @@ def _preview(lst, n=6):
 
 if __name__ == "__main__":
     if len(sys.argv) < 4:
-        print("Usage: python scripts/inspect_single_file.py <dataset_identifier> <file_path> <output_jsonl_path>")
+        print(
+            "Usage: python scripts/inspect_single_file.py <dataset_identifier> <file_path> <output_jsonl_path>"
+        )
         sys.exit(2)
 
     dataset_identifier = sys.argv[1]
@@ -50,11 +53,11 @@ if __name__ == "__main__":
         out_path = os.path.join(artifacts_dir, os.path.basename(out_path))
 
     # Allow fully-qualified identifiers like 'workspace.collection.dataset'
-    parts = dataset_identifier.split('.')
+    parts = dataset_identifier.split(".")
     if len(parts) == 3:
         wk, collection, dname = parts
         catalog_kwargs = dict(catalog_kwargs)
-        catalog_kwargs['workspace'] = wk
+        catalog_kwargs["workspace"] = wk
         dataset_identifier = f"{collection}.{dname}"
 
     cat = OpteryxCatalog(**catalog_kwargs)
@@ -107,7 +110,9 @@ if __name__ == "__main__":
         recomputed = build_parquet_manifest_entry(table, target_fp, len(data)).to_dict()
         rec["recomputed"] = {
             "uncompressed_size": int(recomputed.get("uncompressed_size_in_bytes") or 0),
-            "column_uncompressed_sizes": _preview(recomputed.get("column_uncompressed_sizes_in_bytes")),
+            "column_uncompressed_sizes": _preview(
+                recomputed.get("column_uncompressed_sizes_in_bytes")
+            ),
             "null_counts": _preview(recomputed.get("null_counts")),
             "min_values": _preview(recomputed.get("min_values")),
             "max_values": _preview(recomputed.get("max_values")),
@@ -117,15 +122,29 @@ if __name__ == "__main__":
         }
         # diffs
         diffs = {}
-        if rec["manifest_entry_summary"]["uncompressed_size"] != rec["recomputed"]["uncompressed_size"]:
-            diffs["uncompressed_size_mismatch"] = {"manifest": rec["manifest_entry_summary"]["uncompressed_size"], "recomputed": rec["recomputed"]["uncompressed_size"]}
+        if (
+            rec["manifest_entry_summary"]["uncompressed_size"]
+            != rec["recomputed"]["uncompressed_size"]
+        ):
+            diffs["uncompressed_size_mismatch"] = {
+                "manifest": rec["manifest_entry_summary"]["uncompressed_size"],
+                "recomputed": rec["recomputed"]["uncompressed_size"],
+            }
         man_k = ent.get("min_k_hashes") or []
         rec_k = recomputed.get("min_k_hashes") or []
-        diffs["min_k_hashes_nonempty_counts"] = {"manifest_nonempty": sum(1 for x in man_k if x), "recomputed_nonempty": sum(1 for x in rec_k if x)}
+        diffs["min_k_hashes_nonempty_counts"] = {
+            "manifest_nonempty": sum(1 for x in man_k if x),
+            "recomputed_nonempty": sum(1 for x in rec_k if x),
+        }
         rec["diffs"] = diffs
 
     with open(out_path, "w", encoding="utf-8") as of:
-        of.write(json.dumps({"_meta": {"dataset": dataset_identifier, "timestamp": int(time.time() * 1000)}}) + "\n")
+        of.write(
+            json.dumps(
+                {"_meta": {"dataset": dataset_identifier, "timestamp": int(time.time() * 1000)}}
+            )
+            + "\n"
+        )
         of.write(json.dumps(rec) + "\n")
 
     print("WROTE", out_path)
