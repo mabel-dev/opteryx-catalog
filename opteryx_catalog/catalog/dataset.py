@@ -1127,23 +1127,25 @@ class SimpleDataset(Dataset):
                 global_max = max(num_maxs)
 
             # kmv approx
-            approx_cardinality = 0
+            cardinality = 0
+            cardinality_is_exact = False
             try:
                 collected = s["hashes"]
                 if collected:
                     smallest = heapq.nsmallest(32, collected)
                     k = len(smallest)
-                    if k <= 1:
-                        approx_cardinality = len(set(smallest))
+                    if k < 31:
+                        cardinality = len(set(smallest))
+                        cardinality_is_exact = True
                     else:
                         MAX_HASH = (1 << 64) - 1
                         R = max(smallest)
                         if R == 0:
-                            approx_cardinality = len(set(smallest))
+                            cardinality = len(set(smallest))
                         else:
-                            approx_cardinality = int((k - 1) * (MAX_HASH + 1) / (R + 1))
+                            cardinality = int((k - 1) * (MAX_HASH + 1) / (R + 1))
             except Exception:
-                approx_cardinality = 0
+                cardinality = 0
 
             # distribution via distogram
             distribution = None
@@ -1221,7 +1223,8 @@ class SimpleDataset(Dataset):
                 "max": global_max,
                 "null_count": s["null_count"],
                 "uncompressed_bytes": s["uncompressed_bytes"],
-                "approx_cardinality": approx_cardinality,
+                "cardinality": cardinality,
+                "cardinality_is_exact": cardinality_is_exact,
                 "distribution": distribution,
             }
 
