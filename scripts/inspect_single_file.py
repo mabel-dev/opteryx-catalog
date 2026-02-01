@@ -12,9 +12,7 @@ import os
 import sys
 import time
 
-import pyarrow.parquet as pq
-
-from opteryx_catalog.catalog.manifest import build_parquet_manifest_entry
+from opteryx_catalog.catalog.manifest import build_parquet_manifest_entry_from_bytes
 from opteryx_catalog.opteryx_catalog import OpteryxCatalog
 
 
@@ -106,8 +104,7 @@ if __name__ == "__main__":
     if not data:
         rec["recomputed"] = {"error": "empty file"}
     else:
-        table = pq.read_table(data)
-        recomputed = build_parquet_manifest_entry(table, target_fp, len(data)).to_dict()
+        recomputed = build_parquet_manifest_entry_from_bytes(data, target_fp, len(data)).to_dict()
         rec["recomputed"] = {
             "uncompressed_size": int(recomputed.get("uncompressed_size_in_bytes") or 0),
             "column_uncompressed_sizes": _preview(

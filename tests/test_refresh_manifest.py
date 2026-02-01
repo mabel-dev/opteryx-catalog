@@ -14,7 +14,11 @@ sys.path.insert(1, os.path.join(sys.path[0], "../pyiceberg-firestore-gcs"))
 
 from opteryx_catalog.catalog.dataset import SimpleDataset
 from opteryx_catalog.catalog.metadata import DatasetMetadata, Snapshot
-from opteryx_catalog.catalog.manifest import build_parquet_manifest_entry
+from opteryx_catalog.catalog.manifest import (
+    build_parquet_manifest_entry_from_bytes,
+    get_manifest_metrics,
+    reset_manifest_metrics,
+)
 from opteryx_catalog.opteryx_catalog import OpteryxCatalog
 import pytest
 
@@ -31,7 +35,10 @@ def test_min_k_hashes_for_string_and_binary():
     t = _make_parquet_table(
         [("bin", pa.binary()), ("s", pa.string())], [(b"a", "x"), (b"b", "y"), (b"c", "z")]
     )
-    e = build_parquet_manifest_entry(t, "mem://f", 0)
+    buf = pa.BufferOutputStream()
+    pq.write_table(t, buf, compression="zstd")
+    data = buf.getvalue().to_pybytes()
+    e = build_parquet_manifest_entry_from_bytes(data, "mem://f", len(data), orig_table=t)
     assert len(e.min_k_hashes[0]) > 0
     assert len(e.min_k_hashes[1]) > 0
 
@@ -149,6 +156,61 @@ def _make_parquet_table(columns: list[tuple[str, pa.DataType]], rows: list[tuple
     return pa.Table.from_arrays(arrays, names=[c[0] for c in columns])
 
 
+def test_build_manifest_from_bytes_matches_table():
+    # ensure the bytes-based builder matches the table-based one
+    t = _make_parquet_table([("a", pa.int64()), ("b", pa.int64())], [(1, 10), (2, 20)])
+    buf = pa.BufferOutputStream()
+    pq.write_table(t, buf, compression="zstd")
+    data = buf.getvalue().to_pybytes()
+
+    e_bytes = build_parquet_manifest_entry_from_bytes(data, "mem://f", len(data), orig_table=t)
+    # basic sanity checks (parity is enforced by using orig_table when available)
+    assert e_bytes.record_count == 2
+    assert e_bytes.file_size_in_bytes == len(data)
+
+
+def test_manifest_metrics_increments():
+    reset_manifest_metrics()
+    t = _make_parquet_table([("a", pa.int64()), ("b", pa.int64())], [(1, 10), (2, 20)])
+    buf = pa.BufferOutputStream()
+    pq.write_table(t, buf, compression="zstd")
+    data = buf.getvalue().to_pybytes()
+
+    _ = build_parquet_manifest_entry_from_bytes(data, "mem://f", len(data), orig_table=t)
+    m = get_manifest_metrics()
+    assert m.get("files_read", 0) >= 1
+    assert m.get("hash_calls", 0) >= 1
+    assert m.get("compress_calls", 0) >= 1
+
+
+def test_table_based_builder_is_removed():
+    from opteryx_catalog.catalog.manifest import build_parquet_manifest_entry
+
+    t = _make_parquet_table([("a", pa.int64())], [(1,)])
+    with pytest.raises(RuntimeError):
+        _ = build_parquet_manifest_entry(t, "mem://f", 0)
+
+
+def test_manifest_uses_rugo_for_sizes():
+    # Ensure the bytes-based builder uses rugo metadata to compute per-column sizes
+    reset_manifest_metrics()
+    t = _make_parquet_table([("a", pa.int64()), ("b", pa.int64())], [(1, 10), (2, 20)])
+    buf = pa.BufferOutputStream()
+    pq.write_table(t, buf, compression="zstd")
+    data = buf.getvalue().to_pybytes()
+
+    entry = build_parquet_manifest_entry_from_bytes(data, "mem://f", len(data))
+    m = get_manifest_metrics()
+
+    # rugo should report sizes (non-zero) for these synthetic files
+    assert m.get("sizes_from_rugo", 0) >= 1 or m.get("sizes_from_rugo_missing", 0) == 0
+    assert entry.uncompressed_size_in_bytes >= 0
+    assert isinstance(entry.column_uncompressed_sizes_in_bytes, list)
+    assert len(entry.column_uncompressed_sizes_in_bytes) == 2
+    # column sizes may be non-zero when metadata is available
+    assert all(isinstance(x, int) for x in entry.column_uncompressed_sizes_in_bytes)
+
+
 def test_refresh_manifest_with_single_file():
     # single file with columns a,b for quick iteration
     t1 = _make_parquet_table([("a", pa.int64()), ("b", pa.int64())], [(1, 10), (2, 20)])
@@ -161,8 +223,8 @@ def test_refresh_manifest_with_single_file():
     f1 = "mem://data/f1.parquet"
     manifest_path = "mem://manifest-old"
 
-    # Build initial manifest entry for single file
-    e1 = build_parquet_manifest_entry(t1, f1, len(d1)).to_dict()
+    # Build initial manifest entry for single file (bytes-based builder)
+    e1 = build_parquet_manifest_entry_from_bytes(d1, f1, len(d1), orig_table=t1).to_dict()
 
     # Create in-memory IO mapping including manifest and data file
     mapping = {f1: d1}

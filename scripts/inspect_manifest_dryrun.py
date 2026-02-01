@@ -7,7 +7,7 @@ Example:
   python scripts/inspect_manifest_dryrun.py opteryx.ops.audit_log /tmp/audit_log_manifest_dryrun.jsonl
 
 This script is non-mutating: it reads the manifest and referenced data files (when readable),
-recomputes per-file statistics via `build_parquet_manifest_entry`, and writes per-file results
+recomputes per-file statistics via `build_parquet_manifest_entry_from_bytes`, and writes per-file results
 and a dataset-level summary to the output JSON-lines file.
 """
 
@@ -18,7 +18,7 @@ import time
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from opteryx_catalog.catalog.manifest import build_parquet_manifest_entry
+from opteryx_catalog.catalog.manifest import build_parquet_manifest_entry_from_bytes
 from opteryx_catalog.opteryx_catalog import OpteryxCatalog
 
 
@@ -132,8 +132,10 @@ def inspect_dataset(dataset_identifier: str, output_path: str, catalog_kwargs: d
                 rec["recomputed"] = {"error": "empty file"}
                 out_file.write(json.dumps(rec) + "\n")
                 continue
-            table = pq.read_table(pa.BufferReader(data))
-            recomputed_entry = build_parquet_manifest_entry(table, fp, len(data)).to_dict()
+            # Use bytes-based builder for deterministic behavior
+            recomputed_entry = build_parquet_manifest_entry_from_bytes(
+                data, fp, len(data)
+            ).to_dict()
 
             # Build a compact summary for output
             recomputed_summary = {
