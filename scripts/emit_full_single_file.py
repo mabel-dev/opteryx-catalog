@@ -4,11 +4,9 @@ import sys
 import time
 
 # Recursively convert non-JSON types (bytes, pyarrow Buffers, etc.) to hex or JSON-safe types
-import pyarrow as pa
-import pyarrow.parquet as pq
 from google.cloud import storage
 
-from opteryx_catalog.catalog.manifest import build_parquet_manifest_entry
+from opteryx_catalog.catalog.manifest import build_parquet_manifest_entry_from_bytes
 
 # Add local paths to sys.path to use local code instead of installed packages
 sys.path.insert(0, os.path.join(sys.path[0], ".."))  # Add parent dir for pyiceberg_firestore_gcs
@@ -29,8 +27,7 @@ print("Downloaded bytes:", len(data))
 
 
 # read parquet bytes via a BufferReader
-table = pq.read_table(pa.BufferReader(data))
-entry = build_parquet_manifest_entry(table, TARGET, len(data)).to_dict()
+entry = build_parquet_manifest_entry_from_bytes(data, TARGET, len(data)).to_dict()
 
 out = {
     "_meta": {

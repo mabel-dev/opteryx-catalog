@@ -123,3 +123,16 @@ class GcsFileIO(FileIO):
             return True
         except Exception:
             return False
+
+
+# Centralized Parquet write options used across the codebase when writing
+# parquet files. Exported here so all writers share the same configuration.
+WRITE_PARQUET_OPTIONS = {
+    "compression": "ZSTD",
+    "compression_level": 3,
+    "use_dictionary": True,
+    "dictionary_pagesize_limit": 1024 * 1024,
+    "data_page_size": 1024 * 1024,
+    "version": "2.6",
+    "write_statistics": True,
+}

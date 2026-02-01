@@ -14,7 +14,7 @@ from typing import Optional
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from .manifest import build_parquet_manifest_entry
+from .manifest import build_parquet_manifest_entry_from_bytes
 from .metadata import Snapshot
 
 # Constants
@@ -398,18 +398,25 @@ class DatasetCompactor:
             file_name = f"data-{snapshot_id}-{idx:04d}.parquet"
             file_path = os.path.join(self.dataset.metadata.location, file_name)
 
-            # Write parquet file
+            # Write parquet file to buffer and upload (so we can reuse bytes)
             try:
+                buf = pa.BufferOutputStream()
+                from ..iops.fileio import WRITE_PARQUET_OPTIONS
+
+                pq.write_table(table, buf, **WRITE_PARQUET_OPTIONS)
+                pdata = buf.getvalue().to_pybytes()
                 io = self.dataset.io
-                out = io.new_output(file_path)
-                with out.create() as f:
-                    pq.write_table(table, f)
+                out = io.new_output(file_path).create()
+                out.write(pdata)
+                out.close()
             except Exception:
-                # Failed to write, abort
+                # Failed to write or upload, abort
                 return None
 
-            # Build manifest entry with full statistics
-            entry_dict = build_parquet_manifest_entry(table, file_path)
+            # Build manifest entry with full statistics using the bytes-based builder
+            entry_dict = build_parquet_manifest_entry_from_bytes(
+                pdata, file_path, len(pdata), orig_table=table
+            )
             new_entries.append(entry_dict)
 
         # Create new manifest with updated entries

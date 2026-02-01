@@ -674,6 +674,8 @@ class OpteryxCatalog(Metastore):
         import pyarrow as pa
         import pyarrow.parquet as pq
 
+        from .iops.fileio import WRITE_PARQUET_OPTIONS
+
         # If entries is None we skip writing; if entries is empty list, write
         # an empty Parquet manifest (represents an empty dataset for this
         # snapshot). This preserves previous manifests so older snapshots
@@ -749,7 +751,7 @@ class OpteryxCatalog(Metastore):
             table = pa.Table.from_pylist(normalized, schema=schema)
 
             buf = pa.BufferOutputStream()
-            pq.write_table(table, buf, compression="zstd")
+            pq.write_table(table, buf, **WRITE_PARQUET_OPTIONS)
             data = buf.getvalue().to_pybytes()
 
             if self.io:

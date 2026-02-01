@@ -15,7 +15,7 @@ import time
 import pyarrow.parquet as pq
 from google.cloud import storage
 
-from opteryx_catalog.catalog.manifest import build_parquet_manifest_entry
+from opteryx_catalog.catalog.manifest import build_parquet_manifest_entry_from_bytes
 
 
 def _preview(lst, n=6):
@@ -85,8 +85,7 @@ if __name__ == "__main__":
     blob2 = client.bucket(bucket2).blob(path)
     data = blob2.download_as_bytes()
 
-    table = pq.read_table(data)
-    recomputed = build_parquet_manifest_entry(table, target_fp, len(data)).to_dict()
+    recomputed = build_parquet_manifest_entry_from_bytes(data, target_fp, len(data)).to_dict()
 
     rec = {"file_index": match_idx, "file_path": target_fp}
     ent = match_row

@@ -9,7 +9,7 @@ from typing import Iterable
 from typing import Optional
 
 from .manifest import ParquetManifestEntry
-from .manifest import build_parquet_manifest_entry
+from .manifest import build_parquet_manifest_entry_from_bytes
 from .metadata import DatasetMetadata
 from .metadata import Snapshot
 from .metastore import Dataset
@@ -380,16 +380,20 @@ class SimpleDataset(Dataset):
         import pyarrow as pa
         import pyarrow.parquet as pq
 
+        from ..iops.fileio import WRITE_PARQUET_OPTIONS
+
         buf = pa.BufferOutputStream()
-        pq.write_table(table, buf, compression="zstd")
+        pq.write_table(table, buf, **WRITE_PARQUET_OPTIONS)
         pdata = buf.getvalue().to_pybytes()
 
         out = self.io.new_output(data_path).create()
         out.write(pdata)
         out.close()
 
-        # Build manifest entry with statistics
-        manifest_entry = build_parquet_manifest_entry(table, data_path, len(pdata))
+        # Build manifest entry with statistics using a bytes-based, per-column scan
+        manifest_entry = build_parquet_manifest_entry_from_bytes(
+            pdata, data_path, len(pdata), orig_table=table
+        )
         return manifest_entry
 
     def overwrite(self, table: Any, author: str = None, commit_message: Optional[str] = None):
@@ -562,11 +566,9 @@ class SimpleDataset(Dataset):
                     data = f.read()
 
                 if data:
-                    # Read full table to compute complete statistics
-                    table = pq.read_table(pa.BufferReader(data))
+                    # Compute statistics using a single read of the compressed bytes
                     file_size = len(data)
-                    # Use build_parquet_manifest_entry which computes full statistics
-                    manifest_entry = build_parquet_manifest_entry(table, fp, file_size)
+                    manifest_entry = build_parquet_manifest_entry_from_bytes(data, fp, file_size)
                 else:
                     # Empty file, create placeholder entry
                     manifest_entry = ParquetManifestEntry(
@@ -726,9 +728,6 @@ class SimpleDataset(Dataset):
             seen.add(fp)
 
             try:
-                import pyarrow as pa
-                import pyarrow.parquet as pq
-
                 data = None
                 if self.io and hasattr(self.io, "new_input"):
                     inp = self.io.new_input(fp)
@@ -748,11 +747,9 @@ class SimpleDataset(Dataset):
                         data = blob.download_as_bytes()
 
                 if data:
-                    # Read full table to compute complete statistics
-                    table = pq.read_table(pa.BufferReader(data))
+                    # Compute statistics using a single read of the compressed bytes
                     file_size = len(data)
-                    # Use build_parquet_manifest_entry which computes full statistics
-                    manifest_entry = build_parquet_manifest_entry(table, fp, file_size)
+                    manifest_entry = build_parquet_manifest_entry_from_bytes(data, fp, file_size)
                 else:
                     # Empty file, create placeholder entry
                     manifest_entry = ParquetManifestEntry(
@@ -1341,8 +1338,8 @@ class SimpleDataset(Dataset):
                 with inp.open() as f:
                     data = f.read()
                 # Full statistics including histograms and k-hashes
-                table = pq.read_table(pa.BufferReader(data))
-                manifest_entry = build_parquet_manifest_entry(table, fp, len(data))
+                file_size = len(data)
+                manifest_entry = build_parquet_manifest_entry_from_bytes(data, fp, file_size)
                 dent = manifest_entry.to_dict()
             except Exception:
                 # Fall back to original entry if re-read fails
