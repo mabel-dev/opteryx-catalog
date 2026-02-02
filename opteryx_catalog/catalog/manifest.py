@@ -299,6 +299,7 @@ def build_parquet_manifest_entry_from_bytes(
     t_start = time.perf_counter()
     _manifest_metrics["files_read"] += 1
     _manifest_metrics["bytes_read"] += len(data_bytes)
+    data_bytes_len = len(data_bytes)
 
     buf = pa.BufferReader(data_bytes)
     pf = pq.ParquetFile(buf)
@@ -324,8 +325,8 @@ def build_parquet_manifest_entry_from_bytes(
 
     # iterate schema fields and process each column independently
     schema = pf.schema_arrow
-    for col_idx, field in enumerate(schema):
-        col_name = field.name
+    for col_idx, col_field in enumerate(schema):
+        col_name = col_field.name
         try:
             col_table = pf.read(columns=[col_name])
             col = col_table.column(0).combine_chunks()
@@ -443,7 +444,7 @@ def build_parquet_manifest_entry_from_bytes(
         file_path=file_path,
         file_format="parquet",
         record_count=int(meta.num_rows),
-        file_size_in_bytes=int(file_size_in_bytes or len(data_bytes)),
+        file_size_in_bytes=int(file_size_in_bytes or data_bytes_len),
         uncompressed_size_in_bytes=uncompressed_size,
         column_uncompressed_sizes_in_bytes=column_uncompressed,
         null_counts=null_counts,

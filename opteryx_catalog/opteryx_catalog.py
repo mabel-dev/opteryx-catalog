@@ -145,6 +145,7 @@ class OpteryxCatalog(Metastore):
                 "author": author,
                 "maintenance-policy": metadata.maintenance_policy,
                 "annotations": metadata.annotations,
+                "refresh-frequency-mins": None,
             }
         )
 
@@ -225,6 +226,7 @@ class OpteryxCatalog(Metastore):
         metadata.description = data.get("description")
         metadata.describer = data.get("describer")
         metadata.annotations = data.get("annotations") or []
+        metadata.refresh_frequency_mins = data.get("refresh-frequency-mins")
 
         # Load snapshots based on load_history flag
         snaps = []
@@ -331,7 +333,7 @@ class OpteryxCatalog(Metastore):
         """List top-level collections (documents) in this workspace."""
         try:
             return [col.id for col in self._catalog_ref.list_documents() if col.id[0] != "$"]
-        except:
+        except (ValueError, KeyError, AttributeError):
             return []
 
     def create_collection(
@@ -829,6 +831,7 @@ class OpteryxCatalog(Metastore):
                 "describer": metadata.describer,
                 "maintenance-policy": metadata.maintenance_policy,
                 "sort-orders": metadata.sort_orders,
+                "refresh-frequency-mins": metadata.refresh_frequency_mins,
             }
         )
 

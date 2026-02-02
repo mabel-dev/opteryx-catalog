@@ -12,6 +12,8 @@ import os
 import sys
 import time
 
+import pyarrow.parquet as pq
+
 from opteryx_catalog.catalog.manifest import build_parquet_manifest_entry_from_bytes
 from opteryx_catalog.opteryx_catalog import OpteryxCatalog
 
