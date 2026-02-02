@@ -55,7 +55,6 @@ class DatasetMetadata:
     # Maintenance policy: retention settings grouped under a single block
     maintenance_policy: dict = field(
         default_factory=lambda: {
-            "retained-snapshot-count": None,
             "retained-snapshot-age-days": None,
             "compaction-policy": "performance",
         }
@@ -71,6 +70,8 @@ class DatasetMetadata:
     # Annotations: list of annotation objects attached to this dataset
     # Each annotation is a dict with keys like 'key' and 'value'.
     annotations: List[dict] = field(default_factory=list)
+    # Refresh frequency in minutes; None means no automatic refresh
+    refresh_frequency_mins: Optional[int] = None
 
     def current_snapshot(self) -> Optional[Snapshot]:
         if self.current_snapshot_id is None:
