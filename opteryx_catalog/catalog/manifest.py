@@ -349,7 +349,7 @@ def build_parquet_manifest_entry_from_bytes(
             col_min_display,
             col_max_display,
             null_count,
-        ) = _compute_stats_for_arrow_column(col, field.type, file_path)
+        ) = _compute_stats_for_arrow_column(col, col_field.type, file_path)
 
         # free the table-level reference if present so memory can be reclaimed
         try:
