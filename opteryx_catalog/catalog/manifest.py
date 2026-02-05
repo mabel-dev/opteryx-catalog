@@ -250,22 +250,61 @@ def _compute_stats_for_arrow_column(col, field_type, file_path: str):
                 min_display = None
                 max_display = None
         else:
-            if col_py is None:
-                try:
-                    col_py = col.to_pylist()
-                except Exception:
-                    col_py = None
-            if col_py is not None:
-                non_nulls = [x for x in col_py if x is not None]
-                if non_nulls:
-                    min_display = min(non_nulls)
-                    max_display = max(non_nulls)
+            # Handle dates and timestamps with special formatting
+            if (
+                pa.types.is_date(field_type)
+                or pa.types.is_timestamp(field_type)
+                or pa.types.is_time(field_type)
+            ):
+                if col_py is None:
+                    try:
+                        col_py = col.to_pylist()
+                    except Exception:
+                        col_py = None
+                if col_py is not None:
+                    non_nulls = [x for x in col_py if x is not None]
+                    if non_nulls:
+                        min_val = min(non_nulls)
+                        max_val = max(non_nulls)
+                        # Convert to ISO format strings for proper display
+                        try:
+                            min_display = (
+                                min_val.isoformat()
+                                if hasattr(min_val, "isoformat")
+                                else str(min_val)
+                            )
+                            max_display = (
+                                max_val.isoformat()
+                                if hasattr(max_val, "isoformat")
+                                else str(max_val)
+                            )
+                        except Exception:
+                            min_display = str(min_val)
+                            max_display = str(max_val)
+                    else:
+                        min_display = None
+                        max_display = None
                 else:
                     min_display = None
                     max_display = None
             else:
-                min_display = None
-                max_display = None
+                # For other types (numbers, etc.)
+                if col_py is None:
+                    try:
+                        col_py = col.to_pylist()
+                    except Exception:
+                        col_py = None
+                if col_py is not None:
+                    non_nulls = [x for x in col_py if x is not None]
+                    if non_nulls:
+                        min_display = min(non_nulls)
+                        max_display = max(non_nulls)
+                    else:
+                        min_display = None
+                        max_display = None
+                else:
+                    min_display = None
+                    max_display = None
     except Exception:
         min_display = None
         max_display = None
