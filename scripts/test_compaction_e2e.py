@@ -16,11 +16,13 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+# Add parent to path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
 from opteryx_catalog import OpteryxCatalog
 from opteryx_catalog.catalog.compaction import DatasetCompactor
 
-# Add parent to path
-sys.path.insert(0, str(Path(__file__).parent.parent))
+
 
 
 def create_small_dataset_with_multiple_files():
