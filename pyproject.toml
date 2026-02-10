@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "opteryx-catalog"
-version = "0.4.30"
+version = "0.4.31"
 description = "Opteryx Cloud Catalog"
 readme = { file = "README.md", content-type = "text/markdown" }
 authors = [
@@ -26,12 +26,12 @@ classifiers = [
 urls = { "Homepage" = "https://github.com/mabel-dev/opteryx-catalog" }
 requires-python = ">=3.9"
 dependencies = [
-    "google-cloud-firestore==2.23.*",
-    "google-cloud-storage==3.8.*",
+    "google-cloud-firestore==2.*",
+    "google-cloud-storage==3.*",
     "orso==0.0.*",
-    "opteryx-core",
-    "pyarrow==23.0.*",
-    "requests==2.32.*"
+    "opteryx-core=0.6.*",
+    "pyarrow==23.*",
+    "requests==2.*"
 ]
 
 [project.optional-dependencies]
