@@ -7,7 +7,6 @@ Provides incremental compaction strategies to address the small files problem.
 from __future__ import annotations
 
 import os
-import re
 import time
 import uuid
 from typing import List
@@ -16,8 +15,8 @@ from typing import Optional
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from .manifest import build_parquet_manifest_entry_from_bytes
 from .manifest import ParquetManifestEntry
+from .manifest import build_parquet_manifest_entry_from_bytes
 from .metadata import Snapshot
 
 # Stable node identifier for this process (hex-mac-hex-pid)
@@ -137,13 +136,11 @@ class DatasetCompactor:
 
     def _read_manifest(self, manifest_path: str) -> List[dict]:
         """Read manifest entries from manifest file."""
+        # Prefer parsed-manifest cache to avoid repeated pyarrow parsing
+        from .manifest import get_parsed_manifest
+
         try:
-            io = self.dataset.io
-            inp = io.new_input(manifest_path)
-            with inp.open() as f:
-                data = f.read()
-            table = pq.read_table(pa.BufferReader(data))
-            return table.to_pylist()
+            return get_parsed_manifest(self.dataset.io, manifest_path)
         except Exception:
             return []
 
@@ -390,7 +387,9 @@ class DatasetCompactor:
         output_tables = []
         if plan_type == "split" or (plan_type == "combine-split" and total_size > MAX_SIZE_BYTES):
             # Split into multiple files, but at most MAX_MEMORY_FILES
-            output_tables = self._split_table(combined, TARGET_SIZE_BYTES, max_files=MAX_MEMORY_FILES)
+            output_tables = self._split_table(
+                combined, TARGET_SIZE_BYTES, max_files=MAX_MEMORY_FILES
+            )
         else:
             # Single output file
             output_tables = [combined]
@@ -402,7 +401,7 @@ class DatasetCompactor:
         for idx, table in enumerate(output_tables):
             # Generate collision-resistant file path using nanosecond precision timestamp and node id
             file_name = f"{time.time_ns():x}-{_NODE}.parquet"
-            file_path = os.path.join(self.dataset.metadata.location, 'data', file_name)
+            file_path = os.path.join(self.dataset.metadata.location, "data", file_name)
 
             # Write parquet file to buffer and upload (so we can reuse bytes)
             try:
@@ -431,7 +430,7 @@ class DatasetCompactor:
         # Also validate remaining entries - recover corrupted ones by reading files
         old_file_paths = {f["file_path"] for f in files_to_compact}
         updated_entries = []
-        
+
         for e in all_entries:
             if e.get("file_path") not in old_file_paths:
                 # Validate entry before including
@@ -445,7 +444,7 @@ class DatasetCompactor:
                         # Rebuild failed - catastrophic, abort entire compaction
                         return None
                     updated_entries.append(recovered)
-        
+
         updated_entries.extend(new_entries)
 
         # Ensure all entries are dicts (convert any ParquetManifestEntry objects)
@@ -470,7 +469,7 @@ class DatasetCompactor:
             deleted_size = 0
             deleted_data_size = 0
             deleted_records = 0
-            
+
             # Get actual stats from the tables we read
             for table in tables:
                 deleted_records += table.num_rows
@@ -490,18 +489,20 @@ class DatasetCompactor:
         except Exception:
             # If stats calculation fails, refresh the entire manifest from data files
             final_entries = self._refresh_manifest_from_data_files(final_entries)
-            
+
             # Use what we know directly since we still have new_entries in scope
             deleted_files = len(files_to_compact)
             deleted_size = sum(e.get("file_size_in_bytes", 0) for e in files_to_compact)
-            deleted_data_size = sum(e.get("uncompressed_size_in_bytes", 0) for e in files_to_compact)
+            deleted_data_size = sum(
+                e.get("uncompressed_size_in_bytes", 0) for e in files_to_compact
+            )
             deleted_records = sum(e.get("record_count", 0) for e in files_to_compact)
-            
+
             added_files = len(new_entries)
             added_size = sum(e.get("file_size_in_bytes", 0) for e in new_entries)
             added_data_size = sum(e.get("uncompressed_size_in_bytes", 0) for e in new_entries)
             added_records = sum(e.get("record_count", 0) for e in new_entries)
-            
+
             total_files = len(final_entries)
             total_size = sum(e.get("file_size_in_bytes", 0) for e in final_entries)
             total_data_size = sum(e.get("uncompressed_size_in_bytes", 0) for e in final_entries)
@@ -552,7 +553,9 @@ class DatasetCompactor:
 
             # Persist metadata via catalog
             if self.dataset.catalog:
-                self.dataset.catalog.save_dataset_metadata(self.dataset.identifier, self.dataset.metadata)
+                self.dataset.catalog.save_dataset_metadata(
+                    self.dataset.identifier, self.dataset.metadata
+                )
         except Exception as e:
             raise RuntimeError(
                 f"Failed to persist compaction snapshot {snapshot_id} to metastore"
@@ -560,7 +563,9 @@ class DatasetCompactor:
 
         return snapshot
 
-    def _split_table(self, table: pa.Table, target_size: int, max_files: int = None) -> List[pa.Table]:
+    def _split_table(
+        self, table: pa.Table, target_size: int, max_files: int = None
+    ) -> List[pa.Table]:
         """
         Split a table into multiple tables of approximately target size.
 
@@ -609,20 +614,20 @@ class DatasetCompactor:
     def _to_dict(self, obj):
         """
         Convert a ParquetManifestEntry or similar object to a dict.
-        
+
         Handles various object types that might be returned from manifest operations.
-        
+
         Args:
             obj: Object to convert (dict, ParquetManifestEntry, or dataclass)
-            
+
         Returns:
             Dict representation of the object, or the original if already a dict
         """
         if isinstance(obj, dict):
             return obj
-        elif hasattr(obj, 'to_dict') and callable(obj.to_dict):
+        elif hasattr(obj, "to_dict") and callable(obj.to_dict):
             return obj.to_dict()
-        elif hasattr(obj, '__dict__'):
+        elif hasattr(obj, "__dict__"):
             return vars(obj)
         else:
             return obj
@@ -630,20 +635,20 @@ class DatasetCompactor:
     def _is_valid_entry(self, entry: dict) -> bool:
         """
         Validate a manifest entry by attempting to instantiate the data class.
-        
+
         Tries to construct a ParquetManifestEntry from the dict. If successful,
         the entry is valid. If any exception is raised (missing fields, type errors,
         corrupted values), the entry is considered invalid.
-        
+
         Args:
             entry: Manifest entry dict
-            
+
         Returns:
             True if entry can be successfully converted to ParquetManifestEntry, False otherwise
         """
         if not isinstance(entry, dict):
             return False
-        
+
         try:
             # Try to instantiate the data class from the dict
             # This will validate all fields, types, and constraints
@@ -656,30 +661,30 @@ class DatasetCompactor:
     def _recover_entry(self, corrupted_entry: dict) -> Optional[dict]:
         """
         Recover a corrupted manifest entry by reading the actual file.
-        
+
         Args:
             corrupted_entry: The corrupted manifest entry dict
-            
+
         Returns:
             Rebuilt manifest entry dict, or None if recovery failed
         """
         file_path = corrupted_entry.get("file_path")
         if not file_path:
             return None
-        
+
         try:
             # Read the file
             io = self.dataset.io
             inp = io.new_input(file_path)
             with inp.open() as f:
                 data = f.read()
-            
+
             # Rebuild manifest entry from the actual file data
             table = pq.read_table(pa.BufferReader(data))
             rebuilt_entry = build_parquet_manifest_entry_from_bytes(
                 data, file_path, len(data), orig_table=table
             )
-            
+
             # Convert to dict
             entry_dict = self._to_dict(rebuilt_entry)
             if isinstance(entry_dict, dict):
@@ -692,37 +697,37 @@ class DatasetCompactor:
     def _refresh_manifest_from_data_files(self, all_entries: List[dict]) -> List[dict]:
         """
         Refresh entire manifest by reading all data files and rebuilding entries from scratch.
-        
+
         Used as fallback when stats calculation fails. Rebuilds all manifest entries by reading
         the actual parquet files to ensure accuracy and correctness.
-        
+
         Args:
             all_entries: All current manifest entries
-            
+
         Returns:
             List of refreshed manifest entries
         """
         refreshed_entries = []
-        
+
         for entry in all_entries:
             file_path = entry.get("file_path")
             if not file_path:
                 refreshed_entries.append(entry)  # Skip entries without file paths
                 continue
-            
+
             try:
                 # Read the file and rebuild the entry from scratch
                 io = self.dataset.io
                 inp = io.new_input(file_path)
                 with inp.open() as f:
                     data = f.read()
-                
+
                 # Rebuild manifest entry from actual file data
                 table = pq.read_table(pa.BufferReader(data))
                 rebuilt_entry = build_parquet_manifest_entry_from_bytes(
                     data, file_path, len(data), orig_table=table
                 )
-                
+
                 # Convert to dict
                 entry_dict = self._to_dict(rebuilt_entry)
                 if isinstance(entry_dict, dict):
@@ -732,7 +737,7 @@ class DatasetCompactor:
             except Exception:
                 # If we can't rebuild, keep the original entry
                 refreshed_entries.append(entry)
-        
+
         return refreshed_entries
 
     def _calculate_stats_from_entries(
@@ -740,37 +745,37 @@ class DatasetCompactor:
     ) -> tuple:
         """
         Calculate statistics from manifest entries.
-        
+
         Used when direct calculation from PyArrow tables fails.
-        
+
         Args:
             all_entries: All manifest entries after compaction
             compacted_files: Files that were compacted (to calculate deleted stats)
-            
+
         Returns:
             Tuple of (deleted_files, deleted_size, deleted_data_size, deleted_records,
                     added_files, added_size, added_data_size, added_records,
                     total_files, total_size, total_data_size, total_records)
         """
         compacted_paths = {f.get("file_path") for f in compacted_files}
-        
+
         deleted_files = len(compacted_files)
         deleted_size = 0
         deleted_data_size = 0
         deleted_records = 0
-        
+
         # Sum stats for deleted files
         for entry in compacted_files:
             deleted_size += entry.get("file_size_in_bytes", 0)
             deleted_data_size += entry.get("uncompressed_size_in_bytes", 0)
             deleted_records += entry.get("record_count", 0)
-        
+
         # The new files are those in all_entries that weren't compacted
         added_files = 0
         added_size = 0
         added_data_size = 0
         added_records = 0
-        
+
         for entry in all_entries:
             if entry.get("file_path") not in compacted_paths:
                 continue
@@ -779,13 +784,13 @@ class DatasetCompactor:
             added_size += entry.get("file_size_in_bytes", 0)
             added_data_size += entry.get("uncompressed_size_in_bytes", 0)
             added_records += entry.get("record_count", 0)
-        
+
         # Total stats from all entries
         total_files = len(all_entries)
         total_size = sum(e.get("file_size_in_bytes", 0) for e in all_entries)
         total_data_size = sum(e.get("uncompressed_size_in_bytes", 0) for e in all_entries)
         total_records = sum(e.get("record_count", 0) for e in all_entries)
-        
+
         return (
             deleted_files,
             deleted_size,

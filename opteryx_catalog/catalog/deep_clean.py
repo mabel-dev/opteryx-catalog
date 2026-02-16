@@ -18,8 +18,6 @@ from typing import List
 from typing import Optional
 from typing import Set
 
-import pyarrow.parquet as pq
-
 logger = logging.getLogger(__name__)
 
 
@@ -203,8 +201,9 @@ class DatasetDeepClean:
 
             try:
                 io = self.catalog.io
-                table = pq.read_table(io.new_input(snapshot.manifest_list).open().read())
-                entries = table.to_pylist() if hasattr(table, "to_pylist") else []
+                from .manifest import get_parsed_manifest
+
+                entries = get_parsed_manifest(io, snapshot.manifest_list)
 
                 for entry in entries:
                     file_path = entry.get("file_path")
