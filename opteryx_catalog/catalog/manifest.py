@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import time
 from collections import Counter
+from collections import OrderedDict
 from dataclasses import dataclass
 from dataclasses import field
 from typing import Any
@@ -71,6 +72,106 @@ class ParquetManifestEntry:
 
 logger = logging.getLogger(__name__)
 _manifest_metrics = Counter()
+
+# Parsed-manifest cache (LRU): store parsed Python representation (list[dict])
+# to avoid repeated pyarrow parsing and expensive to_pylist() conversions.
+# Entries are "frozen" for memory efficiency (inner lists -> tuples).
+PARSED_MANIFEST_CACHE_SIZE: int = 32
+_parsed_manifest_cache: "OrderedDict[str, list]" = OrderedDict()
+
+
+def _freeze_for_cache(value):
+    """Recursively freeze lists to tuples and convert byte-like to bytes.
+
+    Keeps top-level entries as dicts (callers expect Mapping access) but
+    replaces inner mutable lists with tuples to reduce memory overhead and
+    prevent accidental mutation of cached data.
+    """
+    # Primitive/bytes
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return bytes(value)
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+
+    # Lists -> tuples (recursive)
+    if isinstance(value, list):
+        return tuple(_freeze_for_cache(v) for v in value)
+
+    # Dicts -> keep as dict but freeze values
+    if isinstance(value, dict):
+        return {k: _freeze_for_cache(v) for k, v in value.items()}
+
+    # Fallback: return as-is
+    return value
+
+
+def get_parsed_manifest(io, manifest_path: str) -> list:
+    """Return a cached Python representation (list[dict]) of the Parquet manifest.
+
+    - Uses an in-memory LRU cache keyed by `manifest_path`.
+    - Cached entries are frozen (inner lists -> tuples) to reduce memory.
+    - Callers MUST treat returned lists/dicts as read-only.
+    """
+
+    if not manifest_path:
+        return []
+
+    # Fast path: cache hit
+    if manifest_path in _parsed_manifest_cache:
+        _parsed_manifest_cache.move_to_end(manifest_path)
+        _manifest_metrics["parsed_cache_hits"] += 1
+        return _parsed_manifest_cache[manifest_path]
+
+    # Miss: read bytes -> parse -> freeze -> cache
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    inp = io.new_input(manifest_path)
+    try:
+        with inp.open() as f:
+            data = f.read()
+    except FileNotFoundError:
+        # keep behavior consistent with callers
+        raise
+
+    if not data:
+        _manifest_metrics["parsed_cache_misses"] += 1
+        _parsed_manifest_cache[manifest_path] = []
+        # Evict oldest if needed
+        if len(_parsed_manifest_cache) > PARSED_MANIFEST_CACHE_SIZE:
+            _parsed_manifest_cache.popitem(last=False)
+        return []
+
+    table = pq.read_table(pa.BufferReader(data))
+    rows = table.to_pylist()
+
+    # Freeze inner mutable structures to tuples where possible
+    frozen_rows: list = []
+    for r in rows:
+        if isinstance(r, dict):
+            fr = {k: _freeze_for_cache(v) for k, v in r.items()}
+            frozen_rows.append(fr)
+        else:
+            frozen_rows.append(r)
+
+    _parsed_manifest_cache[manifest_path] = frozen_rows
+    _manifest_metrics["parsed_cache_misses"] += 1
+
+    # Evict oldest if cache exceeds size
+    if len(_parsed_manifest_cache) > PARSED_MANIFEST_CACHE_SIZE:
+        _parsed_manifest_cache.popitem(last=False)
+
+    return _parsed_manifest_cache[manifest_path]
+
+
+def invalidate_parsed_manifest(manifest_path: str) -> None:
+    """Remove a manifest from the parsed-manifest cache (if present)."""
+    _parsed_manifest_cache.pop(manifest_path, None)
+
+
+def clear_parsed_manifest_cache() -> None:
+    """Clear the entire parsed-manifest cache (tests / admin use)."""
+    _parsed_manifest_cache.clear()
 
 
 def _compute_stats_for_arrow_column(col, field_type, file_path: str):

@@ -878,18 +878,17 @@ class SimpleDataset(Dataset):
 
         # Read manifest via FileIO if available
         try:
-            import pyarrow as pa
-            import pyarrow.parquet as pq
+            # Use parsed-manifest cache to avoid repeated pyarrow parsing
+            from .manifest import get_parsed_manifest
 
-            inp = self.io.new_input(manifest_path)
-            with inp.open() as f:
-                data = f.read()
-
-            if not data:
+            try:
+                rows = get_parsed_manifest(self.io, manifest_path)
+            except FileNotFoundError:
                 return iter(())
 
-            table = pq.read_table(pa.BufferReader(data))
-            rows = table.to_pylist()
+            if not rows:
+                return iter(())
+
             for r in rows:
                 yield Datafile(entry=r)
         except FileNotFoundError:
@@ -913,18 +912,12 @@ class SimpleDataset(Dataset):
 
         # Read manifest once
         try:
-            import pyarrow as pa
-            import pyarrow.parquet as pq
+            # Read parsed manifest (cached) to avoid re-parsing parquet repeatedly
+            from .manifest import get_parsed_manifest
 
-            inp = self.io.new_input(manifest_path)
-            with inp.open() as f:
-                data = f.read()
-
-            if not data:
+            entries = get_parsed_manifest(self.io, manifest_path)
+            if not entries:
                 raise ValueError("Empty manifest data")
-
-            table = pq.read_table(pa.BufferReader(data))
-            entries = table.to_pylist()
         except Exception:
             raise
 
@@ -1310,15 +1303,10 @@ class SimpleDataset(Dataset):
         entries = []
         try:
             # Read previous manifest entries
-            inp = self.io.new_input(prev.manifest_list)
-            with inp.open() as f:
-                prev_data = f.read()
-            import pyarrow as pa
-            import pyarrow.parquet as pq
+            # Use cached parsed-manifest when available
+            from .manifest import get_parsed_manifest
 
-            # the manifest is a parquet file, read into a pyarrow Table
-            prev_manifest = pq.read_table(pa.BufferReader(prev_data))
-            prev_rows = prev_manifest.to_pylist()
+            prev_rows = get_parsed_manifest(self.io, prev.manifest_list)
         except Exception:
             prev_rows = []
 
