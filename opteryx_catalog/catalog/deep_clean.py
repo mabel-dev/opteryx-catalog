@@ -305,6 +305,37 @@ class DatasetDeepClean:
             logger.error(f"Error deleting file {file_path}: {e}")
             return False
 
+    def get_orphaned_manifests(self, identifier: str) -> Optional[set]:
+        """
+        Identify manifest files present in storage that are NOT referenced by any snapshot.
+
+        Args:
+            identifier: Dataset identifier (collection.dataset_name)
+
+        Returns:
+            Set of orphaned manifest file paths, or None if none found / on error
+        """
+        try:
+            dataset = self.catalog.load_dataset(identifier, load_history=True)
+            if not dataset or not dataset.metadata.snapshots:
+                return None
+
+            # Gather manifest paths referenced by snapshots
+            referenced_manifests = {
+                s.manifest_list for s in dataset.metadata.snapshots if getattr(s, "manifest_list", None)
+            }
+
+            # List physical files and pick manifest files in metadata/ directory
+            physical_files = self.get_all_physical_files(dataset.metadata.location)
+            manifest_files_in_storage = {f for f in physical_files if "/metadata/manifest-" in f}
+
+            # Orphaned manifests are storage manifests not referenced by any snapshot
+            orphaned = manifest_files_in_storage - referenced_manifests
+            return orphaned if orphaned else None
+
+        except (ValueError, KeyError, AttributeError) as e:
+            logger.error(f"Error finding orphaned manifests for {identifier}: {e}")
+            return None
 
 def find_orphaned_files(catalog, identifier: str) -> Optional[Set[str]]:
     """

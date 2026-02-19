@@ -1058,28 +1058,34 @@ class SimpleDataset(Dataset):
                 except Exception:
                     pass
 
-                # min-k hashes
+                # min-k hashes (tolerant to scalar/list/tuple shapes)
                 try:
-                    col_mk = mks[cidx] or []
+                    col_mk = mks[cidx]
+                    if isinstance(col_mk, (int, float, bytes, bytearray, memoryview, str)):
+                        col_mk = (col_mk,)
+                    elif col_mk is None:
+                        col_mk = ()
                 except Exception:
-                    col_mk = []
+                    col_mk = ()
                 for h in col_mk:
                     try:
                         stats[cname]["hashes"].add(int(h))
                     except Exception:
                         pass
 
-                # histograms
+                # histograms (tolerant to scalar/list/tuple)
                 try:
                     col_hist = hists[cidx]
+                    if isinstance(col_hist, (int, float, str)):
+                        col_hist = (col_hist,)
+                    elif col_hist is None:
+                        col_hist = ()
                 except Exception:
-                    col_hist = []
+                    col_hist = ()
                 if col_hist:
                     try:
                         if dmin is not None and dmax is not None and dmin != dmax:
-                            stats[cname]["file_hist_infos"].append(
-                                (float(dmin), float(dmax), list(col_hist))
-                            )
+                            stats[cname]["file_hist_infos"].append((float(dmin), float(dmax), list(col_hist)))
                     except Exception:
                         pass
 

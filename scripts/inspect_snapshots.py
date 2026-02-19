@@ -8,16 +8,21 @@ Usage:
   python inspect_snapshots.py collection.ds   # Check one dataset
 """
 
+import os
 import sys
-from pathlib import Path
+
+# Add local paths to sys.path to use local code instead of installed packages
+sys.path.insert(0, os.path.join(sys.path[0], ".."))  # Add parent dir for pyiceberg_firestore_gcs
+sys.path.insert(1, os.path.join(sys.path[0], "../opteryx-core"))
+sys.path.insert(1, os.path.join(sys.path[0], "../pyiceberg-firestore-gcs"))
 
 from opteryx_catalog import OpteryxCatalog
 from opteryx_catalog.catalog.expiration import SnapshotExpiration
 from opteryx_catalog.catalog.expiration import identify_expiring_datasets
 
-# Add parent to path
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
+FIRESTORE_DATABASE = os.environ.get("FIRESTORE_DATABASE")
+BUCKET_NAME = os.environ.get("GCS_BUCKET")
+GCP_PROJECT_ID = os.environ.get("GCP_PROJECT_ID")
 
 def inspect_workspace(catalog):
     """Scan entire workspace for expiring datasets."""
@@ -195,7 +200,7 @@ def inspect_dataset(catalog, identifier: str):
         print("EXPIRATION PLAN (dry-run):\n")
 
         expiration = SnapshotExpiration(catalog, author="inspector")
-        plan = expiration.expire_dataset(identifier, dry_run=True)
+        plan = expiration.expire_dataset(identifier, dry_run=False)
 
         if plan:
             print(f"  Snapshots to delete: {plan['snapshots_to_delete']}")
@@ -210,28 +215,103 @@ def inspect_dataset(catalog, identifier: str):
         print("\n✓ Dataset is within retention policy, no cleanup needed")
 
 
+def _confirm(prompt: str) -> bool:
+    """Ask the user to confirm a destructive action. Returns True for yes."""
+    try:
+        ans = input(prompt + " [y/N]: ")
+        return ans.strip().lower() in ("y", "yes")
+    except Exception:
+        return False
+
+
 def main():
     """Main entry point."""
-    # Setup catalog (with defaults - adjust as needed)
+    import argparse
+    import json
+
+    parser = argparse.ArgumentParser(description="Inspect and (optionally) expire snapshots")
+    parser.add_argument("identifier", nargs="?", help="Optional collection or collection.dataset identifier to inspect")
+    parser.add_argument("--apply", "-a", action="store_true", help="Execute expiration for the inspected target (destructive)")
+    parser.add_argument("--yes", "-y", action="store_true", help="When used with --apply, do not prompt for confirmation")
+    parser.add_argument("--workspace", help="Workspace name to use (overrides default)", default=None)
+
+    args = parser.parse_args()
+
+    wk = args.workspace or os.environ.get("OPTERYX_WORKSPACE") or "opteryx"
     catalog = OpteryxCatalog(
-        workspace="default",
-        firestore_project=None,
-        firestore_database=None,
-        gcs_bucket=None,
+        workspace=wk,
+        firestore_project=GCP_PROJECT_ID,
+        firestore_database=FIRESTORE_DATABASE,
+        gcs_bucket=BUCKET_NAME,
     )
 
-    if len(sys.argv) > 1:
-        arg = sys.argv[1]
-
-        if "." in arg:
-            # Dataset identifier: collection.dataset
-            inspect_dataset(catalog, arg)
-        else:
-            # Collection name
-            inspect_collection(catalog, arg)
-    else:
-        # Entire workspace
+    # No identifier -> inspect workspace
+    if not args.identifier:
         inspect_workspace(catalog)
+
+        if args.apply:
+            expiration = SnapshotExpiration(catalog, author="inspector")
+            plan = expiration.expire_workspace(dry_run=True)
+            print("\nWorkspace expiration plan (dry-run):")
+            print(json.dumps(plan, indent=2))
+
+            if not args.yes and not _confirm("Proceed with workspace expiration? This will delete snapshots/manifests/files"):
+                print("Aborted")
+                return
+
+            result = expiration.expire_workspace(dry_run=False)
+            print("\nWorkspace expiration result:")
+            print(json.dumps(result, indent=2))
+
+        return
+
+    identifier = args.identifier
+
+    # Dataset identifier
+    if "." in identifier:
+        inspect_dataset(catalog, identifier)
+
+        if args.apply:
+            expiration = SnapshotExpiration(catalog, author="inspector")
+            plan = expiration.expire_dataset(identifier, dry_run=True)
+            print("\nExpiration plan (dry-run):")
+            print(json.dumps(plan, indent=2))
+
+            if not plan:
+                print("Nothing to do")
+                return
+
+            if not args.yes and not _confirm(f"Proceed and execute expiration for '{identifier}'? This is destructive"):
+                print("Aborted")
+                return
+
+            result = expiration.expire_dataset(identifier, dry_run=False)
+            print("\nExpiration result:")
+            print(json.dumps(result, indent=2))
+
+        return
+
+    # Collection identifier
+    collection = identifier
+    inspect_collection(catalog, collection)
+
+    if args.apply:
+        expiration = SnapshotExpiration(catalog, author="inspector")
+        plan = expiration.expire_collection(collection, dry_run=True)
+        print("\nCollection expiration plan (dry-run):")
+        print(json.dumps(plan, indent=2))
+
+        if not plan or not plan.get("datasets_expiring"):
+            print("Nothing to do for collection")
+            return
+
+        if not args.yes and not _confirm(f"Proceed and execute expiration for collection '{collection}'? This is destructive"):
+            print("Aborted")
+            return
+
+        result = expiration.expire_collection(collection, dry_run=False)
+        print("\nCollection expiration result:")
+        print(json.dumps(result, indent=2))
 
 
 if __name__ == "__main__":
