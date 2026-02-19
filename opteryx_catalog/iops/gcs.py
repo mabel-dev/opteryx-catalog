@@ -253,3 +253,33 @@ class GcsFileIO(FileIO):
             headers["Authorization"] = f"Bearer {token}"
         response = self._session.head(url, headers=headers, timeout=10)
         return response.status_code == 200
+
+    def list_files(self, prefix: str) -> list:
+        """List files under a storage prefix (gs://bucket/path).
+
+        This uses the google-cloud-storage client as a fallback so callers that
+        expect a `list_files`/`ls` API (used by deep-clean/expiration) will work
+        regardless of which FileIO implementation is attached to the catalog.
+        Returns a list of fully-qualified `gs://` object URIs.
+        """
+        try:
+            if prefix and prefix.startswith("gs://"):
+                from google.cloud import storage
+
+                _, rest = prefix.split("://", 1)
+                parts = rest.split("/", 1)
+                bucket_name = parts[0]
+                object_prefix = parts[1] if len(parts) > 1 else ""
+
+                client = storage.Client()
+                blobs = client.list_blobs(bucket_name, prefix=object_prefix)
+                return [f"gs://{bucket_name}/{b.name}" for b in blobs]
+        except Exception:
+            # Be conservative: on any failure return empty list so callers
+            # (deep-clean / expiration) can continue without crashing.
+            return []
+
+        return []
+
+    # alias
+    ls = list_files

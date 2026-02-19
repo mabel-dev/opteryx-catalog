@@ -31,8 +31,9 @@ class FileIO:
     """Minimal FileIO abstraction used by the `opteryx_catalog` layer.
 
     Concrete implementations should implement `new_input`, `new_output`, and
-    optionally `delete`/`exists`. The abstraction intentionally keeps only the
-    small surface needed by the catalog (read bytes, write bytes).
+    optionally `delete`/`exists`. Some modules also call `list_files`/`ls` —
+    provide a safe default implementation on the base class so callers do not
+    need to special-case missing methods.
     """
 
     def new_input(self, location: str) -> InputFile:
@@ -40,6 +41,16 @@ class FileIO:
 
     def new_output(self, location: str) -> OutputFile:
         return OutputFile(location)
+
+    def list_files(self, prefix: str) -> list:
+        """Safe default: return empty list when listing is not supported.
+
+        Implementations that can perform listing should override this method.
+        """
+        return []
+
+    # alias commonly used by other FileIO implementations
+    ls = list_files
 
 
 class _GcsAdapterOutputFile(OutputFile):
@@ -123,6 +134,44 @@ class GcsFileIO(FileIO):
             return True
         except Exception:
             return False
+
+    def list_files(self, prefix: str) -> list:
+        """List files under a storage prefix.
+
+        Behavior:
+        - If the underlying implementation provides `list_files`, delegate to it.
+        - Otherwise, if `prefix` is a `gs://` URL, use google-cloud-storage to list objects.
+        - Returns a list of fully-qualified paths (e.g. `gs://bucket/path/to/object`).
+        """
+        # Delegate to underlying implementation if available
+        if hasattr(self._impl, "list_files"):
+            try:
+                return list(self._impl.list_files(prefix))
+            except Exception:
+                return []
+
+        # Fallback: handle gs://<bucket>/<prefix> by using google-cloud-storage client
+        try:
+            if prefix.startswith("gs://"):
+                from google.cloud import storage
+
+                _, rest = prefix.split("://", 1)
+                parts = rest.split("/", 1)
+                bucket_name = parts[0]
+                object_prefix = parts[1] if len(parts) > 1 else ""
+
+                client = storage.Client()
+                blobs = client.list_blobs(bucket_name, prefix=object_prefix)
+                return [f"gs://{bucket_name}/{b.name}" for b in blobs]
+        except Exception:
+            # Silently return empty list on failure to avoid crashing callers
+            return []
+
+        # No supported listing available
+        return []
+
+    # alias
+    ls = list_files
 
 
 # Centralized Parquet write options used across the codebase when writing
