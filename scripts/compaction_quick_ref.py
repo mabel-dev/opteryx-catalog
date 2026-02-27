@@ -56,7 +56,7 @@ def strategies():
         "brute": {
             "description": "Simple file combining",
             "best_for": "General-purpose, unordered data",
-            "algorithm": "Combine small files until reaching 128MB target",
+            "algorithm": "Combine small files until reaching 512MB target",
             "auto_used": "When dataset has no sort order",
         },
         "performance": {
@@ -100,14 +100,14 @@ def file_size_thresholds():
         "SMALL_FILE_MB": 64,
         "SMALL_FILE_BYTES": 64 * 1024 * 1024,
         "description_small": "Files below this are candidates for combining",
-        "TARGET_SIZE_MB": 128,
-        "TARGET_SIZE_BYTES": 128 * 1024 * 1024,
+        "TARGET_SIZE_MB": 512,
+        "TARGET_SIZE_BYTES": 512 * 1024 * 1024,
         "description_target": "Goal size for combined files",
-        "LARGE_FILE_MB": 196,
-        "LARGE_FILE_BYTES": 196 * 1024 * 1024,
+        "LARGE_FILE_MB": 500,
+        "LARGE_FILE_BYTES": 500 * 1024 * 1024,
         "description_large": "Files above this are candidates for splitting",
-        "MAX_MEMORY_MB": 280,
-        "MAX_MEMORY_BYTES": 280 * 1024 * 1024,
+        "MAX_MEMORY_MB": 525,
+        "MAX_MEMORY_BYTES": 525 * 1024 * 1024,
         "description_memory": "Max memory for holding files during compaction",
     }
 

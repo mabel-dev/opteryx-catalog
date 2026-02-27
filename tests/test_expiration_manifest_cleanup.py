@@ -1,9 +1,10 @@
 import time
 
-import pytest
 
 # Add local paths like other tests
-import os, sys
+import os
+import sys
+
 sys.path.insert(0, os.path.join(sys.path[0], ".."))
 sys.path.insert(1, os.path.join(sys.path[0], "../opteryx-core"))
 sys.path.insert(1, os.path.join(sys.path[0], "../pyiceberg-firestore-gcs"))

@@ -116,8 +116,9 @@ class SnapshotExpiration:
 
                 # Check for orphaned manifests older than the configured min age
                 try:
-                    from .deep_clean import DatasetDeepClean
                     import re
+
+                    from .deep_clean import DatasetDeepClean
 
                     cleaner = DatasetDeepClean(self.catalog)
                     orphaned_manifests = cleaner.get_orphaned_manifests(identifier) or set()
@@ -126,7 +127,7 @@ class SnapshotExpiration:
                     eligible = []
                     skipped_recent = []
                     for m in orphaned_manifests:
-                        mname = m.rsplit('/', 1)[-1]
+                        mname = m.rsplit("/", 1)[-1]
                         match = re.search(r"manifest-(\d+)\.parquet$", mname)
                         if match:
                             ts = int(match.group(1))
@@ -191,8 +192,6 @@ class SnapshotExpiration:
             # Identify snapshots to delete
             snapshots_to_delete = [s for s in snapshots if s not in snapshots_to_keep]
 
-
-
             summary = {
                 "identifier": identifier,
                 "retention_days": retention_days,
@@ -239,7 +238,7 @@ class SnapshotExpiration:
                         eligible = []
                         skipped_recent = []
                         for m in orphaned_manifests:
-                            mname = m.rsplit('/', 1)[-1]
+                            mname = m.rsplit("/", 1)[-1]
                             match = re.search(r"manifest-(\d+)\.parquet$", mname)
                             if match:
                                 ts = int(match.group(1))
@@ -264,8 +263,9 @@ class SnapshotExpiration:
             # perform a manifest-only tidy-up in execute mode (delete eligible manifests).
             if not dry_run and len(snapshots_to_delete) == 0 and not skip_orphan_detection:
                 try:
-                    from .deep_clean import DatasetDeepClean
                     import re
+
+                    from .deep_clean import DatasetDeepClean
 
                     cleaner = DatasetDeepClean(self.catalog)
                     orphaned_manifests = cleaner.get_orphaned_manifests(identifier) or set()
@@ -274,7 +274,7 @@ class SnapshotExpiration:
                     eligible = []
                     skipped_recent = []
                     for m in orphaned_manifests:
-                        mname = m.rsplit('/', 1)[-1]
+                        mname = m.rsplit("/", 1)[-1]
                         match = re.search(r"manifest-(\d+)\.parquet$", mname)
                         if match:
                             ts = int(match.group(1))
@@ -303,12 +303,17 @@ class SnapshotExpiration:
                         return summary
                 except Exception:
                     # If tidy-up fails, continue to normal execution path
-                    logger.exception("Manifest-only tidy-up failed during execute for %s", identifier)
+                    logger.exception(
+                        "Manifest-only tidy-up failed during execute for %s", identifier
+                    )
 
             # Execute deletion
             return self._execute_expiration(
-                identifier, dataset, snapshots_to_delete, snapshots_to_keep,
-                skip_orphan_detection=skip_orphan_detection
+                identifier,
+                dataset,
+                snapshots_to_delete,
+                snapshots_to_keep,
+                skip_orphan_detection=skip_orphan_detection,
             )
 
         except (ValueError, KeyError, AttributeError) as e:
@@ -436,7 +441,8 @@ class SnapshotExpiration:
         else:
             logger.info(
                 "Skipping orphaned file detection for %s (%d snapshots to delete)",
-                identifier, len(snapshots_to_delete)
+                identifier,
+                len(snapshots_to_delete),
             )
 
         # Step 2: Delete snapshots from Firestore
@@ -466,7 +472,9 @@ class SnapshotExpiration:
                         summary["deleted_manifests"].append(manifest_path)
                         logger.info("Deleted manifest %s", manifest_path)
                     else:
-                        logger.warning("Failed to delete manifest (delete not supported): %s", manifest_path)
+                        logger.warning(
+                            "Failed to delete manifest (delete not supported): %s", manifest_path
+                        )
                 except (ValueError, OSError) as e:
                     logger.error("Failed to delete manifest %s: %s", snapshot.manifest_list, e)
 
@@ -518,7 +526,7 @@ class SnapshotExpiration:
                 "Orphaned file deletion skipped for %s. "
                 "Data files from deleted snapshots may still exist. "
                 "Run expiration again after reducing snapshot count.",
-                identifier
+                identifier,
             )
 
         return summary

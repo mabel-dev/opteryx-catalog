@@ -322,7 +322,9 @@ class DatasetDeepClean:
 
             # Gather manifest paths referenced by snapshots
             referenced_manifests = {
-                s.manifest_list for s in dataset.metadata.snapshots if getattr(s, "manifest_list", None)
+                s.manifest_list
+                for s in dataset.metadata.snapshots
+                if getattr(s, "manifest_list", None)
             }
 
             # List physical files and pick manifest files in metadata/ directory
@@ -336,6 +338,7 @@ class DatasetDeepClean:
         except (ValueError, KeyError, AttributeError) as e:
             logger.error(f"Error finding orphaned manifests for {identifier}: {e}")
             return None
+
 
 def find_orphaned_files(catalog, identifier: str) -> Optional[Set[str]]:
     """

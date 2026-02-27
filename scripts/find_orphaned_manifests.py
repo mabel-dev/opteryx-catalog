@@ -6,15 +6,15 @@ Usage: python scripts/find_orphaned_manifests.py <collection.dataset>
 This prints manifest files that exist in storage under <dataset_location>/metadata
 but are not referenced by any snapshot document.
 """
-import sys
-import json
-from pathlib import Path
 
-# Ensure local package resolution like other scripts
-sys.path.insert(0, str(Path(__file__).parent.parent))
+import sys
+from pathlib import Path
 
 from opteryx_catalog import OpteryxCatalog
 from opteryx_catalog.catalog.deep_clean import DatasetDeepClean
+
+# Ensure local package resolution like other scripts
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 
 def main():
@@ -50,5 +50,5 @@ def main():
         print(m)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
