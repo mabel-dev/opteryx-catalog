@@ -1085,7 +1085,9 @@ class SimpleDataset(Dataset):
                 if col_hist:
                     try:
                         if dmin is not None and dmax is not None and dmin != dmax:
-                            stats[cname]["file_hist_infos"].append((float(dmin), float(dmax), list(col_hist)))
+                            stats[cname]["file_hist_infos"].append(
+                                (float(dmin), float(dmax), list(col_hist))
+                            )
                     except Exception:
                         pass
 

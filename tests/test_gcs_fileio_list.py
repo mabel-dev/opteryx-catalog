@@ -32,6 +32,7 @@ def test_gcsfileio_ls_alias_exists():
     assert callable(getattr(g, "ls", None))
     # class-level alias should point to same function object
     from opteryx_catalog.iops import fileio as _fio_mod
+
     assert getattr(_fio_mod.GcsFileIO, "ls") is getattr(_fio_mod.GcsFileIO, "list_files")
     # runtime call parity
     assert g.ls("x") == g.list_files("x")
@@ -63,7 +64,11 @@ def test_http_gcsfileio_list_files_uses_storage_client(monkeypatch):
             return FakeBucket(self._names).list_blobs(prefix=prefix)
 
     # Patch storage.Client to return our fake client
-    monkeypatch.setattr("opteryx_catalog.iops.gcs.storage", "Client", lambda: FakeClient(["prefix/a", "prefix/b", "other/c"]))
+    monkeypatch.setattr(
+        "opteryx_catalog.iops.gcs.storage",
+        "Client",
+        lambda: FakeClient(["prefix/a", "prefix/b", "other/c"]),
+    )
 
     res = g.list_files("gs://bucket/prefix")
     assert res == ["gs://bucket/prefix/a", "gs://bucket/prefix/b"]
@@ -91,4 +96,3 @@ def test_deep_clean_uses_io_list_files():
 
     files = cleaner.get_all_physical_files("gs://bucket/prefix")
     assert files == {"gs://bucket/prefix/a", "gs://bucket/prefix/b"}
-

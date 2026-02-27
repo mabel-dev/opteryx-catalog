@@ -23,18 +23,18 @@ from .metadata import Snapshot
 _NODE = f"{uuid.getnode():x}-{os.getpid():x}"
 
 # Constants
-TARGET_SIZE_MB = 128
+TARGET_SIZE_MB = 512
 TARGET_SIZE_BYTES = TARGET_SIZE_MB * 1024 * 1024
-MIN_SIZE_MB = 100
+MIN_SIZE_MB = 500
 MIN_SIZE_BYTES = MIN_SIZE_MB * 1024 * 1024
-MAX_SIZE_MB = 140
+MAX_SIZE_MB = 525
 MAX_SIZE_BYTES = MAX_SIZE_MB * 1024 * 1024
 SMALL_FILE_MB = 64
 SMALL_FILE_BYTES = SMALL_FILE_MB * 1024 * 1024
-LARGE_FILE_MB = 196
+LARGE_FILE_MB = 500
 LARGE_FILE_BYTES = LARGE_FILE_MB * 1024 * 1024
 MAX_MEMORY_FILES = 2  # Maximum output files to keep in memory during combine-and-split
-MAX_MEMORY_BYTES = 256 * 1024 * 1024  # 256MB - allows combining files just over target size
+MAX_MEMORY_BYTES = 1100 * 1024 * 1024  # 1GB - allows combining files just over target size
 
 
 class DatasetCompactor:

@@ -11,18 +11,20 @@ Usage:
 import os
 import sys
 
+from opteryx_catalog import OpteryxCatalog
+from opteryx_catalog.catalog.expiration import SnapshotExpiration
+from opteryx_catalog.catalog.expiration import identify_expiring_datasets
+
 # Add local paths to sys.path to use local code instead of installed packages
 sys.path.insert(0, os.path.join(sys.path[0], ".."))  # Add parent dir for pyiceberg_firestore_gcs
 sys.path.insert(1, os.path.join(sys.path[0], "../opteryx-core"))
 sys.path.insert(1, os.path.join(sys.path[0], "../pyiceberg-firestore-gcs"))
 
-from opteryx_catalog import OpteryxCatalog
-from opteryx_catalog.catalog.expiration import SnapshotExpiration
-from opteryx_catalog.catalog.expiration import identify_expiring_datasets
 
 FIRESTORE_DATABASE = os.environ.get("FIRESTORE_DATABASE")
 BUCKET_NAME = os.environ.get("GCS_BUCKET")
 GCP_PROJECT_ID = os.environ.get("GCP_PROJECT_ID")
+
 
 def inspect_workspace(catalog):
     """Scan entire workspace for expiring datasets."""
@@ -230,10 +232,26 @@ def main():
     import json
 
     parser = argparse.ArgumentParser(description="Inspect and (optionally) expire snapshots")
-    parser.add_argument("identifier", nargs="?", help="Optional collection or collection.dataset identifier to inspect")
-    parser.add_argument("--apply", "-a", action="store_true", help="Execute expiration for the inspected target (destructive)")
-    parser.add_argument("--yes", "-y", action="store_true", help="When used with --apply, do not prompt for confirmation")
-    parser.add_argument("--workspace", help="Workspace name to use (overrides default)", default=None)
+    parser.add_argument(
+        "identifier",
+        nargs="?",
+        help="Optional collection or collection.dataset identifier to inspect",
+    )
+    parser.add_argument(
+        "--apply",
+        "-a",
+        action="store_true",
+        help="Execute expiration for the inspected target (destructive)",
+    )
+    parser.add_argument(
+        "--yes",
+        "-y",
+        action="store_true",
+        help="When used with --apply, do not prompt for confirmation",
+    )
+    parser.add_argument(
+        "--workspace", help="Workspace name to use (overrides default)", default=None
+    )
 
     args = parser.parse_args()
 
@@ -255,7 +273,9 @@ def main():
             print("\nWorkspace expiration plan (dry-run):")
             print(json.dumps(plan, indent=2))
 
-            if not args.yes and not _confirm("Proceed with workspace expiration? This will delete snapshots/manifests/files"):
+            if not args.yes and not _confirm(
+                "Proceed with workspace expiration? This will delete snapshots/manifests/files"
+            ):
                 print("Aborted")
                 return
 
@@ -281,7 +301,9 @@ def main():
                 print("Nothing to do")
                 return
 
-            if not args.yes and not _confirm(f"Proceed and execute expiration for '{identifier}'? This is destructive"):
+            if not args.yes and not _confirm(
+                f"Proceed and execute expiration for '{identifier}'? This is destructive"
+            ):
                 print("Aborted")
                 return
 
@@ -305,7 +327,9 @@ def main():
             print("Nothing to do for collection")
             return
 
-        if not args.yes and not _confirm(f"Proceed and execute expiration for collection '{collection}'? This is destructive"):
+        if not args.yes and not _confirm(
+            f"Proceed and execute expiration for collection '{collection}'? This is destructive"
+        ):
             print("Aborted")
             return
 
