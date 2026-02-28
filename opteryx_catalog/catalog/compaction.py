@@ -29,7 +29,7 @@ MIN_SIZE_MB = 500
 MIN_SIZE_BYTES = MIN_SIZE_MB * 1024 * 1024
 MAX_SIZE_MB = 525
 MAX_SIZE_BYTES = MAX_SIZE_MB * 1024 * 1024
-SMALL_FILE_MB = 64
+SMALL_FILE_MB = 400
 SMALL_FILE_BYTES = SMALL_FILE_MB * 1024 * 1024
 LARGE_FILE_MB = 500
 LARGE_FILE_BYTES = LARGE_FILE_MB * 1024 * 1024
@@ -149,37 +149,20 @@ class DatasetCompactor:
         Select files for brute force compaction.
 
         Strategy:
-        1. Find files < 64MB (small files to eliminate)
-        2. Find files >= 196MB (large files to split)
-        3. Combine small files up to 128MB target
-        4. Split large files if any
+        1. Combine files under SMALL_FILE_BYTES threshold to reach TARGET_SIZE_BYTES
+        2. No splitting (file size is less critical with current read approach)
 
         Returns:
             Compaction plan dict or None
         """
         small_files = []
-        large_files = []
-        acceptable_files = []
 
         for entry in entries:
             size = entry.get("uncompressed_size_in_bytes", 0)
             if size < SMALL_FILE_BYTES:
                 small_files.append(entry)
-            elif size >= LARGE_FILE_BYTES:
-                large_files.append(entry)
-            elif MIN_SIZE_BYTES <= size <= MAX_SIZE_BYTES:
-                acceptable_files.append(entry)
 
-        # Priority 1: Split large files
-        if large_files:
-            # Take first large file to split
-            return {
-                "type": "split",
-                "files": [large_files[0]],
-                "reason": "file-too-large",
-            }
-
-        # Priority 2: Combine small files
+        # Priority 1: Combine files under threshold
         if len(small_files) >= 2:
             # Find combination that gets close to target
             selected = []
@@ -195,8 +178,8 @@ class DatasetCompactor:
                 if total_size + entry_size <= MAX_MEMORY_BYTES:
                     selected.append(entry)
                     total_size += entry_size
-                    # Stop if we've reached acceptable size
-                    if total_size >= MIN_SIZE_BYTES:
+                    # Continue accumulating files until we hit target, don't stop early
+                    if total_size >= TARGET_SIZE_BYTES and len(selected) >= 2:
                         break
 
             if len(selected) >= 2:
@@ -214,26 +197,13 @@ class DatasetCompactor:
         Select files for performance-optimized compaction.
 
         Strategy:
-        1. Find files >= 196MB to split
-        2. Find overlapping or adjacent ranges on sort column
-        3. Combine and split to eliminate overlap and reach target size
+        1. Find overlapping or adjacent ranges on sort column
+        2. Combine files to eliminate overlap and reach target size
+        3. No splitting (file size is less critical with current read approach)
 
         Returns:
             Compaction plan dict or None
         """
-        # Priority 1: Split large files (same as brute)
-        large_files = []
-        for entry in entries:
-            size = entry.get("uncompressed_size_in_bytes", 0)
-            if size >= LARGE_FILE_BYTES:
-                large_files.append(entry)
-
-        if large_files:
-            return {
-                "type": "split",
-                "files": [large_files[0]],
-                "reason": "file-too-large",
-            }
 
         # Priority 2: Find overlapping ranges
         # Get schema to find sort column name

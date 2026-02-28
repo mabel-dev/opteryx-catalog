@@ -195,6 +195,7 @@ class OpteryxCatalog(Metastore):
 
         Args:
             identifier: Dataset identifier in format 'collection.dataset_name'
+                (dataset_name can contain dots, e.g. 'public.github.events')
             load_history: If True, load all snapshots from Firestore (expensive for
                 large histories). If False (default), only load the current snapshot,
                 which is sufficient for most write operations.
@@ -205,7 +206,7 @@ class OpteryxCatalog(Metastore):
         Raises:
             DatasetNotFound: If the dataset does not exist in Firestore.
         """
-        collection, dataset_name = identifier.split(".")
+        collection, dataset_name = identifier.split(".", 1)
         doc_ref = self._dataset_doc_ref(collection, dataset_name)
         doc = doc_ref.get()
         if not doc.exists:

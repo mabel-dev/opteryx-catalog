@@ -97,8 +97,8 @@ def file_size_thresholds():
     """Constants used in compaction decisions."""
 
     return {
-        "SMALL_FILE_MB": 64,
-        "SMALL_FILE_BYTES": 64 * 1024 * 1024,
+        "SMALL_FILE_MB": 128,
+        "SMALL_FILE_BYTES": 128 * 1024 * 1024,
         "description_small": "Files below this are candidates for combining",
         "TARGET_SIZE_MB": 512,
         "TARGET_SIZE_BYTES": 512 * 1024 * 1024,
