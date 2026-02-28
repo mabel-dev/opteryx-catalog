@@ -181,7 +181,10 @@ WRITE_PARQUET_OPTIONS = {
     "compression_level": 3,
     "use_dictionary": True,
     "dictionary_pagesize_limit": 1024 * 1024,
-    "data_page_size": 1024 * 1024,
+    "row_group_size": 250_000,          # primary lever: controls column chunk I/O size
+    "data_page_size": 512 * 1024,       # 512 KB — smaller pages = finer statistics pushdown
+    "max_rows_per_page": 8_000,         # keeps page boundaries tight with 512 KB pages
+    "write_batch_size": 1024,           # leave at default; only affects write-side buffering
     "version": "2.6",
     "write_statistics": True,
 }
