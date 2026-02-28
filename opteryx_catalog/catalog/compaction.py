@@ -168,9 +168,9 @@ class DatasetCompactor:
             selected = []
             total_size = 0
 
-            # Sort by size descending to fill efficiently
+            # Sort by size ascending to prioritize eliminating smallest files
             sorted_files = sorted(
-                small_files, key=lambda x: x.get("uncompressed_size_in_bytes", 0), reverse=True
+                small_files, key=lambda x: x.get("uncompressed_size_in_bytes", 0)
             )
 
             for entry in sorted_files:
