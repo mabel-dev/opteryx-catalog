@@ -22,7 +22,7 @@ import time
 FIRESTORE_DATABASE = os.environ.get("FIRESTORE_DATABASE")
 BUCKET_NAME = os.environ.get("GCS_BUCKET")
 GCP_PROJECT_ID = os.environ.get("GCP_PROJECT_ID")
-WORKSPACE = os.environ.get("OPTERYX_WORKSPACE", "public")
+WORKSPACE = os.environ.get("OPTERYX_WORKSPACE", "opteryx")
 
 print(f"Configuration:")
 print(f"  GCP_PROJECT_ID: {GCP_PROJECT_ID}")
@@ -57,7 +57,7 @@ def load_github_events_dataset():
         gcs_bucket=BUCKET_NAME,
     )
     
-    dataset_id = "github.events"
+    dataset_id = "ops.audit_log"
     print(f"\nLoading dataset: {WORKSPACE}.{dataset_id}")
     
     try:
@@ -100,7 +100,10 @@ def analyze_dataset(dataset):
     print(f"  Files: {total_files}")
     print(f"  Uncompressed: {total_uncompressed / 1024 / 1024:.1f} MB")
     print(f"  Compressed: {total_compressed / 1024 / 1024:.1f} MB")
-    print(f"  Ratio: {total_compressed / total_uncompressed * 100:.1f}%")
+    if total_uncompressed > 0:
+        print(f"  Ratio: {total_compressed / total_uncompressed * 100:.1f}%")
+    else:
+        print(f"  Ratio: N/A (no data)")
     print(f"  Small files (< 64 MB): {len(small)}")
     print(f"  Large files (≥ 500 MB): {len(large)}")
     
@@ -187,8 +190,11 @@ def main():
                 print("\n" + "="*70)
                 print("Summary")
                 print("="*70)
-                reduction = (before["files"] - after["files"]) / before["files"] * 100
-                print(f"  Files reduced: {before['files']} → {after['files']} ({reduction:.1f}% reduction)")
+                if before["files"] > 0:
+                    reduction = (before["files"] - after["files"]) / before["files"] * 100
+                    print(f"  Files reduced: {before['files']} → {after['files']} ({reduction:.1f}% reduction)")
+                else:
+                    print(f"  Files reduced: {before['files']} → {after['files']} (N/A)")
                 print(f"  Data preserved: {after['uncompressed'] == before['uncompressed']}")
         
         print("\n✓ Compaction completed successfully")
