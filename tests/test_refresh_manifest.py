@@ -1,10 +1,9 @@
 import io
+import os
+import sys
 
 import pyarrow as pa
 import pyarrow.parquet as pq
-
-import os
-import sys
 
 # Add local paths to sys.path to use local code instead of installed packages
 sys.path.insert(0, os.path.join(sys.path[0], ".."))  # Add parent dir for pyiceberg_firestore_gcs
@@ -12,22 +11,23 @@ sys.path.insert(1, os.path.join(sys.path[0], "../opteryx-core"))
 sys.path.insert(1, os.path.join(sys.path[0], "../pyiceberg-firestore-gcs"))
 
 
+import pytest
+
 from opteryx_catalog.catalog.dataset import SimpleDataset
-from opteryx_catalog.catalog.metadata import DatasetMetadata, Snapshot
 from opteryx_catalog.catalog.manifest import (
     build_parquet_manifest_entry_from_bytes,
     get_manifest_metrics,
     reset_manifest_metrics,
 )
+from opteryx_catalog.catalog.metadata import DatasetMetadata, Snapshot
 from opteryx_catalog.opteryx_catalog import OpteryxCatalog
-import pytest
 
 
 def test_min_k_hashes_for_string_and_binary():
     try:
         pass  # type: ignore
     except Exception:
-        pytest.skip("opteryx.draken not available")
+        pytest.skip("opteryx.compiled.draken not available")
 
     import pyarrow as pa
 
@@ -237,8 +237,8 @@ def test_refresh_manifest_with_single_file():
 
     # Persist the single-file manifest as JSON for quick inspection during
     # iterative debugging (writes to repo `artifacts/` so you can open it).
-    import os
     import json
+    import os
 
     artifacts_dir = os.path.join(os.getcwd(), "artifacts")
     os.makedirs(artifacts_dir, exist_ok=True)

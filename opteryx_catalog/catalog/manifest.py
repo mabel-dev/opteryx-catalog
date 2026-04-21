@@ -15,7 +15,9 @@ ENABLE_BATCH_COLUMN_READS = True  # Read all columns at once before falling back
 PYLIST_CONVERSION_CACHE = True  # Cache to_pylist() results per column
 
 # Manifest retrieval optimization
-ENABLE_LAZY_MANIFEST = True  # Use Arrow format for planning instead of converting to Python
+ENABLE_LAZY_MANIFEST = (
+    True  # Use Arrow format for planning instead of converting to Python
+)
 MANIFEST_COLUMNS_FOR_PLANNING = [  # Only read these columns for query planning
     "file_path",
     "record_count",
@@ -193,7 +195,9 @@ def _parse_manifest_optimized(data: bytes) -> list:
     available_cols = {field.name for field in schema}
 
     # Determine which columns to read (only read what planning needs)
-    cols_to_read = [col for col in MANIFEST_COLUMNS_FOR_PLANNING if col in available_cols]
+    cols_to_read = [
+        col for col in MANIFEST_COLUMNS_FOR_PLANNING if col in available_cols
+    ]
 
     if not cols_to_read:
         # Fallback: read all columns
@@ -223,7 +227,9 @@ def _parse_manifest_optimized(data: bytes) -> list:
         return frozen_rows
     except Exception as e:
         # Fallback: try reading entire manifest without column selection
-        logger.debug(f"Selective column read failed for manifest: {e}, falling back to full read")
+        logger.debug(
+            f"Selective column read failed for manifest: {e}, falling back to full read"
+        )
         try:
             buf = pa.BufferReader(data)
             table = pq.read_table(buf)
@@ -260,7 +266,7 @@ def _compute_stats_for_arrow_column(col, field_type, file_path: str):
     """
     import heapq
 
-    import opteryx.draken as draken  # type: ignore
+    import opteryx.compiled.draken as draken  # type: ignore
     import pyarrow as pa
 
     # Ensure single contiguous array when possible
@@ -365,7 +371,9 @@ def _compute_stats_for_arrow_column(col, field_type, file_path: str):
                     col_hist = [0] * HISTOGRAM_BINS
                     span = float(vmax - vmin)
                     for m in non_nulls_compressed:
-                        b = int(((float(m) - float(vmin)) / span) * (HISTOGRAM_BINS - 1))
+                        b = int(
+                            ((float(m) - float(vmin)) / span) * (HISTOGRAM_BINS - 1)
+                        )
                         if b < 0:
                             b = 0
                         if b >= HISTOGRAM_BINS:
@@ -426,10 +434,14 @@ def _compute_stats_for_arrow_column(col, field_type, file_path: str):
                     # Convert to ISO format strings for proper display
                     try:
                         min_display = (
-                            min_val.isoformat() if hasattr(min_val, "isoformat") else str(min_val)
+                            min_val.isoformat()
+                            if hasattr(min_val, "isoformat")
+                            else str(min_val)
                         )
                         max_display = (
-                            max_val.isoformat() if hasattr(max_val, "isoformat") else str(max_val)
+                            max_val.isoformat()
+                            if hasattr(max_val, "isoformat")
+                            else str(max_val)
                         )
                     except Exception:
                         min_display = str(min_val)
