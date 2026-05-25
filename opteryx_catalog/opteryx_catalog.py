@@ -708,6 +708,8 @@ class OpteryxCatalog(Metastore):
                     ("max_values", pa.list_(pa.int64())),
                     ("min_values_display", pa.list_(pa.string())),
                     ("max_values_display", pa.list_(pa.string())),
+                    ("min_lengths", pa.list_(pa.int64())),
+                    ("max_lengths", pa.list_(pa.int64())),
                 ]
             )
 
@@ -726,6 +728,8 @@ class OpteryxCatalog(Metastore):
                 e.setdefault("null_counts", [])
                 e.setdefault("min_values_display", [])
                 e.setdefault("max_values_display", [])
+                e.setdefault("min_lengths", [])
+                e.setdefault("max_lengths", [])
 
                 # min/max values are stored as compressed int64 values
                 # display values are string representations for human readability

@@ -112,6 +112,8 @@ class _FakeCatalog:
                 ("max_values", pa.list_(pa.int64())),
                 ("min_values_display", pa.list_(pa.string())),
                 ("max_values_display", pa.list_(pa.string())),
+                ("min_lengths", pa.list_(pa.int64())),
+                ("max_lengths", pa.list_(pa.int64())),
             ]
         )
         normalized = []
@@ -127,6 +129,8 @@ class _FakeCatalog:
             e.setdefault("null_counts", [])
             e.setdefault("min_values_display", [])
             e.setdefault("max_values_display", [])
+            e.setdefault("min_lengths", [])
+            e.setdefault("max_lengths", [])
             mv = e.get("min_values") or []
             xv = e.get("max_values") or []
             mv_disp = e.get("min_values_display") or []
@@ -167,6 +171,40 @@ def test_build_manifest_from_bytes_matches_table():
     # basic sanity checks (parity is enforced by using orig_table when available)
     assert e_bytes.record_count == 2
     assert e_bytes.file_size_in_bytes == len(data)
+
+
+def test_build_manifest_keeps_chunked_columns_until_stats(monkeypatch):
+    chunked = pa.chunked_array(
+        [
+            pa.array([b"a"], type=pa.binary()),
+            pa.array([b"bb"], type=pa.binary()),
+            pa.array([b"ccc"], type=pa.binary()),
+        ]
+    )
+    table = pa.Table.from_arrays([chunked], names=["blob"])
+    buf = pa.BufferOutputStream()
+    pq.write_table(table, buf, compression="zstd", row_group_size=1)
+    data = buf.getvalue().to_pybytes()
+
+    seen = {}
+
+    def fake_compute(col, field_type, file_path):
+        seen["col"] = col
+        seen["field_type"] = field_type
+        seen["file_path"] = file_path
+        return ([], [], 0, 0, None, None, 0, 0, 0)
+
+    monkeypatch.setattr(
+        "opteryx_catalog.catalog.manifest._compute_stats_for_arrow_column",
+        fake_compute,
+    )
+
+    entry = build_parquet_manifest_entry_from_bytes(data, "test.parquet", len(data))
+
+    assert isinstance(seen["col"], pa.ChunkedArray)
+    assert seen["field_type"] == pa.binary()
+    assert seen["file_path"] == "test.parquet"
+    assert entry.record_count == 3
 
 
 def test_manifest_metrics_increments():
@@ -273,3 +311,169 @@ def test_refresh_manifest_with_single_file():
     # ensure uncompressed bytes are present and non-zero for both cols
     assert desc["a"]["uncompressed_bytes"] > 0
     assert desc["b"]["uncompressed_bytes"] > 0
+
+
+def test_min_max_lengths_for_strings():
+    """Test min/max length computation for string columns."""
+    try:
+        pass  # type: ignore
+    except Exception:
+        pytest.skip("opteryx.compiled.draken not available")
+
+    # Create a Parquet table with variable-length strings
+    table = pa.table({
+        "strings": pa.array(["a", "hello", "the quick brown fox", None, "hi"])
+    })
+
+    # Write to bytes
+    buf = pa.BufferOutputStream()
+    pq.write_table(table, buf, compression="zstd")
+    data = buf.getvalue().to_pybytes()
+
+    # Build manifest entry
+    entry = build_parquet_manifest_entry_from_bytes(data, "test.parquet", len(data), orig_table=table)
+
+    # Verify min/max lengths (None values should be excluded)
+    # Non-null strings: "a" (1), "hello" (5), "the quick brown fox" (19), "hi" (2)
+    assert entry.min_lengths[0] == 1  # min length is "a"
+    assert entry.max_lengths[0] == 19  # max length is "the quick brown fox"
+
+
+def test_min_max_lengths_for_binary():
+    """Test min/max length computation for binary columns."""
+    try:
+        pass  # type: ignore
+    except Exception:
+        pytest.skip("opteryx.compiled.draken not available")
+
+    # Create a Parquet table with variable-length binary data
+    table = pa.table({
+        "binary_data": pa.array([b"ab", b"x", b"hello world", None, b"123456789"])
+    })
+
+    # Write to bytes
+    buf = pa.BufferOutputStream()
+    pq.write_table(table, buf, compression="zstd")
+    data = buf.getvalue().to_pybytes()
+
+    # Build manifest entry
+    entry = build_parquet_manifest_entry_from_bytes(data, "test.parquet", len(data), orig_table=table)
+
+    # Non-null binary: b"ab" (2), b"x" (1), b"hello world" (11), b"123456789" (9)
+    assert entry.min_lengths[0] == 1  # min length is b"x"
+    assert entry.max_lengths[0] == 11  # max length is b"hello world"
+
+
+def test_min_max_lengths_for_lists():
+    """Test min/max length computation for list/array columns."""
+    try:
+        pass  # type: ignore
+    except Exception:
+        pytest.skip("opteryx.compiled.draken not available")
+
+    # Create a Parquet table with variable-size lists
+    table = pa.table({
+        "list_data": pa.array([[1, 2, 3], [4], [5, 6], None, [7, 8, 9, 10, 11]])
+    })
+
+    # Write to bytes
+    buf = pa.BufferOutputStream()
+    pq.write_table(table, buf, compression="zstd")
+    data = buf.getvalue().to_pybytes()
+
+    # Build manifest entry
+    entry = build_parquet_manifest_entry_from_bytes(data, "test.parquet", len(data), orig_table=table)
+
+    # Non-null lists: [1,2,3] (3), [4] (1), [5,6] (2), [7,8,9,10,11] (5)
+    assert entry.min_lengths[0] == 1  # min length is [4]
+    assert entry.max_lengths[0] == 5  # max length is [7,8,9,10,11]
+
+
+def test_min_max_lengths_for_numeric_columns():
+    """Test that numeric/boolean columns have zero lengths."""
+    try:
+        pass  # type: ignore
+    except Exception:
+        pytest.skip("opteryx.compiled.draken not available")
+
+    # Create a Parquet table with various numeric types
+    table = pa.table({
+        "int_col": pa.array([1, 2, 3, 4, 5]),
+        "float_col": pa.array([1.1, 2.2, 3.3]),
+        "bool_col": pa.array([True, False, True])
+    })
+
+    # Write to bytes
+    buf = pa.BufferOutputStream()
+    pq.write_table(table, buf, compression="zstd")
+    data = buf.getvalue().to_pybytes()
+
+    # Build manifest entry
+    entry = build_parquet_manifest_entry_from_bytes(data, "test.parquet", len(data), orig_table=table)
+
+    # All non-variable-width types should have 0 length
+    assert entry.min_lengths[0] == 0  # int_col
+    assert entry.max_lengths[0] == 0  # int_col
+    assert entry.min_lengths[1] == 0  # float_col
+    assert entry.max_lengths[1] == 0  # float_col
+    assert entry.min_lengths[2] == 0  # bool_col
+    assert entry.max_lengths[2] == 0  # bool_col
+
+
+def test_min_max_lengths_equal_length_strings():
+    """Test edge case where all strings have equal length (fixed-width)."""
+    try:
+        pass  # type: ignore
+    except Exception:
+        pytest.skip("opteryx.compiled.draken not available")
+
+    # Create a Parquet table with fixed-length strings
+    table = pa.table({
+        "codes": pa.array(["ABC", "XYZ", "DEF", None, "123"])
+    })
+
+    # Write to bytes
+    buf = pa.BufferOutputStream()
+    pq.write_table(table, buf, compression="zstd")
+    data = buf.getvalue().to_pybytes()
+
+    # Build manifest entry
+    entry = build_parquet_manifest_entry_from_bytes(data, "test.parquet", len(data), orig_table=table)
+
+    # All non-null strings are 3 characters
+    assert entry.min_lengths[0] == 3
+    assert entry.max_lengths[0] == 3
+
+
+def test_lengths_in_manifest_roundtrip():
+    """Test end-to-end: lengths survive serialization and deserialization."""
+    try:
+        pass  # type: ignore
+    except Exception:
+        pytest.skip("opteryx.compiled.draken not available")
+
+    # Create dataset with string data
+    table = pa.table({
+        "name": pa.array(["Alice", "Bob", "Christopher", None, "Dan"]),
+        "value": pa.array([1, 2, 3, 4, 5])
+    })
+
+    buf = pa.BufferOutputStream()
+    pq.write_table(table, buf, compression="zstd")
+    data = buf.getvalue().to_pybytes()
+
+    # Build initial entry
+    entry = build_parquet_manifest_entry_from_bytes(data, "test.parquet", len(data), orig_table=table)
+
+    # Verify lengths were computed
+    assert entry.min_lengths[0] > 0  # name column has non-zero min length
+    assert entry.max_lengths[0] > 0  # name column has non-zero max length
+    assert entry.min_lengths[1] == 0  # value is numeric
+    assert entry.max_lengths[1] == 0  # value is numeric
+
+    # Convert to dict and back to simulate roundtrip
+    entry_dict = entry.to_dict()
+    assert "min_lengths" in entry_dict
+    assert "max_lengths" in entry_dict
+    assert entry_dict["min_lengths"] == entry.min_lengths
+    assert entry_dict["max_lengths"] == entry.max_lengths

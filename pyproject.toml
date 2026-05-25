@@ -29,8 +29,8 @@ dependencies = [
     "google-cloud-firestore==2.*",
     "google-cloud-storage==3.*",
     "orso==0.0.*",
-    "opteryx-core==0.7.*",
-    "pyarrow==24.*",
+    "opteryx-core>=0.7.*",
+    "pyarrow>=24.*",
     "requests==2.*"
 ]
 

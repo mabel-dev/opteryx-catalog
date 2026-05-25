@@ -102,11 +102,19 @@
     20
   ],
   "min_values_display": [
-    1,
-    10
+    null,
+    null
   ],
   "max_values_display": [
-    2,
-    20
+    null,
+    null
+  ],
+  "min_lengths": [
+    0,
+    0
+  ],
+  "max_lengths": [
+    0,
+    0
   ]
 }

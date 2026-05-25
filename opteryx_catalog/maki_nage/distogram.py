@@ -1,13 +1,12 @@
 # type:ignore
 import math
-from bisect import bisect_left
+from bisect import bisect_left, bisect_right
+from collections import Counter
 from itertools import accumulate
 from operator import itemgetter
 from typing import List
 from typing import Optional
 from typing import Tuple
-
-import numpy
 
 __author__ = """Romain Picard"""
 __email__ = "romain.picard@oakbits.com"
@@ -25,7 +24,45 @@ EPSILON = 1e-5
 BIN_COUNT: int = 50
 Bin = Tuple[float, int]
 
-_caster = numpy.float64
+_caster = float
+
+
+def _histogram_impl(values: List[float], bin_count: int) -> Tuple[List[int], List[float]]:
+    """Create a histogram of values using pure Python.
+
+    Args:
+        values: List of numeric values
+        bin_count: Number of bins to create
+
+    Returns:
+        Tuple of (counts, bin_edges) matching numpy.histogram format
+    """
+    if not values or bin_count < 1:
+        return [], []
+
+    min_val = min(values)
+    max_val = max(values)
+
+    if min_val == max_val:
+        return [len(values)], [min_val, max_val]
+
+    # Create bin edges
+    bin_width = (max_val - min_val) / bin_count
+    bin_edges = [min_val + i * bin_width for i in range(bin_count + 1)]
+    bin_edges[-1] = max_val  # Ensure last edge is exact
+
+    # Count values in each bin
+    counts = [0] * bin_count
+    for val in values:
+        # Find which bin this value belongs to
+        if val == max_val:
+            bin_idx = bin_count - 1
+        else:
+            bin_idx = int((val - min_val) / bin_width)
+            bin_idx = min(bin_idx, bin_count - 1)
+        counts[bin_idx] += 1
+
+    return counts, bin_edges
 
 
 # bins is a tuple of (cut point, count)
@@ -57,19 +94,15 @@ class Distogram:  # pragma: no cover
         import orjson
 
         def handler(obj):
-            obj_type = type(obj)
-            if obj_type is numpy.integer:
+            if isinstance(obj, int):
                 return int(obj)
-            if obj_type is numpy.inexact:
+            if isinstance(obj, float):
                 return float(obj)
             raise TypeError
 
         return orjson.dumps(self.dump(), default=handler)
 
     def dump(self):
-        bin_vals, bin_counts = zip(*self.bins)
-        bin_vals = numpy.array(bin_vals, dtype=numpy.float128)
-        self.bins = list(zip(bin_vals, bin_counts))
         return {
             "bins": self.bins,
             "min": self.min,
@@ -84,20 +117,24 @@ class Distogram:  # pragma: no cover
         return dgram
 
     def bulkload(self, values):
-        # To speed up bulk loads we use numpy to get a histogram at a higher resolution
+        # To speed up bulk loads we use a histogram at a higher resolution
         # and add this to the distogram.
         # Histogram gives us n+1 values, so we average consecutive values.
-        # This ends up being an approximation of an approximation but 1000x faster.
+        # This ends up being an approximation of an approximation but faster.
         # The accuracy of this approach is poor on datasets with very low record counts,
         # but even if a bad decision is made on a table with 500 rows, the consequence
         # is minimal, if a bad decision is made on a table with 5m rows, it starts to
         # matter.
         if len(values) == 0:
             return
-        bin_values, counts = numpy.unique(values, return_counts=True)
+        value_counts = Counter(values)
+        bin_values = sorted(value_counts.keys())
+        counts = [value_counts[v] for v in bin_values]
+
         if len(bin_values) > (self._bin_count * 5):
-            counts, bin_values = numpy.histogram(values, self._bin_count * 5, density=False)
-            bin_values = [bin_values[i] + bin_values[i + 1] / 2 for i in range(len(bin_values) - 1)]
+            counts, bin_edges = _histogram_impl(values, self._bin_count * 5)
+            bin_values = [bin_edges[i] + (bin_edges[i + 1] - bin_edges[i]) / 2 for i in range(len(bin_edges) - 1)]
+
         for index, count in enumerate(counts):
             if count > 0:
                 update(
@@ -107,12 +144,14 @@ class Distogram:  # pragma: no cover
                 )
 
         # we need to overwrite any range values as we've approximated the dataset
+        min_val = min(values)
+        max_val = max(values)
         if self.min is None:
-            self.min = values.min()
-            self.max = values.max()
+            self.min = min_val
+            self.max = max_val
         else:
-            self.min = min(self.min, values.min())
-            self.max = max(self.max, values.max())
+            self.min = min(self.min, min_val)
+            self.max = max(self.max, max_val)
 
     def count(self):
         return sum(f for _, f in self.bins)
@@ -470,12 +509,17 @@ def histogram(
         bin_count: [Optional] The number of bins in the histogram.
 
     Returns:
-        An estimation of the histogram of the distribution, or None
-        if there is not enough items in the distribution.
+        A tuple of (counts, bin_edges) matching numpy.histogram format,
+        or None if there is not enough items in the distribution.
     """
 
     if bin_count is None:
         bin_count = 20
+
+    total_count = count(h)
+    if total_count < bin_count:
+        return None
+
     bin_count = min(bin_count, len(h.bins))
     if bin_count < 2:
         return None
@@ -484,9 +528,7 @@ def histogram(
     counts = [count_up_to(h, e) for e in bin_bounds]
     counts = [new - last for new, last in zip(counts[1:], counts[:-1])]
 
-    result = {f"{bin_bounds[i]} - {bin_bounds[i + 1]}": c for i, c in enumerate(counts)}
-
-    return result
+    return counts, bin_bounds
 
 
 def frequency_density_distribution(
