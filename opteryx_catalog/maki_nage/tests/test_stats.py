@@ -2,14 +2,15 @@
 # isort: skip_file
 import sys
 import os
+import statistics
+import math
 
 sys.path.insert(1, os.path.join(sys.path[0], "../../../.."))
 
-from opteryx.third_party.maki_nage import distogram
+from opteryx_catalog.maki_nage import distogram
 from pytest import approx
 
 
-import numpy as np
 import random
 
 
@@ -20,6 +21,11 @@ def test_stats():
     for i in normal:
         distogram.update(h, i)
 
-    assert distogram.mean(h) == approx(np.mean(normal), abs=0.1)
-    assert distogram.variance(h) == approx(np.var(normal), abs=0.1)
-    assert distogram.stddev(h) == approx(np.std(normal), abs=0.1)
+    # Compare against pure Python statistical implementations
+    py_mean = statistics.mean(normal)
+    py_var = statistics.variance(normal)
+    py_std = math.sqrt(py_var)
+
+    assert distogram.mean(h) == approx(py_mean, abs=0.1)
+    assert distogram.variance(h) == approx(py_var, abs=0.1)
+    assert distogram.stddev(h) == approx(py_std, abs=0.1)

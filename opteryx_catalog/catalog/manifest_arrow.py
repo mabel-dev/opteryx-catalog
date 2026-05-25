@@ -50,6 +50,8 @@ PLANNING_COLUMNS = [
     "min_values_display",
     "max_values_display",
     "column_uncompressed_sizes_in_bytes",
+    "min_lengths",
+    "max_lengths",
 ]
 
 

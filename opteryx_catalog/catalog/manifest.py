@@ -30,6 +30,8 @@ MANIFEST_COLUMNS_FOR_PLANNING = [  # Only read these columns for query planning
     "min_values_display",
     "max_values_display",
     "column_uncompressed_sizes_in_bytes",
+    "min_lengths",
+    "max_lengths",
 ]
 
 # Parsed manifest cache (LRU) for Arrow tables (faster than Python dicts)
@@ -72,6 +74,8 @@ class ParquetManifestEntry:
     max_values: list
     min_values_display: list
     max_values_display: list
+    min_lengths: list[int]
+    max_lengths: list[int]
 
     def to_dict(self) -> dict:
         return {
@@ -89,6 +93,8 @@ class ParquetManifestEntry:
             "max_values": self.max_values,
             "min_values_display": self.min_values_display,
             "max_values_display": self.max_values_display,
+            "min_lengths": self.min_lengths,
+            "max_lengths": self.max_lengths,
         }
 
 
@@ -260,13 +266,13 @@ def clear_parsed_manifest_cache() -> None:
 def _compute_stats_for_arrow_column(col, field_type, file_path: str):
     """Compute statistics for a single PyArrow column (Array or ChunkedArray).
 
-    Returns a tuple: (col_min_k, col_hist, col_min, col_max, min_display, max_display, null_count)
+    Returns a tuple: (col_min_k, col_hist, col_min, col_max, min_display, max_display, null_count, min_len, max_len)
 
     Optimized to call to_pylist() only once if needed, caching the result for all uses.
     """
     import heapq
 
-    import opteryx.compiled.draken as draken  # type: ignore
+    import draken  # type: ignore
     import pyarrow as pa
 
     # Ensure single contiguous array when possible
@@ -281,10 +287,9 @@ def _compute_stats_for_arrow_column(col, field_type, file_path: str):
     _manifest_metrics["hash_calls"] += 1
     _manifest_metrics["compress_calls"] += 1
 
-    try:
-        vec = draken.Vector.from_arrow(col)
-    except Exception:  # pragma: no cover - be robust
-        raise
+    if hasattr(col, "combine_chunks"):
+        col = col.combine_chunks()
+    vec = draken.Vector.from_arrow(col)
 
     hashes = set(vec.hash())
 
@@ -450,6 +455,28 @@ def _compute_stats_for_arrow_column(col, field_type, file_path: str):
         min_display = None
         max_display = None
 
+    # Compute min/max lengths for variable-width types
+    min_len = 0
+    max_len = 0
+    is_variable_width = (
+        pa.types.is_string(field_type)
+        or pa.types.is_large_string(field_type)
+        or pa.types.is_binary(field_type)
+        or pa.types.is_large_binary(field_type)
+        or pa.types.is_list(field_type)
+        or pa.types.is_large_list(field_type)
+    )
+
+    if is_variable_width and col_py is not None:
+        try:
+            lengths = [len(v) for v in col_py if v is not None]
+            if lengths:
+                min_len = min(lengths)
+                max_len = max(lengths)
+        except Exception:
+            min_len = 0
+            max_len = 0
+
     return (
         col_min_k,
         col_hist,
@@ -458,6 +485,8 @@ def _compute_stats_for_arrow_column(col, field_type, file_path: str):
         min_display,
         max_display,
         int(null_count),
+        min_len,
+        max_len,
     )
 
 
@@ -469,9 +498,10 @@ def build_parquet_manifest_entry_from_bytes(
 ) -> ParquetManifestEntry:
     """Build a manifest entry by reading a parquet file as bytes and scanning column-by-column.
 
-    This reads the compressed file once and materializes one full column at a time
-    (combine_chunks) which keeps peak memory low while letting per-column
-    stat calculation (draken) operate on contiguous arrays.
+    This reads the compressed file once and processes one full column at a time.
+    Columns stay chunked here so very large binary/string columns do not overflow
+    Arrow's 32-bit offsets during eager concatenation; the stats helper still
+    attempts a best-effort ``combine_chunks()`` when that is safe.
 
     Optimized with:
     - Batch column reading (all columns at once) before fallback
@@ -507,6 +537,8 @@ def build_parquet_manifest_entry_from_bytes(
     max_values: list[int] = []
     min_values_display: list = []
     max_values_display: list = []
+    min_lengths_list: list[int] = []
+    max_lengths_list: list[int] = []
 
     # Optimized: Try batch read of all columns first (faster for small column counts)
     schema = pf.schema_arrow
@@ -530,21 +562,21 @@ def build_parquet_manifest_entry_from_bytes(
         try:
             if batch_table is not None:
                 # Fast path: column already in memory from batch read
-                col = batch_table.column(col_idx).combine_chunks()
+                col = batch_table.column(col_idx)
             else:
                 # Original fallback strategy
                 try:
                     col_table = pf.read(columns=[col_name])
-                    col = col_table.column(0).combine_chunks()
+                    col = col_table.column(0)
                 except Exception:
                     # fallback: try reading the row group column (more granular)
                     try:
                         tbl = pf.read_row_group(0, columns=[col_name])
-                        col = tbl.column(0).combine_chunks()
+                        col = tbl.column(0)
                     except Exception:
                         # Last resort: read entire file and then take the column
                         tbl = pf.read()
-                        col = tbl.column(col_idx).combine_chunks()
+                        col = tbl.column(col_idx)
 
             # compute stats using existing logic encapsulated in helper
             (
@@ -555,6 +587,8 @@ def build_parquet_manifest_entry_from_bytes(
                 col_min_display,
                 col_max_display,
                 null_count,
+                col_min_len,
+                col_max_len,
             ) = _compute_stats_for_arrow_column(col, col_field.type, file_path)
 
             min_k_hashes.append(col_min_k)
@@ -564,6 +598,8 @@ def build_parquet_manifest_entry_from_bytes(
             min_values_display.append(col_min_display)
             max_values_display.append(col_max_display)
             null_counts.append(null_count)
+            min_lengths_list.append(col_min_len)
+            max_lengths_list.append(col_max_len)
         finally:
             # free the table-level reference if present so memory can be reclaimed
             try:
@@ -684,6 +720,8 @@ def build_parquet_manifest_entry_from_bytes(
         max_values=max_values,
         min_values_display=min_values_display,
         max_values_display=max_values_display,
+        min_lengths=min_lengths_list,
+        max_lengths=max_lengths_list,
     )
 
     logger.debug(

@@ -5,11 +5,30 @@ import os
 
 sys.path.insert(1, os.path.join(sys.path[0], "../../../.."))
 
-from opteryx.third_party.maki_nage import distogram
+from opteryx_catalog.maki_nage import distogram
 from pytest import approx
 
-import numpy as np
 import random
+
+
+def _quantile(data, q):
+    """Simple quantile function for test validation."""
+    sorted_data = sorted(data)
+    n = len(sorted_data)
+    if q <= 0:
+        return sorted_data[0]
+    if q >= 1:
+        return sorted_data[-1]
+
+    pos = q * (n - 1)
+    lower_idx = int(pos)
+    upper_idx = lower_idx + 1
+
+    if upper_idx >= n:
+        return sorted_data[lower_idx]
+
+    fraction = pos - lower_idx
+    return sorted_data[lower_idx] * (1 - fraction) + sorted_data[upper_idx] * fraction
 
 
 def test_quantile():
@@ -37,9 +56,9 @@ def test_quantile_on_left():
     for i in data:
         distogram.update(h, i)
 
-    assert distogram.quantile(h, 0.01) == approx(np.quantile(data, 0.01), rel=0.01)
-    assert distogram.quantile(h, 0.05) == approx(np.quantile(data, 0.05), rel=0.05)
-    assert distogram.quantile(h, 0.25) == approx(np.quantile(data, 0.25), rel=0.05)
+    assert distogram.quantile(h, 0.01) == approx(_quantile(data, 0.01), rel=0.01)
+    assert distogram.quantile(h, 0.05) == approx(_quantile(data, 0.05), rel=0.05)
+    assert distogram.quantile(h, 0.25) == approx(_quantile(data, 0.25), rel=0.05)
 
 
 def test_quantile_on_right():
@@ -49,20 +68,19 @@ def test_quantile_on_right():
     for i in data:
         distogram.update(h, i)
 
-    assert distogram.quantile(h, 0.99) == approx(np.quantile(data, 0.99), rel=0.01)
-    assert distogram.quantile(h, 0.85) == approx(np.quantile(data, 0.85), rel=0.01)
+    assert distogram.quantile(h, 0.99) == approx(_quantile(data, 0.99), rel=0.01)
+    assert distogram.quantile(h, 0.85) == approx(_quantile(data, 0.85), rel=0.01)
 
 
 def test_normal():
-    # normal = np.random.normal(0,1, 1000)
     normal = [random.normalvariate(0.0, 1.0) for _ in range(10000)]
     h = distogram.Distogram(bin_count=64)
 
     for i in normal:
         distogram.update(h, i)
 
-    assert distogram.quantile(h, 0.5) == approx(np.quantile(normal, 0.5), abs=0.2)
-    assert distogram.quantile(h, 0.95) == approx(np.quantile(normal, 0.95), abs=0.2)
+    assert distogram.quantile(h, 0.5) == approx(_quantile(normal, 0.5), abs=0.2)
+    assert distogram.quantile(h, 0.95) == approx(_quantile(normal, 0.95), abs=0.2)
 
 
 def test_quantile_empty():

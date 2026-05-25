@@ -9,14 +9,12 @@ from __future__ import annotations
 import os
 import time
 import uuid
-from typing import List
-from typing import Optional
+from typing import List, Optional
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from .manifest import ParquetManifestEntry
-from .manifest import build_parquet_manifest_entry_from_bytes
+from .manifest import ParquetManifestEntry, build_parquet_manifest_entry_from_bytes
 from .metadata import Snapshot
 
 # Stable node identifier for this process (hex-mac-hex-pid)
@@ -169,9 +167,7 @@ class DatasetCompactor:
             total_size = 0
 
             # Sort by size ascending to prioritize eliminating smallest files
-            sorted_files = sorted(
-                small_files, key=lambda x: x.get("uncompressed_size_in_bytes", 0)
-            )
+            sorted_files = sorted(small_files, key=lambda x: x.get("uncompressed_size_in_bytes", 0))
 
             for entry in sorted_files:
                 entry_size = entry.get("uncompressed_size_in_bytes", 0)
@@ -306,42 +302,42 @@ class DatasetCompactor:
     def _reconcile_schemas(self, tables: List[pa.Table]) -> List[pa.Table]:
         """
         Reconcile schemas across multiple tables.
-        
+
         When tables have incompatible schemas (e.g., one column is null in one table
         and a concrete type in another), cast all tables to a unified schema.
-        
+
         Args:
             tables: List of PyArrow tables with potentially mismatched schemas
-            
+
         Returns:
             List of tables with unified schemas
         """
         if not tables or len(tables) <= 1:
             return tables
-        
+
         # Build unified schema by analyzing all schemas
         unified_schema = None
         field_types = {}  # column_name -> set of types seen
-        
+
         for table in tables:
             for field in table.schema:
                 col_name = field.name
                 col_type = field.type
-                
+
                 if col_name not in field_types:
                     field_types[col_name] = set()
-                
+
                 # Track type (null is represented as None)
                 type_str = str(col_type) if col_type != pa.null() else "null"
                 field_types[col_name].add(type_str)
-        
+
         # Build the unified schema
         unified_fields = []
         for table in tables:
             for field in table.schema:
                 col_name = field.name
                 types_seen = field_types.get(col_name, set())
-                
+
                 # If multiple types including null, use non-null type
                 non_null_types = {t for t in types_seen if t != "null"}
                 if non_null_types:
@@ -351,22 +347,25 @@ class DatasetCompactor:
                     for other_table in tables:
                         other_schema = other_table.schema
                         for other_field in other_schema:
-                            if other_field.name == col_name and str(other_field.type) == target_type_str:
+                            if (
+                                other_field.name == col_name
+                                and str(other_field.type) == target_type_str
+                            ):
                                 target_type = other_field.type
                                 break
                 else:
                     # All null, keep as is
                     target_type = pa.null()
-                
+
                 # Add to unified schema if not already present
                 if not unified_fields or not any(f.name == col_name for f in unified_fields):
                     unified_fields.append(pa.field(col_name, target_type))
-        
+
         if not unified_fields:
             return tables
-        
+
         unified_schema = pa.schema(unified_fields)
-        
+
         # Cast all tables to unified schema
         reconciled_tables = []
         for table in tables:
@@ -381,7 +380,7 @@ class DatasetCompactor:
                     for field in unified_schema:
                         col_name = field.name
                         col_type = field.type
-                        
+
                         if col_name in table.column_names:
                             col = table[col_name]
                             try:
@@ -392,15 +391,17 @@ class DatasetCompactor:
                         else:
                             # Column missing, create empty array of correct type
                             col = pa.array([None] * len(table), type=col_type)
-                        
+
                         casted_cols.append(col)
-                    
-                    casted_table = pa.table({field.name: col for field, col in zip(unified_schema, casted_cols)})
+
+                    casted_table = pa.table(
+                        {field.name: col for field, col in zip(unified_schema, casted_cols)}
+                    )
                     reconciled_tables.append(casted_table)
                 except Exception:
                     # Failed to reconcile, skip this table
                     continue
-        
+
         return reconciled_tables if reconciled_tables else tables
 
     def _execute_compaction(self, all_entries: List[dict], plan: dict) -> Optional[Snapshot]:
@@ -491,6 +492,9 @@ class DatasetCompactor:
                 # Failed to write or upload, abort
                 return None
 
+            # Before passing to manifest entry builder, ensure no chunked columns
+            if hasattr(table, "combine_chunks"):
+                table = table.combine_chunks()
             # Build manifest entry with full statistics using the bytes-based builder
             entry_obj = build_parquet_manifest_entry_from_bytes(
                 pdata, file_path, len(pdata), orig_table=table

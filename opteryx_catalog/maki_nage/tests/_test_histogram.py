@@ -5,10 +5,36 @@ import os
 
 sys.path.insert(1, os.path.join(sys.path[0], "../../../.."))
 
-from opteryx.third_party.maki_nage import distogram
+from opteryx_catalog.maki_nage import distogram
 import random
-import numpy as np
 from pytest import approx
+
+
+def _histogram(values, num_bins):
+    """Pure Python histogram implementation for test validation."""
+    if not values or num_bins < 1:
+        return [], []
+
+    min_val = min(values)
+    max_val = max(values)
+
+    if min_val == max_val:
+        return [len(values)], [min_val, max_val]
+
+    bin_width = (max_val - min_val) / num_bins
+    bin_edges = [min_val + i * bin_width for i in range(num_bins + 1)]
+    bin_edges[-1] = max_val
+
+    counts = [0] * num_bins
+    for val in values:
+        if val == max_val:
+            bin_idx = num_bins - 1
+        else:
+            bin_idx = int((val - min_val) / bin_width)
+            bin_idx = min(bin_idx, num_bins - 1)
+        counts[bin_idx] += 1
+
+    return counts, bin_edges
 
 
 def test_histogram():
@@ -18,8 +44,10 @@ def test_histogram():
     for i in normal:
         distogram.update(h, i)
 
-    np_values, np_edges = np.histogram(normal, 10)
+    # Verify distogram produces valid histogram output
     d_values, d_edges = distogram.histogram(h, 10)
+    assert len(d_values) == 10
+    assert len(d_edges) == 11
 
     h = distogram.Distogram(bin_count=3)
     distogram.update(h, 23)
