@@ -2,11 +2,11 @@
   "file_path": "mem://data/f1.parquet",
   "file_format": "parquet",
   "record_count": 2,
-  "file_size_in_bytes": 803,
-  "uncompressed_size_in_bytes": 32,
+  "file_size_in_bytes": 390,
+  "uncompressed_size_in_bytes": 176,
   "column_uncompressed_sizes_in_bytes": [
-    16,
-    16
+    88,
+    88
   ],
   "null_counts": [
     0,
@@ -14,12 +14,12 @@
   ],
   "min_k_hashes": [
     [
-      4354685563936836441,
-      11400714820970677679
+      "4354685563936836441",
+      "11400714820970677679"
     ],
     [
-      3326683750401710573,
-      6653367500803421144
+      "3326683750401710573",
+      "6653367500803421144"
     ]
   ],
   "histogram_counts": [
@@ -102,12 +102,12 @@
     20
   ],
   "min_values_display": [
-    null,
-    null
+    "1",
+    "10"
   ],
   "max_values_display": [
-    null,
-    null
+    "2",
+    "20"
   ],
   "min_lengths": [
     0,

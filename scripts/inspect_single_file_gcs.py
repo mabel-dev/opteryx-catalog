@@ -12,10 +12,12 @@ import os
 import sys
 import time
 
-import pyarrow.parquet as pq
 from google.cloud import storage
 
-from opteryx_catalog.catalog.manifest import build_parquet_manifest_entry_from_bytes
+from opteryx_catalog.catalog.manifest import (
+    build_parquet_manifest_entry_from_bytes,
+    read_manifest_rows,
+)
 
 
 def _preview(lst, n=6):
@@ -62,8 +64,7 @@ if __name__ == "__main__":
     for b in blobs:
         data = b.download_as_bytes()
         try:
-            table = pq.read_table(data)
-            rows = table.to_pylist()
+            rows = read_manifest_rows(data)
         except Exception:
             continue
         for i, r in enumerate(rows):

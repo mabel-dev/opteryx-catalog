@@ -12,9 +12,18 @@ import sys
 import time
 import traceback
 
-import pyarrow as pa
+from draken.interop.vector_sequence import vector_from_sequence
+from draken.morsels.morsel import Morsel
 
 from opteryx_catalog import OpteryxCatalog
+
+
+def _morsel(columns: dict) -> Morsel:
+    """Build a Morsel from {name: (values, dtype)}."""
+    m = Morsel()
+    for name, (values, dtype) in columns.items():
+        m.append_vector(name, vector_from_sequence(values, dtype=dtype))
+    return m
 
 sys.path.insert(0, os.path.join(sys.path[0], ".."))  # Add parent dir for pyiceberg_firestore_gcs
 sys.path.insert(1, os.path.join(sys.path[0], "../opteryx-core"))
@@ -43,7 +52,7 @@ def create_parquet_only_tables(count: int = 2) -> list:
         try:
             tbl = catalog.create_dataset(
                 f"{collection}.{table_name}",
-                pa.schema([pa.field("id", pa.int64()), pa.field("name", pa.string())]),
+                _morsel({"id": ([], "INTEGER"), "name": ([], "VARCHAR")}),
                 author=author,
             )
             print("Created dataset metadata:", f"{collection}.{table_name}")
@@ -74,7 +83,12 @@ def create_parquet_only_tables(count: int = 2) -> list:
             (8, "Neptune"),
         ]
 
-        data = pa.table({"id": [p[0] for p in planets], "name": [p[1] for p in planets]})
+        data = _morsel(
+            {
+                "id": ([p[0] for p in planets], "INTEGER"),
+                "name": ([p[1] for p in planets], "VARCHAR"),
+            }
+        )
 
         # Append data using the new SimpleDataset.append() which writes the data
         # file, creates a Parquet manifest and persists snapshot metadata.
@@ -89,7 +103,12 @@ def create_parquet_only_tables(count: int = 2) -> list:
         try:
             # small additional rows to simulate an update
             extra = [(9, "Pluto"), (10, "Eris")]
-            data2 = pa.table({"id": [p[0] for p in extra], "name": [p[1] for p in extra]})
+            data2 = _morsel(
+                {
+                    "id": ([p[0] for p in extra], "INTEGER"),
+                    "name": ([p[1] for p in extra], "VARCHAR"),
+                }
+            )
             tbl.append(data2, author=author, commit_message="append extra planets")
             print("Appended second dataset via Dataset.append() for", f"{collection}.{table_name}")
         except Exception as e:

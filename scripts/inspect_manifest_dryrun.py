@@ -15,10 +15,10 @@ import json
 import sys
 import time
 
-import pyarrow as pa
-import pyarrow.parquet as pq
-
-from opteryx_catalog.catalog.manifest import build_parquet_manifest_entry_from_bytes
+from opteryx_catalog.catalog.manifest import (
+    build_parquet_manifest_entry_from_bytes,
+    read_manifest_rows,
+)
 from opteryx_catalog.opteryx_catalog import OpteryxCatalog
 
 
@@ -33,9 +33,7 @@ def safe_read_manifest(ds) -> list:
             data = f.read()
         if not data:
             return []
-        table = pq.read_table(pa.BufferReader(data))
-        rows = table.to_pylist()
-        return rows
+        return read_manifest_rows(data)
     except Exception as e:
         return [{"__error": f"failed to read manifest: {e}"}]
 

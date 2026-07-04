@@ -12,20 +12,24 @@ sys.path.insert(1, os.path.join(sys.path[0], "../pyiceberg-firestore-gcs"))
 
 from unittest.mock import Mock
 
-import pyarrow as pa
-
 from opteryx_catalog.catalog.compaction import DatasetCompactor
 from opteryx_catalog.catalog.metadata import DatasetMetadata, Snapshot
 
 
-def create_test_table(num_rows: int, value_range: tuple = (0, 100)) -> pa.Table:
-    """Create a simple test table with a timestamp column for sorting."""
+def create_test_table(num_rows: int, value_range: tuple = (0, 100)):
+    """Create a simple test Morsel with a timestamp column for sorting."""
     import random
+
+    from draken.interop.vector_sequence import vector_from_sequence
+    from draken.morsels.morsel import Morsel
 
     timestamps = sorted([random.randint(value_range[0], value_range[1]) for _ in range(num_rows)])
     values = [f"value_{i}" for i in range(num_rows)]
 
-    return pa.table({"timestamp": timestamps, "value": values})
+    m = Morsel()
+    m.append_vector("timestamp", vector_from_sequence(timestamps, dtype="INTEGER"))
+    m.append_vector("value", vector_from_sequence(values, dtype="VARCHAR"))
+    return m
 
 
 def test_brute_compaction():

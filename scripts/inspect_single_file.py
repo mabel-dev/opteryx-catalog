@@ -12,9 +12,10 @@ import os
 import sys
 import time
 
-import pyarrow.parquet as pq
-
-from opteryx_catalog.catalog.manifest import build_parquet_manifest_entry_from_bytes
+from opteryx_catalog.catalog.manifest import (
+    build_parquet_manifest_entry_from_bytes,
+    read_manifest_rows,
+)
 from opteryx_catalog.opteryx_catalog import OpteryxCatalog
 
 
@@ -72,7 +73,7 @@ if __name__ == "__main__":
     with inp.open() as f:
         mbytes = f.read()
 
-    rows = pq.read_table(mbytes).to_pylist()
+    rows = read_manifest_rows(mbytes)
 
     match = None
     match_idx = None

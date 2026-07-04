@@ -3,9 +3,7 @@ import os
 import sys
 import time
 
-import pyarrow as pa
-import pyarrow.parquet as pq
-
+from opteryx_catalog.catalog.manifest import read_manifest_rows
 from opteryx_catalog.opteryx_catalog import OpteryxCatalog
 
 # Add local paths to sys.path to use local code instead of installed packages
@@ -79,7 +77,7 @@ s = catalog.load_dataset(f"{collection_name}.{table}")
 def _read_parquet_manifest(io, manifest_path: str) -> list:
     """Read a Parquet manifest produced by `FirestoreCatalog.write_parquet_manifest`.
 
-    Returns a list of entry dicts (the original pyarrow.from_pylist rows).
+    Returns a list of entry dicts.
     """
     if not manifest_path:
         return []
@@ -88,15 +86,25 @@ def _read_parquet_manifest(io, manifest_path: str) -> list:
         buf = inp.open().read()
     except FileNotFoundError:
         return []
-    tbl = pq.read_table(pa.BufferReader(buf))
-    return tbl.to_pylist()
+    return read_manifest_rows(buf)
 
 
 def _read_data_file(io, path: str) -> list:
+    from rugo.parquet import read_parquet
+
     inp = io.new_input(path)
     buf = inp.open().read()
-    tbl = pq.read_table(pa.BufferReader(buf))
-    return tbl.to_pylist()
+
+    columns: dict = {}
+    row_count = 0
+    with read_parquet(bytes(buf)) as reader:
+        for morsel in reader:
+            row_count += morsel.num_rows
+            for name_b in morsel.column_names:
+                name = name_b.decode("utf-8") if isinstance(name_b, (bytes, bytearray)) else name_b
+                columns.setdefault(name, []).extend(morsel.column(name_b).to_pylist())
+    names = list(columns.keys())
+    return [{name: columns[name][i] for name in names} for i in range(row_count)]
 
 
 # s.append(df)
