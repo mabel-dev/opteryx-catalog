@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "opteryx-catalog"
-version = "0.4.43"
+version = "0.4.44"
 description = "Opteryx Cloud Catalog"
 readme = { file = "README.md", content-type = "text/markdown" }
 authors = [
@@ -28,10 +28,8 @@ requires-python = ">=3.9"
 dependencies = [
     "google-cloud-firestore==2.*",
     "google-cloud-storage==3.*",
-    "orso==0.0.*",
-    "opteryx-core>=0.7.*",
-    "pyarrow>=24.*",
-    "requests==2.*"
+    "requests==2.*",
+    "rugo>=0.4"
 ]
 
 [project.optional-dependencies]

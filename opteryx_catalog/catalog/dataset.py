@@ -6,12 +6,69 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Iterable, Optional
 
-from .manifest import ParquetManifestEntry, build_parquet_manifest_entry_from_bytes
+from .manifest import (
+    ParquetManifestEntry,
+    build_parquet_manifest_entry_from_bytes,
+    build_parquet_manifest_entry_from_morsel,
+)
 from .metadata import DatasetMetadata, Snapshot
 from .metastore import Dataset
 
 # Stable node identifier for this process (hex-mac-hex-pid)
 _NODE = f"{uuid.getnode():x}-{os.getpid():x}"
+
+
+@dataclass
+class SchemaColumn:
+    """Dependency-free column descriptor returned by :meth:`SimpleDataset.schema`.
+
+    Field names (``name``/``type``/``element_type``/``precision``/``scale``/
+    ``nullable``) match the generic external-schema convention Opteryx's
+    ``OpteryxConnector._normalize_schema`` duck-types against, so the query
+    engine reconstructs its own typed ``ColumnType`` on the other side — this
+    module never needs to import opteryx-core or draken.
+    """
+
+    name: str
+    type: str
+    element_type: Optional[str] = None
+    precision: Optional[int] = None
+    scale: Optional[int] = None
+    nullable: bool = True
+
+
+@dataclass
+class RelationSchema:
+    """Dependency-free stand-in for an Opteryx ``RelationSchema``."""
+
+    name: str
+    columns: list
+
+
+def _stored_type_display(c: dict) -> str:
+    """Render a stored column's type as the canonical display string (mirrors
+    ``str(opteryx ColumnType)``), without needing any opteryx-core/draken
+    import. Consumers that duck-type this string (this module's own
+    ``describe()`` text-type check, or Opteryx's connector-side
+    ``parse_column_type``) get the same result as the real type object would
+    produce.
+    """
+    raw = c.get("type")
+    name = getattr(raw, "name", None) or (str(raw) if raw is not None else "VARCHAR")
+    name = name.upper()
+
+    if name == "DECIMAL":
+        precision = c.get("precision")
+        scale = c.get("scale")
+        if precision is not None and scale is not None:
+            return f"DECIMAL({precision}, {scale})"
+        return "DECIMAL(38, 9)"
+
+    if name == "ARRAY":
+        element = c.get("element-type") or c.get("element_type")
+        return f"ARRAY<{element or 'VARIANT'}>"
+
+    return name
 
 
 @dataclass
@@ -147,7 +204,7 @@ class SimpleDataset(Dataset):
     def snapshots(self) -> Iterable[Snapshot]:
         return list(self.metadata.snapshots)
 
-    def schema(self, schema_id: Optional[str] = None) -> Optional[dict]:
+    def schema(self, schema_id: Optional[str] = None) -> Optional[RelationSchema]:
         """Return a stored schema description.
 
         If `schema_id` is None, return the current schema (by
@@ -207,39 +264,34 @@ class SimpleDataset(Dataset):
         if sdict is None:
             return None
 
-        # Try to construct an Orso RelationSchema
-        from orso.schema import FlatColumn, RelationSchema
-
-        # If metadata stored a raw schema
+        # Build a dependency-free RelationSchema from the stored column
+        # metadata (see SchemaColumn/RelationSchema above).
         raw = sdict.get("columns")
 
         columns = [
-            FlatColumn(
+            SchemaColumn(
                 name=c.get("name"),
-                type=c.get("type"),
-                element_type=c.get("element-type"),
+                type=_stored_type_display(c),
+                element_type=c.get("element-type") or c.get("element_type"),
                 precision=c.get("precision"),
                 scale=c.get("scale"),
+                nullable=c.get("nullable", True),
             )
             for c in raw
         ]
-        orso_schema = RelationSchema(name=self.identifier, columns=columns)
-        return orso_schema
+        return RelationSchema(name=self.identifier, columns=columns)
 
     def append(self, table: Any, author: str = None, commit_message: Optional[str] = None):
-        """Append a pyarrow.Table:
+        """Append a draken Morsel:
 
         - write a Parquet data file via `self.io`
         - create a simple Parquet manifest (one entry)
         - persist manifest and snapshot metadata using the attached `catalog`
         """
-        import pyarrow as pa
-        import pyarrow.parquet as pq
-
         snapshot_id = int(time.time() * 1000)
 
-        if not hasattr(table, "schema"):
-            raise TypeError("append() expects a pyarrow.Table-like object")
+        if not hasattr(table, "schema") or not hasattr(table, "num_rows"):
+            raise TypeError("append() expects a draken.morsels.morsel.Morsel-like object")
 
         # Write table and build manifest entry
         manifest_entry = self._write_table_and_build_entry(table)
@@ -262,11 +314,9 @@ class SimpleDataset(Dataset):
                     inp = self.io.new_input(prev_manifest_path)
                     with inp.open() as f:
                         prev_data = f.read()
-                    import pyarrow as pa
-                    import pyarrow.parquet as pq
+                    from .manifest import read_manifest_rows
 
-                    prev_table = pq.read_table(pa.BufferReader(prev_data))
-                    prev_rows = prev_table.to_pylist()
+                    prev_rows = read_manifest_rows(prev_data)
                     merged_entries = prev_rows + merged_entries
                 except Exception:
                     # If we can't read the previous manifest, continue with
@@ -363,7 +413,7 @@ class SimpleDataset(Dataset):
             self.catalog.save_dataset_metadata(self.identifier, self.metadata)
 
     def _write_table_and_build_entry(self, table: Any):
-        """Write a PyArrow table to storage and return a ParquetManifestEntry.
+        """Write a draken Morsel to storage and return a ParquetManifestEntry.
 
         This centralizes the IO and manifest construction so other operations
         (e.g. `overwrite`) can reuse the same behavior as `append`.
@@ -372,22 +422,21 @@ class SimpleDataset(Dataset):
         fname = f"{time.time_ns():x}-{self._get_node()}.parquet"
         data_path = f"{self.metadata.location}/data/{fname}"
 
-        import pyarrow as pa
-        import pyarrow.parquet as pq
+        from rugo.parquet import write_parquet
 
         from ..iops.fileio import WRITE_PARQUET_OPTIONS
 
-        buf = pa.BufferOutputStream()
-        pq.write_table(table, buf, **WRITE_PARQUET_OPTIONS)
-        pdata = buf.getvalue().to_pybytes()
+        pdata = write_parquet(table, **WRITE_PARQUET_OPTIONS)
 
         out = self.io.new_output(data_path).create()
         out.write(pdata)
         out.close()
 
-        # Build manifest entry with statistics using a bytes-based, per-column scan
-        manifest_entry = build_parquet_manifest_entry_from_bytes(
-            pdata, data_path, len(pdata), orig_table=table
+        # Build manifest entry with statistics directly from the in-memory
+        # Morsel (avoids re-reading the file and losing temporal/decimal
+        # semantic types to Parquet's physical-int round-trip).
+        manifest_entry = build_parquet_manifest_entry_from_morsel(
+            table, pdata, data_path, len(pdata)
         )
         return manifest_entry
 
@@ -403,8 +452,8 @@ class SimpleDataset(Dataset):
         # Similar validation as append
         snapshot_id = int(time.time() * 1000)
 
-        if not hasattr(table, "schema"):
-            raise TypeError("overwrite() expects a pyarrow.Table-like object")
+        if not hasattr(table, "schema") or not hasattr(table, "num_rows"):
+            raise TypeError("overwrite() expects a draken.morsels.morsel.Morsel-like object")
 
         if author is None:
             raise ValueError("author must be provided when overwriting a dataset")
@@ -524,14 +573,12 @@ class SimpleDataset(Dataset):
         if prev and getattr(prev, "manifest_list", None):
             # try to read prev manifest entries
             try:
-                import pyarrow as pa
-                import pyarrow.parquet as pq
+                from .manifest import read_manifest_rows
 
                 inp = self.io.new_input(prev.manifest_list)
                 with inp.open() as f:
                     data = f.read()
-                table = pq.read_table(pa.BufferReader(data))
-                prev_entries = table.to_pylist()
+                prev_entries = read_manifest_rows(data)
             except Exception:
                 prev_entries = []
 
@@ -553,9 +600,6 @@ class SimpleDataset(Dataset):
 
             # Read file and compute full statistics
             try:
-                import pyarrow as pa
-                import pyarrow.parquet as pq
-
                 inp = self.io.new_input(fp)
                 with inp.open() as f:
                     data = f.read()
@@ -921,17 +965,17 @@ class SimpleDataset(Dataset):
             raise
 
         # Resolve schema and describe all columns
-        orso_schema = None
+        relation_schema = None
         try:
-            orso_schema = self.schema()
+            relation_schema = self.schema()
         except Exception:
-            orso_schema = None
+            relation_schema = None
 
-        if orso_schema is None:
+        if relation_schema is None:
             raise ValueError("Schema unavailable; cannot describe all columns")
 
         # Map column name -> index for every schema column
-        col_to_idx: dict[str, int] = {c.name: i for i, c in enumerate(orso_schema.columns)}
+        col_to_idx: dict[str, int] = {c.name: i for i, c in enumerate(relation_schema.columns)}
 
         # Initialize accumulators per column
         stats: dict[str, dict] = {}
@@ -1228,8 +1272,8 @@ class SimpleDataset(Dataset):
             # If textual, attempt display prefixes like describe()
             try:
                 is_text = False
-                if orso_schema is not None:
-                    col = orso_schema.columns[cidx]
+                if relation_schema is not None:
+                    col = relation_schema.columns[cidx]
                     ctype = getattr(col, "type", None)
                     if ctype is not None:
                         sctype = str(ctype).lower()
@@ -1421,8 +1465,7 @@ class SimpleDataset(Dataset):
         Finally it clears the in-memory snapshot list and persists the
         empty snapshot set via the attached `catalog` (if available).
         """
-        import pyarrow as pa
-        import pyarrow.parquet as pq
+        from .manifest import read_manifest_rows
 
         io = self.io
         # Collect files referenced by existing manifests but do NOT delete
@@ -1444,8 +1487,7 @@ class SimpleDataset(Dataset):
                 inp = io.new_input(manifest_path)
                 with inp.open() as f:
                     data = f.read()
-                table = pq.read_table(pa.BufferReader(data))
-                rows = table.to_pylist()
+                rows = read_manifest_rows(data)
             except Exception:
                 rows = []
 

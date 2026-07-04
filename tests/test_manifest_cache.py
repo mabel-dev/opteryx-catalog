@@ -6,9 +6,6 @@ sys.path.insert(0, os.path.join(sys.path[0], ".."))
 
 import io
 
-import pyarrow as pa
-import pyarrow.parquet as pq
-
 from opteryx_catalog.catalog.dataset import SimpleDataset
 from opteryx_catalog.catalog.metadata import DatasetMetadata, Snapshot
 
@@ -38,63 +35,35 @@ class _MemIO:
 
 
 def _build_manifest_bytes():
-    schema = pa.schema(
-        [
-            ("file_path", pa.string()),
-            ("file_format", pa.string()),
-            ("record_count", pa.int64()),
-            ("file_size_in_bytes", pa.int64()),
-            ("uncompressed_size_in_bytes", pa.int64()),
-            ("column_uncompressed_sizes_in_bytes", pa.list_(pa.int64())),
-            ("null_counts", pa.list_(pa.int64())),
-            ("min_k_hashes", pa.list_(pa.list_(pa.uint64()))),
-            ("histogram_counts", pa.list_(pa.list_(pa.int64()))),
-            ("histogram_bins", pa.int64()),
-            ("min_values", pa.list_(pa.int64())),
-            ("max_values", pa.list_(pa.int64())),
-            ("min_values_display", pa.list_(pa.string())),
-            ("max_values_display", pa.list_(pa.string())),
-        ]
-    )
+    from draken.interop.vector_sequence import vector_from_sequence
+    from draken.morsels.morsel import Morsel
+    from rugo.parquet import write_parquet
 
-    file_path = pa.array(["f1.parquet"], type=pa.string())
-    file_format = pa.array(["parquet"], type=pa.string())
-    record_count = pa.array([10], type=pa.int64())
-    file_size_in_bytes = pa.array([100], type=pa.int64())
-    uncompressed_size_in_bytes = pa.array([1000], type=pa.int64())
-    column_uncompressed_sizes_in_bytes = pa.array([[100, 400]], type=pa.list_(pa.int64()))
-    null_counts = pa.array([[0, 0]], type=pa.list_(pa.int64()))
-    min_k_hashes = pa.array([[[1, 2]]], type=pa.list_(pa.list_(pa.uint64())))
-    histogram_counts = pa.array([[[1, 2]]], type=pa.list_(pa.list_(pa.int64())))
-    histogram_bins = pa.array([32], type=pa.int64())
-    min_values = pa.array([[10, 20]], type=pa.list_(pa.int64()))
-    max_values = pa.array([[100, 400]], type=pa.list_(pa.int64()))
-    min_values_display = pa.array([[None, None]], type=pa.list_(pa.string()))
-    max_values_display = pa.array([[None, None]], type=pa.list_(pa.string()))
+    columns = {
+        "file_path": (["f1.parquet"], "VARCHAR"),
+        "file_format": (["parquet"], "VARCHAR"),
+        "record_count": ([10], "INTEGER"),
+        "file_size_in_bytes": ([100], "INTEGER"),
+        "uncompressed_size_in_bytes": ([1000], "INTEGER"),
+        "column_uncompressed_sizes_in_bytes": ([[100, 400]], "ARRAY"),
+        "null_counts": ([[0, 0]], "ARRAY"),
+        # min_k_hashes/histogram_counts store each per-column hash/bucket list
+        # comma-encoded (see write_parquet_manifest) since rugo can't write
+        # ARRAY<ARRAY<...>> — one string per schema column, per row.
+        "min_k_hashes": ([["1,2"]], "ARRAY"),
+        "histogram_counts": ([["1,2"]], "ARRAY"),
+        "histogram_bins": ([32], "INTEGER"),
+        "min_values": ([[10, 20]], "ARRAY"),
+        "max_values": ([[100, 400]], "ARRAY"),
+        "min_values_display": ([[None, None]], "ARRAY"),
+        "max_values_display": ([[None, None]], "ARRAY"),
+    }
 
-    table = pa.Table.from_arrays(
-        [
-            file_path,
-            file_format,
-            record_count,
-            file_size_in_bytes,
-            uncompressed_size_in_bytes,
-            column_uncompressed_sizes_in_bytes,
-            null_counts,
-            min_k_hashes,
-            histogram_counts,
-            histogram_bins,
-            min_values,
-            max_values,
-            min_values_display,
-            max_values_display,
-        ],
-        schema=schema,
-    )
+    m = Morsel()
+    for name, (values, dtype) in columns.items():
+        m.append_vector(name, vector_from_sequence(values, dtype=dtype))
 
-    buf = io.BytesIO()
-    pq.write_table(table, buf)
-    return buf.getvalue()
+    return write_parquet(m)
 
 
 def test_parsed_manifest_cache_hits_and_invalidation():

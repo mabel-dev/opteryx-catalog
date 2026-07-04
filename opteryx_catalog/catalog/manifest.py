@@ -18,21 +18,6 @@ PYLIST_CONVERSION_CACHE = True  # Cache to_pylist() results per column
 ENABLE_LAZY_MANIFEST = (
     True  # Use Arrow format for planning instead of converting to Python
 )
-MANIFEST_COLUMNS_FOR_PLANNING = [  # Only read these columns for query planning
-    "file_path",
-    "record_count",
-    "null_counts",
-    "min_k_hashes",
-    "histogram_counts",
-    "histogram_bins",
-    "min_values",
-    "max_values",
-    "min_values_display",
-    "max_values_display",
-    "column_uncompressed_sizes_in_bytes",
-    "min_lengths",
-    "max_lengths",
-]
 
 # Parsed manifest cache (LRU) for Arrow tables (faster than Python dicts)
 _arrow_manifest_cache: "OrderedDict[str, Any]" = OrderedDict()
@@ -102,7 +87,7 @@ logger = logging.getLogger(__name__)
 _manifest_metrics = Counter()
 
 # Parsed-manifest cache (LRU): store parsed Python representation (list[dict])
-# to avoid repeated pyarrow parsing and expensive to_pylist() conversions.
+# to avoid repeated rugo parsing and expensive to_pylist() conversions.
 # Entries are "frozen" for memory efficiency (inner lists -> tuples).
 PARSED_MANIFEST_CACHE_SIZE: int = 32
 _parsed_manifest_cache: "OrderedDict[str, list]" = OrderedDict()
@@ -152,9 +137,6 @@ def get_parsed_manifest(io, manifest_path: str) -> list:
         return _parsed_manifest_cache[manifest_path]
 
     # Miss: read bytes -> parse -> freeze -> cache
-    import pyarrow as pa
-    import pyarrow.parquet as pq
-
     inp = io.new_input(manifest_path)
     try:
         with inp.open() as f:
@@ -184,73 +166,70 @@ def get_parsed_manifest(io, manifest_path: str) -> list:
     return _parsed_manifest_cache[manifest_path]
 
 
-def _parse_manifest_optimized(data: bytes) -> list:
-    """Parse manifest parquet bytes with selective column reading.
+# Columns that write_parquet_manifest() comma-encodes into ARRAY<VARCHAR>
+# because rugo's writer doesn't support nested ARRAY<ARRAY<...>> — decoded
+# back to list[list[int]] here so callers see the original shape. Manifests
+# written before this encoding existed store these as raw nested int lists
+# directly (pyarrow's list<list<uint64/int64>>) — pass those through as-is.
+_NESTED_INT_LIST_COLUMNS = ("min_k_hashes", "histogram_counts")
 
-    Reads only columns needed for planning, reducing conversion overhead.
-    Falls back to full read if selective read fails.
+
+def _decode_nested_int_list_column(rows: list) -> list:
+    def _decode_cell(s):
+        if not isinstance(s, str):
+            return s
+        return [int(h) for h in s.split(",")] if s else []
+
+    return [None if row is None else [_decode_cell(s) for s in row] for row in rows]
+
+
+def read_manifest_columns(data: bytes) -> tuple:
+    """Decode manifest parquet bytes into ``({column_name: [values...]}, row_count)``.
+
+    The native (no-pyarrow) read path, backed by rugo. The manifest schema
+    contains dictionary-encoded strings and nested ``list<list<...>>``
+    statistics columns, all of which are materialized directly into Python
+    values matching the previous pyarrow ``to_pylist()`` output.
     """
-    import pyarrow as pa
-    import pyarrow.parquet as pq
+    if not data:
+        return {}, 0
 
-    buf = pa.BufferReader(data)
-    pf = pq.ParquetFile(buf)
-    schema = pf.schema_arrow
+    from rugo import parquet as _rugo_parquet
 
-    # Get available column names
-    available_cols = {field.name for field in schema}
+    column_data: dict[str, list] = {}
+    row_count = 0
+    with _rugo_parquet.read_parquet(bytes(data)) as reader:
+        for morsel in reader:
+            row_count += morsel.num_rows
+            for name_b in morsel.column_names:
+                name = (
+                    name_b.decode("utf-8")
+                    if isinstance(name_b, (bytes, bytearray))
+                    else name_b
+                )
+                column_data.setdefault(name, []).extend(morsel.column(name_b).to_pylist())
 
-    # Determine which columns to read (only read what planning needs)
-    cols_to_read = [
-        col for col in MANIFEST_COLUMNS_FOR_PLANNING if col in available_cols
-    ]
+    for name in _NESTED_INT_LIST_COLUMNS:
+        if name in column_data:
+            column_data[name] = _decode_nested_int_list_column(column_data[name])
 
-    if not cols_to_read:
-        # Fallback: read all columns
-        cols_to_read = None
+    return column_data, row_count
 
-    try:
-        # Read only the needed columns - significantly faster for wide manifests
-        if cols_to_read:
-            table = pq.read_table(buf, columns=cols_to_read)
-            _manifest_metrics["selective_column_reads"] += 1
-        else:
-            table = pq.read_table(buf)
-            _manifest_metrics["full_column_reads"] += 1
 
-        # Minimize to_pylist() overhead by batch converting
-        rows = table.to_pylist()
+def read_manifest_rows(data: bytes) -> list:
+    """Decode manifest parquet bytes into a list of row dicts using rugo."""
+    column_data, row_count = read_manifest_columns(data)
+    if not column_data:
+        return []
+    names = list(column_data.keys())
+    return [{name: column_data[name][i] for name in names} for i in range(row_count)]
 
-        # Freeze inner mutable structures to tuples
-        frozen_rows: list = []
-        for r in rows:
-            if isinstance(r, dict):
-                fr = {k: _freeze_for_cache(v) for k, v in r.items()}
-                frozen_rows.append(fr)
-            else:
-                frozen_rows.append(r)
 
-        return frozen_rows
-    except Exception as e:
-        # Fallback: try reading entire manifest without column selection
-        logger.debug(
-            f"Selective column read failed for manifest: {e}, falling back to full read"
-        )
-        try:
-            buf = pa.BufferReader(data)
-            table = pq.read_table(buf)
-            rows = table.to_pylist()
-            frozen_rows: list = []
-            for r in rows:
-                if isinstance(r, dict):
-                    fr = {k: _freeze_for_cache(v) for k, v in r.items()}
-                    frozen_rows.append(fr)
-                else:
-                    frozen_rows.append(r)
-            return frozen_rows
-        except Exception:
-            # Last resort: return empty
-            return []
+def _parse_manifest_optimized(data: bytes) -> list:
+    """Parse manifest parquet bytes into frozen row dicts for caching."""
+    rows = read_manifest_rows(data)
+    _manifest_metrics["full_column_reads"] += 1
+    return [{k: _freeze_for_cache(v) for k, v in r.items()} for r in rows]
 
 
 def invalidate_parsed_manifest(manifest_path: str) -> None:
@@ -263,453 +242,422 @@ def clear_parsed_manifest_cache() -> None:
     _parsed_manifest_cache.clear()
 
 
-def _compute_stats_for_arrow_column(col, field_type, file_path: str):
-    """Compute statistics for a single PyArrow column (Array or ChunkedArray).
+import datetime
+import heapq
+import re
 
-    Returns a tuple: (col_min_k, col_hist, col_min, col_max, min_display, max_display, null_count, min_len, max_len)
+_COMPRESSIBLE_CATEGORIES = {
+    "INT8",
+    "INT16",
+    "INT32",
+    "INT64",
+    "DECIMAL",
+    "DECIMAL128",
+    "FLOAT32",
+    "FLOAT64",
+    "DATE32",
+    "TIMESTAMP64",
+    "TIME32",
+    "TIME64",
+    "INTERVAL",
+    "BOOL",
+}
+_VARIABLE_WIDTH_CATEGORIES = {"VARCHAR", "NVARCHAR", "VARBINARY", "ARRAY"}
 
-    Optimized to call to_pylist() only once if needed, caching the result for all uses.
+# Maps a rugo ParquetMetadata SchemaColumn.logical_type string (e.g.
+# "date32[day]", "timestamp[ms,UTC]", "decimal(10, 2)", "varchar") to the same
+# category names used by draken's Morsel.schema (DrakenType.name), so a single
+# stats path works whether the vector came from a live in-memory Morsel or
+# from re-reading a parquet file's bytes.
+_LOGICAL_TYPE_ALIASES = {
+    "varchar": "VARCHAR",
+    "nvarchar": "NVARCHAR",
+    "varbinary": "VARBINARY",
+    "boolean": "BOOL",
+    "int8": "INT8",
+    "int16": "INT16",
+    "int32": "INT32",
+    "int64": "INT64",
+    "float": "FLOAT32",
+    "double": "FLOAT64",
+    "array": "ARRAY",
+    "interval": "INTERVAL",
+}
+
+
+def _category_from_logical_type(logical_type: str) -> tuple:
+    """Return ``(category, decimal_scale)`` from a rugo/parquet logical-type
+    string. ``decimal_scale`` is only set for DECIMAL columns (needed to
+    rescale the raw unscaled integer back into a display value).
     """
-    import heapq
+    lt = (logical_type or "").lower()
+    if lt.startswith("decimal"):
+        m = re.match(r"decimal\((\d+)\s*,\s*(\d+)\)", lt)
+        return "DECIMAL", (int(m.group(2)) if m else 0)
+    if lt.startswith("timestamp"):
+        return "TIMESTAMP64", None
+    if lt.startswith("date"):
+        return "DATE32", None
+    if lt.startswith("time"):
+        return "TIME64", None
+    return _LOGICAL_TYPE_ALIASES.get(lt, lt.upper()), None
 
-    import draken  # type: ignore
-    import pyarrow as pa
 
-    # Ensure single contiguous array when possible
-    if hasattr(col, "combine_chunks"):
-        try:
-            col = col.combine_chunks()
-        except Exception:
-            # leave as-is
-            pass
+def _display_value(value, category: str, decimal_scale=None):
+    """Render a decoded column value as a display string.
 
-    # Record compress/hash usage
-    _manifest_metrics["hash_calls"] += 1
-    _manifest_metrics["compress_calls"] += 1
+    Handles two shapes of ``value``: a proper Python object (``datetime.date``,
+    ``decimal.Decimal``, ...) as produced by a live Morsel's ``to_pylist()``,
+    or a raw physical int as produced by re-reading a parquet file (Parquet
+    round-trips DATE/TIMESTAMP/TIME/DECIMAL columns down to plain physical
+    ints — draken's Vector doesn't carry the logical annotation back).
+    """
+    if value is None:
+        return None
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    if category == "DECIMAL" and decimal_scale is not None and isinstance(value, int):
+        import decimal
 
-    if hasattr(col, "combine_chunks"):
-        col = col.combine_chunks()
-    vec = draken.Vector.from_arrow(col)
+        return str(decimal.Decimal(value).scaleb(-decimal_scale))
+    if category == "DATE32" and isinstance(value, int):
+        return (datetime.date(1970, 1, 1) + datetime.timedelta(days=value)).isoformat()
+    if category == "TIMESTAMP64" and isinstance(value, int):
+        return (
+            datetime.datetime(1970, 1, 1) + datetime.timedelta(microseconds=value)
+        ).isoformat()
+    if category in ("TIME32", "TIME64") and isinstance(value, int):
+        return str(datetime.timedelta(microseconds=value))
+    if isinstance(value, str):
+        return value[:16] + "..." if len(value) > 16 else value
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        b = bytes(value)
+        if any(c < 32 or c > 126 for c in b):
+            hexed = b.hex()
+            return hexed[:16] + "..." if len(hexed) > 16 else hexed
+        s = b.decode("latin-1", errors="replace")
+        return s[:16] + "..." if len(s) > 16 else s
+    return str(value)
 
-    hashes = set(vec.hash())
 
-    # Decide whether to compute min-k/histogram and if we need pylist upfront
-    needs_pylist = False
-    compute_min_k = False
+def _compute_column_stats(vec, category: str, decimal_scale=None) -> tuple:
+    """Compute statistics for a single column from its native draken Vector.
 
-    if (
-        pa.types.is_integer(field_type)
-        or pa.types.is_floating(field_type)
-        or pa.types.is_decimal(field_type)
-    ):
-        compute_min_k = True
-    elif (
-        pa.types.is_timestamp(field_type)
-        or pa.types.is_date(field_type)
-        or pa.types.is_time(field_type)
-    ):
-        compute_min_k = True
-        needs_pylist = True
-    elif (
-        pa.types.is_string(field_type)
-        or pa.types.is_large_string(field_type)
-        or pa.types.is_binary(field_type)
-        or pa.types.is_large_binary(field_type)
-    ):
-        compute_min_k = True
-        needs_pylist = True
+    ``vec`` may come from a live in-memory Morsel (correct semantic type) or
+    from re-reading a parquet file's bytes (temporal/decimal columns flattened
+    to plain physical ints by the round-trip — ``category``/``decimal_scale``
+    carry the true semantic type so display values still render correctly).
 
-    if pa.types.is_boolean(field_type):
-        needs_pylist = True
+    Returns: (min_k, histogram, min_value, max_value, min_display, max_display,
+    null_count, min_length, max_length)
+    """
+    try:
+        # ARRAY (and possibly other nested/complex types) don't support
+        # native hashing — no min-k sketch for those, everything else works.
+        hashes = vec.hash()
+    except ValueError:
+        hashes = []
+    null_count = int(sum(vec.is_null()))
+    is_compressible = category in _COMPRESSIBLE_CATEGORIES
+    is_boolean = category == "BOOL"
+    is_variable_width = category in _VARIABLE_WIDTH_CATEGORIES
 
-    # Single to_pylist() call if needed (major optimization)
-    col_py = None
-    if needs_pylist:
-        try:
-            col_py = col.to_pylist()
-        except Exception:
-            col_py = None
-
-    if compute_min_k:
-        smallest = heapq.nsmallest(MIN_K_HASHES, hashes)
-        col_min_k = sorted(smallest)
-    else:
-        col_min_k = []
-
-    # Use draken.compress() to get canonical int64 per value
-    compressed = list(vec.compress())
-    null_count = sum(1 for m in compressed if m == NULL_FLAG)
-
-    non_nulls_compressed = [m for m in compressed if m != NULL_FLAG]
-    if non_nulls_compressed:
-        vmin = min(non_nulls_compressed)
-        vmax = max(non_nulls_compressed)
-        col_min = int(vmin)
-        col_max = int(vmax)
-
-        # Compute histogram if needed
-        compute_hist = compute_min_k
-        if pa.types.is_boolean(field_type):
-            compute_hist = True
-
-        if compute_hist:
-            # Special-case boolean histograms
-            if pa.types.is_boolean(field_type):
-                try:
-                    if col_py is not None:
-                        non_nulls_bool = [v for v in col_py if v is not None]
-                        false_count = sum(1 for v in non_nulls_bool if v is False)
-                        true_count = sum(1 for v in non_nulls_bool if v is True)
-                    else:
-                        # Fallback: infer from compressed mapping (assume 0/1)
-                        false_count = sum(1 for m in non_nulls_compressed if m == 0)
-                        true_count = sum(1 for m in non_nulls_compressed if m != 0)
-                except Exception:
-                    false_count = 0
-                    true_count = 0
-
-                col_hist = [int(true_count), int(false_count)]
-            else:
-                if vmin == vmax:
-                    col_hist = []
-                else:
-                    col_hist = [0] * HISTOGRAM_BINS
-                    span = float(vmax - vmin)
-                    for m in non_nulls_compressed:
-                        b = int(
-                            ((float(m) - float(vmin)) / span) * (HISTOGRAM_BINS - 1)
-                        )
-                        if b < 0:
-                            b = 0
-                        if b >= HISTOGRAM_BINS:
-                            b = HISTOGRAM_BINS - 1
-                        col_hist[b] += 1
-        else:
-            col_hist = []
-    else:
-        # no non-null values
-        col_min = NULL_FLAG
-        col_max = NULL_FLAG
-        col_hist = []
-
-    # Compute display values using cached col_py
+    # Stored as decimal strings: .hash() returns true unsigned 64-bit values
+    # (up to 2**64-1) that overflow draken's signed int64 vectors on write.
+    # TODO: switch to a native UINT64 vector once rugo ships one — draken's
+    # DRAKEN_UINT64 tag, kernels, and vector_uint64_from_sequence() already
+    # exist upstream (as of writing, uncommitted in opteryx-core), and
+    # rugo's parquet read/write pipeline already has UINT64 support wired in
+    # too; it just hasn't reached a released `rugo` version yet. Until then,
+    # consumers already do int(h) on each element (see dataset.py
+    # describe()'s KMV estimator), so the string encoding is a lossless
+    # round-trip with no downstream change needed.
+    col_min_k = [str(h) for h in sorted(heapq.nsmallest(MIN_K_HASHES, set(hashes)))]
+    col_hist: list = []
+    col_min = NULL_FLAG
+    col_max = NULL_FLAG
     min_display = None
     max_display = None
-    try:
-        if pa.types.is_string(field_type) or pa.types.is_large_string(field_type):
-            if col_py is not None:
-                non_nulls_str = [x for x in col_py if x is not None]
-                if non_nulls_str:
-                    min_value = min(non_nulls_str)
-                    max_value = max(non_nulls_str)
-                    if len(min_value) > 16:
-                        min_value = min_value[:16] + "..."
-                    if len(max_value) > 16:
-                        max_value = max_value[:16] + "..."
-                    min_display = min_value
-                    max_display = max_value
-        elif pa.types.is_binary(field_type) or pa.types.is_large_binary(field_type):
-            if col_py is not None:
-                non_nulls = [x for x in col_py if x is not None]
-                if non_nulls:
-                    min_value = min(non_nulls)
-                    max_value = max(non_nulls)
-                    if len(min_value) > 16:
-                        min_value = min_value[:16] + "..."
-                    if len(max_value) > 16:
-                        max_value = max_value[:16] + "..."
-                    if any(ord(b) < 32 or ord(b) > 126 for b in min_value):
-                        min_value = min_value.hex()
-                        min_value = min_value[:16] + "..."
-                    if any(ord(b) < 32 or ord(b) > 126 for b in max_value):
-                        max_value = max_value.hex()
-                        max_value = max_value[:16] + "..."
-                    min_display = min_value
-                    max_display = max_value
-        elif (
-            pa.types.is_date(field_type)
-            or pa.types.is_timestamp(field_type)
-            or pa.types.is_time(field_type)
-        ):
-            if col_py is not None:
-                non_nulls = [x for x in col_py if x is not None]
-                if non_nulls:
-                    min_val = min(non_nulls)
-                    max_val = max(non_nulls)
-                    # Convert to ISO format strings for proper display
-                    try:
-                        min_display = (
-                            min_val.isoformat()
-                            if hasattr(min_val, "isoformat")
-                            else str(min_val)
-                        )
-                        max_display = (
-                            max_val.isoformat()
-                            if hasattr(max_val, "isoformat")
-                            else str(max_val)
-                        )
-                    except Exception:
-                        min_display = str(min_val)
-                        max_display = str(max_val)
-    except Exception:
-        min_display = None
-        max_display = None
-
-    # Compute min/max lengths for variable-width types
     min_len = 0
     max_len = 0
-    is_variable_width = (
-        pa.types.is_string(field_type)
-        or pa.types.is_large_string(field_type)
-        or pa.types.is_binary(field_type)
-        or pa.types.is_large_binary(field_type)
-        or pa.types.is_list(field_type)
-        or pa.types.is_large_list(field_type)
-    )
 
-    if is_variable_width and col_py is not None:
-        try:
-            lengths = [len(v) for v in col_py if v is not None]
-            if lengths:
-                min_len = min(lengths)
-                max_len = max(lengths)
-        except Exception:
-            min_len = 0
-            max_len = 0
+    values = vec.to_pylist()
+    non_null_values = [v for v in values if v is not None]
+
+    if is_compressible:
+        compressed = [c for c in vec.compress() if c != NULL_FLAG]
+        if compressed:
+            vmin, vmax = min(compressed), max(compressed)
+            col_min, col_max = int(vmin), int(vmax)
+            if is_boolean:
+                true_count = sum(1 for v in non_null_values if v is True)
+                false_count = sum(1 for v in non_null_values if v is False)
+                col_hist = [int(true_count), int(false_count)]
+            elif vmax > vmin:
+                col_hist = [0] * HISTOGRAM_BINS
+                span = float(vmax - vmin)
+                for c in compressed:
+                    b = int(((float(c) - float(vmin)) / span) * (HISTOGRAM_BINS - 1))
+                    col_hist[max(0, min(HISTOGRAM_BINS - 1, b))] += 1
+        if non_null_values:
+            min_display = _display_value(min(non_null_values), category, decimal_scale)
+            max_display = _display_value(max(non_null_values), category, decimal_scale)
+    elif non_null_values:
+        min_display = _display_value(min(non_null_values), category, decimal_scale)
+        max_display = _display_value(max(non_null_values), category, decimal_scale)
+
+    if is_variable_width:
+        lengths = [len(v) for v in non_null_values]
+        if lengths:
+            min_len, max_len = min(lengths), max(lengths)
 
     return (
         col_min_k,
         col_hist,
-        int(col_min),
-        int(col_max),
+        col_min,
+        col_max,
         min_display,
         max_display,
-        int(null_count),
+        null_count,
         min_len,
         max_len,
     )
+
+
+def _column_uncompressed_estimate(values: list) -> int:
+    """Rough uncompressed-size estimate for one column's decoded values.
+
+    Used only for reporting/summary purposes (dataset ``describe()`` and
+    snapshot size totals) — not correctness-critical, so a plain per-value
+    ``sys.getsizeof`` sum is good enough and avoids depending on parquet
+    row-group byte metadata that isn't exposed by rugo's public API.
+    """
+    import sys
+
+    return sum(sys.getsizeof(v) for v in values if v is not None)
+
+
+def build_parquet_manifest_entry_from_morsel(
+    morsel: Any,
+    data_bytes: bytes,
+    file_path: str,
+    file_size_in_bytes: int | None = None,
+) -> ParquetManifestEntry:
+    """Build a manifest entry from the in-memory Morsel that was just written.
+
+    Stats are computed from ``morsel`` directly (not by re-reading
+    ``data_bytes``) because Parquet round-trips temporal/decimal columns down
+    to plain physical ints — re-reading would lose the semantic type needed
+    for correct display values.
+    """
+    t_start = time.perf_counter()
+    _manifest_metrics["files_read"] += 1
+    _manifest_metrics["bytes_read"] += len(data_bytes)
+
+    schema = morsel.schema  # {name: DrakenType}
+    col_names = list(schema.keys())
+
+    min_k_hashes: list = []
+    histograms: list = []
+    min_values: list = []
+    max_values: list = []
+    min_values_display: list = []
+    max_values_display: list = []
+    null_counts: list = []
+    min_lengths_list: list = []
+    max_lengths_list: list = []
+    column_uncompressed: list = []
+    uncompressed_size = 0
+
+    for name in col_names:
+        vec = morsel.column(name)
+        category = schema[name].name
+        (
+            col_min_k,
+            col_hist,
+            col_min,
+            col_max,
+            col_min_display,
+            col_max_display,
+            null_count,
+            col_min_len,
+            col_max_len,
+        ) = _compute_column_stats(vec, category)
+
+        min_k_hashes.append(col_min_k)
+        histograms.append(col_hist)
+        min_values.append(col_min)
+        max_values.append(col_max)
+        min_values_display.append(col_min_display)
+        max_values_display.append(col_max_display)
+        null_counts.append(null_count)
+        min_lengths_list.append(col_min_len)
+        max_lengths_list.append(col_max_len)
+
+        col_bytes = _column_uncompressed_estimate(vec.to_pylist())
+        column_uncompressed.append(col_bytes)
+        uncompressed_size += col_bytes
+
+    entry = ParquetManifestEntry(
+        file_path=file_path,
+        file_format="parquet",
+        record_count=int(morsel.num_rows),
+        file_size_in_bytes=int(file_size_in_bytes or len(data_bytes)),
+        uncompressed_size_in_bytes=uncompressed_size,
+        column_uncompressed_sizes_in_bytes=column_uncompressed,
+        null_counts=null_counts,
+        min_k_hashes=min_k_hashes,
+        histogram_counts=histograms,
+        histogram_bins=HISTOGRAM_BINS,
+        min_values=min_values,
+        max_values=max_values,
+        min_values_display=min_values_display,
+        max_values_display=max_values_display,
+        min_lengths=min_lengths_list,
+        max_lengths=max_lengths_list,
+    )
+
+    logger.debug(
+        "build_parquet_manifest_entry_from_morsel %s files=%d dur=%.3fs",
+        file_path,
+        _manifest_metrics["files_read"],
+        time.perf_counter() - t_start,
+    )
+    return entry
 
 
 def build_parquet_manifest_entry_from_bytes(
     data_bytes: bytes,
     file_path: str,
     file_size_in_bytes: int | None = None,
-    orig_table: Any | None = None,
+    orig_morsel: Any | None = None,
 ) -> ParquetManifestEntry:
-    """Build a manifest entry by reading a parquet file as bytes and scanning column-by-column.
+    """Build a manifest entry by reading a parquet file's bytes.
 
-    This reads the compressed file once and processes one full column at a time.
-    Columns stay chunked here so very large binary/string columns do not overflow
-    Arrow's 32-bit offsets during eager concatenation; the stats helper still
-    attempts a best-effort ``combine_chunks()`` when that is safe.
-
-    Optimized with:
-    - Batch column reading (all columns at once) before fallback
-    - Early memory release of large objects
-    - Reduced to_pylist() calls in stats computation
+    Used when there's no live in-memory Morsel to hand (rescanning an
+    existing file during ``add_files``/``refresh_manifest``/compaction, or
+    from a standalone script). Pass ``orig_morsel`` when you do have the
+    original in-memory Morsel (e.g. right after writing it) to skip the
+    re-read and get exact stats via :func:`build_parquet_manifest_entry_from_morsel`.
     """
-    import pyarrow as pa
-    import pyarrow.parquet as pq
+    if orig_morsel is not None:
+        return build_parquet_manifest_entry_from_morsel(
+            orig_morsel, data_bytes, file_path, file_size_in_bytes
+        )
+
+    from rugo.parquet import read_metadata_from_memoryview
+    from rugo.parquet import read_parquet
 
     t_start = time.perf_counter()
     _manifest_metrics["files_read"] += 1
     _manifest_metrics["bytes_read"] += len(data_bytes)
-    data_bytes_len = len(data_bytes)
 
-    buf = pa.BufferReader(data_bytes)
-    pf = pq.ParquetFile(buf)
-    meta = pf.metadata
+    meta = read_metadata_from_memoryview(memoryview(data_bytes))
+    # name -> (category, decimal_scale) from Parquet's own logical-type
+    # annotations, since a re-read Vector's own .type is the flattened
+    # physical storage type (e.g. a DATE column reads back as plain INT64).
+    col_info = {
+        c.name: _category_from_logical_type(c.logical_type) for c in meta.schema_columns
+    }
+    col_names = list(col_info.keys())
 
-    # Try to read rugo metadata early so we can compute sizes without
-    # materializing the table later. This is zero-copy and fast.
-    try:
-        from opteryx.rugo.parquet import read_metadata_from_memoryview
-
-        rmeta = read_metadata_from_memoryview(memoryview(data_bytes))
-    except Exception:
-        rmeta = None
-
-    # Prepare result containers
-    min_k_hashes: list[list[int]] = []
-    histograms: list[list[int]] = []
-    min_values: list[int] = []
-    null_counts: list[int] = []
-    max_values: list[int] = []
+    min_k_hashes: list = []
+    histograms: list = []
+    min_values: list = []
+    max_values: list = []
     min_values_display: list = []
     max_values_display: list = []
-    min_lengths_list: list[int] = []
-    max_lengths_list: list[int] = []
-
-    # Optimized: Try batch read of all columns first (faster for small column counts)
-    schema = pf.schema_arrow
-    batch_table = None
-    use_batch = ENABLE_BATCH_COLUMN_READS and len(schema) <= 128
-
-    if use_batch:
-        try:
-            batch_table = pf.read()
-            _manifest_metrics["batch_reads"] += 1
-        except Exception:
-            batch_table = None
-
-    # iterate schema fields and process each column independently
-    for col_idx, col_field in enumerate(schema):
-        col_name = col_field.name
-        col = None
-        col_table = None
-        tbl = None
-
-        try:
-            if batch_table is not None:
-                # Fast path: column already in memory from batch read
-                col = batch_table.column(col_idx)
-            else:
-                # Original fallback strategy
-                try:
-                    col_table = pf.read(columns=[col_name])
-                    col = col_table.column(0)
-                except Exception:
-                    # fallback: try reading the row group column (more granular)
-                    try:
-                        tbl = pf.read_row_group(0, columns=[col_name])
-                        col = tbl.column(0)
-                    except Exception:
-                        # Last resort: read entire file and then take the column
-                        tbl = pf.read()
-                        col = tbl.column(col_idx)
-
-            # compute stats using existing logic encapsulated in helper
-            (
-                col_min_k,
-                col_hist,
-                col_min,
-                col_max,
-                col_min_display,
-                col_max_display,
-                null_count,
-                col_min_len,
-                col_max_len,
-            ) = _compute_stats_for_arrow_column(col, col_field.type, file_path)
-
-            min_k_hashes.append(col_min_k)
-            histograms.append(col_hist)
-            min_values.append(col_min)
-            max_values.append(col_max)
-            min_values_display.append(col_min_display)
-            max_values_display.append(col_max_display)
-            null_counts.append(null_count)
-            min_lengths_list.append(col_min_len)
-            max_lengths_list.append(col_max_len)
-        finally:
-            # free the table-level reference if present so memory can be reclaimed
-            try:
-                del col_table
-            except Exception:
-                pass
-            try:
-                del tbl
-            except Exception:
-                pass
-            try:
-                del col
-            except Exception:
-                pass
-
-    # Calculate uncompressed sizes. When the original in-memory table is
-    # available (we just wrote it), prefer using it so sizes match the
-    # table-based builder exactly. Otherwise use rugo metadata or batch_table.
-    column_uncompressed: list[int] = []
+    null_counts: list = []
+    min_lengths_list: list = []
+    max_lengths_list: list = []
+    column_uncompressed = [0] * len(col_names)
     uncompressed_size = 0
+    record_count = 0
 
-    # Free references to large objects we no longer need so memory can be reclaimed
-    try:
-        del buf
-    except Exception:
-        pass
-    try:
-        del pf
-    except Exception:
-        pass
-    try:
-        del data_bytes
-    except Exception:
-        pass
+    # Accumulate across row groups (read_parquet yields one Morsel per
+    # surviving row group).
+    accum: dict = {name: {"hashes": set(), "compressed": [], "values": []} for name in col_names}
 
-    if orig_table is not None:
-        # Use the original table buffers so results match the table-based route
-        for col in orig_table.columns:
-            col_total = 0
-            for chunk in col.chunks:
+    with read_parquet(bytes(data_bytes)) as reader:
+        for morsel in reader:
+            record_count += morsel.num_rows
+            for name_b in morsel.column_names:
+                name = name_b.decode("utf-8") if isinstance(name_b, (bytes, bytearray)) else name_b
+                if name not in accum:
+                    continue
+                vec = morsel.column(name_b)
+                category, _ = col_info[name]
+                acc = accum[name]
                 try:
-                    buffs = chunk.buffers()
-                except Exception as exc:
-                    raise RuntimeError(
-                        f"Unable to access chunk buffers to calculate uncompressed size for {file_path}: {exc}"
-                    ) from exc
-                for buffer in buffs:
-                    if buffer is not None:
-                        col_total += buffer.size
-            column_uncompressed.append(int(col_total))
-            uncompressed_size += col_total
-    elif batch_table is not None:
-        # If we already have the batch table loaded, compute sizes from it
-        for col in batch_table.columns:
-            col_total = 0
-            for chunk in col.chunks:
-                try:
-                    buffs = chunk.buffers()
-                except Exception:
-                    # If buffers unavailable, fall through to rugo/zero
-                    col_total = 0
-                    break
-                for buffer in buffs:
-                    if buffer is not None:
-                        col_total += buffer.size
-            column_uncompressed.append(int(col_total))
-            uncompressed_size += col_total
-        _manifest_metrics["sizes_from_batch_table"] += 1
-    else:
-        # Use rugo metadata (if available) to compute per-column uncompressed sizes
-        if rmeta:
-            rgs = rmeta.get("row_groups", [])
-            if rgs:
-                ncols = len(rgs[0].get("columns", []))
-                for cidx in range(ncols):
-                    col_total = 0
-                    for rg in rgs:
-                        cols = rg.get("columns", [])
-                        if cidx < len(cols):
-                            col_total += int(cols[cidx].get("total_byte_size", 0) or 0)
-                    column_uncompressed.append(int(col_total))
-                    uncompressed_size += col_total
-                _manifest_metrics["sizes_from_rugo"] += 1
-            else:
-                column_uncompressed = [0] * len(schema)
-                uncompressed_size = 0
-                _manifest_metrics["sizes_from_rugo_missing"] += 1
-        else:
-            # If rugo metadata isn't available, avoid materializing the table;
-            # emit zero sizes (safe and memory-light) and track that we lacked
-            # metadata for sizes.
-            column_uncompressed = [0] * len(schema)
-            uncompressed_size = 0
-            _manifest_metrics["sizes_from_rugo_unavailable"] += 1
-            logger.debug(
-                "rugo metadata unavailable for %s; emitting zero column sizes to avoid materializing table",
-                file_path,
-            )
+                    acc["hashes"].update(vec.hash())
+                except ValueError:
+                    pass
+                acc["values"].extend(vec.to_pylist())
+                if category in _COMPRESSIBLE_CATEGORIES:
+                    acc["compressed"].extend(vec.compress())
 
-    # Free batch table if it was loaded
-    try:
-        del batch_table
-    except Exception:
-        pass
+    for name in col_names:
+        category, decimal_scale = col_info[name]
+        acc = accum[name]
+        values = acc["values"]
+        non_null_values = [v for v in values if v is not None]
+        null_count = sum(1 for v in values if v is None)
+
+        col_min_k = [str(h) for h in sorted(heapq.nsmallest(MIN_K_HASHES, acc["hashes"]))]
+        col_hist: list = []
+        col_min = NULL_FLAG
+        col_max = NULL_FLAG
+        min_display = None
+        max_display = None
+        min_len = 0
+        max_len = 0
+
+        if category in _COMPRESSIBLE_CATEGORIES:
+            compressed = [c for c in acc["compressed"] if c != NULL_FLAG]
+            if compressed:
+                vmin, vmax = min(compressed), max(compressed)
+                col_min, col_max = int(vmin), int(vmax)
+                if category == "BOOL":
+                    true_count = sum(1 for v in non_null_values if v is True)
+                    false_count = sum(1 for v in non_null_values if v is False)
+                    col_hist = [int(true_count), int(false_count)]
+                elif vmax > vmin:
+                    col_hist = [0] * HISTOGRAM_BINS
+                    span = float(vmax - vmin)
+                    for c in compressed:
+                        b = int(((float(c) - float(vmin)) / span) * (HISTOGRAM_BINS - 1))
+                        col_hist[max(0, min(HISTOGRAM_BINS - 1, b))] += 1
+            if non_null_values:
+                min_display = _display_value(min(non_null_values), category, decimal_scale)
+                max_display = _display_value(max(non_null_values), category, decimal_scale)
+        elif non_null_values:
+            min_display = _display_value(min(non_null_values), category, decimal_scale)
+            max_display = _display_value(max(non_null_values), category, decimal_scale)
+
+        if category in _VARIABLE_WIDTH_CATEGORIES:
+            lengths = [len(v) for v in non_null_values]
+            if lengths:
+                min_len, max_len = min(lengths), max(lengths)
+
+        min_k_hashes.append(col_min_k)
+        histograms.append(col_hist)
+        min_values.append(col_min)
+        max_values.append(col_max)
+        min_values_display.append(min_display)
+        max_values_display.append(max_display)
+        null_counts.append(null_count)
+        min_lengths_list.append(min_len)
+        max_lengths_list.append(max_len)
+
+        col_bytes = _column_uncompressed_estimate(values)
+        column_uncompressed[col_names.index(name)] = col_bytes
+        uncompressed_size += col_bytes
 
     entry = ParquetManifestEntry(
         file_path=file_path,
         file_format="parquet",
-        record_count=int(meta.num_rows),
-        file_size_in_bytes=int(file_size_in_bytes or data_bytes_len),
+        record_count=int(record_count or meta.num_rows),
+        file_size_in_bytes=int(file_size_in_bytes or len(data_bytes)),
         uncompressed_size_in_bytes=uncompressed_size,
         column_uncompressed_sizes_in_bytes=column_uncompressed,
         null_counts=null_counts,
@@ -731,29 +679,6 @@ def build_parquet_manifest_entry_from_bytes(
         time.perf_counter() - t_start,
     )
     return entry
-
-
-# Backwards-compatible wrapper that keeps the original calling convention
-# when a pyarrow Table is already provided (tests and some scripts rely on it).
-def build_parquet_manifest_entry(
-    table: Any, file_path: str, file_size_in_bytes: int | None = None
-) -> ParquetManifestEntry:
-    """DEPRECATED: explicit table-based manifest building is removed.
-
-    The implementation previously accepted a PyArrow ``table`` and performed
-    the same per-column statistics calculation. That behavior hid a different
-    IO/scan path and led to inconsistent performance characteristics.
-
-    Use ``build_parquet_manifest_entry_from_bytes(data_bytes, file_path, file_size_in_bytes, orig_table=None)``
-    instead. If you have an in-memory table you can serialize it and call the
-    bytes-based builder, or pass ``orig_table`` to preserve exact uncompressed
-    size calculations.
-
-    This function now fails fast to avoid silently using the removed path.
-    """
-    raise RuntimeError(
-        "table-based manifest builder removed: use build_parquet_manifest_entry_from_bytes(data_bytes, file_path, file_size_in_bytes, orig_table=table) instead"
-    )
 
 
 def get_manifest_metrics() -> dict:

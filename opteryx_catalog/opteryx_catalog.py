@@ -25,6 +25,77 @@ from .webhooks.events import dataset_created_payload
 from .webhooks.events import view_created_payload
 
 
+def _core_type_to_stored(column_type: Any) -> tuple:
+    """Map an Opteryx ``ColumnType`` to ``(type_name, element_type, precision, scale)``.
+
+    ``type_name`` is the dispatch-category name (``INTEGER``, ``DECIMAL``,
+    ``ARRAY``, ...) so it round-trips through ``parse_column_type`` on read.
+    """
+    if column_type is None:
+        return ("VARCHAR", None, None, None)
+
+    category = column_type.category.name
+    if category == "DECIMAL":
+        logical = column_type.logical
+        precision = getattr(logical, "precision", None) if logical is not None else None
+        scale = getattr(logical, "scale", None) if logical is not None else None
+        return ("DECIMAL", None, precision, scale)
+    if category == "ARRAY":
+        element = column_type.element
+        element_name = element.category.name if element is not None else None
+        return ("ARRAY", element_name, None, None)
+    return (category, None, None, None)
+
+
+# draken physical type name (DrakenType.name, from Morsel.schema) -> the same
+# category names _core_type_to_stored uses.
+_DRAKEN_CATEGORY_OF = {
+    "INT8": "INTEGER",
+    "INT16": "INTEGER",
+    "INT32": "INTEGER",
+    "INT64": "INTEGER",
+    "DECIMAL": "DECIMAL",
+    "DECIMAL128": "DECIMAL",
+    "FLOAT32": "FLOAT",
+    "FLOAT64": "FLOAT",
+    "DATE32": "DATE",
+    "TIMESTAMP64": "TIMESTAMP",
+    "TIME32": "TIME",
+    "TIME64": "TIME",
+    "INTERVAL": "INTERVAL",
+    "BOOL": "BOOLEAN",
+    "VARCHAR": "VARCHAR",
+    "NVARCHAR": "NVARCHAR",
+    "VARBINARY": "VARBINARY",
+    "VARIANT": "VARIANT",
+    "ARRAY": "ARRAY",
+    "NULL": "NULL",
+    "VECTOR_FP16": "VECTOR",
+}
+
+
+def _morsel_type_to_stored(dtype: Any) -> tuple:
+    """Map a draken ``DrakenType`` (from ``Morsel.schema``) to
+    ``(type_name, element_type, precision, scale)``.
+
+    This is the write/create path (a Morsel's schema is being persisted), so
+    draken's physical type tag is used directly — no opteryx-core or pyarrow
+    involved. ``type_name`` uses the same category names as
+    :func:`_core_type_to_stored`.
+
+    ``Morsel.schema`` only exposes the physical type tag, not parameterization
+    (DECIMAL precision/scale, ARRAY element type), so those fall back to the
+    same defaults used on read (see ``dataset.py``'s ``_stored_type_display``).
+    """
+    name = getattr(dtype, "name", str(dtype))
+    category = _DRAKEN_CATEGORY_OF.get(name, "VARCHAR")
+    if category == "DECIMAL":
+        return ("DECIMAL", None, 38, 9)
+    if category == "ARRAY":
+        return ("ARRAY", "VARIANT", None, None)
+    return (category, None, None, None)
+
+
 class OpteryxCatalog(Metastore):
     """Firestore-backed Metastore implementation.
 
@@ -73,6 +144,12 @@ class OpteryxCatalog(Metastore):
             pass
         self.gcs_bucket = gcs_bucket
         self._storage_client = storage.Client() if gcs_bucket else None
+        # Caches for immutable, version-addressed artifacts. Snapshots, schemas
+        # and data files are write-once (a new write mints a new id), so caching
+        # them by id is always correct: only the dataset doc's current-*-id
+        # pointers are mutable, and those are re-read on every get_relation().
+        self._snapshot_cache = {}  # (collection, name, snapshot_id) -> Snapshot
+        self._schema_cache = {}  # (collection, name, schema_id) -> schema dict
         # Default to a GCS-backed FileIO when a GCS bucket is configured and
         # no explicit `io` was provided.
         if io is not None:
@@ -207,11 +284,86 @@ class OpteryxCatalog(Metastore):
             DatasetNotFound: If the dataset does not exist in Firestore.
         """
         collection, dataset_name = identifier.split(".", 1)
-        doc_ref = self._dataset_doc_ref(collection, dataset_name)
-        doc = doc_ref.get()
+        doc = self._dataset_doc_ref(collection, dataset_name).get()
         if not doc.exists:
             raise DatasetNotFound(f"Dataset not found: {identifier}")
+        return self._build_dataset(identifier, collection, dataset_name, doc, load_history)
 
+    def get_relation(self, identifier):
+        """Catalog resolution step: resolve a relation without knowing whether
+        it is a dataset or a view, in a single ``get_all([dataset, view])``
+        round trip. Returns ``(kind, obj)`` with kind in
+        ``{"dataset", "view", None}``.
+
+        The mutable dataset doc is read here on every call (it is the version
+        pointer), so there is no staleness. The immutable snapshot/schema docs
+        reached while building a dataset are served from id-keyed caches.
+        """
+        if isinstance(identifier, (tuple, list)):
+            ident = ".".join(str(p) for p in identifier)
+        else:
+            ident = identifier
+        # Dataset names may contain dots (split on the first); views are
+        # addressed name-last. The two coincide for the common two-part name.
+        ds_collection, ds_name = ident.split(".", 1) if "." in ident else (ident, ident)
+        parts = ident.split(".")
+        vw_collection = ".".join(parts[:-1]) or ds_collection
+        vw_name = parts[-1]
+
+        ds_ref = self._dataset_doc_ref(ds_collection, ds_name)
+        vw_ref = self._view_doc_ref(vw_collection, vw_name)
+
+        docs_by_path = {}
+        try:
+            for d in self.firestore_client.get_all([ds_ref, vw_ref]):
+                ref = getattr(d, "reference", None)
+                if ref is not None:
+                    docs_by_path[ref.path] = d
+        except Exception:
+            docs_by_path = {}
+
+        ds_doc = docs_by_path.get(ds_ref.path)
+        vw_doc = docs_by_path.get(vw_ref.path)
+
+        if ds_doc is not None and ds_doc.exists:
+            return "dataset", self._build_dataset(ident, ds_collection, ds_name, ds_doc)
+        if vw_doc is not None and vw_doc.exists:
+            return "view", self._build_view(vw_collection, vw_name, vw_doc)
+        return None, None
+
+    def _snapshot_from_dict(self, sd: dict) -> Snapshot:
+        return Snapshot(
+            snapshot_id=sd.get("snapshot-id"),
+            timestamp_ms=sd.get("timestamp-ms"),
+            author=sd.get("author"),
+            sequence_number=sd.get("sequence-number"),
+            user_created=sd.get("user-created"),
+            manifest_list=sd.get("manifest"),
+            schema_id=sd.get("schema-id"),
+            summary=sd.get("summary", {}),
+            operation_type=sd.get("operation-type"),
+            parent_snapshot_id=sd.get("parent-snapshot-id"),
+        )
+
+    def _schema_entry_from_doc(self, sdoc) -> dict:
+        sd = sdoc.to_dict() or {}
+        return {
+            "schema_id": sdoc.id,
+            "columns": sd.get("columns", []),
+            "timestamp-ms": sd.get("timestamp-ms"),
+            "author": sd.get("author"),
+            "sequence-number": sd.get("sequence-number"),
+        }
+
+    def _build_dataset(
+        self, identifier, collection, dataset_name, doc, load_history: bool = False
+    ) -> SimpleDataset:
+        """Build a SimpleDataset from an already-fetched dataset doc.
+
+        Non-history path resolves the current snapshot + schema, preferring the
+        id-keyed caches (immutable artifacts) and batching any misses into one
+        get_all().
+        """
         data = doc.to_dict() or {}
         metadata = DatasetMetadata(
             dataset_identifier=identifier,
@@ -220,8 +372,6 @@ class OpteryxCatalog(Metastore):
             schema=data.get("schema"),
             properties=data.get("properties") or {},
         )
-
-        # Load dataset-level timestamp/author and collection/workspace
         metadata.timestamp_ms = data.get("timestamp-ms")
         metadata.author = data.get("author")
         metadata.description = data.get("description")
@@ -229,92 +379,75 @@ class OpteryxCatalog(Metastore):
         metadata.annotations = data.get("annotations") or []
         metadata.refresh_frequency_mins = data.get("refresh-frequency-mins")
 
-        # Load snapshots based on load_history flag
-        snaps = []
+        schemas_coll = self._dataset_doc_ref(collection, dataset_name).collection("schemas")
+
         if load_history:
-            # Load all snapshots from Firestore (expensive for large histories)
+            snaps = []
             for snap_doc in self._snapshots_collection(collection, dataset_name).stream():
-                sd = snap_doc.to_dict() or {}
-                snap = Snapshot(
-                    snapshot_id=sd.get("snapshot-id"),
-                    timestamp_ms=sd.get("timestamp-ms"),
-                    author=sd.get("author"),
-                    sequence_number=sd.get("sequence-number"),
-                    user_created=sd.get("user-created"),
-                    manifest_list=sd.get("manifest"),
-                    schema_id=sd.get("schema-id"),
-                    summary=sd.get("summary", {}),
-                    operation_type=sd.get("operation-type"),
-                    parent_snapshot_id=sd.get("parent-snapshot-id"),
-                )
-                snaps.append(snap)
+                snaps.append(self._snapshot_from_dict(snap_doc.to_dict() or {}))
             if snaps:
                 metadata.current_snapshot_id = snaps[-1].snapshot_id
-        else:
-            # Load only the current snapshot (efficient single read)
-            current_snap_id = data.get("current-snapshot-id")
-            if current_snap_id:
-                try:
-                    snap_doc = (
-                        self._snapshots_collection(collection, dataset_name)
-                        .document(str(current_snap_id))
-                        .get()
-                    )
-                    if snap_doc.exists:
-                        sd = snap_doc.to_dict() or {}
-                        snap = Snapshot(
-                            snapshot_id=sd.get("snapshot-id"),
-                            timestamp_ms=sd.get("timestamp-ms"),
-                            author=sd.get("author"),
-                            sequence_number=sd.get("sequence-number"),
-                            user_created=sd.get("user-created"),
-                            manifest_list=sd.get("manifest"),
-                            schema_id=sd.get("schema-id"),
-                            summary=sd.get("summary", {}),
-                            operation_type=sd.get("operation-type"),
-                            parent_snapshot_id=sd.get("parent-snapshot-id"),
-                        )
-                        snaps.append(snap)
-                        metadata.current_snapshot_id = current_snap_id
-                except Exception:
-                    pass
+            metadata.snapshots = snaps
+            metadata.schemas = [self._schema_entry_from_doc(s) for s in schemas_coll.stream()]
+            metadata.current_schema_id = data.get("current-schema-id")
+            return SimpleDataset(identifier=identifier, _metadata=metadata, io=self.io, catalog=self)
+
+        current_snap_id = data.get("current-snapshot-id")
+        current_schema_id = data.get("current-schema-id")
+
+        # Prefer the immutable id-keyed caches; batch any misses into one read.
+        snap_obj = (
+            self._snapshot_cache.get((collection, dataset_name, current_snap_id))
+            if current_snap_id
+            else None
+        )
+        schema_entry = (
+            self._schema_cache.get((collection, dataset_name, current_schema_id))
+            if current_schema_id
+            else None
+        )
+
+        snap_ref = schema_ref = None
+        refs = []
+        if current_snap_id and snap_obj is None:
+            snap_ref = self._snapshots_collection(collection, dataset_name).document(
+                str(current_snap_id)
+            )
+            refs.append(snap_ref)
+        if current_schema_id and schema_entry is None:
+            schema_ref = schemas_coll.document(str(current_schema_id))
+            refs.append(schema_ref)
+
+        docs_by_path = {}
+        if refs:
+            try:
+                for d in self.firestore_client.get_all(refs):
+                    ref = getattr(d, "reference", None)
+                    if ref is not None:
+                        docs_by_path[ref.path] = d
+            except Exception:
+                docs_by_path = {}
+
+        snaps = []
+        if snap_obj is None and snap_ref is not None:
+            sdoc = docs_by_path.get(snap_ref.path)
+            if sdoc is not None and sdoc.exists:
+                snap_obj = self._snapshot_from_dict(sdoc.to_dict() or {})
+                self._snapshot_cache[(collection, dataset_name, current_snap_id)] = snap_obj
+        if snap_obj is not None:
+            snaps.append(snap_obj)
+            metadata.current_snapshot_id = current_snap_id
         metadata.snapshots = snaps
 
-        # Load schemas subcollection
-        schemas_coll = doc_ref.collection("schemas")
-        # Load all schemas if requested; otherwise load only current schema
-        if load_history:
-            schemas = []
-            for sdoc in schemas_coll.stream():
-                sd = sdoc.to_dict() or {}
-                schemas.append(
-                    {
-                        "schema_id": sdoc.id,
-                        "columns": sd.get("columns", []),
-                        "timestamp-ms": sd.get("timestamp-ms"),
-                        "author": sd.get("author"),
-                        "sequence-number": sd.get("sequence-number"),
-                    }
-                )
-            metadata.schemas = schemas
-            metadata.current_schema_id = doc.to_dict().get("current-schema-id")
-        else:
-            # Only load the current schema document for efficiency
-            current_schema_id = doc.to_dict().get("current-schema-id")
-            if current_schema_id:
-                sdoc = schemas_coll.document(str(current_schema_id)).get()
-                if sdoc.exists:
-                    sd = sdoc.to_dict() or {}
-                    metadata.schemas = [
-                        {
-                            "schema_id": sdoc.id,
-                            "columns": sd.get("columns", []),
-                            "timestamp-ms": sd.get("timestamp-ms"),
-                            "author": sd.get("author"),
-                            "sequence-number": sd.get("sequence-number"),
-                        }
-                    ]
-                    metadata.current_schema_id = current_schema_id
+        if schema_entry is None and schema_ref is not None:
+            scdoc = docs_by_path.get(schema_ref.path)
+            if scdoc is not None and scdoc.exists:
+                schema_entry = self._schema_entry_from_doc(scdoc)
+                self._schema_cache[(collection, dataset_name, current_schema_id)] = schema_entry
+        if schema_entry is not None:
+            metadata.schemas = [schema_entry]
+            metadata.current_schema_id = current_schema_id
+
         return SimpleDataset(identifier=identifier, _metadata=metadata, io=self.io, catalog=self)
 
     def drop_dataset(self, identifier: str) -> None:
@@ -510,17 +643,23 @@ class OpteryxCatalog(Metastore):
         else:
             collection, view_name = identifier.split(".")
 
-        doc_ref = self._view_doc_ref(collection, view_name)
-        doc = doc_ref.get()
+        doc = self._view_doc_ref(collection, view_name).get()
         if not doc.exists:
             raise ViewNotFound(f"View not found: {collection}.{view_name}")
+        return self._build_view(collection, view_name, doc)
 
+    def _build_view(self, collection, view_name, doc) -> CatalogView:
+        """Build a CatalogView from an already-fetched view doc."""
         data = doc.to_dict() or {}
         stmt_id = data.get("statement-id")
-        sql = None
         schema = data.get("schema")
 
-        sdoc = doc_ref.collection("statement").document(str(stmt_id)).get()
+        sdoc = (
+            self._view_doc_ref(collection, view_name)
+            .collection("statement")
+            .document(str(stmt_id))
+            .get()
+        )
         sql = (sdoc.to_dict() or {}).get("sql")
 
         v = CatalogView(name=view_name, definition=sql or "", properties=data.get("properties", {}))
@@ -671,11 +810,12 @@ class OpteryxCatalog(Metastore):
     ) -> Optional[str]:
         """Write a Parquet manifest for the given snapshot id and entries.
 
-        Entries should be plain dicts convertible by pyarrow.Table.from_pylist.
-        The manifest will be written to <dataset_location>/metadata/manifest-<snapshot_id>.parquet
+        Entries should be plain dicts. The manifest will be written to
+        <dataset_location>/metadata/manifest-<snapshot_id>.parquet
         """
-        import pyarrow as pa
-        import pyarrow.parquet as pq
+        from draken.interop.vector_sequence import vector_from_sequence
+        from draken.morsels.morsel import Morsel
+        from rugo.parquet import write_parquet
 
         from .iops.fileio import WRITE_PARQUET_OPTIONS
 
@@ -690,34 +830,32 @@ class OpteryxCatalog(Metastore):
 
         # Use provided FileIO if it supports writing; otherwise write to GCS
         try:
-            # Use an explicit schema so PyArrow types (especially nested lists)
-            # are correct and we avoid integer overflow / inference issues.
-            schema = pa.schema(
-                [
-                    ("file_path", pa.string()),
-                    ("file_format", pa.string()),
-                    ("record_count", pa.int64()),
-                    ("file_size_in_bytes", pa.int64()),
-                    ("uncompressed_size_in_bytes", pa.int64()),
-                    ("column_uncompressed_sizes_in_bytes", pa.list_(pa.int64())),
-                    ("null_counts", pa.list_(pa.int64())),
-                    ("min_k_hashes", pa.list_(pa.list_(pa.uint64()))),
-                    ("histogram_counts", pa.list_(pa.list_(pa.int64()))),
-                    ("histogram_bins", pa.int32()),
-                    ("min_values", pa.list_(pa.int64())),
-                    ("max_values", pa.list_(pa.int64())),
-                    ("min_values_display", pa.list_(pa.string())),
-                    ("max_values_display", pa.list_(pa.string())),
-                    ("min_lengths", pa.list_(pa.int64())),
-                    ("max_lengths", pa.list_(pa.int64())),
-                ]
-            )
+            # Explicit dtype per column (especially the nested-list stats
+            # columns) so rugo's writer gets a consistent shape regardless of
+            # what individual entries happen to carry.
+            columns = {
+                "file_path": "VARCHAR",
+                "file_format": "VARCHAR",
+                "record_count": "INTEGER",
+                "file_size_in_bytes": "INTEGER",
+                "uncompressed_size_in_bytes": "INTEGER",
+                "column_uncompressed_sizes_in_bytes": "ARRAY",
+                "null_counts": "ARRAY",
+                "min_k_hashes": "ARRAY",
+                "histogram_counts": "ARRAY",
+                "histogram_bins": "INTEGER",
+                "min_values": "ARRAY",
+                "max_values": "ARRAY",
+                "min_values_display": "ARRAY",
+                "max_values_display": "ARRAY",
+                "min_lengths": "ARRAY",
+                "max_lengths": "ARRAY",
+            }
 
-            # Normalize entries to match schema expectations:
+            # Normalize entries to match the column set above:
             normalized = []
             for ent in entries:
                 if not isinstance(ent, dict):
-                    normalized.append(ent)
                     continue
                 e = dict(ent)
                 # Ensure list fields exist
@@ -753,13 +891,25 @@ class OpteryxCatalog(Metastore):
                 # Display values truncated to 32 chars with '...' suffix if longer
                 e["min_values_display"] = [truncate_display(v) for v in mv_disp]
                 e["max_values_display"] = [truncate_display(v) for v in xv_disp]
+
+                # rugo's parquet writer only supports flat ARRAY<scalar>, not
+                # nested ARRAY<ARRAY<...>> — comma-encode each column's inner
+                # list into one string so these become ARRAY<VARCHAR>.
+                # read_manifest_columns() decodes them back transparently.
+                e["min_k_hashes"] = [
+                    ",".join(str(h) for h in col) if col else "" for col in e["min_k_hashes"]
+                ]
+                e["histogram_counts"] = [
+                    ",".join(str(h) for h in col) if col else "" for col in e["histogram_counts"]
+                ]
                 normalized.append(e)
 
-            table = pa.Table.from_pylist(normalized, schema=schema)
+            morsel = Morsel()
+            for name, dtype in columns.items():
+                values = [e.get(name) for e in normalized]
+                morsel.append_vector(name, vector_from_sequence(values, dtype=dtype))
 
-            buf = pa.BufferOutputStream()
-            pq.write_table(table, buf, **WRITE_PARQUET_OPTIONS)
-            data = buf.getvalue().to_pybytes()
+            data = write_parquet(morsel, **WRITE_PARQUET_OPTIONS)
 
             if self.io:
                 out = self.io.new_output(parquet_path).create()
@@ -882,55 +1032,47 @@ class OpteryxCatalog(Metastore):
             schemas_coll.document(stale).delete()
 
     def _schema_to_columns(self, schema: Any) -> list:
-        """Convert a pyarrow.Schema into a simple columns list for storage.
+        """Convert a schema into a simple columns list for storage.
 
-        Each column is a dict: {"id": index (1-based), "name": column_name, "type": str(type)}
+        Each column is a dict:
+        ``{"id": index (1-based), "name", "type", "element-type", "scale",
+        "precision", "expectation-policies", "annotations"}``.
+
+        Accepts a draken ``Morsel`` (the schema of a table being written) or
+        any relation-schema-like object exposing a ``.columns`` list of
+        columns with ``.name``/``.column_type`` (duck-typed, so a real
+        Opteryx ``RelationSchema`` works without importing opteryx-core
+        here). The stored ``type`` is a category/type name (``INTEGER``,
+        ``DECIMAL``, ``ARRAY``, ...) that round-trips through
+        ``opteryx.types.logical_type.parse_column_type`` on the query-engine
+        side.
         """
-        # Support pyarrow.Schema and Orso RelationSchema. When Orso's
-        # FlatColumn.from_arrow is available, use it to derive Orso types
-        # (type, element-type, scale, precision). Fall back to simple
-        # stringified types if Orso isn't installed.
-        cols = []
-        # Try Orso FlatColumn importer
-        import orso
-        import pyarrow as pa
-
-        # If schema is an Orso RelationSchema, try to obtain a list of columns
-        columns = None
-        if isinstance(schema, orso.schema.RelationSchema):
-            columns = schema.columns
-        elif isinstance(schema, pa.Schema):
-            orso_schema = orso.schema.convert_arrow_schema_to_orso_schema(schema)
-            columns = orso_schema.columns
+        if hasattr(schema, "columns"):
+            entries = [
+                (col.name, _core_type_to_stored(col.column_type)) for col in schema.columns
+            ]
+        elif hasattr(schema, "schema") and hasattr(schema, "num_rows"):
+            entries = [(name, _morsel_type_to_stored(dtype)) for name, dtype in schema.schema.items()]
         else:
-            # print(f"[DEBUG] _schema_to_columns: unsupported schema type: {type(schema)}")
             raise ValueError(
-                "Unsupported schema type, expected pyarrow.Schema or orso.RelationSchema"
+                "Unsupported schema type, expected a relation-schema-like object "
+                "with a `.columns` attribute or a draken.morsels.morsel.Morsel"
             )
 
-        # print(f"[DEBUG] _schema_to_columns: processing {len(columns)} columns")
-
-        for idx, column in enumerate(columns, start=1):
-            # If f looks like a pyarrow.Field, use its name/type
-            name = column.name
-
-            # Extract expected attributes safely
-            ctype = column.type
-            element_type = column.element_type if column.element_type else None
-            scale = column.scale
-            precision = column.precision
-            typed = {
-                "id": idx,
-                "name": name,
-                "type": ctype,
-                "element-type": element_type,
-                "scale": scale,
-                "precision": precision,
-                "expectation-policies": [],
-                "annotations": [],
-            }
-
-            cols.append(typed)
+        cols = []
+        for idx, (name, (type_name, element_type, precision, scale)) in enumerate(entries, start=1):
+            cols.append(
+                {
+                    "id": idx,
+                    "name": name,
+                    "type": type_name,
+                    "element-type": element_type,
+                    "scale": scale,
+                    "precision": precision,
+                    "expectation-policies": [],
+                    "annotations": [],
+                }
+            )
 
         return cols
 

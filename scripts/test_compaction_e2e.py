@@ -13,11 +13,12 @@ import sys
 import time
 from pathlib import Path
 
-import pyarrow as pa
-import pyarrow.parquet as pq
+from draken.interop.vector_sequence import vector_from_sequence
+from draken.morsels.morsel import Morsel
 
 from opteryx_catalog import OpteryxCatalog
 from opteryx_catalog.catalog.compaction import DatasetCompactor
+from opteryx_catalog.catalog.manifest import read_manifest_rows
 
 # Add parent to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -50,14 +51,11 @@ def create_small_dataset_with_multiple_files():
     identifier = f"{collection}.{dataset_name}"
 
     # Define schema
-    schema = pa.schema(
-        [
-            ("id", pa.int64()),
-            ("timestamp", pa.int64()),
-            ("value", pa.float64()),
-            ("text", pa.string()),
-        ]
-    )
+    schema = Morsel()
+    schema.append_vector("id", vector_from_sequence([], dtype="INTEGER"))
+    schema.append_vector("timestamp", vector_from_sequence([], dtype="INTEGER"))
+    schema.append_vector("value", vector_from_sequence([], dtype="DOUBLE"))
+    schema.append_vector("text", vector_from_sequence([], dtype="VARCHAR"))
 
     dataset = catalog.create_dataset(
         identifier=identifier,
@@ -100,7 +98,11 @@ def add_small_data_files(dataset, catalog, identifier, num_files=5, rows_per_fil
             "text": [f"file{file_idx}_row{i}" for i in range(rows_per_file)],
         }
 
-        table = pa.table(data)
+        table = Morsel()
+        table.append_vector("id", vector_from_sequence(data["id"], dtype="INTEGER"))
+        table.append_vector("timestamp", vector_from_sequence(data["timestamp"], dtype="INTEGER"))
+        table.append_vector("value", vector_from_sequence(data["value"], dtype="DOUBLE"))
+        table.append_vector("text", vector_from_sequence(data["text"], dtype="VARCHAR"))
 
         # Append to dataset (this creates a new snapshot)
         try:
@@ -124,8 +126,7 @@ def add_small_data_files(dataset, catalog, identifier, num_files=5, rows_per_fil
             inp = io.new_input(current_snapshot.manifest_list)
             with inp.open() as f:
                 data = f.read()
-            manifest_table = pq.read_table(pa.BufferReader(data))
-            entries = manifest_table.to_pylist()
+            entries = read_manifest_rows(data)
             print(f"  📈 Initial entry count: {len(entries)}")
 
             for idx, entry in enumerate(entries):
@@ -239,8 +240,7 @@ def verify_compaction_results(dataset_after, entries_before):
         inp = io.new_input(current_snapshot.manifest_list)
         with inp.open() as f:
             data = f.read()
-        manifest_table = pq.read_table(pa.BufferReader(data))
-        entries_after = manifest_table.to_pylist()
+        entries_after = read_manifest_rows(data)
 
         print("  📈 After compaction:")
         print(f"    Files before: {len(entries_before)}")

@@ -51,7 +51,7 @@ class Dataset:
         raise NotImplementedError()
 
     def append(self, table):
-        """Append data (implementations can accept pyarrow.Table or similar)."""
+        """Append data (implementations can accept a draken Morsel or similar)."""
         raise NotImplementedError()
 
     def scan(

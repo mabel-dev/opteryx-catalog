@@ -175,16 +175,10 @@ class GcsFileIO(FileIO):
 
 
 # Centralized Parquet write options used across the codebase when writing
-# parquet files. Exported here so all writers share the same configuration.
+# parquet files via rugo's native (no-pyarrow) writer. Exported here so all
+# writers share the same configuration.
 WRITE_PARQUET_OPTIONS = {
-    "compression": "ZSTD",
-    "compression_level": 3,
-    "use_dictionary": True,
-    "dictionary_pagesize_limit": 1024 * 1024,
-    "row_group_size": 250_000,          # primary lever: controls column chunk I/O size
-    "data_page_size": 512 * 1024,       # 512 KB — smaller pages = finer statistics pushdown
-    "max_rows_per_page": 8_000,         # keeps page boundaries tight with 512 KB pages
-    "write_batch_size": 1024,           # leave at default; only affects write-side buffering
-    "version": "2.6",
-    "write_statistics": True,
+    "compression": "zstd",
+    "bloom_filters": True,
+    "max_rows_per_row_group": 250_000,  # primary lever: controls column chunk I/O size
 }

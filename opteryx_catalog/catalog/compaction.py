@@ -11,9 +11,6 @@ import time
 import uuid
 from typing import List, Optional
 
-import pyarrow as pa
-import pyarrow.parquet as pq
-
 from .manifest import ParquetManifestEntry, build_parquet_manifest_entry_from_bytes
 from .metadata import Snapshot
 
@@ -134,7 +131,7 @@ class DatasetCompactor:
 
     def _read_manifest(self, manifest_path: str) -> List[dict]:
         """Read manifest entries from manifest file."""
-        # Prefer parsed-manifest cache to avoid repeated pyarrow parsing
+        # Prefer parsed-manifest cache to avoid repeated rugo parsing
         from .manifest import get_parsed_manifest
 
         try:
@@ -299,110 +296,69 @@ class DatasetCompactor:
         # No compaction opportunities
         return None
 
-    def _reconcile_schemas(self, tables: List[pa.Table]) -> List[pa.Table]:
+    def _reconcile_schemas(self, morsels: list) -> list:
         """
-        Reconcile schemas across multiple tables.
+        Reconcile schemas across multiple draken Morsels.
 
-        When tables have incompatible schemas (e.g., one column is null in one table
-        and a concrete type in another), cast all tables to a unified schema.
+        When morsels have incompatible schemas (e.g. one column is NULL-typed
+        in one morsel because every value there was None, and a concrete type
+        in another, or a column is missing entirely from one morsel), rebuild
+        the mismatched columns so every morsel shares one unified schema
+        before concatenation.
 
         Args:
-            tables: List of PyArrow tables with potentially mismatched schemas
+            morsels: List of draken Morsels with potentially mismatched schemas
 
         Returns:
-            List of tables with unified schemas
+            List of morsels with unified schemas
         """
-        if not tables or len(tables) <= 1:
-            return tables
+        if not morsels or len(morsels) <= 1:
+            return morsels
 
-        # Build unified schema by analyzing all schemas
-        unified_schema = None
-        field_types = {}  # column_name -> set of types seen
+        from draken.interop.vector_sequence import vector_from_sequence
+        from draken.morsels.morsel import Morsel
 
-        for table in tables:
-            for field in table.schema:
-                col_name = field.name
-                col_type = field.type
+        # Build the unified per-column type: prefer the first non-NULL type
+        # seen for each column name, across all morsels.
+        unified_types: dict = {}
+        for morsel in morsels:
+            for name, dtype in morsel.schema.items():
+                dtype_name = getattr(dtype, "name", str(dtype))
+                if name not in unified_types or unified_types[name] == "NULL":
+                    unified_types[name] = dtype_name
 
-                if col_name not in field_types:
-                    field_types[col_name] = set()
+        reconciled = []
+        for morsel in morsels:
+            morsel_types = {
+                name: getattr(dtype, "name", str(dtype)) for name, dtype in morsel.schema.items()
+            }
+            if morsel_types == unified_types:
+                reconciled.append(morsel)
+                continue
 
-                # Track type (null is represented as None)
-                type_str = str(col_type) if col_type != pa.null() else "null"
-                field_types[col_name].add(type_str)
-
-        # Build the unified schema
-        unified_fields = []
-        for table in tables:
-            for field in table.schema:
-                col_name = field.name
-                types_seen = field_types.get(col_name, set())
-
-                # If multiple types including null, use non-null type
-                non_null_types = {t for t in types_seen if t != "null"}
-                if non_null_types:
-                    # Use the first non-null type found
-                    target_type_str = next(iter(non_null_types))
-                    # Map back to actual PyArrow type from one of the tables
-                    for other_table in tables:
-                        other_schema = other_table.schema
-                        for other_field in other_schema:
-                            if (
-                                other_field.name == col_name
-                                and str(other_field.type) == target_type_str
-                            ):
-                                target_type = other_field.type
-                                break
-                else:
-                    # All null, keep as is
-                    target_type = pa.null()
-
-                # Add to unified schema if not already present
-                if not unified_fields or not any(f.name == col_name for f in unified_fields):
-                    unified_fields.append(pa.field(col_name, target_type))
-
-        if not unified_fields:
-            return tables
-
-        unified_schema = pa.schema(unified_fields)
-
-        # Cast all tables to unified schema
-        reconciled_tables = []
-        for table in tables:
             try:
-                # Cast to unified schema
-                casted_table = table.cast(unified_schema)
-                reconciled_tables.append(casted_table)
-            except Exception:
-                # If casting fails, try to match by column name and cast individual columns
-                try:
-                    casted_cols = []
-                    for field in unified_schema:
-                        col_name = field.name
-                        col_type = field.type
-
-                        if col_name in table.column_names:
-                            col = table[col_name]
-                            try:
-                                col = col.cast(col_type)
-                            except Exception:
-                                # If specific column cast fails, try to create empty array of correct type
-                                col = pa.array([None] * len(col), type=col_type)
+                rebuilt = Morsel()
+                for name, target_type in unified_types.items():
+                    if name in morsel_types:
+                        vec = morsel.column(name.encode("utf-8"))
+                        if morsel_types[name] == target_type:
+                            rebuilt.append_vector(name, vec)
                         else:
-                            # Column missing, create empty array of correct type
-                            col = pa.array([None] * len(table), type=col_type)
+                            rebuilt.append_vector(
+                                name, vector_from_sequence(vec.to_pylist(), dtype=target_type)
+                            )
+                    else:
+                        # Column missing entirely: fill with nulls
+                        rebuilt.append_vector(
+                            name,
+                            vector_from_sequence([None] * morsel.num_rows, dtype=target_type),
+                        )
+                reconciled.append(rebuilt)
+            except Exception:
+                # Failed to reconcile, skip this morsel
+                continue
 
-                        casted_cols.append(col)
-
-                    casted_table = pa.table(
-                        {field.name: col for field, col in zip(unified_schema, casted_cols)}
-                    )
-                    reconciled_tables.append(casted_table)
-                except Exception:
-                    # Failed to reconcile, skip this table
-                    continue
-
-        return reconciled_tables if reconciled_tables else tables
+        return reconciled if reconciled else morsels
 
     def _execute_compaction(self, all_entries: List[dict], plan: dict) -> Optional[Snapshot]:
         """
@@ -419,6 +375,8 @@ class DatasetCompactor:
         files_to_compact = plan["files"]
         sort_column = plan.get("sort_column")
 
+        from draken.morsels.morsel import Morsel
+
         # Read files to compact
         tables = []
         total_size = 0
@@ -428,12 +386,18 @@ class DatasetCompactor:
                 continue
 
             try:
+                from rugo.parquet import read_parquet
+
                 io = self.dataset.io
                 inp = io.new_input(file_path)
                 with inp.open() as f:
                     data = f.read()
-                table = pq.read_table(pa.BufferReader(data))
-                tables.append(table)
+                with read_parquet(bytes(data)) as reader:
+                    row_group_morsels = list(reader)
+                file_morsel = (
+                    Morsel.combine(row_group_morsels) if len(row_group_morsels) > 1 else row_group_morsels[0]
+                )
+                tables.append(file_morsel)
                 total_size += entry.get("uncompressed_size_in_bytes", 0)
             except Exception:
                 # Failed to read file, abort this compaction
@@ -445,14 +409,15 @@ class DatasetCompactor:
         # Reconcile schemas before concatenation
         tables = self._reconcile_schemas(tables)
 
-        # Combine tables
-        combined = pa.concat_tables(tables)
+        # Combine morsels
+        combined = Morsel.combine(tables) if len(tables) > 1 else tables[0]
 
         # Sort if performance mode
         if sort_column and plan_type == "combine-split":
             try:
-                # Sort by the sort column
-                combined = combined.sort_by([(sort_column, "ascending")])
+                sort_values = combined.column(sort_column.encode("utf-8")).to_pylist()
+                order = sorted(range(len(sort_values)), key=lambda i: (sort_values[i] is None, sort_values[i]))
+                combined = combined.take(order)
             except Exception:
                 # Sort failed, continue without sorting
                 pass
@@ -477,13 +442,13 @@ class DatasetCompactor:
             file_name = f"{time.time_ns():x}-{_NODE}.parquet"
             file_path = os.path.join(self.dataset.metadata.location, "data", file_name)
 
-            # Write parquet file to buffer and upload (so we can reuse bytes)
+            # Write parquet file and upload (so we can reuse bytes)
             try:
-                buf = pa.BufferOutputStream()
+                from rugo.parquet import write_parquet
+
                 from ..iops.fileio import WRITE_PARQUET_OPTIONS
 
-                pq.write_table(table, buf, **WRITE_PARQUET_OPTIONS)
-                pdata = buf.getvalue().to_pybytes()
+                pdata = write_parquet(table, **WRITE_PARQUET_OPTIONS)
                 io = self.dataset.io
                 out = io.new_output(file_path).create()
                 out.write(pdata)
@@ -492,12 +457,11 @@ class DatasetCompactor:
                 # Failed to write or upload, abort
                 return None
 
-            # Before passing to manifest entry builder, ensure no chunked columns
-            if hasattr(table, "combine_chunks"):
-                table = table.combine_chunks()
-            # Build manifest entry with full statistics using the bytes-based builder
+            # Build manifest entry with full statistics directly from the
+            # in-memory Morsel (avoids re-reading and losing temporal/decimal
+            # semantic types to Parquet's physical-int round-trip).
             entry_obj = build_parquet_manifest_entry_from_bytes(
-                pdata, file_path, len(pdata), orig_table=table
+                pdata, file_path, len(pdata), orig_morsel=table
             )
             entry_dict = self._to_dict(entry_obj)
             new_entries.append(entry_dict)
@@ -551,8 +515,7 @@ class DatasetCompactor:
             for table in tables:
                 deleted_records += table.num_rows
                 # Estimate data size from actual table
-                table_size = sum(sum(chunk.nbytes for chunk in col.chunks) for col in table.columns)
-                deleted_data_size += table_size
+                deleted_data_size += table.nbytes
 
             added_files = len(new_entries)
             added_size = sum(e.get("file_size_in_bytes", 0) for e in new_entries)
@@ -640,25 +603,23 @@ class DatasetCompactor:
 
         return snapshot
 
-    def _split_table(
-        self, table: pa.Table, target_size: int, max_files: int = None
-    ) -> List[pa.Table]:
+    def _split_table(self, table, target_size: int, max_files: int = None) -> list:
         """
-        Split a table into multiple tables of approximately target size.
+        Split a Morsel into multiple Morsels of approximately target size.
 
         Args:
-            table: PyArrow table to split
+            table: draken Morsel to split
             target_size: Target size in bytes (uncompressed)
             max_files: Maximum number of output files to create (optional)
 
         Returns:
-            List of tables
+            List of Morsels
         """
         if not table or table.num_rows == 0:
             return [table]
 
         # Estimate size per row
-        total_size = sum(sum(chunk.nbytes for chunk in col.chunks) for col in table.columns)
+        total_size = table.nbytes
 
         if total_size <= target_size:
             return [table]
@@ -757,10 +718,7 @@ class DatasetCompactor:
                 data = f.read()
 
             # Rebuild manifest entry from the actual file data
-            table = pq.read_table(pa.BufferReader(data))
-            rebuilt_entry = build_parquet_manifest_entry_from_bytes(
-                data, file_path, len(data), orig_table=table
-            )
+            rebuilt_entry = build_parquet_manifest_entry_from_bytes(data, file_path, len(data))
 
             # Convert to dict
             entry_dict = self._to_dict(rebuilt_entry)
@@ -800,10 +758,7 @@ class DatasetCompactor:
                     data = f.read()
 
                 # Rebuild manifest entry from actual file data
-                table = pq.read_table(pa.BufferReader(data))
-                rebuilt_entry = build_parquet_manifest_entry_from_bytes(
-                    data, file_path, len(data), orig_table=table
-                )
+                rebuilt_entry = build_parquet_manifest_entry_from_bytes(data, file_path, len(data))
 
                 # Convert to dict
                 entry_dict = self._to_dict(rebuilt_entry)

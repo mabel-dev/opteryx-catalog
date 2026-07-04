@@ -1,14 +1,15 @@
-"""Arrow-native manifest retrieval for efficient query planning.
+"""Native manifest retrieval for efficient query planning.
 
-This module provides optimized manifest reading that keeps data in Arrow format
-instead of converting to Python lists, avoiding the expensive to_pylist() overhead.
+This module reads manifest parquet files via rugo (no pyarrow) and keeps the
+data in a column-oriented form, avoiding per-cell scalar conversion.
 
-Key improvements:
-- No to_pylist() conversion (this was the bottleneck)
-- Selective column reading for planning
-- Lazy per-field deserialization (only convert what's accessed)
-- Arrow table caching instead of Python list caching
-- Dict-like interface for compatibility with existing code
+Key properties:
+- Columns are materialized once (bulk) and shared across row views.
+- Column-oriented cache keyed by manifest path.
+- Dict-like row interface for compatibility with existing code.
+
+The module name is retained for backwards compatibility; the data is no longer
+held as an Arrow table.
 """
 
 from __future__ import annotations
@@ -16,16 +17,15 @@ from __future__ import annotations
 import logging
 import time
 from collections import OrderedDict
-from typing import Any, Iterable, Iterator, Optional
+from typing import Any, Iterable, Iterator
 
-import pyarrow as pa
-import pyarrow.parquet as pq
+from .manifest import read_manifest_columns
 
 logger = logging.getLogger(__name__)
 
-# Cache configuration
+# Cache configuration. Each entry is ``({column_name: [values...]}, row_count)``.
 ARROW_MANIFEST_CACHE_SIZE: int = 32
-_arrow_manifest_cache: "OrderedDict[str, pa.Table]" = OrderedDict()
+_arrow_manifest_cache: "OrderedDict[str, tuple]" = OrderedDict()
 
 # Metrics
 _manifest_retrieval_metrics = {
@@ -37,243 +37,132 @@ _manifest_retrieval_metrics = {
     "total_conversion_time_ms": 0,
 }
 
-# Columns needed for query planning
-PLANNING_COLUMNS = [
-    "file_path",
-    "record_count",
-    "null_counts",
-    "min_k_hashes",
-    "histogram_counts",
-    "histogram_bins",
-    "min_values",
-    "max_values",
-    "min_values_display",
-    "max_values_display",
-    "column_uncompressed_sizes_in_bytes",
-    "min_lengths",
-    "max_lengths",
-]
-
 
 class ArrowManifestRow:
-    """Dict-like wrapper for a row from Arrow manifest table.
+    """Dict-like view over one row of a manifest whose columns have already
+    been bulk-materialized to Python lists.
 
-    Provides lazy deserialization - only converts fields to Python when accessed.
-    This avoids materializing the entire row, saving memory and time.
+    Field access is a plain list index — no per-cell scalar conversion.
     """
 
-    __slots__ = ("_table", "_row_idx", "_cache")
+    __slots__ = ("_columns", "_row_idx")
 
-    def __init__(self, table: pa.Table, row_idx: int):
-        self._table = table
+    def __init__(self, columns: dict, row_idx: int):
+        self._columns = columns
         self._row_idx = row_idx
-        self._cache: dict[str, Any] = {}
 
     def get(self, key: str, default: Any = None) -> Any:
-        """Get a field value, with lazy conversion to Python."""
-        # Check cache first
-        if key in self._cache:
-            return self._cache[key]
-
-        try:
-            col = self._table[key]
-            value = col[self._row_idx].as_py()
-            self._cache[key] = value
-            return value
-        except (KeyError, IndexError):
+        col = self._columns.get(key)
+        if col is None:
             return default
+        return col[self._row_idx]
 
     def __getitem__(self, key: str) -> Any:
-        """Get a field value, with lazy conversion to Python."""
-        if key in self._cache:
-            return self._cache[key]
-
-        col = self._table[key]
-        value = col[self._row_idx].as_py()
-        self._cache[key] = value
-        return value
+        return self._columns[key][self._row_idx]
 
     def __contains__(self, key: str) -> bool:
-        """Check if field exists in table."""
-        return key in self._table.column_names
+        return key in self._columns
 
     def keys(self):
-        """Get all column names."""
-        return self._table.column_names
+        return self._columns.keys()
 
     def items(self):
-        """Iterate over key-value pairs (materializes row)."""
-        for key in self._table.column_names:
-            yield key, self.get(key)
+        idx = self._row_idx
+        for key, col in self._columns.items():
+            yield key, col[idx]
 
     def __repr__(self) -> str:
         return f"ArrowManifestRow(row={self._row_idx})"
 
 
 class ArrowManifest(Iterable):
-    """Iterable wrapper over Arrow manifest table.
+    """Iterable wrapper over a manifest's column data.
 
-    Provides dict-like row access without full Python conversion.
+    Columns are already materialized as Python lists and shared across all row
+    views, so iterating N rows costs no per-cell conversion.
     """
 
-    __slots__ = ("_table", "_row_count")
+    __slots__ = ("_columns", "_row_count")
 
-    def __init__(self, table: pa.Table):
-        self._table = table
-        self._row_count = len(table)
+    def __init__(self, columns: dict, row_count: int):
+        self._columns = columns
+        self._row_count = row_count
 
     def __iter__(self) -> Iterator[ArrowManifestRow]:
         """Iterate over rows as dict-like objects."""
+        columns = self._columns
         for i in range(self._row_count):
-            yield ArrowManifestRow(self._table, i)
+            yield ArrowManifestRow(columns, i)
 
     def __len__(self) -> int:
         """Get number of rows."""
         return self._row_count
 
     def to_pylist(self) -> list[dict]:
-        """Convert entire table to Python list (for compatibility).
-
-        This materializes everything and should be avoided for large manifests.
-        Use iteration instead when possible.
-        """
-        return self._table.to_pylist()
-
-    @property
-    def table(self) -> pa.Table:
-        """Access underlying Arrow table directly."""
-        return self._table
+        """Convert to a list of row dicts."""
+        columns = self._columns
+        names = list(columns.keys())
+        return [{name: columns[name][i] for name in names} for i in range(self._row_count)]
 
 
 def get_arrow_manifest(io: Any, manifest_path: str) -> ArrowManifest:
-    """Get manifest as Arrow table without Python conversion.
-
-    This is the optimized path that keeps data in Arrow format for planning.
-
-    Args:
-        io: FileIO object for reading
-        manifest_path: Path to manifest parquet file
-
-    Returns:
-        ArrowManifest wrapper around Arrow table
-
-    Timing breakdown (typical):
-        - Firestore lookup: ~50-100ms
-        - GCS fetch: ~100-200ms (network + auth)
-        - Parquet read: ~10-50ms
-        - This function (Arrow reading): ~5-20ms
-
-        Total before optimization: ~200-400ms (with to_pylist conversion)
-        Total after optimization: ~180-270ms (no Python conversion)
-
-    Savings: ~20-30% reduction in planning time by skipping to_pylist()
-    """
+    """Get manifest column data via rugo, keeping it column-oriented for planning."""
 
     if not manifest_path:
-        return ArrowManifest(pa.Table.from_pylist([]))
+        return ArrowManifest({}, 0)
 
     # Check cache
     if manifest_path in _arrow_manifest_cache:
         _arrow_manifest_cache.move_to_end(manifest_path)
         _manifest_retrieval_metrics["arrow_cache_hits"] += 1
-        return ArrowManifest(_arrow_manifest_cache[manifest_path])
+        columns, row_count = _arrow_manifest_cache[manifest_path]
+        return ArrowManifest(columns, row_count)
 
     _manifest_retrieval_metrics["arrow_cache_misses"] += 1
     start_time = time.perf_counter()
 
     # Read bytes from storage
     inp = io.new_input(manifest_path)
-    try:
-        with inp.open() as f:
-            data = f.read()
-    except FileNotFoundError:
-        raise
+    with inp.open() as f:
+        data = f.read()
 
-    if not data:
-        empty_table = pa.Table.from_pylist([])
-        _arrow_manifest_cache[manifest_path] = empty_table
-        if len(_arrow_manifest_cache) > ARROW_MANIFEST_CACHE_SIZE:
-            _arrow_manifest_cache.popitem(last=False)
-        return ArrowManifest(empty_table)
-
-    # Read parquet with selective column loading
-    buf = pa.BufferReader(data)
-    pf = pq.ParquetFile(buf)
-    schema = pf.schema_arrow
-
-    # Get available columns
-    available_cols = {field.name for field in schema}
-
-    # Determine which columns to actually read
-    cols_to_read = [col for col in PLANNING_COLUMNS if col in available_cols]
-
-    try:
-        if cols_to_read and len(cols_to_read) < len(available_cols):
-            # Selective read - faster when manifest has many columns
-            table = pq.read_table(pa.BufferReader(data), columns=cols_to_read)
-            _manifest_retrieval_metrics["selective_reads"] += 1
-            logger.debug(
-                f"Selective column read: {len(cols_to_read)}/{len(available_cols)} columns"
-            )
-        else:
-            # Read all columns if selective set is empty or same size
-            table = pq.read_table(pa.BufferReader(data))
-            _manifest_retrieval_metrics["full_reads"] += 1
-    except Exception as e:
-        logger.warning(f"Failed to read manifest {manifest_path}: {e}")
-        raise
+    columns, row_count = read_manifest_columns(data)
+    _manifest_retrieval_metrics["full_reads"] += 1
 
     elapsed_ms = (time.perf_counter() - start_time) * 1000
     _manifest_retrieval_metrics["total_retrieval_time_ms"] += elapsed_ms
 
-    # Cache the Arrow table (not Python list)
-    _arrow_manifest_cache[manifest_path] = table
+    _arrow_manifest_cache[manifest_path] = (columns, row_count)
     if len(_arrow_manifest_cache) > ARROW_MANIFEST_CACHE_SIZE:
         _arrow_manifest_cache.popitem(last=False)
 
-    logger.debug(f"Loaded manifest {manifest_path} in {elapsed_ms:.1f}ms ({len(table)} rows)")
+    logger.debug(f"Loaded manifest {manifest_path} in {elapsed_ms:.1f}ms ({row_count} rows)")
 
-    return ArrowManifest(table)
+    return ArrowManifest(columns, row_count)
 
 
 def get_parsed_manifest(io: Any, manifest_path: str) -> list:
-    """Compatibility wrapper: returns list of dicts like before.
-
-    For code that still expects Python lists. New code should use get_arrow_manifest()
-    instead to avoid the to_pylist() conversion.
-    """
+    """Compatibility wrapper: returns list of row dicts."""
     start_time = time.perf_counter()
-    arrow_manifest = get_arrow_manifest(io, manifest_path)
-    result = arrow_manifest.to_pylist()
+    result = get_arrow_manifest(io, manifest_path).to_pylist()
     elapsed_ms = (time.perf_counter() - start_time) * 1000
     _manifest_retrieval_metrics["total_conversion_time_ms"] += elapsed_ms
     return result
 
 
 def get_arrow_manifest_rows(io: Any, manifest_path: str) -> Iterator[ArrowManifestRow]:
-    """Iterate manifest rows without full materialization.
-
-    This is the most efficient path:
-    - No to_pylist() conversion
-    - Only materializes fields as they're accessed
-    - Minimal memory overhead
-
-    Usage:
-        for row in get_arrow_manifest_rows(io, manifest_path):
-            file_path = row.get("file_path")
-            record_count = row.get("record_count")
-    """
+    """Iterate manifest rows without building a list of dicts."""
     manifest = get_arrow_manifest(io, manifest_path)
     return iter(manifest)
 
 
 def invalidate_arrow_manifest(manifest_path: str) -> None:
-    """Remove manifest from Arrow cache."""
+    """Remove manifest from cache."""
     _arrow_manifest_cache.pop(manifest_path, None)
 
 
 def clear_arrow_manifest_cache() -> None:
-    """Clear entire Arrow manifest cache."""
+    """Clear entire manifest cache."""
     _arrow_manifest_cache.clear()
 
 
@@ -298,9 +187,5 @@ def reset_retrieval_metrics() -> None:
 
 # For backwards compatibility with existing code
 def get_manifest_rows_as_dicts(io: Any, manifest_path: str) -> list[dict]:
-    """Get manifest as list of dicts (old API).
-
-    Kept for compatibility. Prefer get_arrow_manifest() or get_arrow_manifest_rows()
-    for better performance.
-    """
+    """Get manifest as list of dicts (old API)."""
     return get_parsed_manifest(io, manifest_path)

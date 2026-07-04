@@ -3,7 +3,7 @@ import os
 import sys
 import time
 
-# Recursively convert non-JSON types (bytes, pyarrow Buffers, etc.) to hex or JSON-safe types
+# Recursively convert non-JSON types (bytes, buffer-like objects, etc.) to hex or JSON-safe types
 from google.cloud import storage
 
 from opteryx_catalog.catalog.manifest import build_parquet_manifest_entry_from_bytes
@@ -26,7 +26,6 @@ data = blob.download_as_bytes()
 print("Downloaded bytes:", len(data))
 
 
-# read parquet bytes via a BufferReader
 entry = build_parquet_manifest_entry_from_bytes(data, TARGET, len(data)).to_dict()
 
 out = {
@@ -44,7 +43,7 @@ def _hexify(obj):
     # raw bytes-like
     if isinstance(obj, (bytes, bytearray, memoryview)):
         return obj.hex()
-    # pyarrow buffers/scalars -> try to extract python value
+    # buffer/scalar-like objects -> try to extract python value
     if hasattr(obj, "to_py"):
         try:
             val = obj.to_py()
