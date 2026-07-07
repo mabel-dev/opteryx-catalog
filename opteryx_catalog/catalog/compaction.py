@@ -318,11 +318,13 @@ class DatasetCompactor:
         from draken.interop.vector_sequence import vector_from_sequence
         from draken.morsels.morsel import Morsel
 
+        from .manifest import morsel_schema_dict
+
         # Build the unified per-column type: prefer the first non-NULL type
         # seen for each column name, across all morsels.
         unified_types: dict = {}
         for morsel in morsels:
-            for name, dtype in morsel.schema.items():
+            for name, dtype in morsel_schema_dict(morsel).items():
                 dtype_name = getattr(dtype, "name", str(dtype))
                 if name not in unified_types or unified_types[name] == "NULL":
                     unified_types[name] = dtype_name
@@ -330,7 +332,8 @@ class DatasetCompactor:
         reconciled = []
         for morsel in morsels:
             morsel_types = {
-                name: getattr(dtype, "name", str(dtype)) for name, dtype in morsel.schema.items()
+                name: getattr(dtype, "name", str(dtype))
+                for name, dtype in morsel_schema_dict(morsel).items()
             }
             if morsel_types == unified_types:
                 reconciled.append(morsel)

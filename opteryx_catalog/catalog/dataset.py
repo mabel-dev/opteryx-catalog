@@ -290,7 +290,7 @@ class SimpleDataset(Dataset):
         """
         snapshot_id = int(time.time() * 1000)
 
-        if not hasattr(table, "schema") or not hasattr(table, "num_rows"):
+        if not hasattr(table, "num_rows") or not hasattr(table, "column_names"):
             raise TypeError("append() expects a draken.morsels.morsel.Morsel-like object")
 
         # Write table and build manifest entry
@@ -452,7 +452,7 @@ class SimpleDataset(Dataset):
         # Similar validation as append
         snapshot_id = int(time.time() * 1000)
 
-        if not hasattr(table, "schema") or not hasattr(table, "num_rows"):
+        if not hasattr(table, "num_rows") or not hasattr(table, "column_names"):
             raise TypeError("overwrite() expects a draken.morsels.morsel.Morsel-like object")
 
         if author is None:
