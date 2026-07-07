@@ -1051,8 +1051,15 @@ class OpteryxCatalog(Metastore):
             entries = [
                 (col.name, _core_type_to_stored(col.column_type)) for col in schema.columns
             ]
-        elif hasattr(schema, "schema") and hasattr(schema, "num_rows"):
-            entries = [(name, _morsel_type_to_stored(dtype)) for name, dtype in schema.schema.items()]
+        elif hasattr(schema, "num_rows") and hasattr(schema, "column_names"):
+            # Duck-typed as a draken Morsel. Don't check for `.schema`
+            # directly — older draken releases (e.g. 0.4.2) don't expose it.
+            from .catalog.manifest import morsel_schema_dict
+
+            entries = [
+                (name, _morsel_type_to_stored(dtype))
+                for name, dtype in morsel_schema_dict(schema).items()
+            ]
         else:
             raise ValueError(
                 "Unsupported schema type, expected a relation-schema-like object "

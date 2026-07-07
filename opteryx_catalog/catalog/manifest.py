@@ -364,12 +364,13 @@ def _compute_column_stats(vec, category: str, decimal_scale=None) -> tuple:
 
     # Stored as decimal strings: .hash() returns true unsigned 64-bit values
     # (up to 2**64-1) that overflow draken's signed int64 vectors on write.
-    # TODO: switch to a native UINT64 vector once rugo ships one — draken's
-    # DRAKEN_UINT64 tag, kernels, and vector_uint64_from_sequence() already
-    # exist upstream (as of writing, uncommitted in opteryx-core), and
-    # rugo's parquet read/write pipeline already has UINT64 support wired in
-    # too; it just hasn't reached a released `rugo` version yet. Until then,
-    # consumers already do int(h) on each element (see dataset.py
+    # TODO: switch to a native UINT64 vector once rugo's parquet writer
+    # supports it. draken.draken_native.DrakenType.UINT64 and
+    # vector_uint64_from_sequence() already exist and work (rugo>=0.4.0) —
+    # verified independently. But rugo.parquet.write_parquet() still rejects
+    # UINT64 columns ("unsupported column type 107"); only the Vector layer
+    # has landed so far, not the parquet read/write pipeline. Until that
+    # ships, consumers already do int(h) on each element (see dataset.py
     # describe()'s KMV estimator), so the string encoding is a lossless
     # round-trip with no downstream change needed.
     col_min_k = [str(h) for h in sorted(heapq.nsmallest(MIN_K_HASHES, set(hashes)))]
@@ -437,6 +438,26 @@ def _column_uncompressed_estimate(values: list) -> int:
     return sum(sys.getsizeof(v) for v in values if v is not None)
 
 
+def morsel_schema_dict(morsel: Any) -> dict:
+    """Return ``{name: DrakenType}`` for a Morsel, across draken versions.
+
+    Newer draken exposes ``Morsel.schema`` directly. Older versions (draken
+    0.4.2, as pinned by at least one real consumer app) have no ``.schema``
+    property at all — only the separate ``column_names``/``column_types``
+    lists. Always go through this helper rather than ``morsel.schema``
+    directly so both versions work.
+    """
+    schema = getattr(morsel, "schema", None)
+    if schema is not None:
+        return schema
+    names = morsel.column_names
+    types = morsel.column_types
+    return {
+        (n.decode("utf-8") if isinstance(n, (bytes, bytearray)) else n): t
+        for n, t in zip(names, types)
+    }
+
+
 def build_parquet_manifest_entry_from_morsel(
     morsel: Any,
     data_bytes: bytes,
@@ -454,7 +475,7 @@ def build_parquet_manifest_entry_from_morsel(
     _manifest_metrics["files_read"] += 1
     _manifest_metrics["bytes_read"] += len(data_bytes)
 
-    schema = morsel.schema  # {name: DrakenType}
+    schema = morsel_schema_dict(morsel)
     col_names = list(schema.keys())
 
     min_k_hashes: list = []
@@ -470,7 +491,9 @@ def build_parquet_manifest_entry_from_morsel(
     uncompressed_size = 0
 
     for name in col_names:
-        vec = morsel.column(name)
+        # draken 0.4.2's Morsel.column() requires bytes; newer versions accept
+        # either, so bytes is the universally-safe choice here.
+        vec = morsel.column(name.encode("utf-8"))
         category = schema[name].name
         (
             col_min_k,
