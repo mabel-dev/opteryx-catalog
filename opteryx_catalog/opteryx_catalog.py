@@ -910,22 +910,26 @@ class OpteryxCatalog(Metastore):
                     # signed leaf would read back negative above INT64_MAX and
                     # corrupt min-k ordering.
                     #
-                    # Migration: legacy manifests stored these hashes signed
-                    # (INT64 reinterpret), so a value above INT64_MAX reads back
-                    # as a negative int. A hash is a 64-bit identifier, not an
-                    # arithmetic quantity, so mask to the unsigned bit pattern —
-                    # this recovers the true uint64 for legacy values and is a
-                    # no-op for already-unsigned ones (draken's UINT64 factory
-                    # rejects negatives outright).
-                    values = [
-                        None
-                        if entry is None
-                        else [
-                            None
-                            if col is None
-                            else [None if h is None else (h & 0xFFFFFFFFFFFFFFFF) for h in col]
-                            for col in entry
+                    # Entries reach here in mixed forms during migration: freshly
+                    # computed (int hashes), decoded from a legacy comma-joined
+                    # manifest (int hashes, possibly NEGATIVE where a uint64 was
+                    # stored signed), a per-hash decimal-string list, or a single
+                    # comma-joined string per column. Normalize every hash to its
+                    # unsigned 64-bit value: a hash is a 64-bit identifier, not an
+                    # arithmetic quantity, so `int(h) & mask` recovers the true
+                    # uint64 (no-op for correct values, fixes legacy negatives)
+                    # and draken's UINT64 factory then accepts it.
+                    def _norm_col(col):
+                        if col is None:
+                            return None
+                        if isinstance(col, str):  # legacy comma-joined column
+                            col = col.split(",") if col else []
+                        return [
+                            None if h is None else (int(h) & 0xFFFFFFFFFFFFFFFF) for h in col
                         ]
+
+                    values = [
+                        None if entry is None else [_norm_col(col) for col in entry]
                         for entry in values
                     ]
                     morsel.append_vector(

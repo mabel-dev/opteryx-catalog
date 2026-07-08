@@ -362,18 +362,11 @@ def _compute_column_stats(vec, category: str, decimal_scale=None) -> tuple:
     is_boolean = category == "BOOL"
     is_variable_width = category in _VARIABLE_WIDTH_CATEGORIES
 
-    # Stored as decimal strings: .hash() returns true unsigned 64-bit values
-    # (up to 2**64-1) that overflow draken's signed int64 vectors on write.
-    # TODO: switch to a native UINT64 vector once rugo's parquet writer
-    # supports it. draken.draken_native.DrakenType.UINT64 and
-    # vector_uint64_from_sequence() already exist and work (rugo>=0.4.0) —
-    # verified independently. But rugo.parquet.write_parquet() still rejects
-    # UINT64 columns ("unsupported column type 107"); only the Vector layer
-    # has landed so far, not the parquet read/write pipeline. Until that
-    # ships, consumers already do int(h) on each element (see dataset.py
-    # describe()'s KMV estimator), so the string encoding is a lossless
-    # round-trip with no downstream change needed.
-    col_min_k = [str(h) for h in sorted(heapq.nsmallest(MIN_K_HASHES, set(hashes)))]
+    # Native uint64: .hash() returns true unsigned 64-bit values (up to 2**64-1).
+    # rugo's parquet writer now stores nested ARRAY<ARRAY<UINT64>> with an
+    # unsigned leaf annotation, so these are kept as plain ints (no decimal-string
+    # workaround) — write_parquet_manifest builds the UINT64 vector directly.
+    col_min_k = sorted(heapq.nsmallest(MIN_K_HASHES, set(hashes)))
     col_hist: list = []
     col_min = NULL_FLAG
     col_max = NULL_FLAG
@@ -626,7 +619,9 @@ def build_parquet_manifest_entry_from_bytes(
         non_null_values = [v for v in values if v is not None]
         null_count = sum(1 for v in values if v is None)
 
-        col_min_k = [str(h) for h in sorted(heapq.nsmallest(MIN_K_HASHES, acc["hashes"]))]
+        # Native uint64 (see _compute_column_stats): kept as ints, not strings —
+        # rugo's writer stores them as an unsigned nested array.
+        col_min_k = sorted(heapq.nsmallest(MIN_K_HASHES, acc["hashes"]))
         col_hist: list = []
         col_min = NULL_FLAG
         col_max = NULL_FLAG
