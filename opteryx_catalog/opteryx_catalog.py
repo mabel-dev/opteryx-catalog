@@ -892,22 +892,50 @@ class OpteryxCatalog(Metastore):
                 e["min_values_display"] = [truncate_display(v) for v in mv_disp]
                 e["max_values_display"] = [truncate_display(v) for v in xv_disp]
 
-                # rugo's parquet writer only supports flat ARRAY<scalar>, not
-                # nested ARRAY<ARRAY<...>> — comma-encode each column's inner
-                # list into one string so these become ARRAY<VARCHAR>.
-                # read_manifest_columns() decodes them back transparently.
-                e["min_k_hashes"] = [
-                    ",".join(str(h) for h in col) if col else "" for col in e["min_k_hashes"]
-                ]
-                e["histogram_counts"] = [
-                    ",".join(str(h) for h in col) if col else "" for col in e["histogram_counts"]
-                ]
+                # min_k_hashes / histogram_counts are per-column lists of ints,
+                # so each entry is list[list[int]] and the column is a native
+                # nested ARRAY<ARRAY<...>> (rugo's writer emits the 2-level LIST
+                # encoding; read_manifest_columns reads it straight back). No
+                # string encoding — min_k_hashes are full-range xxhash uint64,
+                # stored with an unsigned leaf so values above INT64_MAX survive.
                 normalized.append(e)
+
+            from draken import draken_native as _dn
 
             morsel = Morsel()
             for name, dtype in columns.items():
                 values = [e.get(name) for e in normalized]
-                morsel.append_vector(name, vector_from_sequence(values, dtype=dtype))
+                if name == "min_k_hashes":
+                    # UINT64 leaf: xxhash values span the full unsigned range; a
+                    # signed leaf would read back negative above INT64_MAX and
+                    # corrupt min-k ordering.
+                    #
+                    # Migration: legacy manifests stored these hashes signed
+                    # (INT64 reinterpret), so a value above INT64_MAX reads back
+                    # as a negative int. A hash is a 64-bit identifier, not an
+                    # arithmetic quantity, so mask to the unsigned bit pattern —
+                    # this recovers the true uint64 for legacy values and is a
+                    # no-op for already-unsigned ones (draken's UINT64 factory
+                    # rejects negatives outright).
+                    values = [
+                        None
+                        if entry is None
+                        else [
+                            None
+                            if col is None
+                            else [None if h is None else (h & 0xFFFFFFFFFFFFFFFF) for h in col]
+                            for col in entry
+                        ]
+                        for entry in values
+                    ]
+                    morsel.append_vector(
+                        name,
+                        _dn.vector_array_from_sequence(
+                            values, element_type=_dn.DrakenType.UINT64.value, nesting_depth=2
+                        ),
+                    )
+                else:
+                    morsel.append_vector(name, vector_from_sequence(values, dtype=dtype))
 
             data = write_parquet(morsel, **WRITE_PARQUET_OPTIONS)
 
