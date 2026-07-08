@@ -180,5 +180,5 @@ class GcsFileIO(FileIO):
 WRITE_PARQUET_OPTIONS = {
     "compression": "zstd",
     "bloom_filters": True,
-    "max_rows_per_row_group": 250_000,  # primary lever: controls column chunk I/O size
+    # No override: use rugo's own default (262,144 rows/row group).
 }
