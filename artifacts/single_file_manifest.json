@@ -2,7 +2,7 @@
   "file_path": "mem://data/f1.parquet",
   "file_format": "parquet",
   "record_count": 2,
-  "file_size_in_bytes": 390,
+  "file_size_in_bytes": 411,
   "uncompressed_size_in_bytes": 176,
   "column_uncompressed_sizes_in_bytes": [
     88,
