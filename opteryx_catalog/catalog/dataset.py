@@ -906,6 +906,10 @@ class SimpleDataset(Dataset):
         """Return Datafile objects for the given snapshot.
 
         - If `snapshot_id` is None, use the current snapshot.
+
+        A snapshot carrying no manifest is an empty dataset. A snapshot whose
+        manifest exists but cannot be read is a failure, and raises: yielding
+        no rows would be indistinguishable from an empty dataset.
         """
         # Determine snapshot to read using the dataset-level helper which
         # prefers the in-memory current snapshot and otherwise performs a
@@ -913,31 +917,13 @@ class SimpleDataset(Dataset):
         snap = self.snapshot(snapshot_id)
 
         if snap is None or not getattr(snap, "manifest_list", None):
-            return iter(())
+            return
 
-        manifest_path = snap.manifest_list
+        # Use Arrow-native manifest retrieval (30-50% faster than to_pylist)
+        from .manifest_arrow import get_arrow_manifest_rows
 
-        # Read manifest via FileIO if available
-        try:
-            # Use Arrow-native manifest retrieval (30-50% faster than to_pylist)
-            from .manifest_arrow import get_arrow_manifest_rows
-
-            try:
-                rows = get_arrow_manifest_rows(self.io, manifest_path)
-            except FileNotFoundError:
-                return iter(())
-
-            # Convert to list to check if empty (iterators don't support len)
-            rows = list(rows)
-            if not rows:
-                return iter(())
-
-            for r in rows:
-                yield Datafile(entry=r)
-        except FileNotFoundError:
-            return iter(())
-        except Exception:
-            return iter(())
+        for r in get_arrow_manifest_rows(self.io, snap.manifest_list):
+            yield Datafile(entry=r)
 
     def describe(self, snapshot_id: Optional[int] = None, bins: int = 10) -> dict:
         """Describe all schema columns for the given snapshot.
