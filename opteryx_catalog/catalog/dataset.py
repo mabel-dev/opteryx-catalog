@@ -925,6 +925,22 @@ class SimpleDataset(Dataset):
         for r in get_arrow_manifest_rows(self.io, snap.manifest_list):
             yield Datafile(entry=r)
 
+    def manifest_sketch_vectors(self, snapshot_id: Optional[int] = None) -> dict:
+        """Whole-column native draken Vectors for the sketch columns of a snapshot.
+
+        Returns ``{column_name: Vector}`` for ``min_k_hashes`` / ``histogram_counts``
+        so the planner can reduce them with native kernels instead of the per-file
+        boxed lists. Reads through the same cached manifest retrieval as ``scan``
+        (a cache hit when scan ran first), so this adds no extra decode. Empty dict
+        when the snapshot has no manifest.
+        """
+        snap = self.snapshot(snapshot_id)
+        if snap is None or not getattr(snap, "manifest_list", None):
+            return {}
+        from .manifest_arrow import get_arrow_manifest
+
+        return get_arrow_manifest(self.io, snap.manifest_list).sketch_vectors
+
     def describe(self, snapshot_id: Optional[int] = None, bins: int = 10) -> dict:
         """Describe all schema columns for the given snapshot.
 

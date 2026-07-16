@@ -183,24 +183,36 @@ def _decode_nested_int_list_column(rows: list) -> list:
     return [None if row is None else [_decode_cell(s) for s in row] for row in rows]
 
 
-def read_manifest_columns(data: bytes) -> tuple:
-    """Decode manifest parquet bytes into ``({column_name: [values...]}, row_count)``.
+def read_manifest_columns(data: bytes, keep_native: tuple = ()) -> tuple:
+    """Decode manifest parquet bytes into ``({column_name: [values...]}, row_count, native)``.
 
     The native (no-pyarrow) read path, backed by rugo. The manifest schema
     contains dictionary-encoded strings and nested ``list<list<...>>``
     statistics columns, all of which are materialized directly into Python
     values matching the previous pyarrow ``to_pylist()`` output.
+
+    Internal API: returns a 3-tuple ``(columns, row_count, native)``. ``keep_native``
+    names columns whose whole-column native draken Vector is retained (in addition
+    to the boxed lists) and returned in the third element ``{column_name: Vector}``. Consumers that reduce a column with native
+    kernels (e.g. the planner's KMV/histogram over ``min_k_hashes`` /
+    ``histogram_counts``) take the vector and skip re-boxing. The morsel owns its
+    buffers, so a retained vector outlives the reader context. For a
+    multi-row-group manifest the per-morsel vectors are concatenated
+    (``Morsel.combine``) into one whole-column vector.
     """
     if not data:
-        return {}, 0
+        return {}, 0, {}
 
     from rugo import parquet as _rugo_parquet
 
     column_data: dict[str, list] = {}
     row_count = 0
+    kept_morsels: list = []
     with _rugo_parquet.read_parquet(bytes(data)) as reader:
         for morsel in reader:
             row_count += morsel.num_rows
+            if keep_native:
+                kept_morsels.append(morsel)
             for name_b in morsel.column_names:
                 name = (
                     name_b.decode("utf-8")
@@ -213,12 +225,20 @@ def read_manifest_columns(data: bytes) -> tuple:
         if name in column_data:
             column_data[name] = _decode_nested_int_list_column(column_data[name])
 
-    return column_data, row_count
+    native: dict = {}
+    if kept_morsels:
+        combined = kept_morsels[0] if len(kept_morsels) == 1 else kept_morsels[0].combine(kept_morsels)
+        for name in keep_native:
+            name_b = name.encode("utf-8")
+            if name_b in combined.column_names or name in combined.column_names:
+                native[name] = combined.column(name_b)
+
+    return column_data, row_count, native
 
 
 def read_manifest_rows(data: bytes) -> list:
     """Decode manifest parquet bytes into a list of row dicts using rugo."""
-    column_data, row_count = read_manifest_columns(data)
+    column_data, row_count, _native = read_manifest_columns(data)
     if not column_data:
         return []
     names = list(column_data.keys())

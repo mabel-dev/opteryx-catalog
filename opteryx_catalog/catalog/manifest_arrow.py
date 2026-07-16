@@ -23,7 +23,15 @@ from .manifest import read_manifest_columns
 
 logger = logging.getLogger(__name__)
 
-# Cache configuration. Each entry is ``({column_name: [values...]}, row_count)``.
+# Columns whose whole-column native draken Vector the planner reduces with
+# native kernels (KMV NDV, histogram fold, exact-set membership) rather than the
+# per-file boxed lists. Retained by get_arrow_manifest alongside the boxed data.
+_SKETCH_VECTOR_COLUMNS = ("min_k_hashes", "histogram_counts")
+
+# Cache configuration. Each entry is ``({column_name: [values...]}, row_count, sketch_vectors)``.
+# Note: entries now also pin the native sketch vectors (min_k_hashes /
+# histogram_counts) per manifest, so a cached entry holds that manifest's sketch
+# buffers alongside the boxed columns until evicted.
 ARROW_MANIFEST_CACHE_SIZE: int = 32
 _arrow_manifest_cache: "OrderedDict[str, tuple]" = OrderedDict()
 
@@ -82,11 +90,15 @@ class ArrowManifest(Iterable):
     views, so iterating N rows costs no per-cell conversion.
     """
 
-    __slots__ = ("_columns", "_row_count")
+    __slots__ = ("_columns", "_row_count", "sketch_vectors")
 
-    def __init__(self, columns: dict, row_count: int):
+    def __init__(self, columns: dict, row_count: int, sketch_vectors: dict | None = None):
         self._columns = columns
         self._row_count = row_count
+        # Whole-column native draken Vectors for sketch columns (min_k_hashes /
+        # histogram_counts), retained so the planner reduces them with native
+        # kernels instead of re-boxing. Empty on the boxing-only path.
+        self.sketch_vectors = sketch_vectors or {}
 
     def __iter__(self) -> Iterator[ArrowManifestRow]:
         """Iterate over rows as dict-like objects."""
@@ -115,8 +127,8 @@ def get_arrow_manifest(io: Any, manifest_path: str) -> ArrowManifest:
     if manifest_path in _arrow_manifest_cache:
         _arrow_manifest_cache.move_to_end(manifest_path)
         _manifest_retrieval_metrics["arrow_cache_hits"] += 1
-        columns, row_count = _arrow_manifest_cache[manifest_path]
-        return ArrowManifest(columns, row_count)
+        columns, row_count, sketch_vectors = _arrow_manifest_cache[manifest_path]
+        return ArrowManifest(columns, row_count, sketch_vectors)
 
     _manifest_retrieval_metrics["arrow_cache_misses"] += 1
     start_time = time.perf_counter()
@@ -126,19 +138,21 @@ def get_arrow_manifest(io: Any, manifest_path: str) -> ArrowManifest:
     with inp.open() as f:
         data = f.read()
 
-    columns, row_count = read_manifest_columns(data)
+    columns, row_count, sketch_vectors = read_manifest_columns(
+        data, keep_native=_SKETCH_VECTOR_COLUMNS
+    )
     _manifest_retrieval_metrics["full_reads"] += 1
 
     elapsed_ms = (time.perf_counter() - start_time) * 1000
     _manifest_retrieval_metrics["total_retrieval_time_ms"] += elapsed_ms
 
-    _arrow_manifest_cache[manifest_path] = (columns, row_count)
+    _arrow_manifest_cache[manifest_path] = (columns, row_count, sketch_vectors)
     if len(_arrow_manifest_cache) > ARROW_MANIFEST_CACHE_SIZE:
         _arrow_manifest_cache.popitem(last=False)
 
     logger.debug(f"Loaded manifest {manifest_path} in {elapsed_ms:.1f}ms ({row_count} rows)")
 
-    return ArrowManifest(columns, row_count)
+    return ArrowManifest(columns, row_count, sketch_vectors)
 
 
 def get_parsed_manifest(io: Any, manifest_path: str) -> list:
