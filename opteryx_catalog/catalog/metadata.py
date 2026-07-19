@@ -67,6 +67,11 @@ class DatasetMetadata:
     # Each schema dict may also include `timestamp-ms` and `author`.
     schemas: List[dict] = field(default_factory=list)
     current_schema_id: Optional[str] = None
+    # Monotonically-increasing, never-reused counter for allocating stable per-column
+    # field-ids (Iceberg-style). Used to key manifest min/max statistics so they
+    # survive schema evolution without positional drift. Persisted on the dataset's
+    # root Firestore doc alongside `current-schema-id`.
+    next_field_id: int = 1
     # Annotations: list of annotation objects attached to this dataset
     # Each annotation is a dict with keys like 'key' and 'value'.
     annotations: List[dict] = field(default_factory=list)

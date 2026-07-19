@@ -61,6 +61,12 @@ class ParquetManifestEntry:
     max_values_display: list
     min_lengths: list[int]
     max_lengths: list[int]
+    # Stable per-column field-id, same order/index as every list above (e.g.
+    # min_values[i] is field_ids[i]'s min). Lets readers key statistics by a
+    # schema-stable id instead of assuming array position equals column
+    # position in some other schema snapshot. Empty for entries built before
+    # field-ids existed or for schemas with no catalog-assigned ids.
+    field_ids: list[int] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -80,6 +86,7 @@ class ParquetManifestEntry:
             "max_values_display": self.max_values_display,
             "min_lengths": self.min_lengths,
             "max_lengths": self.max_lengths,
+            "field_ids": self.field_ids,
         }
 
 
@@ -476,6 +483,7 @@ def build_parquet_manifest_entry_from_morsel(
     data_bytes: bytes,
     file_path: str,
     file_size_in_bytes: int | None = None,
+    field_id_by_name: Dict[str, int] | None = None,
 ) -> ParquetManifestEntry:
     """Build a manifest entry from the in-memory Morsel that was just written.
 
@@ -483,6 +491,15 @@ def build_parquet_manifest_entry_from_morsel(
     ``data_bytes``) because Parquet round-trips temporal/decimal columns down
     to plain physical ints — re-reading would lose the semantic type needed
     for correct display values.
+
+    ``field_id_by_name``, when provided, is the dataset's current
+    name->field_id mapping (from its schema doc). ``field_ids`` on the
+    resulting entry is a list parallel to every other per-column stats list
+    (``field_ids[i]`` is the field-id for whichever column produced
+    ``min_values[i]``/``max_values[i]``/etc.); a column absent from the
+    mapping (e.g. a stale/dropped column) gets ``None`` in that slot so
+    readers can tell "no usable field-id for this position" from "not
+    computed at all".
     """
     t_start = time.perf_counter()
     _manifest_metrics["files_read"] += 1
@@ -501,9 +518,11 @@ def build_parquet_manifest_entry_from_morsel(
     min_lengths_list: list = []
     max_lengths_list: list = []
     column_uncompressed: list = []
+    field_ids: list = []
     uncompressed_size = 0
 
     for name in col_names:
+        field_ids.append(field_id_by_name.get(name) if field_id_by_name else None)
         # draken 0.4.2's Morsel.column() requires bytes; newer versions accept
         # either, so bytes is the universally-safe choice here.
         vec = morsel.column(name.encode("utf-8"))
@@ -551,6 +570,7 @@ def build_parquet_manifest_entry_from_morsel(
         max_values_display=max_values_display,
         min_lengths=min_lengths_list,
         max_lengths=max_lengths_list,
+        field_ids=field_ids,
     )
 
     logger.debug(
@@ -567,6 +587,7 @@ def build_parquet_manifest_entry_from_bytes(
     file_path: str,
     file_size_in_bytes: int | None = None,
     orig_morsel: Any | None = None,
+    field_id_by_name: Dict[str, int] | None = None,
 ) -> ParquetManifestEntry:
     """Build a manifest entry by reading a parquet file's bytes.
 
@@ -575,10 +596,12 @@ def build_parquet_manifest_entry_from_bytes(
     from a standalone script). Pass ``orig_morsel`` when you do have the
     original in-memory Morsel (e.g. right after writing it) to skip the
     re-read and get exact stats via :func:`build_parquet_manifest_entry_from_morsel`.
+
+    ``field_id_by_name``: see :func:`build_parquet_manifest_entry_from_morsel`.
     """
     if orig_morsel is not None:
         return build_parquet_manifest_entry_from_morsel(
-            orig_morsel, data_bytes, file_path, file_size_in_bytes
+            orig_morsel, data_bytes, file_path, file_size_in_bytes, field_id_by_name
         )
 
     from rugo.parquet import read_metadata_from_memoryview
@@ -632,7 +655,9 @@ def build_parquet_manifest_entry_from_bytes(
                 if category in _COMPRESSIBLE_CATEGORIES:
                     acc["compressed"].extend(vec.compress())
 
+    field_ids: list = []
     for name in col_names:
+        field_ids.append(field_id_by_name.get(name) if field_id_by_name else None)
         category, decimal_scale = col_info[name]
         acc = accum[name]
         values = acc["values"]
@@ -708,6 +733,7 @@ def build_parquet_manifest_entry_from_bytes(
         max_values_display=max_values_display,
         min_lengths=min_lengths_list,
         max_lengths=max_lengths_list,
+        field_ids=field_ids,
     )
 
     logger.debug(

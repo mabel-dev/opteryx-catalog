@@ -4,7 +4,7 @@ import os
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Iterable, Optional
+from typing import Any, Dict, Iterable, Optional
 
 from .manifest import (
     ParquetManifestEntry,
@@ -35,6 +35,9 @@ class SchemaColumn:
     precision: Optional[int] = None
     scale: Optional[int] = None
     nullable: bool = True
+    # Stable, catalog-assigned field-id (see DatasetMetadata.next_field_id) —
+    # None for schemas persisted before field-ids existed.
+    id: Optional[int] = None
 
 
 @dataclass
@@ -111,6 +114,31 @@ class Datafile:
     @property
     def max_values(self) -> list:
         return self.entry.get("max_values") or []
+
+    @property
+    def field_ids(self) -> list:
+        """Stable field-id per position in min_values/max_values/etc., parallel
+        to those lists. Empty for manifest rows written before field-ids
+        existed."""
+        return self.entry.get("field_ids") or []
+
+    @property
+    def lower_bounds(self) -> Optional[Dict[int, Any]]:
+        """min_values keyed by field-id instead of position. None when this
+        entry has no field-ids (pre-migration manifest row) — callers must
+        fall back to positional indexing of min_values in that case."""
+        field_ids, min_values = self.field_ids, self.min_values
+        if not field_ids or len(field_ids) != len(min_values):
+            return None
+        return {fid: v for fid, v in zip(field_ids, min_values) if fid is not None}
+
+    @property
+    def upper_bounds(self) -> Optional[Dict[int, Any]]:
+        """max_values keyed by field-id — see lower_bounds."""
+        field_ids, max_values = self.field_ids, self.max_values
+        if not field_ids or len(field_ids) != len(max_values):
+            return None
+        return {fid: v for fid, v in zip(field_ids, max_values) if fid is not None}
 
 
 @dataclass
@@ -276,10 +304,25 @@ class SimpleDataset(Dataset):
                 precision=c.get("precision"),
                 scale=c.get("scale"),
                 nullable=c.get("nullable", True),
+                id=c.get("id"),
             )
             for c in raw
         ]
         return RelationSchema(name=self.identifier, columns=columns)
+
+    def _field_id_by_name(self) -> Dict[str, int]:
+        """Current schema's name->field_id mapping, for keying manifest stats.
+
+        Returns an empty dict for schemas with no catalog-assigned ids (e.g.
+        datasets created before field-ids existed and not yet backfilled) —
+        callers must treat that as "no field-ids available", not an error.
+        """
+        schema = self.schema()
+        if schema is None:
+            return {}
+        return {
+            col.name: col.id for col in schema.columns if getattr(col, "id", None) is not None
+        }
 
     def append(self, table: Any, author: str = None, commit_message: Optional[str] = None):
         """Append a draken Morsel:
@@ -436,7 +479,7 @@ class SimpleDataset(Dataset):
         # Morsel (avoids re-reading the file and losing temporal/decimal
         # semantic types to Parquet's physical-int round-trip).
         manifest_entry = build_parquet_manifest_entry_from_morsel(
-            table, pdata, data_path, len(pdata)
+            table, pdata, data_path, len(pdata), self._field_id_by_name()
         )
         return manifest_entry
 
@@ -607,7 +650,9 @@ class SimpleDataset(Dataset):
                 if data:
                     # Compute statistics using a single read of the compressed bytes
                     file_size = len(data)
-                    manifest_entry = build_parquet_manifest_entry_from_bytes(data, fp, file_size)
+                    manifest_entry = build_parquet_manifest_entry_from_bytes(
+                        data, fp, file_size, field_id_by_name=self._field_id_by_name()
+                    )
                 else:
                     # Empty file, create placeholder entry
                     manifest_entry = ParquetManifestEntry(
@@ -790,7 +835,9 @@ class SimpleDataset(Dataset):
                 if data:
                     # Compute statistics using a single read of the compressed bytes
                     file_size = len(data)
-                    manifest_entry = build_parquet_manifest_entry_from_bytes(data, fp, file_size)
+                    manifest_entry = build_parquet_manifest_entry_from_bytes(
+                        data, fp, file_size, field_id_by_name=self._field_id_by_name()
+                    )
                 else:
                     # Empty file, create placeholder entry
                     manifest_entry = ParquetManifestEntry(
@@ -1380,7 +1427,9 @@ class SimpleDataset(Dataset):
                     data = f.read()
                 # Full statistics including histograms and k-hashes
                 file_size = len(data)
-                manifest_entry = build_parquet_manifest_entry_from_bytes(data, fp, file_size)
+                manifest_entry = build_parquet_manifest_entry_from_bytes(
+                    data, fp, file_size, field_id_by_name=self._field_id_by_name()
+                )
                 dent = manifest_entry.to_dict()
             except Exception:
                 # Fall back to original entry if re-read fails

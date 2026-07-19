@@ -464,7 +464,11 @@ class DatasetCompactor:
             # in-memory Morsel (avoids re-reading and losing temporal/decimal
             # semantic types to Parquet's physical-int round-trip).
             entry_obj = build_parquet_manifest_entry_from_bytes(
-                pdata, file_path, len(pdata), orig_morsel=table
+                pdata,
+                file_path,
+                len(pdata),
+                orig_morsel=table,
+                field_id_by_name=self.dataset._field_id_by_name(),
             )
             entry_dict = self._to_dict(entry_obj)
             new_entries.append(entry_dict)
@@ -721,7 +725,9 @@ class DatasetCompactor:
                 data = f.read()
 
             # Rebuild manifest entry from the actual file data
-            rebuilt_entry = build_parquet_manifest_entry_from_bytes(data, file_path, len(data))
+            rebuilt_entry = build_parquet_manifest_entry_from_bytes(
+                data, file_path, len(data), field_id_by_name=self.dataset._field_id_by_name()
+            )
 
             # Convert to dict
             entry_dict = self._to_dict(rebuilt_entry)
@@ -761,7 +767,9 @@ class DatasetCompactor:
                     data = f.read()
 
                 # Rebuild manifest entry from actual file data
-                rebuilt_entry = build_parquet_manifest_entry_from_bytes(data, file_path, len(data))
+                rebuilt_entry = build_parquet_manifest_entry_from_bytes(
+                    data, file_path, len(data), field_id_by_name=self.dataset._field_id_by_name()
+                )
 
                 # Convert to dict
                 entry_dict = self._to_dict(rebuilt_entry)
