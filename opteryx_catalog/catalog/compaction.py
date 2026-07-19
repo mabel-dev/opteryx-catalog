@@ -198,47 +198,83 @@ class DatasetCompactor:
             Compaction plan dict or None
         """
 
-        # Priority 2: Find overlapping ranges
-        # Get schema to find sort column name
-        schema = self.dataset.metadata.schema
-        if not schema or not self.sort_column_id:
-            # Fallback to brute logic
+        # Priority 2: Find overlapping ranges on the sort column.
+        #
+        # Resolve the sort column from the dataset's *stored* schema. The raw
+        # ``metadata.schema`` attribute is frequently None on a freshly loaded
+        # dataset (the real schema lives in the schemas subcollection), so
+        # prefer ``dataset.schema()`` which resolves it. ``sort_column_id`` is a
+        # positional index into the schema's columns.
+        sort_index = self.sort_column_id
+        columns = None
+        try:
+            resolved = self.dataset.schema()
+            if resolved is not None and getattr(resolved, "columns", None):
+                columns = resolved.columns
+        except Exception:
+            columns = None
+        if columns is None:
+            schema = getattr(self.dataset.metadata, "schema", None)
+            if getattr(schema, "columns", None):
+                columns = schema.columns  # RelationSchema
+            elif getattr(schema, "fields", None):
+                columns = schema.fields
+            elif isinstance(schema, dict) and "fields" in schema:
+                columns = schema["fields"]
+
+        if not columns or sort_index is None or sort_index >= len(columns):
+            # Can't resolve the sort column; fall back to brute logic.
             return self._select_brute_compaction(entries)
 
-        # Find sort column name from schema
-        sort_column_name = None
-        if hasattr(schema, "fields") and self.sort_column_id < len(schema.fields):
-            sort_column_name = schema.fields[self.sort_column_id].name
-        elif isinstance(schema, dict) and "fields" in schema:
-            fields = schema["fields"]
-            if self.sort_column_id < len(fields):
-                sort_column_name = fields[self.sort_column_id].get("name")
+        sort_col = columns[sort_index]
+        sort_column_name = getattr(sort_col, "name", None)
+        sort_field_id = getattr(sort_col, "id", None)
+        if isinstance(sort_col, dict):
+            sort_column_name = sort_column_name or sort_col.get("name")
+            sort_field_id = sort_field_id if sort_field_id is not None else sort_col.get("id")
 
         if not sort_column_name:
-            # Can't find sort column, fallback to brute
             return self._select_brute_compaction(entries)
 
-        # Extract ranges for each file
+        # Extract the sort-column min/max for each file. Parquet manifest entries
+        # store per-column statistics as positional lists (min_values/max_values)
+        # aligned with field_ids, NOT as iceberg-style lower_bounds/upper_bounds
+        # dicts. Read the positional stats, keyed by stable field-id when the
+        # entry carries field_ids and falling back to schema column position.
         file_ranges = []
         for entry in entries:
-            lower_bounds = entry.get("lower_bounds", {})
-            upper_bounds = entry.get("upper_bounds", {})
+            min_values = entry.get("min_values") or []
+            max_values = entry.get("max_values") or []
+            if not min_values or not max_values:
+                continue
 
-            if sort_column_name in lower_bounds and sort_column_name in upper_bounds:
-                min_val = lower_bounds[sort_column_name]
-                max_val = upper_bounds[sort_column_name]
-                size = entry.get("uncompressed_size_in_bytes", 0)
-                file_ranges.append(
-                    {
-                        "entry": entry,
-                        "min": min_val,
-                        "max": max_val,
-                        "size": size,
-                    }
-                )
+            field_ids = entry.get("field_ids") or []
+            idx = None
+            if sort_field_id is not None and sort_field_id in field_ids:
+                idx = field_ids.index(sort_field_id)
+            elif sort_index < len(min_values):
+                idx = sort_index
+
+            if idx is None or idx >= len(min_values) or idx >= len(max_values):
+                continue
+
+            min_val = min_values[idx]
+            max_val = max_values[idx]
+            if min_val is None or max_val is None:
+                continue
+
+            size = entry.get("uncompressed_size_in_bytes", 0)
+            file_ranges.append(
+                {
+                    "entry": entry,
+                    "min": min_val,
+                    "max": max_val,
+                    "size": size,
+                }
+            )
 
         if not file_ranges:
-            # No range information, fallback to brute
+            # No usable range information, fallback to brute
             return self._select_brute_compaction(entries)
 
         # Sort by min value
