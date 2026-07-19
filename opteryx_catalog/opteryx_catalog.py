@@ -206,6 +206,15 @@ class OpteryxCatalog(Metastore):
             properties=properties or {},
         )
 
+        # Allocate stable, never-reused field-ids for the initial schema's columns
+        # up front, so they can be persisted alongside the dataset doc in the same
+        # write as the rest of its metadata.
+        field_ids = None
+        if schema is not None:
+            column_count = len(self._schema_to_columns(schema))
+            field_ids = list(range(1, column_count + 1))
+            metadata.next_field_id = column_count + 1
+
         # Persist document with timestamp and author
         now_ms = int(time.time() * 1000)
         metadata.timestamp_ms = now_ms
@@ -223,12 +232,15 @@ class OpteryxCatalog(Metastore):
                 "maintenance-policy": metadata.maintenance_policy,
                 "annotations": metadata.annotations,
                 "refresh-frequency-mins": None,
+                "next-field-id": metadata.next_field_id,
             }
         )
 
         # Persist initial schema into `schemas` subcollection if provided
         if schema is not None:
-            schema_id = self._write_schema(collection, dataset_name, schema, author=author)
+            schema_id = self._write_schema(
+                collection, dataset_name, schema, author=author, field_ids=field_ids
+            )
             metadata.current_schema_id = schema_id
             # Read back the schema doc to capture timestamp-ms, author, sequence-number
             try:
@@ -237,7 +249,9 @@ class OpteryxCatalog(Metastore):
                 metadata.schemas = [
                     {
                         "schema_id": schema_id,
-                        "columns": sdata.get("columns", self._schema_to_columns(schema)),
+                        "columns": sdata.get(
+                            "columns", self._schema_to_columns(schema, field_ids=field_ids)
+                        ),
                         "timestamp-ms": sdata.get("timestamp-ms"),
                         "author": sdata.get("author"),
                         "sequence-number": sdata.get("sequence-number"),
@@ -245,7 +259,10 @@ class OpteryxCatalog(Metastore):
                 ]
             except Exception:
                 metadata.schemas = [
-                    {"schema_id": schema_id, "columns": self._schema_to_columns(schema)}
+                    {
+                        "schema_id": schema_id,
+                        "columns": self._schema_to_columns(schema, field_ids=field_ids),
+                    }
                 ]
             # update dataset doc to reference current schema
             doc_ref.update({"current-schema-id": metadata.current_schema_id})
@@ -378,6 +395,7 @@ class OpteryxCatalog(Metastore):
         metadata.describer = data.get("describer")
         metadata.annotations = data.get("annotations") or []
         metadata.refresh_frequency_mins = data.get("refresh-frequency-mins")
+        metadata.next_field_id = data.get("next-field-id", 1)
 
         schemas_coll = self._dataset_doc_ref(collection, dataset_name).collection("schemas")
 
@@ -850,6 +868,14 @@ class OpteryxCatalog(Metastore):
                 "max_values_display": "ARRAY",
                 "min_lengths": "ARRAY",
                 "max_lengths": "ARRAY",
+                # Stable per-column field-id, same order/index as every other
+                # per-column stats array above (min_values[i] is field_ids[i]'s
+                # min, etc.) — lets readers key stats by a schema-stable id
+                # instead of assuming today's array position equals a column's
+                # position in some other schema snapshot. Empty for manifest
+                # rows written before this existed; readers must fall back to
+                # positional indexing in that case.
+                "field_ids": "ARRAY",
             }
 
             # Normalize entries to match the column set above:
@@ -868,6 +894,7 @@ class OpteryxCatalog(Metastore):
                 e.setdefault("max_values_display", [])
                 e.setdefault("min_lengths", [])
                 e.setdefault("max_lengths", [])
+                e.setdefault("field_ids", [])
 
                 # min/max values are stored as compressed int64 values
                 # display values are string representations for human readability
@@ -1063,11 +1090,11 @@ class OpteryxCatalog(Metastore):
         for stale in existing_schema_ids - new_schema_ids:
             schemas_coll.document(stale).delete()
 
-    def _schema_to_columns(self, schema: Any) -> list:
+    def _schema_to_columns(self, schema: Any, field_ids: list | None = None) -> list:
         """Convert a schema into a simple columns list for storage.
 
         Each column is a dict:
-        ``{"id": index (1-based), "name", "type", "element-type", "scale",
+        ``{"id": field-id, "name", "type", "element-type", "scale",
         "precision", "expectation-policies", "annotations"}``.
 
         Accepts a draken ``Morsel`` (the schema of a table being written) or
@@ -1078,6 +1105,13 @@ class OpteryxCatalog(Metastore):
         ``DECIMAL``, ``ARRAY``, ...) that round-trips through
         ``opteryx.types.logical_type.parse_column_type`` on the query-engine
         side.
+
+        ``field_ids``, when provided, is a stable, catalog-allocated id per
+        column (same order as ``entries``) used as ``"id"`` instead of a
+        freshly-recomputed position — this is what lets manifest statistics
+        stay keyed correctly across schema evolution. When omitted, falls
+        back to the historical ``enumerate(..., start=1)`` behavior for
+        callers that haven't been updated to pass allocated ids.
         """
         if hasattr(schema, "columns"):
             entries = [
@@ -1098,11 +1132,18 @@ class OpteryxCatalog(Metastore):
                 "with a `.columns` attribute or a draken.morsels.morsel.Morsel"
             )
 
+        if field_ids is not None and len(field_ids) != len(entries):
+            raise ValueError(
+                f"field_ids length ({len(field_ids)}) does not match column count "
+                f"({len(entries)})"
+            )
+        ids = field_ids if field_ids is not None else range(1, len(entries) + 1)
+
         cols = []
-        for idx, (name, (type_name, element_type, precision, scale)) in enumerate(entries, start=1):
+        for col_id, (name, (type_name, element_type, precision, scale)) in zip(ids, entries):
             cols.append(
                 {
-                    "id": idx,
+                    "id": col_id,
                     "name": name,
                     "type": type_name,
                     "element-type": element_type,
@@ -1115,7 +1156,14 @@ class OpteryxCatalog(Metastore):
 
         return cols
 
-    def _write_schema(self, namespace: str, dataset_name: str, schema: Any, author: str) -> str:
+    def _write_schema(
+        self,
+        namespace: str,
+        dataset_name: str,
+        schema: Any,
+        author: str,
+        field_ids: list | None = None,
+    ) -> str:
         """Persist a schema document in the dataset's `schemas` subcollection and
         return the new schema id.
         """
@@ -1126,7 +1174,7 @@ class OpteryxCatalog(Metastore):
         sid = str(uuid.uuid4())
         # print(f"[DEBUG] _write_schema called for {namespace}/{dataset_name} sid={sid}")
         try:
-            cols = self._schema_to_columns(schema)
+            cols = self._schema_to_columns(schema, field_ids=field_ids)
         except Exception:
             # print(
             #     f"[DEBUG] _write_schema: _schema_to_columns raised: {e}; falling back to empty columns list"
