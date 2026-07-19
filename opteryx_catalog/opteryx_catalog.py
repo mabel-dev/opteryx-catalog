@@ -396,6 +396,11 @@ class OpteryxCatalog(Metastore):
         metadata.annotations = data.get("annotations") or []
         metadata.refresh_frequency_mins = data.get("refresh-frequency-mins")
         metadata.next_field_id = data.get("next-field-id", 1)
+        # Load the configured sort order. Without this the value round-tripped
+        # by save_dataset_metadata is silently dropped on read, so DatasetCompactor
+        # always sees an empty sort_orders and falls back to the (non-locality-
+        # preserving) brute strategy — i.e. order-aware compaction never runs.
+        metadata.sort_orders = data.get("sort-orders") or []
 
         schemas_coll = self._dataset_doc_ref(collection, dataset_name).collection("schemas")
 
