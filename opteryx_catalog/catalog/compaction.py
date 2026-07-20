@@ -18,18 +18,34 @@ from .metadata import Snapshot
 _NODE = f"{uuid.getnode():x}-{os.getpid():x}"
 
 # Constants
-TARGET_SIZE_MB = 512
+#
+# All size thresholds below are compared against `uncompressed_size_in_bytes`,
+# NOT the on-disk size. At the ~8.6x zstd ratio measured on github.events, a
+# 4 GB uncompressed target lands at roughly 470 MB on disk.
+#
+# These were raised from ~512 MB to ~4 GB on the strength of measurements over a
+# 187M-row github.events dataset: 4 GB-uncompressed files scanned ~5x faster per
+# row than the ~160 MB files they replaced. The old 512 MB target (~60 MB on
+# disk) produced far more, far smaller files than reads want.
+TARGET_SIZE_MB = 4096  # 4.0 GB - ideal output size
 TARGET_SIZE_BYTES = TARGET_SIZE_MB * 1024 * 1024
-MIN_SIZE_MB = 500
+MIN_SIZE_MB = 3584  # 3.5 GB - lower bound of the acceptable band
 MIN_SIZE_BYTES = MIN_SIZE_MB * 1024 * 1024
-MAX_SIZE_MB = 525
+MAX_SIZE_MB = 4198  # 4.1 GB - hard cap
 MAX_SIZE_BYTES = MAX_SIZE_MB * 1024 * 1024
-SMALL_FILE_MB = 400
+SMALL_FILE_MB = 3584  # anything under the lower bound is a merge candidate
 SMALL_FILE_BYTES = SMALL_FILE_MB * 1024 * 1024
-LARGE_FILE_MB = 500
+LARGE_FILE_MB = 4198
 LARGE_FILE_BYTES = LARGE_FILE_MB * 1024 * 1024
-MAX_MEMORY_FILES = 2  # Maximum output files to keep in memory during combine-and-split
-MAX_MEMORY_BYTES = 1100 * 1024 * 1024  # 1GB - allows combining files just over target size
+# Combine-and-split is capped to a single output file: at this scale, splitting
+# a combined batch in two would yield ~2 GB halves, i.e. below MIN_SIZE. One
+# output per pass also halves the working set - `Morsel.combine` holds the
+# inputs and the concatenated result at the same time, so peak memory is
+# ~2x MAX_MEMORY_BYTES plus serialization overhead (~10-11 GB here).
+MAX_MEMORY_FILES = 1
+# Must exceed MAX_SIZE_BYTES, or the guard rejects candidates before they can
+# ever reach target - which is what pinned effective output at ~128 MB on disk.
+MAX_MEMORY_BYTES = 4300 * 1024 * 1024  # 4.2 GB - just above the 4.1 GB cap
 
 
 class DatasetCompactor:

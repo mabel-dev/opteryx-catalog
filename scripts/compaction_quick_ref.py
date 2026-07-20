@@ -94,21 +94,36 @@ def api_reference():
 
 
 def file_size_thresholds():
-    """Constants used in compaction decisions."""
+    """Constants used in compaction decisions.
+
+    Read from `opteryx_catalog.catalog.compaction` rather than restated here:
+    these previously drifted out of sync with the real values, which makes a
+    quick-reference actively misleading. All thresholds are compared against
+    uncompressed size, not on-disk size.
+    """
+    from opteryx_catalog.catalog import compaction as c
 
     return {
-        "SMALL_FILE_MB": 128,
-        "SMALL_FILE_BYTES": 128 * 1024 * 1024,
+        "SMALL_FILE_MB": c.SMALL_FILE_MB,
+        "SMALL_FILE_BYTES": c.SMALL_FILE_BYTES,
         "description_small": "Files below this are candidates for combining",
-        "TARGET_SIZE_MB": 512,
-        "TARGET_SIZE_BYTES": 512 * 1024 * 1024,
+        "MIN_SIZE_MB": c.MIN_SIZE_MB,
+        "MIN_SIZE_BYTES": c.MIN_SIZE_BYTES,
+        "description_min": "Lower bound of the acceptable output band",
+        "TARGET_SIZE_MB": c.TARGET_SIZE_MB,
+        "TARGET_SIZE_BYTES": c.TARGET_SIZE_BYTES,
         "description_target": "Goal size for combined files",
-        "LARGE_FILE_MB": 500,
-        "LARGE_FILE_BYTES": 500 * 1024 * 1024,
+        "MAX_SIZE_MB": c.MAX_SIZE_MB,
+        "MAX_SIZE_BYTES": c.MAX_SIZE_BYTES,
+        "description_max": "Hard cap on output size",
+        "LARGE_FILE_MB": c.LARGE_FILE_MB,
+        "LARGE_FILE_BYTES": c.LARGE_FILE_BYTES,
         "description_large": "Files above this are candidates for splitting",
-        "MAX_MEMORY_MB": 525,
-        "MAX_MEMORY_BYTES": 525 * 1024 * 1024,
-        "description_memory": "Max memory for holding files during compaction",
+        "MAX_MEMORY_MB": c.MAX_MEMORY_BYTES // (1024 * 1024),
+        "MAX_MEMORY_BYTES": c.MAX_MEMORY_BYTES,
+        "description_memory": "Max input accumulated in memory during compaction",
+        "MAX_MEMORY_FILES": c.MAX_MEMORY_FILES,
+        "description_memory_files": "Max output files per combine-and-split pass",
     }
 
 
