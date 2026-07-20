@@ -69,6 +69,17 @@ class SnapshotExpiration:
         Returns:
             Summary dict or None if no expiration needed
         """
+        # Timed here rather than by the caller: callers that expire a whole
+        # workspace or collection only see the aggregate, so per-dataset cost
+        # is measurable at this level alone.
+        start = time.perf_counter()
+        summary = self._expire_dataset(identifier, dry_run=dry_run)
+        if summary is not None:
+            summary["duration_ms"] = int((time.perf_counter() - start) * 1000)
+        return summary
+
+    def _expire_dataset(self, identifier: str, dry_run: bool = False) -> Optional[Dict]:
+        """Apply retention policy to a single dataset (see `expire_dataset`)."""
         try:
             # Load dataset with full history
             dataset = self.catalog.load_dataset(identifier, load_history=True)
@@ -151,6 +162,7 @@ class SnapshotExpiration:
                             "deleted_snapshots": [],
                             "deleted_manifests": [],
                             "deleted_files": [],
+                            "bytes_reclaimed": 0,
                             "orphaned_files_count": 0,
                             "orphaned_manifests_count": len(eligible),
                             "manifests_to_delete": sorted(eligible),
@@ -178,6 +190,7 @@ class SnapshotExpiration:
                         "deleted_snapshots": [],
                         "deleted_manifests": deleted,
                         "deleted_files": [],
+                        "bytes_reclaimed": 0,
                         "orphaned_files_count": 0,
                         "orphaned_manifests_count": len(deleted),
                         "manifests_to_delete": sorted(eligible),
@@ -200,6 +213,7 @@ class SnapshotExpiration:
                 "deleted_snapshots": [],
                 "deleted_manifests": [],
                 "deleted_files": [],
+                "bytes_reclaimed": 0,
                 "orphaned_files_count": 0,
                 "orphaned_manifests_count": 0,
                 "manifests_to_delete": [],
@@ -221,9 +235,12 @@ class SnapshotExpiration:
                 # Find orphaned files only if under snapshot limit
                 if not skip_orphan_detection:
                     kept_files = self._get_files_in_snapshots(snapshots_to_keep)
-                    deleted_files = self._get_files_in_snapshots(snapshots_to_delete)
-                    orphaned = deleted_files - kept_files
+                    deleted_file_sizes = self._get_file_sizes_in_snapshots(snapshots_to_delete)
+                    orphaned = set(deleted_file_sizes) - kept_files
                     summary["orphaned_files_count"] = len(orphaned)
+                    # Bytes that *would* be reclaimed, so a dry run reports the
+                    # same measure the execute path does.
+                    summary["bytes_reclaimed"] = sum(deleted_file_sizes[p] for p in orphaned)
 
                     # Identify orphaned manifest files (storage manifests not referenced by any snapshot)
                     try:
@@ -314,6 +331,7 @@ class SnapshotExpiration:
                 snapshots_to_delete,
                 snapshots_to_keep,
                 skip_orphan_detection=skip_orphan_detection,
+                retention_days=retention_days,
             )
 
         except (ValueError, KeyError, AttributeError) as e:
@@ -340,6 +358,7 @@ class SnapshotExpiration:
             "total_manifests_deleted": 0,
             "total_files_deleted": 0,
             "total_orphaned_files": 0,
+            "total_bytes_reclaimed": 0,
             "details": [],
         }
 
@@ -354,6 +373,7 @@ class SnapshotExpiration:
                 results["total_manifests_deleted"] += len(summary.get("deleted_manifests", []))
                 results["total_files_deleted"] += len(summary.get("deleted_files", []))
                 results["total_orphaned_files"] += summary.get("orphaned_files_count", 0)
+                results["total_bytes_reclaimed"] += summary.get("bytes_reclaimed", 0)
                 results["details"].append(summary)
 
         return results
@@ -378,6 +398,7 @@ class SnapshotExpiration:
             "total_manifests_deleted": 0,
             "total_files_deleted": 0,
             "total_orphaned_files": 0,
+            "total_bytes_reclaimed": 0,
             "details": [],
         }
 
@@ -394,6 +415,7 @@ class SnapshotExpiration:
             )
             results["total_files_deleted"] += collection_result.get("total_files_deleted", 0)
             results["total_orphaned_files"] += collection_result.get("total_orphaned_files", 0)
+            results["total_bytes_reclaimed"] += collection_result.get("total_bytes_reclaimed", 0)
 
             if collection_result.get("details"):
                 results["details"].extend(collection_result["details"])
@@ -407,6 +429,7 @@ class SnapshotExpiration:
         snapshots_to_delete: List[Snapshot],
         snapshots_to_keep: List[Snapshot],
         skip_orphan_detection: bool = False,
+        retention_days: Optional[int] = None,
     ) -> Dict:
         """
         Execute snapshot expiration: delete snapshots, manifests, and orphaned files.
@@ -417,6 +440,7 @@ class SnapshotExpiration:
             snapshots_to_delete: Snapshots to remove
             snapshots_to_keep: Snapshots to retain
             skip_orphan_detection: Skip orphaned file detection to save memory
+            retention_days: Retention window applied, echoed into the summary
 
         Returns:
             Summary of deletions
@@ -424,20 +448,28 @@ class SnapshotExpiration:
         collection, dataset_name = identifier.split(".")
         summary = {
             "identifier": identifier,
+            "retention_days": retention_days,
             "snapshots_to_delete": len(snapshots_to_delete),
             "snapshots_to_keep": len(snapshots_to_keep),
             "deleted_snapshots": [],
             "deleted_manifests": [],
             "deleted_files": [],
+            # Storage reclaimed by deleting orphaned *data* files. Manifest files
+            # are not counted: a manifest's own size is recorded nowhere, and
+            # FileIO has no stat/size call, so including them would cost an extra
+            # request per manifest for a rounding-error contribution.
+            "bytes_reclaimed": 0,
             "orphan_detection_skipped": skip_orphan_detection,
         }
 
         # Step 1: Find which files are kept and which are orphaned (if not skipped)
         orphaned_files = set()
+        orphaned_file_sizes: Dict[str, int] = {}
         if not skip_orphan_detection:
             kept_files = self._get_files_in_snapshots(snapshots_to_keep)
-            deleted_files_snapshot = self._get_files_in_snapshots(snapshots_to_delete)
-            orphaned_files = deleted_files_snapshot - kept_files
+            deleted_file_sizes = self._get_file_sizes_in_snapshots(snapshots_to_delete)
+            orphaned_files = set(deleted_file_sizes) - kept_files
+            orphaned_file_sizes = {p: deleted_file_sizes[p] for p in orphaned_files}
         else:
             logger.info(
                 "Skipping orphaned file detection for %s (%d snapshots to delete)",
@@ -518,6 +550,7 @@ class SnapshotExpiration:
                     io = self.catalog.io or dataset.io
                     self._delete_file(io, file_path)
                     summary["deleted_files"].append(file_path)
+                    summary["bytes_reclaimed"] += orphaned_file_sizes.get(file_path, 0)
                     logger.info("Deleted orphaned file %s", file_path)
                 except (ValueError, OSError) as e:
                     logger.error("Failed to delete orphaned file %s: %s", file_path, e)
@@ -531,17 +564,21 @@ class SnapshotExpiration:
 
         return summary
 
-    def _get_files_in_snapshots(self, snapshots: List[Snapshot]) -> Set[str]:
+    def _get_file_sizes_in_snapshots(self, snapshots: List[Snapshot]) -> Dict[str, int]:
         """
-        Get all data files referenced by a set of snapshots.
+        Get all data files referenced by a set of snapshots, with their sizes.
+
+        Sizes come from `file_size_in_bytes` on the manifest entries we already
+        have to read here, so capturing them costs no extra IO. This is what
+        lets expiration report the bytes actually reclaimed from storage.
 
         Args:
             snapshots: List of snapshots
 
         Returns:
-            Set of file paths referenced in all manifests
+            Mapping of file path -> on-disk size in bytes (0 when unrecorded)
         """
-        files = set()
+        files: Dict[str, int] = {}
 
         for snapshot in snapshots:
             if not snapshot.manifest_list:
@@ -554,15 +591,27 @@ class SnapshotExpiration:
 
                 entries = get_parsed_manifest(io, snapshot.manifest_list)
 
-                # Extract file paths
+                # Extract file paths and their on-disk sizes
                 for entry in entries:
                     file_path = entry.get("file_path")
                     if file_path:
-                        files.add(file_path)
+                        files[file_path] = int(entry.get("file_size_in_bytes") or 0)
             except (ValueError, OSError) as e:
                 logger.error("Error reading manifest %s: %s", snapshot.manifest_list, e)
 
         return files
+
+    def _get_files_in_snapshots(self, snapshots: List[Snapshot]) -> Set[str]:
+        """
+        Get all data files referenced by a set of snapshots.
+
+        Args:
+            snapshots: List of snapshots
+
+        Returns:
+            Set of file paths referenced in all manifests
+        """
+        return set(self._get_file_sizes_in_snapshots(snapshots))
 
     def _delete_file(self, io, file_path: str) -> bool:
         """
