@@ -2,6 +2,34 @@
 Compaction module for optimizing dataset file layout.
 
 Provides incremental compaction strategies to address the small files problem.
+
+HOW PERFORMANCE COMPACTION WORKS
+--------------------------------
+The ``performance`` strategy has two merge modes and gradually improves
+partitioning. It never merges past the target size (there is no size-based
+split step).
+
+  1. Never merge to exceed ~4 GB (TARGET_SIZE_BYTES). Bin-pack up to the target;
+     we simply do not create a file larger than target.
+  2. Files under 512 MB (MIN_FILE_SIZE_BYTES): BRUTE-FORCE merge - concatenate,
+     no sort. Sorting tiny scattered files is wasted work; they get sorted once
+     they graduate past the floor.
+  3. Files at/over ~512 MB: SORT-AWARE merge that gradually improves
+     partitioning - combine OVERLAPPING files, sort on the sort key, and split
+     the result into DISJOINT key ranges. The split granularity depends on size:
+     if the merged result exceeds ~4 GB it becomes multiple FILES (each a
+     disjoint range); if it stays under ~4 GB it is one file whose disjoint
+     ranges are expressed as sorted ROW GROUPS only (never split into a new file
+     under target). Each pass tightens the partitioning a little; repeated
+     passes converge toward non-overlapping files.
+  4. At most ONE file under 512 MB may remain: whenever two or more sub-floor
+     files exist they are merged; a single leftover "remainder" file below the
+     floor (e.g. a 200 MB tail) is acceptable and expected.
+  5. Execution streams row groups (see ``_execute_compaction_streaming``):
+     constant memory, so a merge can be larger than RAM.
+
+``brute`` strategy is a separate, older fallback for datasets with no sort
+order; it is unrelated to the above.
 """
 
 from __future__ import annotations
@@ -17,6 +45,71 @@ from .metadata import Snapshot
 # Stable node identifier for this process (hex-mac-hex-pid)
 _NODE = f"{uuid.getnode():x}-{os.getpid():x}"
 
+
+def normalize_sort_order(sort_orders) -> Optional[dict]:
+    """Reduce a ``sort_orders`` value to the primary sort key in canonical form.
+
+    ``sort_orders`` has been written in two incompatible shapes:
+
+    * positional ints — ``[0]`` — an index into the schema's columns (used by
+      the tests and by production ``ops.*`` datasets); and
+    * Iceberg-style dicts — ``[{"order-id": 1, "fields": [{"name": "id",
+      "direction": "asc"}]}]`` — name-based with a direction (written by
+      ``scripts/create_dataset.py``). The old code treated ``sort_orders[0]`` as
+      an int unconditionally, so the dict shape raised an uncaught ``TypeError``
+      (``dict >= int``) out of ``compact()``.
+
+    Returns ``{"name", "field_id", "index", "ascending"}`` for the primary
+    (first) sort key, with the unused resolution keys set to ``None``, or
+    ``None`` when nothing usable can be extracted (caller falls back to brute).
+    Resolution precedence downstream is field_id → name → index.
+    """
+    try:
+        if not sort_orders:
+            return None
+        entry = sort_orders[0]
+
+        # Positional int index.
+        if isinstance(entry, bool):
+            return None  # bool is an int subclass; never a valid column index
+        if isinstance(entry, int):
+            return {"name": None, "field_id": None, "index": entry, "ascending": True}
+
+        # Bare column name.
+        if isinstance(entry, str):
+            return {"name": entry, "field_id": None, "index": None, "ascending": True}
+
+        if isinstance(entry, dict):
+            # Iceberg sort-order object: unwrap to its first field. Also accept a
+            # bare field dict ({"name": ..., "direction": ...}).
+            field = entry
+            fields = entry.get("fields")
+            if isinstance(fields, (list, tuple)) and fields:
+                field = fields[0]
+            if not isinstance(field, dict):
+                return None
+
+            name = field.get("name")
+            # Iceberg identifies the source column by "source-id" (a field id);
+            # accept it as field_id when present.
+            field_id = field.get("source-id")
+            if field_id is None:
+                field_id = field.get("field-id")
+            direction = str(field.get("direction", "asc")).lower()
+            ascending = direction != "desc"
+
+            if name is None and field_id is None:
+                return None
+            return {
+                "name": name,
+                "field_id": field_id,
+                "index": None,
+                "ascending": ascending,
+            }
+    except Exception:
+        return None
+    return None
+
 # Constants
 #
 # All size thresholds below are compared against `uncompressed_size_in_bytes`,
@@ -31,21 +124,143 @@ TARGET_SIZE_MB = 4096  # 4.0 GB - ideal output size
 TARGET_SIZE_BYTES = TARGET_SIZE_MB * 1024 * 1024
 MIN_SIZE_MB = 3584  # 3.5 GB - lower bound of the acceptable band
 MIN_SIZE_BYTES = MIN_SIZE_MB * 1024 * 1024
+
+# --- Small-file floor ("no files under X") -------------------------------------
+#
+# The invariant that answers "who merges tiny files": THIS policy does. After
+# compaction settles, no file persists below MIN_FILE_SIZE_BYTES. Whenever there
+# are two or more sub-floor files, they are combined - there is NO volume
+# threshold to wait for (waiting is just the small-files problem by another
+# name; a drip-fed dataset would sit with its tiny files un-merged for weeks).
+#
+# The sub-floor files (below the floor) are the only ones this policy touches;
+# files at/above the floor are left alone. Consolidation only consumes sub-floor
+# files and produces >=floor files (once enough accumulate), so it converges and
+# never fights itself.
+#
+# MIN_FILE_SIZE_BYTES (512 MB) is the floor. A consolidation of a small drip
+# yields a sub-floor output that stays a candidate and keeps absorbing new tiny
+# files until it crosses the floor and freezes - a bounded accretion up to ~one
+# floor of rewrites, the accepted price for not leaving tiny files around. A
+# large accumulated mass instead splits straight into target-sized files.
+MIN_FILE_SIZE_MB = 512
+MIN_FILE_SIZE_BYTES = MIN_FILE_SIZE_MB * 1024 * 1024
 MAX_SIZE_MB = 4198  # 4.1 GB - hard cap
 MAX_SIZE_BYTES = MAX_SIZE_MB * 1024 * 1024
 SMALL_FILE_MB = 3584  # anything under the lower bound is a merge candidate
 SMALL_FILE_BYTES = SMALL_FILE_MB * 1024 * 1024
 LARGE_FILE_MB = 4198
 LARGE_FILE_BYTES = LARGE_FILE_MB * 1024 * 1024
-# Combine-and-split is capped to a single output file: at this scale, splitting
-# a combined batch in two would yield ~2 GB halves, i.e. below MIN_SIZE. One
-# output per pass also halves the working set - `Morsel.combine` holds the
-# inputs and the concatenated result at the same time, so peak memory is
-# ~2x MAX_MEMORY_BYTES plus serialization overhead (~10-11 GB here).
+# Deprecated: combine-split no longer caps output to one file. Splitting a
+# key-sorted batch into k = ceil(total / TARGET) target-sized files is what
+# converges a scattered sort key (see _split_into_k); forcing a single output
+# produced one union-range file per pass and never converged. Retained only so
+# any external reference still resolves.
 MAX_MEMORY_FILES = 1
-# Must exceed MAX_SIZE_BYTES, or the guard rejects candidates before they can
-# ever reach target - which is what pinned effective output at ~128 MB on disk.
-MAX_MEMORY_BYTES = 4300 * 1024 * 1024  # 4.2 GB - just above the 4.1 GB cap
+
+# --- Byte-aware memory budget --------------------------------------------------
+#
+# A merge holds the combined input in RAM, then the sorted `take` copy, on top of
+# a one-time native runtime warmup. The gate must bound that PEAK RSS against the
+# container's real memory - not compare a flat 4.3 GB against the manifest's
+# `uncompressed_size_in_bytes`, which is a sum-of-sys.getsizeof estimate whose
+# ratio to real RAM is data-dependent.
+#
+# Calibration (measured, real data): a 7.9M-row file with 8.7 GB budget-unit read
+# to ~10.2 GB RSS. Per-slice output (below) keeps the sort/write stage at
+# ~read-footprint (measured 10.5 GB, ~1.2x budget). For a MULTI-file merge the
+# peak driver is instead `Morsel.combine`, which holds the inputs and the
+# concatenated result together (~2x the combined budget-unit) before the inputs
+# are freed. We size the gate to that ~2x transient (times the budget->RAM ratio,
+# ~1.0-1.2 for string/array-heavy data) so we do not OOM on the combine step.
+# (A streaming k-way combine would remove this 2x and let the factor drop.)
+#
+# We fold the container RAM back into a ceiling on a merge's *combined budget-unit
+# size*, so all selection arithmetic stays in the one budget unit. Override the
+# container size for non-16 GB deployments via OPTERYX_COMPACTION_RAM_MB.
+CONTAINER_RAM_MB = int(os.environ.get("OPTERYX_COMPACTION_RAM_MB", 16 * 1024))
+CONTAINER_RAM_BYTES = CONTAINER_RAM_MB * 1024 * 1024
+RUNTIME_WARMUP_BYTES = 768 * 1024 * 1024   # native lib/arena/threadpool floor (~measured)
+PEAK_RAM_PER_BUDGET_BYTE = 2.0             # combine transient dominates (~2x combined budget-unit)
+RAM_SAFETY_FRACTION = 0.85                 # headroom for Python/GC/other allocations
+# Largest combined (uncompressed/budget-unit) input a single merge may hold.
+# Never gated below one TARGET, so a legitimate single-target merge always fits.
+MAX_SELECTED_BUDGET_BYTES = int(
+    max(
+        TARGET_SIZE_BYTES,
+        (CONTAINER_RAM_BYTES * RAM_SAFETY_FRACTION - RUNTIME_WARMUP_BYTES)
+        / PEAK_RAM_PER_BUDGET_BYTE,
+    )
+)
+# Deprecated name, retained for external references (scripts/compaction_quick_ref.py).
+# Now the byte-aware ceiling rather than a flat 4.3 GB.
+MAX_MEMORY_BYTES = MAX_SELECTED_BUDGET_BYTES
+
+# --- Decluster (rule 3) combined-input cap -------------------------------------
+#
+# Declustering runs on the STREAMING executor, whose peak is bounded by one
+# window (~ROW_GROUP_HARD_CAP_ROWS rows) regardless of total merge size or file
+# count - that is the whole reason the streaming writer was built. So decluster
+# must NOT be bound by the hold-everything RAM gate (MAX_SELECTED_BUDGET_BYTES):
+# that would refuse the motivating case, two OVERLAPPING ~4 GB (target-sized)
+# files, which combine to 8 GB and split back into two disjoint ~4 GB files.
+#
+# Instead the cap bounds WORK PER PASS (bytes rewritten in one snapshot), not
+# memory: it keeps a single decluster op from rewriting the whole dataset at
+# once (resumability, and less contention with a live compactor). A larger
+# overlapping cluster is declustered a chunk at a time and converges over passes.
+# At 4x target a pass declusters up to ~four target-sized files into ~four
+# disjoint outputs. Tunable; raising it only trades bigger snapshots for fewer
+# passes, never memory (streaming is window-bounded).
+DECLUSTER_MAX_COMBINED_BYTES = 4 * TARGET_SIZE_BYTES
+
+# --- Three-pass streaming execution --------------------------------------------
+#
+# The hold-everything path above (read all inputs -> Morsel.combine -> sort ->
+# per-slice take -> write) needs the whole merge resident, gated by
+# MAX_SELECTED_BUDGET_BYTES. That gate rejects real merges of already-target-sized
+# files (measured: two ~4GB github.events files -> 14.9GB real peak, over budget)
+# even though the merge is small relative to available disk/storage - the limit
+# is RAM, not data size.
+#
+# The streaming path removes that ceiling by never holding more than ~one row
+# group's worth of data (across all input files contributing to it) at once:
+#   pass 1: project the sort column ONLY from all candidate files, combine
+#           (small - one column), native sort. This gives the EXACT global
+#           sorted key sequence, not an estimate.
+#   pass 2+: walk that sorted sequence in ~ROW_GROUP_TARGET_ROWS windows, snapped
+#           to distinct-value edges (never split a run of equal keys across a
+#           predicate boundary - predicates match by VALUE, not row position).
+#           For each window, predicate-read [lo, hi) from every candidate file
+#           (row-group pruned), combine + sort just that window, and
+#           write_row_group() it before moving on. Peak is bounded by one
+#           window's real size, independent of total merge size - true
+#           larger-than-memory handling, at the cost of re-reading each
+#           candidate file once per window it contributes to (read
+#           amplification, paid deliberately to avoid write amplification: see
+#           the accretive-merge measurement showing a ~21x total-bytes-rewritten
+#           blowup from repeated whole-file rewrites).
+#
+# Two cases a value predicate cannot express, both handled by falling back to
+# row-group-native accumulation (stream row groups, slice by row count instead
+# of by value, so the ROW_GROUP_HARD_CAP_ROWS cap is never exceeded):
+#   * NULLs in the sort key never match any value predicate (SQL three-valued
+#     logic - confirmed empirically: rugo has no IS NULL predicate op, and
+#     `col < x` matches zero null rows). Nulls are placed at position 0 (the
+#     start of the first output file) by policy, extracted via draken's own
+#     is_null()+filter_mask() on the (small, per-row-group) source data.
+#   * A single value with more rows than the hard cap ("hot" value) can't be
+#     sliced further by value (all matching rows look identical to a
+#     predicate). Its rows are pulled via an exact `= value` predicate (which
+#     already row-filters correctly) and flushed every ROW_GROUP_TARGET_ROWS
+#     rows via plain row-count slicing.
+#
+# Used for any combine-split plan with a resolvable sort column. (An earlier
+# rugo predicate-read filter_mask bug on ARRAY columns forced array datasets
+# onto hold-everything; that is fixed as of rugo 0.4.17, so no schema
+# restriction remains.) On any failure it falls back to hold-everything.
+ROW_GROUP_TARGET_ROWS = 256_000
+ROW_GROUP_HARD_CAP_ROWS = 272_000
 
 
 class DatasetCompactor:
@@ -93,14 +308,17 @@ class DatasetCompactor:
             self.strategy = strategy
             self.decision = "user"
 
-        # Get sort column if available
-        self.sort_column_id = None
+        # Resolve the sort key to a canonical shape up front. ``sort_orders`` is
+        # stored either as positional ints or Iceberg-style dicts; see
+        # ``normalize_sort_order``. ``self.sort_order`` is
+        # ``{"name", "field_id", "index", "ascending"}`` or None.
+        self.sort_order = None
         if self.strategy == "performance":
-            sort_orders = getattr(dataset.metadata, "sort_orders", [])
-            if sort_orders and len(sort_orders) > 0:
-                self.sort_column_id = sort_orders[0]
-            else:
-                # Fallback to brute if performance requested but no sort order
+            self.sort_order = normalize_sort_order(
+                getattr(dataset.metadata, "sort_orders", [])
+            )
+            if self.sort_order is None:
+                # Performance mode needs a usable sort key; fall back to brute.
                 self.strategy = "brute"
                 self.decision = "no-sort"
 
@@ -184,7 +402,7 @@ class DatasetCompactor:
 
             for entry in sorted_files:
                 entry_size = entry.get("uncompressed_size_in_bytes", 0)
-                if total_size + entry_size <= MAX_MEMORY_BYTES:
+                if total_size + entry_size <= MAX_SELECTED_BUDGET_BYTES:
                     selected.append(entry)
                     total_size += entry_size
                     # Continue accumulating files until we hit target, don't stop early
@@ -201,27 +419,68 @@ class DatasetCompactor:
         # No compaction needed
         return None
 
+    def _resolve_sort_column(self, sort_order: dict, columns):
+        """Resolve a canonical sort key against schema ``columns``.
+
+        Precedence: field_id → name → positional index. ``columns`` entries may
+        be objects with ``.name``/``.id`` or dicts with ``"name"``/``"id"``.
+        Returns ``(column_name, field_id, index)`` where ``index`` is the
+        column's schema position (used to read positional min/max stats when a
+        manifest entry carries no field_ids). ``column_name`` is None when the
+        key cannot be resolved (caller falls back to brute).
+        """
+
+        def col_name(c):
+            return getattr(c, "name", None) or (c.get("name") if isinstance(c, dict) else None)
+
+        def col_id(c):
+            cid = getattr(c, "id", None)
+            if cid is None and isinstance(c, dict):
+                cid = c.get("id")
+            return cid
+
+        target_fid = sort_order.get("field_id")
+        target_name = sort_order.get("name")
+        target_index = sort_order.get("index")
+
+        sort_index = None
+        if target_fid is not None:
+            sort_index = next((i for i, c in enumerate(columns) if col_id(c) == target_fid), None)
+        if sort_index is None and target_name is not None:
+            sort_index = next((i for i, c in enumerate(columns) if col_name(c) == target_name), None)
+        if sort_index is None and target_index is not None and 0 <= target_index < len(columns):
+            sort_index = target_index
+
+        if sort_index is None:
+            return None, None, None
+        sort_col = columns[sort_index]
+        return col_name(sort_col), col_id(sort_col), sort_index
+
     def _select_performance_compaction(self, entries: List[dict]) -> Optional[dict]:
+        """Select ONE performance-compaction operation, per the five rules in the
+        module docstring. Repeated ``compact()`` calls converge the layout.
+
+        Decision order (highest priority first; the first applicable tier wins):
+
+          Tier 1 - rules 2 & 4: two or more sub-floor (< MIN_FILE_SIZE_BYTES)
+                   files => BRUTE-force merge (no sort), bin-packed toward
+                   TARGET. Tiny scattered files hurt reads most and are cheapest
+                   to fix; sorting them is wasted until they graduate the floor.
+          Tier 2 - rule 3: an OVERLAPPING group of at/above-floor files =>
+                   sort-aware combine-split that declusters it into disjoint key
+                   ranges.
+          Tier 3 - rule 1: consecutive, already-disjoint MEDIUM files (floor..
+                   MIN_SIZE_BYTES) => sort-aware bin-pack toward TARGET to reduce
+                   file count.
+
+        Every output respects rule 1 (never a file over TARGET). Falls back to
+        brute selection when the sort column cannot be resolved.
         """
-        Select files for performance-optimized compaction.
-
-        Strategy:
-        1. Find overlapping or adjacent ranges on sort column
-        2. Combine files to eliminate overlap and reach target size
-        3. No splitting (file size is less critical with current read approach)
-
-        Returns:
-            Compaction plan dict or None
-        """
-
-        # Priority 2: Find overlapping ranges on the sort column.
-        #
         # Resolve the sort column from the dataset's *stored* schema. The raw
         # ``metadata.schema`` attribute is frequently None on a freshly loaded
         # dataset (the real schema lives in the schemas subcollection), so
-        # prefer ``dataset.schema()`` which resolves it. ``sort_column_id`` is a
-        # positional index into the schema's columns.
-        sort_index = self.sort_column_id
+        # prefer ``dataset.schema()`` which resolves it. ``self.sort_order`` is
+        # the canonical sort key (name/field_id/index); see normalize_sort_order.
         columns = None
         try:
             resolved = self.dataset.schema()
@@ -238,25 +497,57 @@ class DatasetCompactor:
             elif isinstance(schema, dict) and "fields" in schema:
                 columns = schema["fields"]
 
-        if not columns or sort_index is None or sort_index >= len(columns):
+        if not columns or self.sort_order is None:
             # Can't resolve the sort column; fall back to brute logic.
             return self._select_brute_compaction(entries)
 
-        sort_col = columns[sort_index]
-        sort_column_name = getattr(sort_col, "name", None)
-        sort_field_id = getattr(sort_col, "id", None)
-        if isinstance(sort_col, dict):
-            sort_column_name = sort_column_name or sort_col.get("name")
-            sort_field_id = sort_field_id if sort_field_id is not None else sort_col.get("id")
-
+        sort_column_name, sort_field_id, sort_index = self._resolve_sort_column(
+            self.sort_order, columns
+        )
         if not sort_column_name:
             return self._select_brute_compaction(entries)
 
-        # Extract the sort-column min/max for each file. Parquet manifest entries
-        # store per-column statistics as positional lists (min_values/max_values)
-        # aligned with field_ids, NOT as iceberg-style lower_bounds/upper_bounds
-        # dicts. Read the positional stats, keyed by stable field-id when the
-        # entry carries field_ids and falling back to schema column position.
+        # Tier 1 (rules 2 & 4): brute-force consolidate sub-floor files. No range
+        # stats needed - brute merge doesn't sort, so files without min/max still
+        # qualify.
+        sub_floor = [
+            e
+            for e in entries
+            if e.get("uncompressed_size_in_bytes", 0) < MIN_FILE_SIZE_BYTES
+        ]
+        plan = self._select_brute_consolidation(sub_floor, sort_column_name)
+        if plan:
+            return plan
+
+        # Tiers 2 & 3 reason about sort-key ranges of the at/above-floor files.
+        big = [
+            e
+            for e in entries
+            if e.get("uncompressed_size_in_bytes", 0) >= MIN_FILE_SIZE_BYTES
+        ]
+        file_ranges = self._build_file_ranges(big, sort_field_id, sort_index)
+        if not file_ranges:
+            return None
+
+        # Tier 2 (rule 3): decluster one overlapping group.
+        plan = self._select_overlap_decluster(file_ranges, sort_column_name)
+        if plan:
+            return plan
+
+        # Tier 3 (rule 1): bin-pack consecutive medium files toward target.
+        return self._select_binpack(file_ranges, sort_column_name)
+
+    def _build_file_ranges(self, entries, sort_field_id, sort_index):
+        """Extract ``{entry, min, max, size}`` on the sort key for each entry
+        that carries usable positional min/max stats.
+
+        Parquet manifest entries expose per-column statistics as positional
+        ``min_values``/``max_values`` lists aligned with ``field_ids`` (NOT
+        iceberg-style ``lower_bounds``/``upper_bounds`` dicts). Resolve the sort
+        column's slot by stable field-id when the entry carries field_ids,
+        falling back to schema column position. Entries with no usable stats are
+        skipped - they can't be reasoned about for overlap or key-ordered packing.
+        """
         file_ranges = []
         for entry in entries:
             min_values = entry.get("min_values") or []
@@ -268,7 +559,7 @@ class DatasetCompactor:
             idx = None
             if sort_field_id is not None and sort_field_id in field_ids:
                 idx = field_ids.index(sort_field_id)
-            elif sort_index < len(min_values):
+            elif sort_index is not None and sort_index < len(min_values):
                 idx = sort_index
 
             if idx is None or idx >= len(min_values) or idx >= len(max_values):
@@ -279,73 +570,171 @@ class DatasetCompactor:
             if min_val is None or max_val is None:
                 continue
 
-            size = entry.get("uncompressed_size_in_bytes", 0)
             file_ranges.append(
                 {
                     "entry": entry,
                     "min": min_val,
                     "max": max_val,
-                    "size": size,
+                    "size": entry.get("uncompressed_size_in_bytes", 0),
                 }
             )
+        return file_ranges
 
-        if not file_ranges:
-            # No usable range information, fallback to brute
-            return self._select_brute_compaction(entries)
+    def _select_brute_consolidation(self, sub_floor, sort_column_name) -> Optional[dict]:
+        """Rules 2 & 4: whenever two or more sub-floor (< MIN_FILE_SIZE_BYTES)
+        files exist, BRUTE-force merge them - concatenate, NO sort - bin-packing
+        the smallest first toward TARGET_SIZE_BYTES (rule 1: never exceed target),
+        one bin per ``compact()`` call.
 
-        # Sort by min value
-        file_ranges.sort(key=lambda x: x["min"])
+        There is no volume threshold to wait for: a drip-fed dataset gets its
+        handful of tiny files merged NOW (waiting is the small-files problem by
+        another name). Sorting scattered tiny files is wasted work; the merged
+        result is sort-aware declustered (tier 2) once it graduates past the
+        floor. A single leftover sub-floor remainder is acceptable (rule 4): the
+        merge only needs two files to make progress, and it accretes a sub-floor
+        output over calls until it crosses the floor and freezes.
 
-        # Find first overlapping or adjacent group
-        for i in range(len(file_ranges) - 1):
-            current = file_ranges[i]
-            next_file = file_ranges[i + 1]
+        Emits a ``combine`` (brute) plan; the executor's ``combine`` path never
+        sorts and produces one output, so no ``morsel_sort`` runs on this path.
+        """
+        if len(sub_floor) < 2:
+            return None  # need at least two sub-floor files to combine
 
-            # Check for overlap or adjacency
-            if current["max"] >= next_file["min"]:
-                # Found overlap or adjacency
-                # Check if combining would be beneficial
-                combined_size = current["size"] + next_file["size"]
+        ordered = sorted(
+            sub_floor, key=lambda e: e.get("uncompressed_size_in_bytes", 0)
+        )
+        selected = []
+        total = 0
+        for e in ordered:
+            size = e.get("uncompressed_size_in_bytes", 0)
+            if selected and total + size > TARGET_SIZE_BYTES:
+                break
+            selected.append(e)
+            total += size
 
-                # Only combine if:
-                # 1. Total size is within memory limits
-                # 2. At least one file is below acceptable range
-                # 3. Combined size would benefit from splitting OR result is in acceptable range
-                if combined_size <= MAX_MEMORY_BYTES and (
-                    current["size"] < MIN_SIZE_BYTES
-                    or next_file["size"] < MIN_SIZE_BYTES
-                    or (current["max"] >= next_file["min"])  # Overlap exists
-                ):
-                    return {
-                        "type": "combine-split",
-                        "files": [current["entry"], next_file["entry"]],
-                        "reason": "overlapping-ranges",
-                        "sort_column": sort_column_name,
-                    }
+        if len(selected) < 2:
+            return None
+        return {
+            "type": "combine",
+            "mode": "brute",
+            "files": selected,
+            "reason": "small-file-brute",
+            "sort_column": sort_column_name,
+        }
 
-        # No overlaps found, check for small files to combine
-        small_files = [fr for fr in file_ranges if fr["size"] < SMALL_FILE_BYTES]
-        if len(small_files) >= 2:
-            # Combine adjacent small files
-            selected = []
-            total_size = 0
+    def _select_overlap_decluster(self, file_ranges, sort_column_name) -> Optional[dict]:
+        """Rule 3: among files at/above the floor, find a group whose sort-key
+        ranges OVERLAP, bound it so the combined size stays within the memory
+        gate, and emit a sort-aware ``combine-split``. The (streaming) executor
+        sorts the merged rows and splits them into k = ceil(combined / TARGET)
+        disjoint key ranges: k == 1 -> one file whose disjoint ranges are sorted
+        ROW GROUPS only (never a new file under target); k > 1 -> that many
+        disjoint-range FILES. Each call tightens one overlapping group; repeated
+        passes converge toward non-overlapping files.
 
-            for fr in small_files:
-                if total_size + fr["size"] <= MAX_MEMORY_BYTES:
-                    selected.append(fr["entry"])
-                    total_size += fr["size"]
-                    if total_size >= MIN_SIZE_BYTES:
-                        break
+        Overlap uses a STRICT test (``next.min < running_max``): files that
+        merely touch at a shared boundary value - the exact artifact of a prior
+        split on a tie - are NOT treated as overlapping, so declustering
+        converges instead of endlessly re-merging its own outputs.
 
-            if len(selected) >= 2:
+        The combined group is capped at DECLUSTER_MAX_COMBINED_BYTES, a
+        work-per-pass bound (NOT a memory bound): the streaming executor is
+        window-bounded, so declustering two overlapping ~4 GB files is fully
+        supported (combined 8 GB -> two disjoint ~4 GB files). A cluster larger
+        than the cap is declustered a chunk per pass and converges over passes.
+        """
+        try:
+            ordered = sorted(file_ranges, key=lambda fr: fr["min"])
+        except TypeError:
+            return None  # sort-key mins not mutually comparable
+
+        i = 0
+        m = len(ordered)
+        while i < m:
+            group = [ordered[i]]
+            running_max = ordered[i]["max"]
+            total = ordered[i]["size"]
+            j = i + 1
+            while j < m:
+                fr = ordered[j]
+                try:
+                    overlaps = fr["min"] < running_max
+                except TypeError:
+                    overlaps = False
+                if not overlaps:
+                    break
+                if total + fr["size"] > DECLUSTER_MAX_COMBINED_BYTES:
+                    break
+                group.append(fr)
+                try:
+                    if fr["max"] > running_max:
+                        running_max = fr["max"]
+                except TypeError:
+                    pass
+                total += fr["size"]
+                j += 1
+
+            if len(group) >= 2:
+                combined = sum(fr["size"] for fr in group)
+                k = max(1, -(-combined // TARGET_SIZE_BYTES))
                 return {
                     "type": "combine-split",
-                    "files": selected,
-                    "reason": "small-files",
+                    "mode": "sort-aware",
+                    "files": [fr["entry"] for fr in group],
+                    "reason": "overlap-decluster",
                     "sort_column": sort_column_name,
+                    "expected_outputs": k,
                 }
+            i += 1
+        return None
 
-        # No compaction opportunities
+    def _select_binpack(self, file_ranges, sort_column_name) -> Optional[dict]:
+        """Rule 1: reduce file count by packing CONSECUTIVE (in sort-key order),
+        already-disjoint MEDIUM files toward TARGET. Only unsettled files (below
+        MIN_SIZE_BYTES, the lower edge of the acceptable band) are packed; a file
+        already near target is left alone so packing converges.
+
+        Packing only *consecutive* files keeps the merged key range tight
+        (``[first.min, last.max]``), so the result stays disjoint from its
+        neighbours and does NOT manufacture new overlap for tier 2 to chase.
+        Combined stays <= TARGET, so the sort-aware merge yields a single sorted
+        output - no file over target (rule 1), and its disjoint ranges are
+        expressed as sorted row groups.
+        """
+        try:
+            ordered = sorted(file_ranges, key=lambda fr: fr["min"])
+        except TypeError:
+            return None
+
+        i = 0
+        m = len(ordered)
+        while i < m:
+            if ordered[i]["size"] >= MIN_SIZE_BYTES:
+                i += 1
+                continue  # already settled near target - leave alone
+            group = [ordered[i]]
+            total = ordered[i]["size"]
+            j = i + 1
+            while j < m:
+                fr = ordered[j]
+                if fr["size"] >= MIN_SIZE_BYTES:
+                    break  # settled file breaks the packable run
+                if total + fr["size"] > TARGET_SIZE_BYTES:
+                    break
+                group.append(fr)
+                total += fr["size"]
+                j += 1
+
+            if len(group) >= 2:
+                return {
+                    "type": "combine-split",
+                    "mode": "sort-aware",
+                    "files": [fr["entry"] for fr in group],
+                    "reason": "bin-pack",
+                    "sort_column": sort_column_name,
+                    "expected_outputs": 1,
+                }
+            i += 1
         return None
 
     def _reconcile_schemas(self, morsels: list) -> list:
@@ -429,6 +818,37 @@ class DatasetCompactor:
         plan_type = plan["type"]
         files_to_compact = plan["files"]
         sort_column = plan.get("sort_column")
+        # ``mode`` threads the merge kind through the plan: "brute" (rule 2 -
+        # concatenate, NO sort) vs "sort-aware" (rules 1 & 3 - sort + disjoint
+        # split). Brute plans are always type "combine" (single output, no
+        # streaming, no sort), but we gate on ``mode`` too so a brute plan can
+        # never trigger a sort regardless of type.
+        mode = plan.get("mode", "sort-aware")
+        sort_aware = mode != "brute"
+
+        # Prefer the streaming path for combine-split plans: it holds only ~one
+        # row group at a time (see the module comment above ROW_GROUP_TARGET_ROWS)
+        # so it has no ceiling on combined input size, whereas hold-everything is
+        # RAM-bound. Arrays used to be excluded (a rugo predicate-read filter_mask
+        # bug on ARRAY columns) but that is fixed as of rugo 0.4.17, so streaming
+        # is now the path for every combine-split with a resolvable sort column.
+        if sort_aware and sort_column and plan_type == "combine-split":
+            streamed = self._execute_compaction_streaming(all_entries, plan)
+            if streamed is not None:
+                return streamed
+            # Streaming declined or failed (e.g. couldn't resolve a usable sort
+            # column at execution time). Falling back to hold-everything is only
+            # safe when the combined input fits the RAM gate; a decluster group
+            # can now be far larger than RAM (that is the point of streaming), so
+            # for an oversized merge we ABORT this compaction - leaving the data
+            # intact for a later pass - rather than OOM by reading it all in.
+            combined_budget = sum(
+                e.get("uncompressed_size_in_bytes", 0) for e in files_to_compact
+            )
+            if combined_budget > MAX_SELECTED_BUDGET_BYTES:
+                return None
+            # Small enough to hold in memory - fall through to hold-everything
+            # rather than losing the compaction outright.
 
         from draken.morsels.morsel import Morsel
 
@@ -467,43 +887,93 @@ class DatasetCompactor:
         # Combine morsels
         combined = Morsel.combine(tables) if len(tables) > 1 else tables[0]
 
-        # Sort if performance mode
-        if sort_column and plan_type == "combine-split":
+        # Capture input stats now and release the input morsels. `combine` has
+        # produced its own concatenated buffers, so the per-file inputs are dead
+        # weight; freeing them here keeps peak RSS at ~one copy of the data
+        # instead of inputs + combined. These feed the deleted-* snapshot stats.
+        input_records = sum(t.num_rows for t in tables)
+        input_data_size = sum(t.nbytes for t in tables)
+        del tables
+
+        # Sort if performance mode. Prefer draken's native sort (rugo >=0.4.16):
+        # it computes the permutation in C (radix/stable) with no Python objects.
+        # The old path materialised the whole sort column via to_pylist() and
+        # sorted it in Python - a ~9 GB allocation at github.events scale.
+        #
+        # We keep only the permutation here and DO NOT apply a full take: a
+        # `combined.take(perm)` would materialise an entire second sorted copy
+        # (~2x peak). Instead each output slice is gathered on demand below via
+        # `combined.take(perm[lo:hi])`, so peak stays at ~combined + one output.
+        # The outcome is recorded in the snapshot (sort_status) - never silent.
+        sort_status = "skipped"
+        perm = None
+        if sort_aware and sort_column and plan_type == "combine-split":
+            ascending = True
+            if isinstance(self.sort_order, dict):
+                ascending = self.sort_order.get("ascending", True)
             try:
-                sort_values = combined.column(sort_column.encode("utf-8")).to_pylist()
-                order = sorted(range(len(sort_values)), key=lambda i: (sort_values[i] is None, sort_values[i]))
-                combined = combined.take(order)
+                from draken.morsels.sort import morsel_sort
+
+                perm = morsel_sort(combined, [sort_column], [ascending])
+                sort_status = "native"
+            except ImportError:
+                try:
+                    sort_values = combined.column(sort_column.encode("utf-8")).to_pylist()
+                    perm = sorted(
+                        range(len(sort_values)),
+                        key=lambda i: (sort_values[i] is None, sort_values[i]),
+                    )
+                    sort_status = "python-fallback"
+                except Exception:
+                    perm = None
+                    sort_status = "failed"
             except Exception:
-                # Sort failed, continue without sorting
-                pass
+                # Native sort raised on this data; leave output unsorted but
+                # record it rather than silently degrading.
+                perm = None
+                sort_status = "failed"
 
-        # Determine how to split
-        output_tables = []
-        if plan_type == "split" or (plan_type == "combine-split" and total_size > MAX_SIZE_BYTES):
-            # Split into multiple files, but at most MAX_MEMORY_FILES
-            output_tables = self._split_table(
-                combined, TARGET_SIZE_BYTES, max_files=MAX_MEMORY_FILES
-            )
-        else:
-            # Single output file
-            output_tables = [combined]
+        # Determine the output row ranges. ``combined`` is emitted in sorted
+        # order (via ``perm``), so slicing at row offsets yields output files with
+        # DISJOINT key ranges (bar a shared boundary value on ties) - this is what
+        # makes repeated compaction converge a scattered sort key instead of
+        # merging it into ever-wider union ranges.
+        #
+        # Choose the number of outputs k in the budget unit (uncompressed size),
+        # the SAME unit TARGET_SIZE_BYTES is expressed in. Do NOT derive k from
+        # table.nbytes: draken's in-memory nbytes and the manifest's
+        # uncompressed_size_in_bytes differ several-fold.
+        n = combined.num_rows
+        k = max(1, -(-total_size // TARGET_SIZE_BYTES))  # ceil(total / target)
+        split_ok = plan_type in ("split", "combine-split") and k > 1 and n >= k
+        ranges = self._split_ranges(n, k if split_ok else 1)
 
-        # Write new files and build manifest entries
+        # Write new files and build manifest entries. Each output is materialised
+        # on demand and dropped before the next, so peak stays at ~combined + one
+        # output rather than combined + a full sorted copy + all outputs.
+        from rugo.parquet import write_parquet
+
+        from ..iops.fileio import WRITE_PARQUET_OPTIONS
+
         new_entries = []
         snapshot_id = int(time.time() * 1000)
 
-        for idx, table in enumerate(output_tables):
+        for lo, hi in ranges:
+            if perm is not None:
+                # gather this slice's rows in sorted order (per-slice take)
+                part = combined.take(list(perm[lo:hi]))
+            elif len(ranges) == 1:
+                part = combined  # single unsorted output: no copy needed
+            else:
+                part = combined.slice(lo, hi - lo)
+
             # Generate collision-resistant file path using nanosecond precision timestamp and node id
             file_name = f"{time.time_ns():x}-{_NODE}.parquet"
             file_path = os.path.join(self.dataset.metadata.location, "data", file_name)
 
             # Write parquet file and upload (so we can reuse bytes)
             try:
-                from rugo.parquet import write_parquet
-
-                from ..iops.fileio import WRITE_PARQUET_OPTIONS
-
-                pdata = write_parquet(table, **WRITE_PARQUET_OPTIONS)
+                pdata = write_parquet(part, **WRITE_PARQUET_OPTIONS)
                 io = self.dataset.io
                 out = io.new_output(file_path).create()
                 out.write(pdata)
@@ -519,12 +989,39 @@ class DatasetCompactor:
                 pdata,
                 file_path,
                 len(pdata),
-                orig_morsel=table,
+                orig_morsel=part,
                 field_id_by_name=self.dataset._field_id_by_name(),
             )
             entry_dict = self._to_dict(entry_obj)
             new_entries.append(entry_dict)
 
+            # Drop this output before materialising the next.
+            if part is not combined:
+                del part
+            del pdata
+
+        return self._finalize_compaction_snapshot(
+            all_entries, files_to_compact, new_entries, snapshot_id,
+            input_records, input_data_size, sort_status,
+        )
+
+    def _finalize_compaction_snapshot(
+        self,
+        all_entries: List[dict],
+        files_to_compact: List[dict],
+        new_entries: List[dict],
+        snapshot_id: int,
+        input_records: int,
+        input_data_size: int,
+        sort_status: str,
+    ) -> Optional[Snapshot]:
+        """Shared tail for both execution paths (hold-everything and streaming):
+        prune/validate the surviving old entries, write the new manifest, compute
+        summary stats, and commit the snapshot. Neither execution path needs to
+        know about manifest/Firestore mechanics - they just produce
+        ``new_entries`` (already-built manifest dicts for the files they wrote)
+        and call this.
+        """
         # Create new manifest with updated entries
         # Remove old entries, add new entries
         # Also validate remaining entries - recover corrupted ones by reading files
@@ -567,14 +1064,9 @@ class DatasetCompactor:
         try:
             deleted_files = len(files_to_compact)
             deleted_size = 0
-            deleted_data_size = 0
-            deleted_records = 0
-
-            # Get actual stats from the tables we read
-            for table in tables:
-                deleted_records += table.num_rows
-                # Estimate data size from actual table
-                deleted_data_size += table.nbytes
+            # Input stats captured before the input morsels were freed.
+            deleted_records = input_records
+            deleted_data_size = input_data_size
 
             added_files = len(new_entries)
             added_size = sum(e.get("file_size_in_bytes", 0) for e in new_entries)
@@ -641,6 +1133,7 @@ class DatasetCompactor:
                     "compaction-algorithm-decision": self.decision,
                     "compaction-files-combined": deleted_files,
                     "compaction-files-written": added_files,
+                    "compaction-sort": sort_status,
                 },
             },
         )
@@ -661,6 +1154,389 @@ class DatasetCompactor:
             ) from e
 
         return snapshot
+
+    # --- Streaming execution (see the module comment above ROW_GROUP_TARGET_ROWS) ---
+
+    def _read_sort_column_combined(self, files_to_compact: List[dict], sort_column: str):
+        """Pass 1: project ONLY the sort column from every candidate file,
+        streaming row-group by row-group, and combine into one small morsel.
+        Cheap regardless of total merge size (measured: 60MB for 7.9M rows on
+        one column, vs 10GB+ for the same rows with all columns). Returns None
+        if any file can't be read (caller falls back to hold-everything).
+        """
+        from draken.morsels.morsel import Morsel
+        from rugo.parquet import read_parquet
+
+        parts = []
+        for entry in files_to_compact:
+            file_path = entry.get("file_path")
+            if not file_path:
+                return None
+            try:
+                with self.dataset.io.new_input(file_path).open() as f:
+                    data = f.read()
+                with read_parquet(bytes(data), columns=[sort_column]) as reader:
+                    parts.extend(reader)
+            except Exception:
+                return None
+        if not parts:
+            return None
+        return Morsel.combine(parts) if len(parts) > 1 else parts[0]
+
+    def _compute_chunk_groups(self, sorted_keys: list, ascending: bool) -> list:
+        """Turn the exact, fully sorted key sequence into an ordered list of
+        chunk-group descriptors for pass 2+. Each group is one of:
+
+          {"type": "nulls", "count": N}            - always first, if N>0
+          {"type": "range", "lo": v, "hi": v|None}  - half-open [lo,hi); hi=None
+                                                       for the final group (no
+                                                       upper bound needed)
+          {"type": "hot", "value": v}               - a single value whose run
+                                                       alone exceeds the hard cap
+
+        Boundaries snap to distinct-value edges so a predicate range never
+        needs to split a run of equal keys (predicates match by value, not row
+        position). Target ROW_GROUP_TARGET_ROWS per group; hard cap
+        ROW_GROUP_HARD_CAP_ROWS - if extending to the next distinct value would
+        exceed the cap, cut earlier instead (undershoot, never overshoot),
+        except for a single run that alone exceeds the cap, which becomes its
+        own "hot" group (pass 2+ falls back to row-count slicing for that one,
+        since no value-based predicate can split it further).
+        """
+        n = len(sorted_keys)
+        # draken's morsel_sort is NULLS-FIRST on ascending, NULLS-LAST on
+        # descending; nulls cluster entirely to one end either way. Bring them
+        # to logical position 0 regardless of sort direction (project policy,
+        # not draken's own semantics).
+        if ascending:
+            null_count = 0
+            while null_count < n and sorted_keys[null_count] is None:
+                null_count += 1
+            values = sorted_keys[null_count:]
+        else:
+            null_count = 0
+            while null_count < n and sorted_keys[n - 1 - null_count] is None:
+                null_count += 1
+            values = sorted_keys[: n - null_count] if null_count else sorted_keys
+
+        groups = []
+        if null_count > 0:
+            groups.append({"type": "nulls", "count": null_count})
+
+        m = len(values)
+        i = 0
+        while i < m:
+            run_end = i + 1
+            while run_end < m and values[run_end] == values[i]:
+                run_end += 1
+            run_len = run_end - i
+            if run_len > ROW_GROUP_HARD_CAP_ROWS:
+                # A single value spans more rows than one chunk can safely
+                # hold, and predicates can't slice within it - hand the whole
+                # run to the row-count-slicing fallback.
+                groups.append({"type": "hot", "value": values[i]})
+                i = run_end
+                continue
+
+            # Normal case: extend from i, snapping to run boundaries, until
+            # adding the next run would cross the hard cap.
+            j = run_end
+            count = run_len
+            while j < m:
+                next_end = j + 1
+                while next_end < m and values[next_end] == values[j]:
+                    next_end += 1
+                next_run_len = next_end - j
+                if count + next_run_len > ROW_GROUP_HARD_CAP_ROWS:
+                    break
+                j = next_end
+                count += next_run_len
+            hi = values[j] if j < m else None
+            groups.append({"type": "range", "lo": values[i], "hi": hi})
+            i = j
+
+        return groups
+
+    def _entry_field_idx(self, entry: dict, sort_field_id, sort_index):
+        """Resolve the sort column's positional index within one manifest
+        entry's stat lists (field-id keyed when available, else schema
+        position) - the same precedence used during selection."""
+        field_ids = entry.get("field_ids") or []
+        if sort_field_id is not None and sort_field_id in field_ids:
+            return field_ids.index(sort_field_id)
+        if sort_index is not None and sort_index < len(entry.get("min_values") or []):
+            return sort_index
+        return None
+
+    def _iter_group_morsels(
+        self, files_to_compact, sort_column, ascending, group, null_bearing_paths
+    ):
+        """Yield one or more sorted, <=ROW_GROUP_HARD_CAP_ROWS-row Morsels for
+        a single chunk group. Dispatches on group type:
+
+          range - one predicate read across all candidate files (row-group
+                  pruned), combine, native sort. Already <=hard-cap by
+                  construction (see _compute_chunk_groups), so always exactly
+                  one output morsel.
+          hot   - an exact `= value` predicate read (already row-filtered,
+                  no further per-row filtering needed - all matching rows
+                  share the one value, so any relative order among them is
+                  fine), flushed every ROW_GROUP_TARGET_ROWS rows by plain
+                  row-count slicing across possibly many output morsels.
+          nulls - no predicate can express IS NULL (confirmed: rugo raises on
+                  `col = None`, and value predicates never match null rows -
+                  SQL three-valued logic). Stream row groups from files known
+                  to carry nulls in this column, extract just the null rows via
+                  draken's own is_null()+filter_mask() per row group (safe:
+                  eligibility already excludes ARRAY columns), accumulate and
+                  flush at the same row-count cap.
+        """
+        from draken.morsels.morsel import Morsel
+        from draken.interop.vector_sequence import vector_from_sequence
+        from rugo.parquet import read_parquet
+
+        def sort_and_yield(morsel):
+            if morsel is None or morsel.num_rows == 0:
+                return
+            from draken.morsels.sort import morsel_sort
+
+            perm = morsel_sort(morsel, [sort_column], [ascending])
+            yield morsel.take(list(perm))
+
+        if group["type"] == "range":
+            parts = []
+            lo, hi = group["lo"], group["hi"]
+            preds = [(sort_column, ">=", lo)]
+            if hi is not None:
+                preds.append((sort_column, "<", hi))
+            for entry in files_to_compact:
+                file_path = entry.get("file_path")
+                with self.dataset.io.new_input(file_path).open() as f:
+                    data = f.read()
+                with read_parquet(bytes(data), predicates=preds) as reader:
+                    parts.extend(reader)
+            if parts:
+                combined = Morsel.combine(parts) if len(parts) > 1 else parts[0]
+                yield from sort_and_yield(combined)
+            return
+
+        if group["type"] == "hot":
+            value = group["value"]
+            preds = [(sort_column, "=", value)]
+            acc = []
+            acc_rows = 0
+            for entry in files_to_compact:
+                file_path = entry.get("file_path")
+                with self.dataset.io.new_input(file_path).open() as f:
+                    data = f.read()
+                with read_parquet(bytes(data), predicates=preds) as reader:
+                    for rg in reader:
+                        acc.append(rg)
+                        acc_rows += rg.num_rows
+                        while acc_rows >= ROW_GROUP_TARGET_ROWS:
+                            combined = Morsel.combine(acc) if len(acc) > 1 else acc[0]
+                            head = combined.slice(0, ROW_GROUP_TARGET_ROWS)
+                            tail_len = combined.num_rows - ROW_GROUP_TARGET_ROWS
+                            yield head
+                            acc = [combined.slice(ROW_GROUP_TARGET_ROWS, tail_len)] if tail_len else []
+                            acc_rows = tail_len
+            if acc_rows:
+                yield Morsel.combine(acc) if len(acc) > 1 else acc[0]
+            return
+
+        if group["type"] == "nulls":
+            acc = []
+            acc_rows = 0
+            for entry in files_to_compact:
+                file_path = entry.get("file_path")
+                if file_path not in null_bearing_paths:
+                    continue
+                with self.dataset.io.new_input(file_path).open() as f:
+                    data = f.read()
+                with read_parquet(bytes(data)) as reader:
+                    for rg in reader:
+                        col = rg.column(sort_column)
+                        mask_bytes = col.is_null()
+                        if not any(mask_bytes):
+                            continue
+                        mask = vector_from_sequence([bool(b) for b in mask_bytes], dtype="BOOL")
+                        nulls_only = rg.filter_mask(mask)
+                        if nulls_only.num_rows == 0:
+                            continue
+                        acc.append(nulls_only)
+                        acc_rows += nulls_only.num_rows
+                        while acc_rows >= ROW_GROUP_TARGET_ROWS:
+                            combined = Morsel.combine(acc) if len(acc) > 1 else acc[0]
+                            head = combined.slice(0, ROW_GROUP_TARGET_ROWS)
+                            tail_len = combined.num_rows - ROW_GROUP_TARGET_ROWS
+                            yield head
+                            acc = [combined.slice(ROW_GROUP_TARGET_ROWS, tail_len)] if tail_len else []
+                            acc_rows = tail_len
+            if acc_rows:
+                yield Morsel.combine(acc) if len(acc) > 1 else acc[0]
+            return
+
+    def _execute_compaction_streaming(self, all_entries: List[dict], plan: dict) -> Optional[Snapshot]:
+        """Three-pass streaming execution: project+sort the key column, derive
+        chunk groups, stream row-group-sized sorted chunks per group, and roll
+        them into target-sized output files via rugo's streaming writer
+        (`write_parquet_stream`, undocumented as of rugo 0.4.17 - flagged here
+        so it's easy to find when regression coverage lands upstream). Peak
+        memory is bounded by one chunk's size, independent of merge size.
+
+        Returns None (never raises) if anything about this path can't proceed,
+        so the caller can fall back to hold-everything.
+        """
+        plan_type = plan["type"]
+        files_to_compact = plan["files"]
+        sort_column = plan.get("sort_column")
+        if not sort_column or plan_type != "combine-split":
+            return None
+
+        ascending = True
+        if isinstance(self.sort_order, dict):
+            ascending = self.sort_order.get("ascending", True)
+
+        # Pass 1: exact global sort of the key column alone.
+        key_morsel = self._read_sort_column_combined(files_to_compact, sort_column)
+        if key_morsel is None or key_morsel.num_rows == 0:
+            return None
+        try:
+            from draken.morsels.sort import morsel_sort
+
+            perm = morsel_sort(key_morsel, [sort_column], [ascending])
+        except Exception:
+            return None
+        sorted_keys = key_morsel.take(list(perm)).column(sort_column).to_pylist()
+        n = len(sorted_keys)
+        del key_morsel, perm
+
+        groups = self._compute_chunk_groups(sorted_keys, ascending)
+        del sorted_keys
+        if not groups:
+            return None
+
+        # Which candidate files actually carry nulls in the sort column -
+        # lets the "nulls" group skip files that can't contribute (common
+        # case: most files have none). ``plan`` only carries the sort
+        # column's NAME, not its field_id/schema-index, so re-resolve those
+        # against the schema (self.sort_order is always a dict here: a
+        # combine-split plan only exists when performance-mode selection
+        # already normalized and resolved it).
+        try:
+            columns = self.dataset.schema().columns
+            _, sort_field_id, sort_index = self._resolve_sort_column(self.sort_order, columns)
+        except Exception:
+            sort_field_id, sort_index = None, None
+        null_bearing_paths = set()
+        for entry in files_to_compact:
+            idx = self._entry_field_idx(entry, sort_field_id, sort_index)
+            null_counts = entry.get("null_counts") or []
+            if idx is not None and idx < len(null_counts) and null_counts[idx]:
+                null_bearing_paths.add(entry.get("file_path"))
+            elif idx is None:
+                # Can't confirm zero nulls for this file - check it rather
+                # than risk silently dropping null rows.
+                null_bearing_paths.add(entry.get("file_path"))
+
+        total_size = sum(e.get("uncompressed_size_in_bytes", 0) for e in files_to_compact)
+        k = max(1, -(-total_size // TARGET_SIZE_BYTES))
+        target_rows_per_file = max(1, -(-n // k))
+
+        def master_chunks():
+            for group in groups:
+                yield from self._iter_group_morsels(
+                    files_to_compact, sort_column, ascending, group, null_bearing_paths
+                )
+
+        def file_chunk_source(gen, target_rows):
+            rows = 0
+            for chunk in gen:
+                yield chunk
+                rows += chunk.num_rows
+                if rows >= target_rows:
+                    return
+
+        def rechain(first, rest):
+            yield first
+            yield from rest
+
+        from rugo.parquet import write_parquet_stream
+
+        from ..iops.fileio import WRITE_PARQUET_OPTIONS
+
+        gen = master_chunks()
+        new_entries = []
+        snapshot_id = int(time.time() * 1000)
+        try:
+            while True:
+                sub = file_chunk_source(gen, target_rows_per_file)
+                first = next(sub, None)
+                if first is None:
+                    break
+                file_name = f"{time.time_ns():x}-{_NODE}.parquet"
+                file_path = os.path.join(self.dataset.metadata.location, "data", file_name)
+                out = self.dataset.io.new_output(file_path).create()
+                try:
+                    write_parquet_stream(rechain(first, sub), out.write, **WRITE_PARQUET_OPTIONS)
+                finally:
+                    out.close()
+
+                # Re-read the just-written file to compute manifest stats. This
+                # is the one place the streaming path re-materialises data -
+                # the COMPRESSED bytes of one output file (a few hundred MB at
+                # target size, not the multi-GB uncompressed dataset it
+                # replaces) - reusing build_parquet_manifest_entry_from_bytes's
+                # existing, correct, row-group-streaming stat computation
+                # rather than hand-rolling a parallel (and error-prone)
+                # incremental histogram/sketch merge.
+                with self.dataset.io.new_input(file_path).open() as f:
+                    written = f.read()
+                written = bytes(written)
+                entry_obj = build_parquet_manifest_entry_from_bytes(
+                    written,
+                    file_path,
+                    len(written),
+                    field_id_by_name=self.dataset._field_id_by_name(),
+                )
+                new_entries.append(self._to_dict(entry_obj))
+                del written
+        except Exception:
+            return None
+
+        if not new_entries:
+            return None
+
+        input_records = n
+        input_data_size = sum(e.get("uncompressed_size_in_bytes", 0) for e in files_to_compact)
+
+        return self._finalize_compaction_snapshot(
+            all_entries, files_to_compact, new_entries, snapshot_id,
+            input_records, input_data_size, "native",
+        )
+
+    def _split_ranges(self, n: int, k: int) -> list:
+        """The ``k`` (lo, hi) row ranges that partition ``n`` rows into near-equal
+        contiguous slices. ceil step, so at most ``k`` ranges are produced. Used
+        by both the per-slice output loop and _split_into_k so the two never
+        diverge on boundary arithmetic."""
+        if k <= 1 or n == 0:
+            return [(0, n)]
+        step = -(-n // k)
+        return [(off, min(off + step, n)) for off in range(0, n, step)]
+
+    def _split_into_k(self, table, k: int) -> list:
+        """Split a (sorted) Morsel into ``k`` slices of near-equal row count.
+
+        Slicing a key-sorted morsel at row offsets gives outputs with disjoint
+        key ranges (adjacent slices may share a single value where a run of
+        equal keys straddles a boundary). ``slice`` returns a view over the
+        parent buffer, so this holds no extra copy.
+        """
+        n = table.num_rows
+        if k <= 1 or n == 0:
+            return [table]
+        return [table.slice(lo, hi - lo) for lo, hi in self._split_ranges(n, k)]
 
     def _split_table(self, table, target_size: int, max_files: int = None) -> list:
         """
