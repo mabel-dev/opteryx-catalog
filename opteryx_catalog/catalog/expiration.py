@@ -21,11 +21,21 @@ from .metadata import Snapshot
 logger = logging.getLogger(__name__)
 
 # Memory management: limit snapshot processing to avoid excessive memory usage
-# when loading manifests for orphaned file detection
-MAX_SNAPSHOTS_FOR_ORPHAN_DETECTION = 100
+# when loading manifests for orphaned file detection. Kept well above a single
+# day's snapshot count for datasets on 15-minutely maintenance schedules
+# (~96/day) so same-day runs never trip it.
+MAX_SNAPSHOTS_FOR_ORPHAN_DETECTION = 2500
 
 # Manifest orphan cleanup: only delete manifest files older than this (ms)
 MANIFEST_ORPHAN_MIN_AGE_MS = 24 * 60 * 60 * 1000  # 1 day
+
+# Data-file deep-clean: a physical file must be at least this old before it's
+# eligible for deletion as "orphaned". Data files have no reliable
+# timestamp-in-filename convention (unlike manifests), so age comes from
+# storage object metadata; a file whose age can't be determined is treated as
+# not-old-enough. This guards against deleting a file that was just uploaded
+# by an in-flight append/compaction whose snapshot commit hasn't landed yet.
+DATA_FILE_ORPHAN_MIN_AGE_MS = MANIFEST_ORPHAN_MIN_AGE_MS
 
 
 class SnapshotExpiration:
@@ -149,7 +159,15 @@ class SnapshotExpiration:
                         else:
                             skipped_recent.append(m)
 
-                    if not eligible:
+                    # Full reconciliation for orphaned *data* files: the delta
+                    # method below has nothing to diff against here (no
+                    # snapshots are being deleted this run), so this is the
+                    # only path that can ever catch data files orphaned by a
+                    # past event (a run where detection was skipped, etc).
+                    kept_files = self._get_files_in_snapshots(snapshots_to_keep)
+                    full_orphans = self._find_full_orphaned_data_files(dataset, kept_files)
+
+                    if not eligible and not full_orphans:
                         return None
 
                     # For dry-run we should *not* delete anything; return a plan only.
@@ -163,14 +181,16 @@ class SnapshotExpiration:
                             "deleted_manifests": [],
                             "deleted_files": [],
                             "bytes_reclaimed": 0,
-                            "orphaned_files_count": 0,
+                            "orphaned_files_count": len(full_orphans),
+                            "data_files_to_delete": sorted(full_orphans),
                             "orphaned_manifests_count": len(eligible),
                             "manifests_to_delete": sorted(eligible),
                             "manifests_skipped_due_to_age": sorted(skipped_recent),
                             "orphan_detection_skipped": False,
                         }
 
-                    # Execute mode: perform deletion of eligible manifests and return a summary.
+                    # Execute mode: perform deletion of eligible manifests and
+                    # full-reconciliation orphaned data files, return a summary.
                     deleted = []
                     io = self.catalog.io or dataset.io
                     for m in eligible:
@@ -182,6 +202,14 @@ class SnapshotExpiration:
                             # Continue deleting what we can, but don't fail the whole op
                             pass
 
+                    deleted_data_files = []
+                    for f in full_orphans:
+                        try:
+                            if self._delete_file(io, f):
+                                deleted_data_files.append(f)
+                        except Exception as e:
+                            logger.error("Failed to delete orphaned data file %s: %s", f, e)
+
                     return {
                         "identifier": identifier,
                         "retention_days": retention_days,
@@ -189,9 +217,9 @@ class SnapshotExpiration:
                         "snapshots_to_keep": len(snapshots_to_keep),
                         "deleted_snapshots": [],
                         "deleted_manifests": deleted,
-                        "deleted_files": [],
+                        "deleted_files": deleted_data_files,
                         "bytes_reclaimed": 0,
-                        "orphaned_files_count": 0,
+                        "orphaned_files_count": len(deleted_data_files),
                         "orphaned_manifests_count": len(deleted),
                         "manifests_to_delete": sorted(eligible),
                         "manifests_skipped_due_to_age": sorted(skipped_recent),
@@ -237,10 +265,19 @@ class SnapshotExpiration:
                     kept_files = self._get_files_in_snapshots(snapshots_to_keep)
                     deleted_file_sizes = self._get_file_sizes_in_snapshots(snapshots_to_delete)
                     orphaned = set(deleted_file_sizes) - kept_files
+                    # Full reconciliation catches data files orphaned by any
+                    # past event, not just this run's condemned snapshots.
+                    full_orphans = self._find_full_orphaned_data_files(dataset, kept_files)
+                    orphaned = orphaned | full_orphans
                     summary["orphaned_files_count"] = len(orphaned)
+                    summary["data_files_to_delete"] = sorted(orphaned)
                     # Bytes that *would* be reclaimed, so a dry run reports the
-                    # same measure the execute path does.
-                    summary["bytes_reclaimed"] = sum(deleted_file_sizes[p] for p in orphaned)
+                    # same measure the execute path does. Full-reconciliation
+                    # orphans have no known size (physical listing carries no
+                    # stats), so they contribute 0 here.
+                    summary["bytes_reclaimed"] = sum(
+                        deleted_file_sizes.get(p, 0) for p in orphaned
+                    )
 
                     # Identify orphaned manifest files (storage manifests not referenced by any snapshot)
                     try:
@@ -470,6 +507,11 @@ class SnapshotExpiration:
             deleted_file_sizes = self._get_file_sizes_in_snapshots(snapshots_to_delete)
             orphaned_files = set(deleted_file_sizes) - kept_files
             orphaned_file_sizes = {p: deleted_file_sizes[p] for p in orphaned_files}
+            # Full reconciliation catches data files orphaned by any past
+            # event, not just this run's condemned snapshots (e.g. a prior
+            # run where orphan detection was skipped). No size info for
+            # these - orphaned_file_sizes.get() below defaults to 0.
+            orphaned_files |= self._find_full_orphaned_data_files(dataset, kept_files)
         else:
             logger.info(
                 "Skipping orphaned file detection for %s (%d snapshots to delete)",
@@ -548,10 +590,12 @@ class SnapshotExpiration:
             for file_path in orphaned_files:
                 try:
                     io = self.catalog.io or dataset.io
-                    self._delete_file(io, file_path)
-                    summary["deleted_files"].append(file_path)
-                    summary["bytes_reclaimed"] += orphaned_file_sizes.get(file_path, 0)
-                    logger.info("Deleted orphaned file %s", file_path)
+                    if self._delete_file(io, file_path):
+                        summary["deleted_files"].append(file_path)
+                        summary["bytes_reclaimed"] += orphaned_file_sizes.get(file_path, 0)
+                        logger.info("Deleted orphaned file %s", file_path)
+                    else:
+                        logger.warning("Failed to delete orphaned file %s", file_path)
                 except (ValueError, OSError) as e:
                     logger.error("Failed to delete orphaned file %s: %s", file_path, e)
         else:
@@ -596,7 +640,10 @@ class SnapshotExpiration:
                     file_path = entry.get("file_path")
                     if file_path:
                         files[file_path] = int(entry.get("file_size_in_bytes") or 0)
-            except (ValueError, OSError) as e:
+            except Exception as e:
+                # Broad on purpose: a corrupt/unreadable manifest (including
+                # native-decoder errors like RuntimeError) must not abort
+                # expiration for the whole dataset - skip it and move on.
                 logger.error("Error reading manifest %s: %s", snapshot.manifest_list, e)
 
         return files
@@ -612,6 +659,54 @@ class SnapshotExpiration:
             Set of file paths referenced in all manifests
         """
         return set(self._get_file_sizes_in_snapshots(snapshots))
+
+    def _find_full_orphaned_data_files(self, dataset, kept_files: Set[str]) -> Set[str]:
+        """
+        Full reconciliation: physical data files under the dataset location
+        that aren't referenced by any currently-kept snapshot.
+
+        Unlike the delta approach (`_get_files_in_snapshots` diffed against
+        this run's condemned snapshots), this catches files orphaned by any
+        past event - a run where orphan detection was skipped, a snapshot
+        removed some other way, etc. Manifest files themselves are excluded
+        here; those are handled separately by `get_orphaned_manifests` with
+        its own age gate.
+
+        A file whose storage age can't be determined, or that isn't at least
+        DATA_FILE_ORPHAN_MIN_AGE_MS old, is left alone - it may be mid-write
+        by an in-flight append/compaction whose snapshot commit hasn't landed.
+
+        Args:
+            dataset: Dataset object (used for its storage location)
+            kept_files: File paths referenced by all currently-retained snapshots
+
+        Returns:
+            Set of file paths safe to delete
+        """
+        try:
+            from .deep_clean import DatasetDeepClean
+
+            cleaner = DatasetDeepClean(self.catalog)
+            location = dataset.metadata.location
+            if not location:
+                return set()
+
+            physical = cleaner.get_all_physical_files(location)
+            candidates = {
+                f for f in physical if f not in kept_files and "/metadata/manifest-" not in f
+            }
+            if not candidates:
+                return set()
+
+            ages = cleaner.get_physical_file_ages_ms(location)
+            return {
+                f
+                for f in candidates
+                if ages.get(f, 0) >= DATA_FILE_ORPHAN_MIN_AGE_MS
+            }
+        except Exception as e:
+            logger.error("Error during full orphaned-data-file reconciliation: %s", e)
+            return set()
 
     def _delete_file(self, io, file_path: str) -> bool:
         """
