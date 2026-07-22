@@ -1239,6 +1239,14 @@ class SimpleDataset(Dataset):
 
             # distribution via distogram
             distribution = None
+            # A column with fewer distinct values than requested buckets doesn't have
+            # enough real data to fill `bins` slots -- interpolating across `bins`
+            # anyway manufactures empty/fractional buckets that don't correspond to
+            # any actual value. Only shrink using an exact cardinality: an estimate
+            # can undercount, and shrinking on it would truncate a wider distribution.
+            effective_bins = bins
+            if cardinality_is_exact and cardinality > 0:
+                effective_bins = min(bins, cardinality)
             if (
                 s["file_hist_infos"]
                 and global_min is not None
@@ -1252,7 +1260,7 @@ class SimpleDataset(Dataset):
                     from opteryx_catalog.maki_nage.distogram import merge as _merge_distogram
                     from opteryx_catalog.maki_nage.distogram import update as _update_distogram
 
-                    dist_bin_count = max(50, bins * 5)
+                    dist_bin_count = max(50, effective_bins * 5)
                     global_d = Distogram(bin_count=dist_bin_count)
                     for fmin, fmax, counts in s["file_hist_infos"]:
                         fbins = len(counts)
@@ -1270,16 +1278,16 @@ class SimpleDataset(Dataset):
                             _update_distogram(temp, float(rep), int(cnt))
                         global_d = _merge_distogram(global_d, temp)
 
-                    distribution = [0] * bins
+                    distribution = [0] * effective_bins
                     total = int(_count_dist(global_d) or 0)
                     if total == 0:
-                        distribution = [0] * bins
+                        distribution = [0] * effective_bins
                     else:
                         prev = 0.0
                         gmin = float(global_min)
                         gmax = float(global_max)
-                        for i in range(1, bins + 1):
-                            edge = gmin + (i / bins) * (gmax - gmin)
+                        for i in range(1, effective_bins + 1):
+                            edge = gmin + (i / effective_bins) * (gmax - gmin)
                             cum = _count_up_to(global_d, edge) or 0.0
                             distribution[i - 1] = int(round(cum - prev))
                             prev = cum
@@ -1287,7 +1295,7 @@ class SimpleDataset(Dataset):
                         if diff != 0:
                             distribution[-1] += diff
                 except Exception:
-                    distribution = [0] * bins
+                    distribution = [0] * effective_bins
                     gspan = float(global_max - global_min)
                     for fmin, fmax, counts in s["file_hist_infos"]:
                         fbins = len(counts)
@@ -1297,11 +1305,11 @@ class SimpleDataset(Dataset):
                             if cnt <= 0:
                                 continue
                             rep = fmin + (bi + 0.5) * (fmax - fmin) / fbins
-                            gi = int((rep - global_min) / gspan * bins)
+                            gi = int((rep - global_min) / gspan * effective_bins)
                             if gi < 0:
                                 gi = 0
-                            if gi >= bins:
-                                gi = bins - 1
+                            if gi >= effective_bins:
+                                gi = effective_bins - 1
                             distribution[gi] += int(cnt)
 
             res = {
