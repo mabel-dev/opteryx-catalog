@@ -283,3 +283,42 @@ class GcsFileIO(FileIO):
 
     # alias
     ls = list_files
+
+    def list_files_with_age_ms(self, prefix: str) -> dict:
+        """List files under a prefix along with each object's age in ms.
+
+        Used to safety-gate destructive orphan cleanup: a data file can be
+        uploaded to storage moments before its snapshot's manifest commit
+        lands, so a file must be old enough that it can't still be
+        mid-write before it's eligible for deletion (mirrors the age check
+        already applied to orphaned manifest files).
+
+        Returns {uri: age_ms}. An object whose creation time can't be
+        determined is omitted rather than guessed, so callers treat it as
+        "not provably old enough" and leave it alone.
+        """
+        try:
+            if prefix and prefix.startswith("gs://"):
+                import time as _time
+
+                from google.cloud import storage
+
+                _, rest = prefix.split("://", 1)
+                parts = rest.split("/", 1)
+                bucket_name = parts[0]
+                object_prefix = parts[1] if len(parts) > 1 else ""
+
+                client = storage.Client()
+                blobs = client.list_blobs(bucket_name, prefix=object_prefix)
+                now_ms = int(_time.time() * 1000)
+                ages = {}
+                for b in blobs:
+                    if b.time_created is None:
+                        continue
+                    uri = f"gs://{bucket_name}/{b.name}"
+                    ages[uri] = now_ms - int(b.time_created.timestamp() * 1000)
+                return ages
+        except Exception:
+            return {}
+
+        return {}

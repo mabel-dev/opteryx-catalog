@@ -87,9 +87,12 @@ def test_deep_clean_uses_io_list_files():
     from types import SimpleNamespace
     from opteryx_catalog.iops.gcs import GcsFileIO
 
-    # fake catalog with GcsFileIO instance (avoid __init__ side effects)
+    # fake catalog with GcsFileIO instance (avoid __init__ side effects).
+    # get_all_physical_files normalizes the prefix to end with "/" before
+    # listing (a path-boundary guard against e.g. "tweets" prefix-matching
+    # "tweets_512"), so the fake mimics a real listing off that prefix.
     fake_io = object.__new__(GcsFileIO)
-    fake_io.list_files = lambda prefix: [f"{prefix}/a", f"{prefix}/b"]
+    fake_io.list_files = lambda prefix: [f"{prefix}a", f"{prefix}b"]
 
     fake_catalog = SimpleNamespace(io=fake_io)
     cleaner = DatasetDeepClean(fake_catalog)

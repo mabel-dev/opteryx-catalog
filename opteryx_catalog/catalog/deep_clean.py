@@ -185,19 +185,28 @@ class DatasetDeepClean:
 
     def get_all_manifest_files(self, snapshots: List) -> Set[str]:
         """
-        Get all files referenced in any snapshot manifest.
+        Get all files referenced in any snapshot manifest, plus the manifest
+        files themselves.
+
+        `clean_dataset` diffs this set against *every* physical file under the
+        dataset location, which includes the `metadata/manifest-*.parquet`
+        objects - so a live manifest file must be counted as "referenced" here
+        or it gets misidentified as orphaned and deleted out from under its
+        still-retained snapshot.
 
         Args:
             snapshots: List of Snapshot objects
 
         Returns:
-            Set of all file paths from all manifests
+            Set of all file paths from all manifests, plus each manifest's own path
         """
         manifest_files = set()
 
         for snapshot in snapshots:
             if not snapshot.manifest_list:
                 continue
+
+            manifest_files.add(snapshot.manifest_list)
 
             try:
                 io = self.catalog.io
@@ -228,6 +237,14 @@ class DatasetDeepClean:
         """
         physical_files = set()
 
+        # GCS (and similar) prefix listing is a raw string match, not a path-
+        # boundary match: an un-slashed prefix like ".../test/tweets" also
+        # matches ".../test/tweets_512/..." and pulls in an unrelated
+        # dataset's files as false-positive "orphans". Force a trailing
+        # separator so only true children of this dataset's location match.
+        if dataset_location and not dataset_location.endswith("/"):
+            dataset_location = dataset_location + "/"
+
         try:
             io = self.catalog.io
             if not io:
@@ -257,6 +274,32 @@ class DatasetDeepClean:
             logger.error(f"Error listing physical files in {dataset_location}: {e}")
             return physical_files
 
+    def get_physical_file_ages_ms(self, dataset_location: str) -> Dict[str, int]:
+        """
+        Get the age (in ms) of each physical file in dataset storage.
+
+        Best-effort: returns {} when the attached FileIO can't report object
+        creation times, so callers must treat a missing entry as "age
+        unknown" and skip that file rather than assume it's safe to delete.
+
+        Args:
+            dataset_location: Base path of dataset (e.g., gs://bucket/dataset)
+
+        Returns:
+            Dict of file path -> age in milliseconds
+        """
+        if dataset_location and not dataset_location.endswith("/"):
+            dataset_location = dataset_location + "/"
+
+        try:
+            io = self.catalog.io
+            if not io or not hasattr(io, "list_files_with_age_ms"):
+                return {}
+            return io.list_files_with_age_ms(dataset_location) or {}
+        except (ValueError, OSError, AttributeError) as e:
+            logger.error(f"Error listing physical file ages in {dataset_location}: {e}")
+            return {}
+
     def _execute_cleanup(self, orphaned_files: Set[str], dataset, summary: Dict) -> Dict:
         """
         Execute deletion of orphaned files.
@@ -274,10 +317,12 @@ class DatasetDeepClean:
 
         for file_path in orphaned_files:
             try:
-                self._delete_file(io, file_path)
-                summary["deleted_files"].append(file_path)
-                deleted_count += 1
-                logger.info(f"Deleted orphaned file: {file_path}")
+                if self._delete_file(io, file_path):
+                    summary["deleted_files"].append(file_path)
+                    deleted_count += 1
+                    logger.info(f"Deleted orphaned file: {file_path}")
+                else:
+                    logger.warning(f"Failed to delete orphaned file: {file_path}")
             except (ValueError, OSError) as e:
                 logger.error(f"Failed to delete {file_path}: {e}")
 
