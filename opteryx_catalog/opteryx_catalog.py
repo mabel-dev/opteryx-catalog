@@ -360,6 +360,7 @@ class OpteryxCatalog(Metastore):
             summary=sd.get("summary", {}),
             operation_type=sd.get("operation-type"),
             parent_snapshot_id=sd.get("parent-snapshot-id"),
+            commit_message=sd.get("commit-message"),
         )
 
     def _schema_entry_from_doc(self, sdoc) -> dict:
