@@ -44,9 +44,23 @@ def dataset_created_payload(
     return payload
 
 
-def dataset_deleted_payload() -> dict[str, Any]:
-    """Build payload for dataset deletion event."""
-    return {}
+def dataset_deleted_payload(
+    location: Optional[str] = None,
+    dropped_by: Optional[str] = None,
+) -> dict[str, Any]:
+    """Build payload for dataset deletion event.
+
+    Args:
+        location: GCS location whose files are now awaiting reclamation
+        dropped_by: identity that dropped the dataset
+
+    Returns:
+        Payload dictionary describing the deletion
+    """
+    return {
+        "location": location,
+        "dropped_by": dropped_by,
+    }
 
 
 def dataset_updated_payload(
@@ -128,9 +142,16 @@ def view_created_payload(
     }
 
 
-def view_deleted_payload() -> dict[str, Any]:
-    """Build payload for view deletion event."""
-    return {}
+def view_deleted_payload(dropped_by: Optional[str] = None) -> dict[str, Any]:
+    """Build payload for view deletion event.
+
+    Args:
+        dropped_by: identity that dropped the view
+
+    Returns:
+        Payload dictionary describing the deletion
+    """
+    return {"dropped_by": dropped_by}
 
 
 def view_updated_payload(

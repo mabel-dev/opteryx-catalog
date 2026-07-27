@@ -20,9 +20,17 @@ from .exceptions import DatasetNotFound
 from .exceptions import ViewAlreadyExists
 from .exceptions import ViewNotFound
 from .iops.base import FileIO
+from .audit import emit_audit
 from .webhooks import send_webhook
 from .webhooks.events import dataset_created_payload
+from .webhooks.events import dataset_deleted_payload
 from .webhooks.events import view_created_payload
+from .webhooks.events import view_deleted_payload
+
+# Workspace-level document holding drop tombstones. The `$` prefix keeps it out of
+# `list_collections()`, which filters `$`-prefixed documents, so tombstones are
+# invisible to normal catalog enumeration.
+DROPPED_DOC = "$dropped"
 
 
 def _core_type_to_stored(column_type: Any) -> tuple:
@@ -186,6 +194,20 @@ class OpteryxCatalog(Metastore):
     def _view_doc_ref(self, collection: str, view_name: str):
         return self._views_collection(collection).document(view_name)
 
+    def _tombstones_collection(self):
+        """Subcollection of drop tombstones for this workspace."""
+        return self._catalog_ref.document(DROPPED_DOC).collection("datasets")
+
+    @staticmethod
+    def _delete_subcollection(coll_ref) -> None:
+        """Delete every document in a subcollection.
+
+        Firestore does not cascade: deleting a document leaves its subcollections
+        addressable but unreachable, so each one must be emptied explicitly.
+        """
+        for doc in coll_ref.stream():
+            coll_ref.document(doc.id).delete()
+
     def create_dataset(
         self, identifier: str, schema: Any, properties: dict | None = None, author: str = None
     ) -> SimpleDataset:
@@ -279,6 +301,16 @@ class OpteryxCatalog(Metastore):
                 location=location,
                 properties=properties,
             ),
+        )
+
+        emit_audit(
+            "create_dataset",
+            resource_type="dataset",
+            workspace=self.workspace,
+            collection=collection,
+            resource=dataset_name,
+            author=author,
+            location=location,
         )
 
         # Return SimpleDataset (attach this catalog so append() can persist)
@@ -474,14 +506,87 @@ class OpteryxCatalog(Metastore):
 
         return SimpleDataset(identifier=identifier, _metadata=metadata, io=self.io, catalog=self)
 
-    def drop_dataset(self, identifier: str) -> None:
+    def drop_dataset(self, identifier: str, author: str = None) -> None:
+        """Drop a dataset, leaving a tombstone so its files can be reclaimed.
+
+        Dropping removes the dataset from the catalog immediately, which also
+        removes it from `list_datasets()` - and the expiration job only visits
+        datasets it can still list. Without a record of the location, the files
+        under it would be unreachable by any later sweep. The tombstone is that
+        record; see `list_dropped_datasets()`.
+        """
         collection, dataset_name = identifier.split(".")
-        # Delete snapshots
-        snaps_coll = self._snapshots_collection(collection, dataset_name)
-        for doc in snaps_coll.stream():
-            snaps_coll.document(doc.id).delete()
-        # Delete dataset doc
-        self._dataset_doc_ref(collection, dataset_name).delete()
+        doc_ref = self._dataset_doc_ref(collection, dataset_name)
+        doc = doc_ref.get()
+        if not doc.exists:
+            # Nothing to drop, so nothing to reclaim and nothing to announce.
+            return
+
+        location = (doc.to_dict() or {}).get("location")
+
+        # Tombstone FIRST: a failure between here and the final delete leaves a
+        # reclaimable record, whereas the reverse order would leak the location.
+        self._write_tombstone(
+            collection=collection,
+            dataset_name=dataset_name,
+            location=location,
+            author=author,
+        )
+
+        self._delete_subcollection(self._snapshots_collection(collection, dataset_name))
+        self._delete_subcollection(doc_ref.collection("schemas"))
+        doc_ref.delete()
+
+        send_webhook(
+            action="delete",
+            workspace=self.workspace,
+            collection=collection,
+            resource_type="dataset",
+            resource_name=dataset_name,
+            payload=dataset_deleted_payload(location=location, dropped_by=author),
+        )
+
+        emit_audit(
+            "drop_dataset",
+            resource_type="dataset",
+            workspace=self.workspace,
+            collection=collection,
+            resource=dataset_name,
+            author=author,
+            location=location,
+        )
+
+    def _write_tombstone(
+        self, collection: str, dataset_name: str, location: Optional[str], author: Optional[str]
+    ) -> None:
+        """Record a dropped dataset's storage location for later reclamation."""
+        self._tombstones_collection().document(f"{collection}.{dataset_name}").set(
+            {
+                "name": dataset_name,
+                "collection": collection,
+                "workspace": self.workspace,
+                "location": location,
+                "dropped-at-ms": int(time.time() * 1000),
+                "dropped-by": author,
+            }
+        )
+
+    def list_dropped_datasets(self) -> List[dict]:
+        """Tombstones for datasets dropped from this workspace.
+
+        Each entry carries `location` (the storage prefix whose files are now
+        unreferenced), `dropped-at-ms` and `dropped-by`. Consumed by the
+        expiration job, which reclaims the files and then calls
+        `delete_tombstone()`.
+        """
+        return [
+            {**(doc.to_dict() or {}), "id": doc.id}
+            for doc in self._tombstones_collection().stream()
+        ]
+
+    def delete_tombstone(self, tombstone_id: str) -> None:
+        """Remove a tombstone once its storage location has been reclaimed."""
+        self._tombstones_collection().document(tombstone_id).delete()
 
     def list_datasets(self, collection: str) -> Iterable[str]:
         coll = self._datasets_collection(collection)
@@ -522,6 +627,14 @@ class OpteryxCatalog(Metastore):
                 "author": author,
                 "annotations": [],
             }
+        )
+
+        emit_audit(
+            "create_collection",
+            resource_type="collection",
+            workspace=self.workspace,
+            resource=collection,
+            author=author,
         )
 
     def create_collection_if_not_exists(
@@ -646,6 +759,16 @@ class OpteryxCatalog(Metastore):
             ),
         )
 
+        emit_audit(
+            "update_view" if update_if_exists else "create_view",
+            resource_type="view",
+            workspace=self.workspace,
+            collection=collection,
+            resource=view_name,
+            author=author,
+            statement_id=statement_id,
+        )
+
         # Return a simple CatalogView wrapper
         v = CatalogView(name=view_name, definition=sql, properties=properties or {})
         # provide convenient attributes used by docs/examples
@@ -706,18 +829,41 @@ class OpteryxCatalog(Metastore):
         setattr(v, "_identifier", f"{collection}.{view_name}")
         return v
 
-    def drop_view(self, identifier: str | tuple) -> None:
+    def drop_view(self, identifier: str | tuple, author: str = None) -> None:
+        """Drop a view.
+
+        No tombstone: a view owns no storage, so dropping it leaves nothing to
+        reclaim - unlike `drop_dataset`.
+        """
         if isinstance(identifier, tuple) or isinstance(identifier, list):
             collection, view_name = identifier[0], identifier[1]
         else:
             collection, view_name = identifier.split(".")
 
         doc_ref = self._view_doc_ref(collection, view_name)
-        # delete statement subcollection
-        for d in doc_ref.collection("statement").stream():
-            doc_ref.collection("statement").document(d.id).delete()
+        if not doc_ref.get().exists:
+            return
 
+        self._delete_subcollection(doc_ref.collection("statement"))
         doc_ref.delete()
+
+        send_webhook(
+            action="delete",
+            workspace=self.workspace,
+            collection=collection,
+            resource_type="view",
+            resource_name=view_name,
+            payload=view_deleted_payload(dropped_by=author),
+        )
+
+        emit_audit(
+            "drop_view",
+            resource_type="view",
+            workspace=self.workspace,
+            collection=collection,
+            resource=view_name,
+            author=author,
+        )
 
     def list_views(self, collection: str) -> Iterable[str]:
         coll = self._views_collection(collection)

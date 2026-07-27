@@ -14,7 +14,10 @@ def test_list_collections_excludes_properties():
     c.workspace = "w"
 
     class MockColl:
-        def stream(self):
+        # list_documents(), not stream(): a collection document that exists only
+        # as the parent of subcollections holds no fields of its own and so is
+        # invisible to stream(). Listing must not depend on it having any.
+        def list_documents(self):
             return [_Doc("$properties"), _Doc("col_a"), _Doc("col_b")]
 
     c._catalog_ref = MockColl()
@@ -29,8 +32,10 @@ def test_list_collections_handles_errors():
     c.workspace = "w"
 
     class BadColl:
-        def stream(self):
-            raise RuntimeError("boom")
+        # ValueError, not RuntimeError: list_collections() only tolerates
+        # (ValueError, KeyError, AttributeError) - anything else propagates.
+        def list_documents(self):
+            raise ValueError("boom")
 
     c._catalog_ref = BadColl()
 
