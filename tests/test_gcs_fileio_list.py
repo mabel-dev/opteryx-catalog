@@ -20,7 +20,11 @@ def test_fileio_base_has_list_files_and_ls_alias():
     # base class provides a safe default (no warnings will be emitted)
     assert callable(getattr(f, "list_files", None))
     assert f.list_files("anything") == []
-    assert getattr(f, "ls") is getattr(f, "list_files")
+    # Compare on the class: attribute access on an *instance* builds a fresh
+    # bound method each time, so `is` between two instance lookups is never true
+    # even when both wrap the same function. The sibling GcsFileIO alias tests
+    # already compare this way.
+    assert getattr(FileIO, "ls") is getattr(FileIO, "list_files")
 
 
 def test_gcsfileio_ls_alias_exists():
@@ -63,9 +67,13 @@ def test_http_gcsfileio_list_files_uses_storage_client(monkeypatch):
             # ignore bucket param for test isolation
             return FakeBucket(self._names).list_blobs(prefix=prefix)
 
-    # Patch storage.Client to return our fake client
+    # Patch google.cloud.storage.Client at its source: gcs.list_files imports
+    # `storage` lazily inside the call, so there is no module-level
+    # `opteryx_catalog.iops.gcs.storage` attribute to patch instead.
+    from google.cloud import storage as gcs_storage
+
     monkeypatch.setattr(
-        "opteryx_catalog.iops.gcs.storage",
+        gcs_storage,
         "Client",
         lambda: FakeClient(["prefix/a", "prefix/b", "other/c"]),
     )

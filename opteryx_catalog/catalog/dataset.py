@@ -6,6 +6,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Optional
 
+from ..audit import emit_audit
 from .manifest import (
     ParquetManifestEntry,
     build_parquet_manifest_entry_from_bytes,
@@ -454,6 +455,28 @@ class SimpleDataset(Dataset):
             self.catalog.save_snapshot(self.identifier, snap)
         if self.catalog and hasattr(self.catalog, "save_dataset_metadata"):
             self.catalog.save_dataset_metadata(self.identifier, self.metadata)
+
+        self._emit_audit(
+            "append",
+            author=author,
+            snapshot_id=snapshot_id,
+            record_count=recs,
+            files_added=added_data_files,
+            bytes_added=added_files_size,
+        )
+
+    def _emit_audit(self, action: str, *, author: Optional[str], **detail: Any) -> None:
+        """Record a data-changing operation against this dataset."""
+        collection, _, name = self.identifier.partition(".")
+        emit_audit(
+            action,
+            resource_type="dataset",
+            workspace=getattr(self.catalog, "workspace", None),
+            collection=collection,
+            resource=name or None,
+            author=author,
+            **detail,
+        )
 
     def _write_table_and_build_entry(self, table: Any):
         """Write a draken Morsel to storage and return a ParquetManifestEntry.
@@ -1635,3 +1658,11 @@ class SimpleDataset(Dataset):
 
         if self.catalog and hasattr(self.catalog, "save_snapshot"):
             self.catalog.save_snapshot(self.identifier, snap)
+
+        self._emit_audit(
+            "truncate",
+            author=author,
+            snapshot_id=snapshot_id,
+            files_removed=deleted_count,
+            bytes_removed=removed_total_size,
+        )

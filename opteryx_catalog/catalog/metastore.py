@@ -23,7 +23,10 @@ class Metastore:
     ) -> "Dataset":
         raise NotImplementedError()
 
-    def drop_dataset(self, identifier: str) -> None:
+    def drop_dataset(self, identifier: str, author: str = None) -> None:
+        raise NotImplementedError()
+
+    def drop_view(self, identifier: str, author: str = None) -> None:
         raise NotImplementedError()
 
     def list_datasets(self, namespace: str) -> Iterable[str]:
