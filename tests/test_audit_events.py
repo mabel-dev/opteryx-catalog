@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 
 from unittest.mock import patch
 
@@ -66,7 +67,8 @@ def test_records_who_and_what(capsys):
     assert record["identifier"] == "coll.tbl"
     assert record["author"] == "alice"
     assert record["detail"]["location"] == "gs://bucket/ws/coll/tbl"
-    assert isinstance(record["timestamp_ms"], int)
+    # an ISO-8601 instant, not epoch ticks
+    assert datetime.fromisoformat(record["event_time"]).tzinfo is not None
 
 
 def test_unattributed_change_is_visibly_unattributed(capsys):
@@ -84,7 +86,7 @@ def test_avoids_cloud_logging_reserved_timestamp_keys(capsys):
     record = _emitted(capsys)[0]
     assert "timestamp" not in record
     assert "time" not in record
-    assert "timestamp_ms" in record
+    assert "event_time" in record
 
 
 def test_non_serialisable_detail_does_not_break_the_caller(capsys):
@@ -213,11 +215,24 @@ def test_write_audit_record_relocates_other_reserved_keys(capsys):
     assert record["kept"] == 1
 
 
-def test_write_audit_record_adds_timestamp_ms(capsys):
+def test_write_audit_record_adds_iso_event_time(capsys):
     from opteryx_catalog.audit import write_audit_record
 
     write_audit_record({"job": "x"})
-    assert isinstance(_emitted(capsys)[0]["timestamp_ms"], int)
+    event_time = _emitted(capsys)[0]["event_time"]
+
+    # a parseable, timezone-aware ISO-8601 instant - not epoch ticks
+    assert isinstance(event_time, str)
+    assert datetime.fromisoformat(event_time).tzinfo is not None
+
+
+def test_event_time_is_never_epoch_ticks(capsys):
+    """The whole point of the rename: a reader should not have to know the unit."""
+    emit_audit("drop_dataset", resource_type="dataset", workspace="ws", resource="t")
+    event_time = _emitted(capsys)[0]["event_time"]
+
+    assert not isinstance(event_time, (int, float))
+    assert event_time.startswith("2")  # "2026-..." not "1785166..."
 
 
 def test_write_audit_record_respects_disable(capsys, monkeypatch):

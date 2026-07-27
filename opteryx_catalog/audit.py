@@ -29,7 +29,8 @@ from __future__ import annotations
 import json
 import os
 import sys
-import time
+from datetime import datetime
+from datetime import timezone
 from typing import Any
 from typing import Optional
 
@@ -46,6 +47,16 @@ _GCP_RESERVED_KEYS = frozenset(
     {"time", "timestamp", "httpRequest", "trace", "spanId", "traceSampled"}
 )
 _GCP_RESERVED_PREFIX = "logging.googleapis.com/"
+
+# Our own emission time, as an ISO-8601 instant rather than epoch ticks. It
+# cannot be called `timestamp` or `time`: those are exactly the keys Cloud
+# Logging lifts onto the LogEntry and deletes from the payload.
+EVENT_TIME_KEY = "event_time"
+
+
+def _now_iso() -> str:
+    """Current UTC instant, e.g. 2026-07-27T15:40:02.583478+00:00."""
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _relocate_reserved(payload: dict) -> dict:
@@ -73,7 +84,7 @@ def write_audit_record(payload: dict) -> None:
     record = _relocate_reserved(payload)
     # Ours wins: the discriminator is not the caller's to set.
     record["severity"] = AUDIT_SEVERITY
-    record.setdefault("timestamp_ms", int(time.time() * 1000))
+    record.setdefault(EVENT_TIME_KEY, _now_iso())
     _write(record)
 
 
@@ -120,9 +131,7 @@ def emit_audit(
         "resource": resource,
         "identifier": identifier or None,
         "author": author,
-        # Not "timestamp"/"time": Cloud Logging promotes those onto the entry and
-        # removes them from the payload, taking the field out of json_payload.
-        "timestamp_ms": int(time.time() * 1000),
+        EVENT_TIME_KEY: _now_iso(),
         "message": f"{action} {qualified} by {author or 'unknown'}",
     }
     if detail:
