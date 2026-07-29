@@ -1539,13 +1539,30 @@ class SimpleDataset(Dataset):
 
         return snapshot_id
 
-    def truncate(self, author: str = None, commit_message: Optional[str] = None) -> None:
+    def truncate(
+        self,
+        author: str = None,
+        commit_message: Optional[str] = None,
+        commit_truncation: bool = False,
+    ) -> None:
         """Delete all data files and manifests for this dataset.
 
         This attempts to delete every data file referenced by existing
         Parquet manifests and then delete the manifest files themselves.
         Finally it clears the in-memory snapshot list and persists the
         empty snapshot set via the attached `catalog` (if available).
+
+        `commit_truncation` defaults to `False`, which preserves this
+        method's existing behavior: the new snapshot is saved via
+        `save_snapshot`, but the dataset document's `current-snapshot-id`
+        pointer is NOT updated via `save_dataset_metadata`, so a fresh
+        `load_dataset()` will still return the pre-truncate snapshot.
+        This default is kept for backward compatibility with callers that
+        rely on the current semantics (e.g. performing further in-memory
+        mutations before a single final metadata save). Pass
+        `commit_truncation=True` to also persist the updated dataset
+        metadata immediately, so the truncation is visible to a subsequent
+        `load_dataset()` call.
         """
         from .manifest import read_manifest_rows
 
@@ -1658,6 +1675,8 @@ class SimpleDataset(Dataset):
 
         if self.catalog and hasattr(self.catalog, "save_snapshot"):
             self.catalog.save_snapshot(self.identifier, snap)
+        if commit_truncation and self.catalog and hasattr(self.catalog, "save_dataset_metadata"):
+            self.catalog.save_dataset_metadata(self.identifier, self.metadata)
 
         self._emit_audit(
             "truncate",
