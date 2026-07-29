@@ -728,6 +728,7 @@ class SimpleDataset(Dataset):
         added_records = 0
         # Sum statistics from new entries
         for entry in new_entries:
+            added_files_size += entry.get("file_size_in_bytes", 0)
             added_data_size += entry.get("uncompressed_size_in_bytes", 0)
             added_records += entry.get("record_count", 0)
         deleted_data_files = 0
@@ -915,6 +916,7 @@ class SimpleDataset(Dataset):
         added_records = 0
         # Sum statistics from new entries
         for entry in new_entries:
+            added_files_size += entry.get("file_size_in_bytes", 0)
             added_data_size += entry.get("uncompressed_size_in_bytes", 0)
             added_records += entry.get("record_count", 0)
 
