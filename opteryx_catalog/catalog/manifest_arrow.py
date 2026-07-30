@@ -24,14 +24,15 @@ from .manifest import read_manifest_columns
 logger = logging.getLogger(__name__)
 
 # Columns whose whole-column native draken Vector the planner reduces with
-# native kernels (KMV NDV, histogram fold, exact-set membership) rather than the
-# per-file boxed lists. Retained by get_arrow_manifest alongside the boxed data.
-_SKETCH_VECTOR_COLUMNS = ("min_k_hashes", "histogram_counts")
+# native kernels (KMV NDV, histogram fold, exact-set membership, char-class
+# fold) rather than the per-file boxed lists. Retained by get_arrow_manifest
+# alongside the boxed data.
+_SKETCH_VECTOR_COLUMNS = ("min_k_hashes", "histogram_counts", "char_class_counts")
 
 # Cache configuration. Each entry is ``({column_name: [values...]}, row_count, sketch_vectors)``.
 # Note: entries now also pin the native sketch vectors (min_k_hashes /
-# histogram_counts) per manifest, so a cached entry holds that manifest's sketch
-# buffers alongside the boxed columns until evicted.
+# histogram_counts / char_class_counts) per manifest, so a cached entry holds
+# that manifest's sketch buffers alongside the boxed columns until evicted.
 ARROW_MANIFEST_CACHE_SIZE: int = 32
 _arrow_manifest_cache: "OrderedDict[str, tuple]" = OrderedDict()
 

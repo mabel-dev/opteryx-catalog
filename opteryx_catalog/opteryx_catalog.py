@@ -1016,8 +1016,6 @@ class OpteryxCatalog(Metastore):
                 "histogram_bins": "INTEGER",
                 "min_values": "ARRAY",
                 "max_values": "ARRAY",
-                "min_values_display": "ARRAY",
-                "max_values_display": "ARRAY",
                 "min_lengths": "ARRAY",
                 "max_lengths": "ARRAY",
                 # Stable per-column field-id, same order/index as every other
@@ -1028,6 +1026,13 @@ class OpteryxCatalog(Metastore):
                 # rows written before this existed; readers must fall back to
                 # positional indexing in that case.
                 "field_ids": "ARRAY",
+                # Per-column byte-class histogram (8 fixed classes) and total
+                # byte count, VARCHAR/NVARCHAR/VARBINARY columns only (empty
+                # list / 0 elsewhere) — backs the LIKE '%needle%' selectivity
+                # char-class estimator. See catalog/manifest.py's
+                # _compute_column_stats / Vector.char_class_stats().
+                "char_class_counts": "ARRAY",
+                "char_total_bytes": "ARRAY",
             }
 
             # Normalize entries to match the column set above:
@@ -1042,34 +1047,19 @@ class OpteryxCatalog(Metastore):
                 e.setdefault("histogram_bins", 0)
                 e.setdefault("column_uncompressed_sizes_in_bytes", [])
                 e.setdefault("null_counts", [])
-                e.setdefault("min_values_display", [])
-                e.setdefault("max_values_display", [])
                 e.setdefault("min_lengths", [])
                 e.setdefault("max_lengths", [])
                 e.setdefault("field_ids", [])
+                e.setdefault("char_class_counts", [])
+                e.setdefault("char_total_bytes", [])
 
                 # min/max values are stored as compressed int64 values
-                # display values are string representations for human readability
                 mv = e.get("min_values") or []
                 xv = e.get("max_values") or []
-                mv_disp = e.get("min_values_display") or []
-                xv_disp = e.get("max_values_display") or []
-
-                def truncate_display(v, max_len=32):
-                    """Truncate display value to max_len characters, adding '...' if longer."""
-                    if v is None:
-                        return None
-                    s = str(v)
-                    if len(s) > max_len:
-                        return s[:max_len] + "..."
-                    return s
 
                 # Ensure int64 values are properly typed for min/max
                 e["min_values"] = [int(v) if v is not None else None for v in mv]
                 e["max_values"] = [int(v) if v is not None else None for v in xv]
-                # Display values truncated to 32 chars with '...' suffix if longer
-                e["min_values_display"] = [truncate_display(v) for v in mv_disp]
-                e["max_values_display"] = [truncate_display(v) for v in xv_disp]
 
                 # min_k_hashes / histogram_counts are per-column lists of ints,
                 # so each entry is list[list[int]] and the column is a native

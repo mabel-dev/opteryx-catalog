@@ -2,11 +2,11 @@
   "file_path": "mem://data/f1.parquet",
   "file_format": "parquet",
   "record_count": 2,
-  "file_size_in_bytes": 413,
-  "uncompressed_size_in_bytes": 176,
+  "file_size_in_bytes": 392,
+  "uncompressed_size_in_bytes": 112,
   "column_uncompressed_sizes_in_bytes": [
-    88,
-    88
+    56,
+    56
   ],
   "null_counts": [
     0,
@@ -101,14 +101,6 @@
     2,
     20
   ],
-  "min_values_display": [
-    "1",
-    "10"
-  ],
-  "max_values_display": [
-    "2",
-    "20"
-  ],
   "min_lengths": [
     0,
     0
@@ -116,5 +108,9 @@
   "max_lengths": [
     0,
     0
+  ],
+  "field_ids": [
+    null,
+    null
   ]
 }

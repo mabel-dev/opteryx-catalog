@@ -707,8 +707,6 @@ class SimpleDataset(Dataset):
                     histogram_bins=0,
                     min_values=[],
                     max_values=[],
-                    min_values_display=[],
-                    max_values_display=[],
                 )
             new_entries.append(manifest_entry.to_dict())
 
@@ -1113,8 +1111,6 @@ class SimpleDataset(Dataset):
             hists = ent.get("histogram_counts") or []
             mv = ent.get("min_values") or []
             xv = ent.get("max_values") or []
-            mv_disp = ent.get("min_values_display") or []
-            xv_disp = ent.get("max_values_display") or []
             col_sizes = ent.get("column_uncompressed_sizes_in_bytes") or []
 
             for cname, cidx in col_to_idx.items():
@@ -1139,41 +1135,6 @@ class SimpleDataset(Dataset):
                     stats[cname]["mins"].append(dmin)
                 if dmax is not None:
                     stats[cname]["maxs"].append(dmax)
-
-                # collect textual display values when present
-                try:
-                    try:
-                        raw_min_disp = mv_disp[cidx]
-                    except Exception:
-                        raw_min_disp = None
-                    try:
-                        raw_max_disp = xv_disp[cidx]
-                    except Exception:
-                        raw_max_disp = None
-
-                    def _decode_display(v):
-                        if v is None:
-                            return None
-                        try:
-                            if isinstance(v, (bytes, bytearray, memoryview)):
-                                b = bytes(v)
-                                if b and b[-1] == 0xFF:
-                                    b = b[:-1]
-                                return b.decode("utf-8", errors="replace")
-                            if isinstance(v, str):
-                                return v
-                        except Exception:
-                            return None
-                        return None
-
-                    md = _decode_display(raw_min_disp)
-                    xd = _decode_display(raw_max_disp)
-                    if md is not None:
-                        stats[cname]["min_displays"].append(md)
-                    if xd is not None:
-                        stats[cname]["max_displays"].append(xd)
-                except Exception:
-                    pass
 
                 # min-k hashes (tolerant to scalar/list/tuple shapes)
                 try:

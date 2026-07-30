@@ -57,8 +57,6 @@ class ParquetManifestEntry:
     histogram_bins: int
     min_values: list
     max_values: list
-    min_values_display: list
-    max_values_display: list
     min_lengths: list[int]
     max_lengths: list[int]
     # Stable per-column field-id, same order/index as every list above (e.g.
@@ -67,6 +65,13 @@ class ParquetManifestEntry:
     # position in some other schema snapshot. Empty for entries built before
     # field-ids existed or for schemas with no catalog-assigned ids.
     field_ids: list[int] = field(default_factory=list)
+    # Per-column byte-class histogram (8 fixed classes: upper, lower, digit,
+    # whitespace, punct_text, semantic, extended, control) and total byte
+    # count, VARCHAR/NVARCHAR/VARBINARY columns only (empty list / 0 for
+    # everything else) -- backs the LIKE '%needle%' selectivity char-class
+    # estimator. See _compute_column_stats / Vector.char_class_stats().
+    char_class_counts: list[list[int]] = field(default_factory=list)
+    char_total_bytes: list[int] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -82,11 +87,11 @@ class ParquetManifestEntry:
             "histogram_bins": self.histogram_bins,
             "min_values": self.min_values,
             "max_values": self.max_values,
-            "min_values_display": self.min_values_display,
-            "max_values_display": self.max_values_display,
             "min_lengths": self.min_lengths,
             "max_lengths": self.max_lengths,
             "field_ids": self.field_ids,
+            "char_class_counts": self.char_class_counts,
+            "char_total_bytes": self.char_total_bytes,
         }
 
 
@@ -269,9 +274,7 @@ def clear_parsed_manifest_cache() -> None:
     _parsed_manifest_cache.clear()
 
 
-import datetime
 import heapq
-import re
 
 _COMPRESSIBLE_CATEGORIES = {
     "INT8",
@@ -290,6 +293,10 @@ _COMPRESSIBLE_CATEGORIES = {
     "BOOL",
 }
 _VARIABLE_WIDTH_CATEGORIES = {"VARCHAR", "NVARCHAR", "VARBINARY", "ARRAY"}
+# The subset of _VARIABLE_WIDTH_CATEGORIES Vector.char_class_stats() accepts
+# (see draken_native.cpp) -- ARRAY has no byte-class concept, stays on the
+# boxed to_pylist()-length fallback below.
+_STRING_CATEGORIES = {"VARCHAR", "NVARCHAR", "VARBINARY"}
 
 # Maps a rugo ParquetMetadata SchemaColumn.logical_type string (e.g.
 # "date32[day]", "timestamp[ms,UTC]", "decimal(10, 2)", "varchar") to the same
@@ -312,71 +319,38 @@ _LOGICAL_TYPE_ALIASES = {
 }
 
 
-def _category_from_logical_type(logical_type: str) -> tuple:
-    """Return ``(category, decimal_scale)`` from a rugo/parquet logical-type
-    string. ``decimal_scale`` is only set for DECIMAL columns (needed to
-    rescale the raw unscaled integer back into a display value).
-    """
+def _category_from_logical_type(logical_type: str) -> str:
+    """Return ``category`` from a rugo/parquet logical-type string."""
     lt = (logical_type or "").lower()
     if lt.startswith("decimal"):
-        m = re.match(r"decimal\((\d+)\s*,\s*(\d+)\)", lt)
-        return "DECIMAL", (int(m.group(2)) if m else 0)
+        return "DECIMAL"
     if lt.startswith("timestamp"):
-        return "TIMESTAMP64", None
+        return "TIMESTAMP64"
     if lt.startswith("date"):
-        return "DATE32", None
+        return "DATE32"
     if lt.startswith("time"):
-        return "TIME64", None
-    return _LOGICAL_TYPE_ALIASES.get(lt, lt.upper()), None
+        return "TIME64"
+    return _LOGICAL_TYPE_ALIASES.get(lt, lt.upper())
 
 
-def _display_value(value, category: str, decimal_scale=None):
-    """Render a decoded column value as a display string.
-
-    Handles two shapes of ``value``: a proper Python object (``datetime.date``,
-    ``decimal.Decimal``, ...) as produced by a live Morsel's ``to_pylist()``,
-    or a raw physical int as produced by re-reading a parquet file (Parquet
-    round-trips DATE/TIMESTAMP/TIME/DECIMAL columns down to plain physical
-    ints — draken's Vector doesn't carry the logical annotation back).
-    """
-    if value is None:
-        return None
-    if hasattr(value, "isoformat"):
-        return value.isoformat()
-    if category == "DECIMAL" and decimal_scale is not None and isinstance(value, int):
-        import decimal
-
-        return str(decimal.Decimal(value).scaleb(-decimal_scale))
-    if category == "DATE32" and isinstance(value, int):
-        return (datetime.date(1970, 1, 1) + datetime.timedelta(days=value)).isoformat()
-    if category == "TIMESTAMP64" and isinstance(value, int):
-        return (
-            datetime.datetime(1970, 1, 1) + datetime.timedelta(microseconds=value)
-        ).isoformat()
-    if category in ("TIME32", "TIME64") and isinstance(value, int):
-        return str(datetime.timedelta(microseconds=value))
-    if isinstance(value, str):
-        return value[:16] + "..." if len(value) > 16 else value
-    if isinstance(value, (bytes, bytearray, memoryview)):
-        b = bytes(value)
-        if any(c < 32 or c > 126 for c in b):
-            hexed = b.hex()
-            return hexed[:16] + "..." if len(hexed) > 16 else hexed
-        s = b.decode("latin-1", errors="replace")
-        return s[:16] + "..." if len(s) > 16 else s
-    return str(value)
-
-
-def _compute_column_stats(vec, category: str, decimal_scale=None) -> tuple:
+def _compute_column_stats(vec, category: str) -> tuple:
     """Compute statistics for a single column from its native draken Vector.
 
-    ``vec`` may come from a live in-memory Morsel (correct semantic type) or
-    from re-reading a parquet file's bytes (temporal/decimal columns flattened
-    to plain physical ints by the round-trip — ``category``/``decimal_scale``
-    carry the true semantic type so display values still render correctly).
+    ``vec`` may come from a live in-memory Morsel or from re-reading a parquet
+    file's bytes; ``category`` selects the compression/histogram/length
+    handling for the column's logical type.
 
-    Returns: (min_k, histogram, min_value, max_value, min_display, max_display,
-    null_count, min_length, max_length)
+    Every reduction below is a native draken kernel over the whole column --
+    no Python-level min()/max()/loop over per-row values (previously: a
+    Python list-comprehension filter, then Python min()/max(), then a Python
+    histogram-bucketing loop -- a real cost at the Tb-scale row counts this
+    catalog runs against). The one remaining Python-level pass is BOOL's
+    true/false histogram, which has no native equivalent (Vector.sum()
+    doesn't support BOOL) and touches only however many rows one column has,
+    not a Tb-scale reduction.
+
+    Returns: (min_k, histogram, min_value, max_value, null_count, min_length,
+    max_length, char_class_counts, char_total_bytes)
     """
     try:
         # ARRAY (and possibly other nested/complex types) don't support
@@ -384,10 +358,11 @@ def _compute_column_stats(vec, category: str, decimal_scale=None) -> tuple:
         hashes = vec.hash()
     except ValueError:
         hashes = []
-    null_count = int(sum(vec.is_null()))
+    null_count = vec.null_count()
     is_compressible = category in _COMPRESSIBLE_CATEGORIES
     is_boolean = category == "BOOL"
     is_variable_width = category in _VARIABLE_WIDTH_CATEGORIES
+    is_string = category in _STRING_CATEGORIES
 
     # Native uint64: .hash() returns true unsigned 64-bit values (up to 2**64-1).
     # rugo's parquet writer now stores nested ARRAY<ARRAY<UINT64>> with an
@@ -397,38 +372,57 @@ def _compute_column_stats(vec, category: str, decimal_scale=None) -> tuple:
     col_hist: list = []
     col_min = NULL_FLAG
     col_max = NULL_FLAG
-    min_display = None
-    max_display = None
     min_len = 0
     max_len = 0
-
-    values = vec.to_pylist()
-    non_null_values = [v for v in values if v is not None]
+    char_class_counts: list = []
+    char_total_bytes = 0
 
     if is_compressible:
-        compressed = [c for c in vec.compress() if c != NULL_FLAG]
-        if compressed:
-            vmin, vmax = min(compressed), max(compressed)
-            col_min, col_max = int(vmin), int(vmax)
-            if is_boolean:
-                true_count = sum(1 for v in non_null_values if v is True)
-                false_count = sum(1 for v in non_null_values if v is False)
-                col_hist = [int(true_count), int(false_count)]
-            elif vmax > vmin:
-                col_hist = [0] * HISTOGRAM_BINS
-                span = float(vmax - vmin)
-                for c in compressed:
-                    b = int(((float(c) - float(vmin)) / span) * (HISTOGRAM_BINS - 1))
-                    col_hist[max(0, min(HISTOGRAM_BINS - 1, b))] += 1
-        if non_null_values:
-            min_display = _display_value(min(non_null_values), category, decimal_scale)
-            max_display = _display_value(max(non_null_values), category, decimal_scale)
-    elif non_null_values:
-        min_display = _display_value(min(non_null_values), category, decimal_scale)
-        max_display = _display_value(max(non_null_values), category, decimal_scale)
+        # draken 2026-07-30: Vector.compress() was renamed to .ordinalize()
+        # (disambiguated from the unrelated native .dictionary_encode()/
+        # .drop_nulls() split on draken.draken_native.Vector -- this is the
+        # draken.vectors.vector shim's int64 sort-key producer), and as of the
+        # kernel relocation below it is fully native end to end: .ordinalize()
+        # produces an INT64 Vector, .ordinal_min_max()/.histogram_bucket() are
+        # native reductions over it that correctly exclude the ORDINAL_NULL
+        # sentinel ordinalize() bakes into null rows (see draken_native.cpp's
+        # ordinal_min_max/histogram_bucket bindings) -- NOT draken's generic
+        # .min()/.max(), which would trust the (absent) validity bitmap on an
+        # ordinalized column and treat the sentinel as real data.
+        # ordinalize() doesn't support ARRAY/VECTOR_FP16/DECIMAL128 (see
+        # draken/ops/ordinalize.h) -- no min/max/histogram for those
+        # specific columns rather than crashing the whole stats pass. Every
+        # OTHER _COMPRESSIBLE_CATEGORIES member (including, as of this
+        # session, VARCHAR/NVARCHAR/VARBINARY) is ordinalize-supported.
+        try:
+            ordinal = vec.ordinalize()
+        except ValueError:
+            ordinal = None
+        if ordinal is not None:
+            min_max = ordinal.ordinal_min_max()
+            if min_max is not None:
+                vmin, vmax = min_max
+                col_min, col_max = int(vmin), int(vmax)
+                if is_boolean:
+                    # No native bool-count kernel (Vector.sum() doesn't support
+                    # BOOL) -- bounded, per-column Python pass, not a Tb-scale one.
+                    values = vec.to_pylist()
+                    true_count = sum(1 for v in values if v is True)
+                    false_count = sum(1 for v in values if v is False)
+                    col_hist = [int(true_count), int(false_count)]
+                elif vmax > vmin:
+                    col_hist = ordinal.histogram_bucket(vmin, vmax, HISTOGRAM_BINS)
 
-    if is_variable_width:
-        lengths = [len(v) for v in non_null_values]
+    if is_string:
+        # One native pass: byte-class counts, total bytes, AND min/max length
+        # together (see draken_native.cpp's char_class_stats binding).
+        char_class_counts, char_total_bytes, length_range = vec.char_class_stats()
+        if length_range is not None:
+            min_len, max_len = length_range
+    elif is_variable_width:
+        # ARRAY: char_class_stats() is string-only; no native length reduction
+        # exists for it, so this one category keeps the boxed length path.
+        lengths = [len(v) for v in vec.to_pylist() if v is not None]
         if lengths:
             min_len, max_len = min(lengths), max(lengths)
 
@@ -437,11 +431,11 @@ def _compute_column_stats(vec, category: str, decimal_scale=None) -> tuple:
         col_hist,
         col_min,
         col_max,
-        min_display,
-        max_display,
         null_count,
         min_len,
         max_len,
+        char_class_counts,
+        char_total_bytes,
     )
 
 
@@ -512,13 +506,13 @@ def build_parquet_manifest_entry_from_morsel(
     histograms: list = []
     min_values: list = []
     max_values: list = []
-    min_values_display: list = []
-    max_values_display: list = []
     null_counts: list = []
     min_lengths_list: list = []
     max_lengths_list: list = []
     column_uncompressed: list = []
     field_ids: list = []
+    char_class_counts: list = []
+    char_total_bytes_list: list = []
     uncompressed_size = 0
 
     for name in col_names:
@@ -532,22 +526,22 @@ def build_parquet_manifest_entry_from_morsel(
             col_hist,
             col_min,
             col_max,
-            col_min_display,
-            col_max_display,
             null_count,
             col_min_len,
             col_max_len,
+            col_char_class_counts,
+            col_char_total_bytes,
         ) = _compute_column_stats(vec, category)
 
         min_k_hashes.append(col_min_k)
         histograms.append(col_hist)
         min_values.append(col_min)
         max_values.append(col_max)
-        min_values_display.append(col_min_display)
-        max_values_display.append(col_max_display)
         null_counts.append(null_count)
         min_lengths_list.append(col_min_len)
         max_lengths_list.append(col_max_len)
+        char_class_counts.append(col_char_class_counts)
+        char_total_bytes_list.append(col_char_total_bytes)
 
         col_bytes = _column_uncompressed_estimate(vec.to_pylist())
         column_uncompressed.append(col_bytes)
@@ -566,11 +560,11 @@ def build_parquet_manifest_entry_from_morsel(
         histogram_bins=HISTOGRAM_BINS,
         min_values=min_values,
         max_values=max_values,
-        min_values_display=min_values_display,
-        max_values_display=max_values_display,
         min_lengths=min_lengths_list,
         max_lengths=max_lengths_list,
         field_ids=field_ids,
+        char_class_counts=char_class_counts,
+        char_total_bytes=char_total_bytes_list,
     )
 
     logger.debug(
@@ -612,9 +606,9 @@ def build_parquet_manifest_entry_from_bytes(
     _manifest_metrics["bytes_read"] += len(data_bytes)
 
     meta = read_metadata_from_memoryview(memoryview(data_bytes))
-    # name -> (category, decimal_scale) from Parquet's own logical-type
-    # annotations, since a re-read Vector's own .type is the flattened
-    # physical storage type (e.g. a DATE column reads back as plain INT64).
+    # name -> category from Parquet's own logical-type annotations, since a
+    # re-read Vector's own .type is the flattened physical storage type (e.g.
+    # a DATE column reads back as plain INT64).
     col_info = {
         c.name: _category_from_logical_type(c.logical_type) for c in meta.schema_columns
     }
@@ -624,18 +618,39 @@ def build_parquet_manifest_entry_from_bytes(
     histograms: list = []
     min_values: list = []
     max_values: list = []
-    min_values_display: list = []
-    max_values_display: list = []
     null_counts: list = []
     min_lengths_list: list = []
     max_lengths_list: list = []
     column_uncompressed = [0] * len(col_names)
+    char_class_counts: list = []
+    char_total_bytes_list: list = []
     uncompressed_size = 0
     record_count = 0
 
     # Accumulate across row groups (read_parquet yields one Morsel per
-    # surviving row group).
-    accum: dict = {name: {"hashes": set(), "compressed": [], "values": []} for name in col_names}
+    # surviving row group). min/max/histogram need the FILE-WIDE ordinal
+    # range before any row can be bucketed, so each row group's ordinalized
+    # column is buffered (a compact INT64 vector, not the raw column) rather
+    # than re-reading the file a second time -- one pass over the on-disk
+    # data, min/max derived natively from the buffered vectors, then
+    # histogram bucketing natively against that range. Every per-row
+    # reduction (hash, null count, ordinalize, char-class counts, min/max,
+    # histogram) is a native kernel; "values"/"bool_values" are the two
+    # documented exceptions with no native equivalent (see
+    # _compute_column_stats and _column_uncompressed_estimate).
+    accum: dict = {
+        name: {
+            "hashes": set(),
+            "null_count": 0,
+            "ordinal_vecs": [],
+            "char_counts": [0] * 8,
+            "char_total_bytes": 0,
+            "length_range": None,
+            "bool_values": [],
+            "values": [],
+        }
+        for name in col_names
+    }
 
     with read_parquet(bytes(data_bytes)) as reader:
         for morsel in reader:
@@ -645,24 +660,60 @@ def build_parquet_manifest_entry_from_bytes(
                 if name not in accum:
                     continue
                 vec = morsel.column(name_b)
-                category, _ = col_info[name]
+                category = col_info[name]
                 acc = accum[name]
                 try:
                     acc["hashes"].update(vec.hash())
                 except ValueError:
                     pass
+                acc["null_count"] += vec.null_count()
+                # Kept only for _column_uncompressed_estimate below -- no
+                # longer used for null count / lengths / bool histogram.
                 acc["values"].extend(vec.to_pylist())
+
                 if category in _COMPRESSIBLE_CATEGORIES:
-                    acc["compressed"].extend(vec.compress())
+                    # ordinalize() doesn't support ARRAY/VECTOR_FP16/DECIMAL128
+                    # -- see the identical guard in _compute_column_stats.
+                    try:
+                        acc["ordinal_vecs"].append(vec.ordinalize())
+                    except ValueError:
+                        pass
+                    if category == "BOOL":
+                        # No native bool-count kernel -- see _compute_column_stats.
+                        values = vec.to_pylist()
+                        acc["bool_values"].append(
+                            (
+                                sum(1 for v in values if v is True),
+                                sum(1 for v in values if v is False),
+                            )
+                        )
+
+                if category in _STRING_CATEGORIES:
+                    counts, total_bytes, length_range = vec.char_class_stats()
+                    for i in range(8):
+                        acc["char_counts"][i] += counts[i]
+                    acc["char_total_bytes"] += total_bytes
+                    if length_range is not None:
+                        lo, hi = length_range
+                        cur = acc["length_range"]
+                        acc["length_range"] = (
+                            (lo, hi) if cur is None else (min(cur[0], lo), max(cur[1], hi))
+                        )
+                elif category in _VARIABLE_WIDTH_CATEGORIES:
+                    # ARRAY: no native length reduction: see _compute_column_stats.
+                    lengths = [len(v) for v in vec.to_pylist() if v is not None]
+                    if lengths:
+                        lo, hi = min(lengths), max(lengths)
+                        cur = acc["length_range"]
+                        acc["length_range"] = (
+                            (lo, hi) if cur is None else (min(cur[0], lo), max(cur[1], hi))
+                        )
 
     field_ids: list = []
     for name in col_names:
         field_ids.append(field_id_by_name.get(name) if field_id_by_name else None)
-        category, decimal_scale = col_info[name]
+        category = col_info[name]
         acc = accum[name]
-        values = acc["values"]
-        non_null_values = [v for v in values if v is not None]
-        null_count = sum(1 for v in values if v is None)
 
         # Native uint64 (see _compute_column_stats): kept as ints, not strings —
         # rugo's writer stores them as an unsigned nested array.
@@ -670,49 +721,43 @@ def build_parquet_manifest_entry_from_bytes(
         col_hist: list = []
         col_min = NULL_FLAG
         col_max = NULL_FLAG
-        min_display = None
-        max_display = None
         min_len = 0
         max_len = 0
 
         if category in _COMPRESSIBLE_CATEGORIES:
-            compressed = [c for c in acc["compressed"] if c != NULL_FLAG]
-            if compressed:
-                vmin, vmax = min(compressed), max(compressed)
+            vecs = acc["ordinal_vecs"]
+            pairs = [p for p in (v.ordinal_min_max() for v in vecs) if p is not None]
+            if pairs:
+                vmin = min(p[0] for p in pairs)
+                vmax = max(p[1] for p in pairs)
                 col_min, col_max = int(vmin), int(vmax)
                 if category == "BOOL":
-                    true_count = sum(1 for v in non_null_values if v is True)
-                    false_count = sum(1 for v in non_null_values if v is False)
+                    true_count = sum(t for t, _ in acc["bool_values"])
+                    false_count = sum(f for _, f in acc["bool_values"])
                     col_hist = [int(true_count), int(false_count)]
                 elif vmax > vmin:
-                    col_hist = [0] * HISTOGRAM_BINS
-                    span = float(vmax - vmin)
-                    for c in compressed:
-                        b = int(((float(c) - float(vmin)) / span) * (HISTOGRAM_BINS - 1))
-                        col_hist[max(0, min(HISTOGRAM_BINS - 1, b))] += 1
-            if non_null_values:
-                min_display = _display_value(min(non_null_values), category, decimal_scale)
-                max_display = _display_value(max(non_null_values), category, decimal_scale)
-        elif non_null_values:
-            min_display = _display_value(min(non_null_values), category, decimal_scale)
-            max_display = _display_value(max(non_null_values), category, decimal_scale)
+                    bins = [0] * HISTOGRAM_BINS
+                    for v in vecs:
+                        per = v.histogram_bucket(vmin, vmax, HISTOGRAM_BINS)
+                        for i in range(HISTOGRAM_BINS):
+                            bins[i] += per[i]
+                    col_hist = bins
 
-        if category in _VARIABLE_WIDTH_CATEGORIES:
-            lengths = [len(v) for v in non_null_values]
-            if lengths:
-                min_len, max_len = min(lengths), max(lengths)
+        length_range = acc["length_range"]
+        if length_range is not None:
+            min_len, max_len = length_range
 
         min_k_hashes.append(col_min_k)
         histograms.append(col_hist)
         min_values.append(col_min)
         max_values.append(col_max)
-        min_values_display.append(min_display)
-        max_values_display.append(max_display)
-        null_counts.append(null_count)
+        null_counts.append(acc["null_count"])
         min_lengths_list.append(min_len)
         max_lengths_list.append(max_len)
+        char_class_counts.append(acc["char_counts"] if category in _STRING_CATEGORIES else [])
+        char_total_bytes_list.append(acc["char_total_bytes"] if category in _STRING_CATEGORIES else 0)
 
-        col_bytes = _column_uncompressed_estimate(values)
+        col_bytes = _column_uncompressed_estimate(acc["values"])
         column_uncompressed[col_names.index(name)] = col_bytes
         uncompressed_size += col_bytes
 
@@ -729,11 +774,11 @@ def build_parquet_manifest_entry_from_bytes(
         histogram_bins=HISTOGRAM_BINS,
         min_values=min_values,
         max_values=max_values,
-        min_values_display=min_values_display,
-        max_values_display=max_values_display,
         min_lengths=min_lengths_list,
         max_lengths=max_lengths_list,
         field_ids=field_ids,
+        char_class_counts=char_class_counts,
+        char_total_bytes=char_total_bytes_list,
     )
 
     logger.debug(
