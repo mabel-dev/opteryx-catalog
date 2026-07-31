@@ -344,6 +344,35 @@ def _category_from_logical_type(logical_type: str) -> str:
     return _LOGICAL_TYPE_ALIASES.get(lt, lt.upper())
 
 
+def _min_k_smallest_distinct(hashes, k: int) -> list:
+    """Return the ``k`` smallest distinct values from ``hashes``, ascending.
+
+    Single Python pass with a bounded (size <= k) max-heap + companion
+    membership set, instead of ``sorted(heapq.nsmallest(k, set(hashes)))``.
+    The old version built a full ``set()`` over every hash in the column
+    (a real cost at millions of rows) before ever looking at k; this way,
+    once the heap has k entries, a new hash needs only one comparison
+    against the current max to be rejected -- for a large/high-cardinality
+    column, most hashes never reach a set insertion or heap operation at
+    all. ``present`` always mirrors the heap's contents (not every hash
+    ever seen), so it stays bounded to k entries rather than growing with
+    the column.
+    """
+    heap: list = []
+    present: set = set()
+    for h in hashes:
+        if h in present:
+            continue
+        if len(heap) < k:
+            heapq.heappush(heap, -h)
+            present.add(h)
+        elif h < -heap[0]:
+            evicted = -heapq.heapreplace(heap, -h)
+            present.discard(evicted)
+            present.add(h)
+    return sorted(-x for x in heap)
+
+
 def _compute_column_stats(vec, category: str) -> tuple:
     """Compute statistics for a single column from its native draken Vector.
 
@@ -379,7 +408,7 @@ def _compute_column_stats(vec, category: str) -> tuple:
     # rugo's parquet writer now stores nested ARRAY<ARRAY<UINT64>> with an
     # unsigned leaf annotation, so these are kept as plain ints (no decimal-string
     # workaround) — write_parquet_manifest builds the UINT64 vector directly.
-    col_min_k = sorted(heapq.nsmallest(MIN_K_HASHES, set(hashes)))
+    col_min_k = _min_k_smallest_distinct(hashes, MIN_K_HASHES)
     col_hist: list = []
     col_min = NULL_FLAG
     col_max = NULL_FLAG
@@ -453,14 +482,32 @@ def _compute_column_stats(vec, category: str) -> tuple:
 def _column_uncompressed_estimate(values: list) -> int:
     """Rough uncompressed-size estimate for one column's decoded values.
 
-    Used only for reporting/summary purposes (dataset ``describe()`` and
-    snapshot size totals) — not correctness-critical, so a plain per-value
-    ``sys.getsizeof`` sum is good enough and avoids depending on parquet
-    row-group byte metadata that isn't exposed by rugo's public API.
+    Fallback path only (see ``_column_nbytes_estimate``) for draken builds
+    that don't expose ``Morsel.select()``/``.nbytes`` -- a plain per-value
+    ``sys.getsizeof`` sum, which requires the caller to have already decoded
+    the column to a Python list.
     """
     import sys
 
     return sum(sys.getsizeof(v) for v in values if v is not None)
+
+
+def _column_nbytes_estimate(morsel: Any, name: str, vec: Any) -> int:
+    """In-memory byte footprint for one column: validity bitmap + payload
+    (string arena for string columns), read natively off the Morsel.
+
+    ``Morsel.nbytes`` already does this accounting via draken's native
+    ``draken_vector_nbytes`` helper -- summed here over a single-column
+    selection rather than decoding every value to a Python object and
+    summing ``sys.getsizeof()`` over them. Falls back to the old estimate
+    only if the running draken build doesn't expose ``select()``/``nbytes``
+    (older pinned versions -- see ``morsel_schema_dict`` for the same kind
+    of cross-version split).
+    """
+    try:
+        return int(morsel.select([name]).nbytes)
+    except AttributeError:
+        return _column_uncompressed_estimate(vec.to_pylist())
 
 
 def morsel_schema_dict(morsel: Any) -> dict:
@@ -554,7 +601,7 @@ def build_parquet_manifest_entry_from_morsel(
         char_class_counts.append(col_char_class_counts)
         char_total_bytes_list.append(col_char_total_bytes)
 
-        col_bytes = _column_uncompressed_estimate(vec.to_pylist())
+        col_bytes = _column_nbytes_estimate(morsel, name, vec)
         column_uncompressed.append(col_bytes)
         uncompressed_size += col_bytes
 
