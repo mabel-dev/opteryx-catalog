@@ -16,6 +16,7 @@ from opteryx_catalog.catalog.compaction import (
     MIN_FILE_SIZE_BYTES,
     MIN_SIZE_BYTES,
     SMALL_FILE_BYTES,
+    SORT_AWARE_FLOOR_BYTES,
     TARGET_SIZE_BYTES,
     DatasetCompactor,
 )
@@ -191,7 +192,7 @@ def _perf_dataset(*, schema_via_method=True, field_id=1):
 
 
 def test_performance_compaction():
-    """Sub-floor files are BRUTE-force merged (rule 2): selection resolves the
+    """Sub-floor files are BRUTE-force merged (rule A/2): selection resolves the
     sort column (for later declustering) but emits a no-sort ``combine`` plan."""
     print("Testing performance compaction...")
 
@@ -202,7 +203,7 @@ def test_performance_compaction():
     assert compactor.strategy == "performance", "Should auto-select performance strategy"
     assert compactor.decision == "auto", "Decision should be auto"
 
-    plan = compactor._select_performance_compaction(_perf_entries())
+    plan = compactor._select_brute_merge(_perf_entries())
 
     assert plan is not None, "Should brute-merge the sub-floor files"
     assert plan["type"] == "combine", "sub-floor tier emits a brute combine plan"
@@ -223,7 +224,7 @@ def test_performance_compaction_positional_fallback():
 
     dataset = _perf_dataset()
     compactor = DatasetCompactor(dataset, strategy="performance", author="t", agent="t")
-    plan = compactor._select_performance_compaction(entries)
+    plan = compactor._select_brute_merge(entries)
 
     assert plan is not None
     assert plan["mode"] == "brute"
@@ -235,7 +236,7 @@ def test_performance_compaction_schema_via_metadata_attr():
     """Also works when the schema is only on the raw metadata.schema attribute."""
     dataset = _perf_dataset(schema_via_method=False)
     compactor = DatasetCompactor(dataset, strategy="performance", author="t", agent="t")
-    plan = compactor._select_performance_compaction(_perf_entries())
+    plan = compactor._select_brute_merge(_perf_entries())
 
     assert plan is not None
     assert plan["sort_column"] == "timestamp"
@@ -377,7 +378,7 @@ def test_overlapping_large_files_decluster():
         _entry("/tmp/B.parquet", 50, 200, _BIG_MB),   # overlaps A -> declustered
         _entry("/tmp/C.parquet", 300, 400, _BIG_MB),  # disjoint from A/B
     ]
-    plan = compactor._select_performance_compaction(entries)
+    plan = compactor._select_sort_aware_merge(entries)
     assert plan is not None, "overlapping big files must be declustered (rule 3)"
     assert plan["type"] == "combine-split"
     assert plan["mode"] == "sort-aware"
@@ -408,7 +409,7 @@ def test_overlapping_target_sized_files_decluster():
     assert combined > MAX_SELECTED_BUDGET_BYTES, "precondition: exceeds the RAM gate"
     assert combined <= DECLUSTER_MAX_COMBINED_BYTES, "precondition: within decluster cap"
 
-    plan = compactor._select_performance_compaction(entries)
+    plan = compactor._select_sort_aware_merge(entries)
     assert plan is not None, "target-sized overlapping files MUST decluster (streaming)"
     assert plan["type"] == "combine-split" and plan["mode"] == "sort-aware"
     assert plan["reason"] == "overlap-decluster"
@@ -450,7 +451,7 @@ def test_disjoint_settled_files_left_alone():
         _entry("/tmp/B.parquet", 200, 300, big),
         _entry("/tmp/C.parquet", 400, 500, big),
     ]
-    plan = compactor._select_performance_compaction(entries)
+    plan = compactor._select_sort_aware_merge(entries)
     assert plan is None, "disjoint settled files are already optimal"
 
 
@@ -464,7 +465,7 @@ def test_binpack_medium_files_toward_target():
         _entry("/tmp/A.parquet", 0, 100, mb),
         _entry("/tmp/B.parquet", 200, 300, mb),
     ]
-    plan = compactor._select_performance_compaction(entries)
+    plan = compactor._select_sort_aware_merge(entries)
     assert plan is not None
     assert plan["type"] == "combine-split"
     assert plan["mode"] == "sort-aware"
@@ -482,13 +483,15 @@ def test_binpack_declines_when_pair_exceeds_target():
         _entry("/tmp/A.parquet", 0, 100, mb),
         _entry("/tmp/B.parquet", 200, 300, mb),
     ]
-    plan = compactor._select_performance_compaction(entries)
+    plan = compactor._select_sort_aware_merge(entries)
     assert plan is None
 
 
-def test_subfloor_takes_priority_over_decluster():
-    """One operation per call, sub-floor tier first: when both a sub-floor pair
-    and an overlapping big group exist, the brute sub-floor merge wins."""
+def test_subfloor_and_decluster_are_independent():
+    """Rule A (brute) and rule B (sort-aware) are attempted independently every
+    pass - not a priority chain where one starves the other. When both a
+    sub-floor pair AND an overlapping big group exist in the same manifest,
+    each selector finds its own plan, oblivious to the other."""
     compactor = DatasetCompactor(_perf_dataset(), strategy="performance", author="t", agent="t")
     entries = [
         _entry("/tmp/big1.parquet", 0, 100, _BIG_MB),
@@ -496,11 +499,44 @@ def test_subfloor_takes_priority_over_decluster():
         _entry("/tmp/s1.parquet", 0, 1, _SMALL_MB),
         _entry("/tmp/s2.parquet", 5, 6, _SMALL_MB),
     ]
-    plan = compactor._select_performance_compaction(entries)
-    assert plan is not None
-    assert plan["mode"] == "brute", "sub-floor consolidation is highest priority"
-    selected = {f["file_path"] for f in plan["files"]}
-    assert selected == {"/tmp/s1.parquet", "/tmp/s2.parquet"}
+
+    brute_plan = compactor._select_brute_merge(entries)
+    assert brute_plan is not None
+    assert brute_plan["mode"] == "brute"
+    assert {f["file_path"] for f in brute_plan["files"]} == {
+        "/tmp/s1.parquet", "/tmp/s2.parquet",
+    }
+
+    sort_aware_plan = compactor._select_sort_aware_merge(entries)
+    assert sort_aware_plan is not None, "the big overlap is not starved by rule A"
+    assert sort_aware_plan["reason"] == "overlap-decluster"
+    assert {f["file_path"] for f in sort_aware_plan["files"]} == {
+        "/tmp/big1.parquet", "/tmp/big2.parquet",
+    }
+
+
+def test_overlap_band_reachable_by_both_pools():
+    """A file between SORT_AWARE_FLOOR_BYTES (500MB) and MIN_FILE_SIZE_BYTES
+    (512MB) is deliberately visible to BOTH selectors - the pools overlap on
+    purpose, they are not a single shared cutoff. Regression test for the two
+    thresholds silently collapsing back into one."""
+    compactor = DatasetCompactor(_perf_dataset(), strategy="performance", author="t", agent="t")
+    band_mb = (SORT_AWARE_FLOOR_BYTES // _MB) + 5  # inside (500MB, 512MB)
+    assert band_mb * _MB < MIN_FILE_SIZE_BYTES, "precondition: still under the brute ceiling"
+    assert band_mb * _MB > SORT_AWARE_FLOOR_BYTES, "precondition: over the sort-aware floor"
+
+    entries = [
+        _entry("/tmp/A.parquet", 0, 1, band_mb),
+        _entry("/tmp/B.parquet", 2, 3, band_mb),
+    ]
+
+    brute_plan = compactor._select_brute_merge(entries)
+    assert brute_plan is not None, "still under 512MB -> visible to rule A"
+    assert {f["file_path"] for f in brute_plan["files"]} == {"/tmp/A.parquet", "/tmp/B.parquet"}
+
+    sort_aware_plan = compactor._select_sort_aware_merge(entries)
+    assert sort_aware_plan is not None, "over 500MB -> ALSO visible to rule B"
+    assert {f["file_path"] for f in sort_aware_plan["files"]} == {"/tmp/A.parquet", "/tmp/B.parquet"}
 
 
 def test_subfloor_brute_bin_packs_to_target():
@@ -511,7 +547,7 @@ def test_subfloor_brute_bin_packs_to_target():
     per_mb = (MIN_FILE_SIZE_BYTES // _MB) - 1  # just under floor
     n = (9 * 1024) // per_mb
     entries = [_entry(f"/tmp/s{i}.parquet", i * 100, i * 100 + 99, per_mb) for i in range(n)]
-    plan = compactor._select_performance_compaction(entries)
+    plan = compactor._select_brute_merge(entries)
     assert plan is not None
     assert plan["type"] == "combine" and plan["mode"] == "brute"
     packed = sum(f["uncompressed_size_in_bytes"] for f in plan["files"])
@@ -530,7 +566,7 @@ def test_tiny_files_brute_merge_immediately():
         _entry("/tmp/B.parquet", 500, 501, 1),  # 1MB
         _entry("/tmp/C.parquet", 1000, 1001, 1),
     ]
-    plan = compactor._select_performance_compaction(entries)
+    plan = compactor._select_brute_merge(entries)
     assert plan is not None, "tiny files must be merged, not left to pile up"
     assert plan["type"] == "combine" and plan["mode"] == "brute"
     assert plan["reason"] == "small-file-brute"
@@ -541,7 +577,7 @@ def test_single_small_file_left_alone():
     """One lone sub-floor file: nothing to combine it with, so no plan."""
     compactor = DatasetCompactor(_perf_dataset(), strategy="performance", author="t", agent="t")
     entries = [_entry("/tmp/A.parquet", 0, 1, 1)]
-    plan = compactor._select_performance_compaction(entries)
+    plan = compactor._select_brute_merge(entries)
     assert plan is None
 
 
@@ -616,7 +652,8 @@ def test_split_into_k_disjoint_and_complete():
 
 def test_iceberg_dict_sort_order_does_not_crash():
     """End-to-end: the Iceberg dict shape now resolves the sort column instead
-    of raising out of _select_performance_compaction."""
+    of raising out of the rule selectors (_select_brute_merge /
+    _select_sort_aware_merge, via the shared _resolve_sort_columns_for_entries)."""
     dataset = _perf_dataset()
     # replace the positional [0] with the crashing Iceberg dict, naming the real
     # sort column ("timestamp") from _perf_dataset's schema.
@@ -626,7 +663,7 @@ def test_iceberg_dict_sort_order_does_not_crash():
     compactor = DatasetCompactor(dataset, strategy=None, author="t", agent="t")
     assert compactor.strategy == "performance"
 
-    plan = compactor._select_performance_compaction(_perf_entries())
+    plan = compactor._select_brute_merge(_perf_entries())
     assert plan is not None
     assert plan["sort_column"] == "timestamp"
 
@@ -643,7 +680,8 @@ if __name__ == "__main__":
     test_disjoint_settled_files_left_alone()
     test_binpack_medium_files_toward_target()
     test_binpack_declines_when_pair_exceeds_target()
-    test_subfloor_takes_priority_over_decluster()
+    test_subfloor_and_decluster_are_independent()
+    test_overlap_band_reachable_by_both_pools()
     test_subfloor_brute_bin_packs_to_target()
     test_tiny_files_brute_merge_immediately()
     test_single_small_file_left_alone()
