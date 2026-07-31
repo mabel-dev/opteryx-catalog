@@ -145,6 +145,21 @@ MIN_SIZE_BYTES = MIN_SIZE_MB * 1024 * 1024
 # large accumulated mass instead splits straight into target-sized files.
 MIN_FILE_SIZE_MB = 512
 MIN_FILE_SIZE_BYTES = MIN_FILE_SIZE_MB * 1024 * 1024
+
+# --- Sort-aware pool floor (deliberately overlaps the brute ceiling) -----------
+#
+# Rule A (brute) claims files < MIN_FILE_SIZE_BYTES (512 MB). Rule B (sort-aware)
+# claims files > SORT_AWARE_FLOOR_BYTES (500 MB) - a lower, separate threshold,
+# not a reuse of the 512 MB floor. The two pools overlap on (500 MB, 512 MB]: a
+# borderline file is visible to both selectors. If it has a real sort-aware
+# opportunity (it overlaps a neighbour, or packs with other sub-target files),
+# rule B's better-quality merge (sorted, disjoint) can claim it; otherwise rule
+# A's brute merge still cleans it up as the coverage guarantee. A single shared
+# boundary would starve rule B of exactly these files, since they'd only ever be
+# `< 512` and never reachable by the sort-aware selectors.
+SORT_AWARE_FLOOR_MB = 500
+SORT_AWARE_FLOOR_BYTES = SORT_AWARE_FLOOR_MB * 1024 * 1024
+
 MAX_SIZE_MB = 4198  # 4.1 GB - hard cap
 MAX_SIZE_BYTES = MAX_SIZE_MB * 1024 * 1024
 SMALL_FILE_MB = 3584  # anything under the lower bound is a merge candidate
@@ -322,46 +337,64 @@ class DatasetCompactor:
                 self.strategy = "brute"
                 self.decision = "no-sort"
 
-    def compact(self, dry_run: bool = False) -> Optional[Snapshot]:
+    def compact(self, dry_run: bool = False, rule: Optional[str] = None) -> Optional[Snapshot]:
         """
-        Perform one incremental compaction operation.
+        Perform ONE compaction pass: a single read -> select -> execute ->
+        commit cycle, same critical-section shape as before rule A/B existed.
+
+        Rule A (brute merge of sub-512MB files) and rule B (sort-aware merge
+        of files over 500MB, toward the 4GB target) are independent - see
+        SORT_AWARE_FLOOR_BYTES for why their pools deliberately overlap. To
+        attempt both in one cron tick, call compact() twice IN SERIES -
+        ``compact(rule="brute")`` then ``compact(rule="sort_aware")`` - rather
+        than chaining them inside a single call. Each call re-reads the
+        manifest fresh at its own start and commits independently, so neither
+        call's read-to-write window is any longer than a single operation's;
+        chaining them in one call would double that window and raise the odds
+        of losing a concurrent writer's commit (``save_dataset_metadata`` has
+        no compare-and-swap - a later write unconditionally clobbers an
+        earlier one). Calling both in series bounds each commit's exposure to
+        one operation, same as a single-rule pass always had, and a writer
+        that commits between the two calls is picked up by the second call
+        instead of silently overwritten by it.
 
         Args:
-            dry_run: If True, return plan without executing
+            dry_run: If True, return the plan found without executing it
+            rule: "brute", "sort_aware", or None. None tries brute, falling
+                  back to sort_aware, for a caller that only wants a single
+                  shot - it is NOT a substitute for calling both explicitly
+                  when both should be attempted this tick.
 
         Returns:
             New Snapshot if compaction was performed, None if nothing to compact
+            (or the plan dict, if dry_run).
         """
-        # Get current manifest entries
         current_snapshot = self.dataset.metadata.current_snapshot()
-        if not current_snapshot:
+        if not current_snapshot or not current_snapshot.manifest_list:
             return None
 
-        manifest_path = current_snapshot.manifest_list
-        if not manifest_path:
-            return None
-
-        # Read manifest entries
-        entries = self._read_manifest(manifest_path)
+        entries = self._read_manifest(current_snapshot.manifest_list)
         if not entries:
             return None
 
-        # Select files to compact based on strategy
         if self.strategy == "brute":
             compaction_plan = self._select_brute_compaction(entries)
-        else:  # performance
-            compaction_plan = self._select_performance_compaction(entries)
+        elif rule == "brute":
+            compaction_plan = self._select_brute_merge(entries)
+        elif rule == "sort_aware":
+            compaction_plan = self._select_sort_aware_merge(entries)
+        elif rule is not None:
+            raise ValueError(f"rule must be 'brute', 'sort_aware', or None; got {rule!r}")
+        else:
+            compaction_plan = self._select_brute_merge(entries) or self._select_sort_aware_merge(
+                entries
+            )
 
         if not compaction_plan:
             return None
-
         if dry_run:
-            # Return plan information (could extend this to return a structured plan)
             return compaction_plan
-
-        # Execute compaction
-        new_snapshot = self._execute_compaction(entries, compaction_plan)
-        return new_snapshot
+        return self._execute_compaction(entries, compaction_plan)
 
     def _read_manifest(self, manifest_path: str) -> List[dict]:
         """Read manifest entries from manifest file."""
@@ -456,31 +489,12 @@ class DatasetCompactor:
         sort_col = columns[sort_index]
         return col_name(sort_col), col_id(sort_col), sort_index
 
-    def _select_performance_compaction(self, entries: List[dict]) -> Optional[dict]:
-        """Select ONE performance-compaction operation, per the five rules in the
-        module docstring. Repeated ``compact()`` calls converge the layout.
-
-        Decision order (highest priority first; the first applicable tier wins):
-
-          Tier 1 - rules 2 & 4: two or more sub-floor (< MIN_FILE_SIZE_BYTES)
-                   files => BRUTE-force merge (no sort), bin-packed toward
-                   TARGET. Tiny scattered files hurt reads most and are cheapest
-                   to fix; sorting them is wasted until they graduate the floor.
-          Tier 2 - rule 3: an OVERLAPPING group of at/above-floor files =>
-                   sort-aware combine-split that declusters it into disjoint key
-                   ranges.
-          Tier 3 - rule 1: consecutive, already-disjoint MEDIUM files (floor..
-                   MIN_SIZE_BYTES) => sort-aware bin-pack toward TARGET to reduce
-                   file count.
-
-        Every output respects rule 1 (never a file over TARGET). Falls back to
-        brute selection when the sort column cannot be resolved.
+    def _resolve_sort_columns_for_entries(self, entries: List[dict]):
+        """Shared prep for both rule selectors: resolve the sort column against
+        the dataset's stored schema. Returns (sort_column_name, sort_field_id,
+        sort_index), all None if it can't be resolved (caller falls back to
+        brute for that rule).
         """
-        # Resolve the sort column from the dataset's *stored* schema. The raw
-        # ``metadata.schema`` attribute is frequently None on a freshly loaded
-        # dataset (the real schema lives in the schemas subcollection), so
-        # prefer ``dataset.schema()`` which resolves it. ``self.sort_order`` is
-        # the canonical sort key (name/field_id/index); see normalize_sort_order.
         columns = None
         try:
             resolved = self.dataset.schema()
@@ -498,43 +512,96 @@ class DatasetCompactor:
                 columns = schema["fields"]
 
         if not columns or self.sort_order is None:
-            # Can't resolve the sort column; fall back to brute logic.
-            return self._select_brute_compaction(entries)
+            return None, None, None
 
-        sort_column_name, sort_field_id, sort_index = self._resolve_sort_column(
-            self.sort_order, columns
-        )
+        return self._resolve_sort_column(self.sort_order, columns)
+
+    def _select_brute_merge(self, entries: List[dict]) -> Optional[dict]:
+        """Rule A (rules 2 & 4): two or more sub-floor (< MIN_FILE_SIZE_BYTES)
+        files => BRUTE-force merge (no sort), bin-packed toward TARGET. Tiny
+        scattered files hurt reads most and are cheapest to fix; sorting them
+        is wasted until they graduate the floor.
+
+        Independent of rule B - see ``_select_sort_aware_merge`` and
+        ``compact()``, which attempt both every pass rather than picking one.
+        """
+        sort_column_name, _, _ = self._resolve_sort_columns_for_entries(entries)
         if not sort_column_name:
+            # No usable sort key at all; the legacy brute strategy (no sort
+            # column required) is the only thing that can make progress.
             return self._select_brute_compaction(entries)
 
-        # Tier 1 (rules 2 & 4): brute-force consolidate sub-floor files. No range
-        # stats needed - brute merge doesn't sort, so files without min/max still
-        # qualify.
+        # No range stats needed here - brute merge doesn't sort, so files
+        # without min/max still qualify.
         sub_floor = [
             e
             for e in entries
             if e.get("uncompressed_size_in_bytes", 0) < MIN_FILE_SIZE_BYTES
         ]
-        plan = self._select_brute_consolidation(sub_floor, sort_column_name)
-        if plan:
-            return plan
+        return self._select_brute_consolidation(sub_floor, sort_column_name)
 
-        # Tiers 2 & 3 reason about sort-key ranges of the at/above-floor files.
+    def _select_sort_aware_merge(self, entries: List[dict]) -> Optional[dict]:
+        """Rule B (rule 1 & 3): files over SORT_AWARE_FLOOR_BYTES (500 MB) -
+        deliberately overlapping rule A's < 512 MB pool, see
+        SORT_AWARE_FLOOR_BYTES - get sort-aware combine + split toward the 4GB
+        TARGET. Three sub-checks, first applicable wins:
+
+          1. Any single file already over the 4.1 GB hard cap (MAX_SIZE_BYTES)
+             gets re-split on its own, regardless of whether it overlaps a
+             neighbour - nothing else in this selector will ever touch a file
+             that large again (bin-pack skips anything >= MIN_SIZE_BYTES as
+             "settled", decluster only acts on overlapping groups), so this
+             must run unconditionally.
+          2. An OVERLAPPING group of >= floor files => sort-aware combine-split
+             that declusters it into disjoint key ranges.
+          3. Consecutive, already-disjoint MEDIUM files (floor..MIN_SIZE_BYTES)
+             => sort-aware bin-pack toward TARGET to reduce file count.
+
+        Independent of rule A - see ``_select_brute_merge`` and ``compact()``.
+        Returns None (not a brute fallback) when the sort column can't be
+        resolved: without a sort key there is nothing sort-aware to do, and
+        rule A already covers the no-sort-key dataset case.
+        """
+        sort_column_name, sort_field_id, sort_index = (
+            self._resolve_sort_columns_for_entries(entries)
+        )
+        if not sort_column_name:
+            return None
+
         big = [
             e
             for e in entries
-            if e.get("uncompressed_size_in_bytes", 0) >= MIN_FILE_SIZE_BYTES
+            if e.get("uncompressed_size_in_bytes", 0) > SORT_AWARE_FLOOR_BYTES
         ]
+
+        # Sub-check 1: repair any file already over the hard cap. Checked
+        # directly against `big`, not `file_ranges`, since it doesn't need
+        # range stats - a lone file needs no overlap partner to be re-split.
+        oversized = next(
+            (e for e in big if e.get("uncompressed_size_in_bytes", 0) > MAX_SIZE_BYTES),
+            None,
+        )
+        if oversized is not None:
+            size = oversized.get("uncompressed_size_in_bytes", 0)
+            return {
+                "type": "combine-split",
+                "mode": "sort-aware",
+                "files": [oversized],
+                "reason": "oversize-resplit",
+                "sort_column": sort_column_name,
+                "expected_outputs": max(1, -(-size // TARGET_SIZE_BYTES)),
+            }
+
         file_ranges = self._build_file_ranges(big, sort_field_id, sort_index)
         if not file_ranges:
             return None
 
-        # Tier 2 (rule 3): decluster one overlapping group.
+        # Sub-check 2: decluster one overlapping group.
         plan = self._select_overlap_decluster(file_ranges, sort_column_name)
         if plan:
             return plan
 
-        # Tier 3 (rule 1): bin-pack consecutive medium files toward target.
+        # Sub-check 3: bin-pack consecutive medium files toward target.
         return self._select_binpack(file_ranges, sort_column_name)
 
     def _build_file_ranges(self, entries, sort_field_id, sort_index):

@@ -46,11 +46,16 @@ class MockCompactor(DatasetCompactor):
         return self.files
     
     def get_compaction_plan(self):
-        """Get plan without needing full dataset metadata."""
+        """Get plan without needing full dataset metadata.
+
+        Mirrors compact(): rule A (brute, <512MB) and rule B (sort-aware,
+        >500MB) are independent per pass. Returns whichever is found first
+        (brute preferred for display) to keep this demo's single-plan-dict
+        callers working; a real pass would execute both if both are present.
+        """
         if self.strategy == "brute":
             return self._select_brute_compaction(self.files)
-        else:
-            return self._select_performance_compaction(self.files)
+        return self._select_brute_merge(self.files) or self._select_sort_aware_merge(self.files)
 
 
 def simulate_github_events():
