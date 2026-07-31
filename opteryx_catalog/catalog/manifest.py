@@ -347,30 +347,61 @@ def _category_from_logical_type(logical_type: str) -> str:
 def _min_k_smallest_distinct(hashes, k: int) -> list:
     """Return the ``k`` smallest distinct values from ``hashes``, ascending.
 
-    Single Python pass with a bounded (size <= k) max-heap + companion
-    membership set, instead of ``sorted(heapq.nsmallest(k, set(hashes)))``.
-    The old version built a full ``set()`` over every hash in the column
-    (a real cost at millions of rows) before ever looking at k; this way,
-    once the heap has k entries, a new hash needs only one comparison
-    against the current max to be rejected -- for a large/high-cardinality
-    column, most hashes never reach a set insertion or heap operation at
-    all. ``present`` always mirrors the heap's contents (not every hash
-    ever seen), so it stays bounded to k entries rather than growing with
-    the column.
+    Python fallback only (see ``_native_min_k_smallest``) for draken builds
+    without ``Vector.unique()``. Single Python pass with a bounded (size
+    <= k) max-heap + companion membership set, instead of
+    ``sorted(heapq.nsmallest(k, set(hashes)))``: once the heap has k
+    entries, a new hash needs only one comparison against the current max
+    to be rejected, so a large/high-cardinality column's hashes mostly
+    never reach a set insertion or heap operation at all. ``present``
+    always mirrors the heap's contents (not every hash ever seen), so it
+    stays bounded to k entries rather than growing with the column.
     """
     heap: list = []
     present: set = set()
+    push = heapq.heappush
+    replace = heapq.heapreplace
+    n = 0  # == len(heap), tracked locally so the hot loop isn't calling len() every row
     for h in hashes:
         if h in present:
             continue
-        if len(heap) < k:
-            heapq.heappush(heap, -h)
+        if n < k:
+            push(heap, -h)
             present.add(h)
+            n += 1
         elif h < -heap[0]:
-            evicted = -heapq.heapreplace(heap, -h)
+            evicted = -replace(heap, -h)
             present.discard(evicted)
             present.add(h)
     return sorted(-x for x in heap)
+
+
+def _native_min_k_smallest(hash_vec, k: int) -> list:
+    """K smallest distinct values of a ``hash_shaped()`` Vector, natively.
+
+    ``Vector.unique()`` (draken_native.cpp) is a first-occurrence-index
+    permutation computed via the same Parvi (<=16 distinct, zero-alloc) ->
+    Carchar (SIMD-probed hash set) promotion path that already drives
+    DISTINCT/GROUP BY -- or, for an already dict-shaped hash vector (a
+    low-cardinality source column), a direct O(n) scan with no hashing at
+    all. Either way it touches Python only for the column's DISTINCT
+    count, never its row count -- the row-count-scale Python loop this
+    replaces (see ``_min_k_smallest_distinct``) is gone entirely for the
+    common case where distinct count is already <= k (idx.length <= k
+    below), and bounded by distinct count otherwise.
+    """
+    idx = hash_vec.unique()
+    if idx.length == 0:
+        return []
+    # hash_shaped() is tagged DRAKEN_INT64 and to_pylist() boxes its bits as
+    # SIGNED Python ints, but .hash()/the min_k_hashes contract (and downstream
+    # KMV consumers) use the true UNSIGNED 64-bit value -- mask back or "smallest"
+    # silently means "smallest by signed comparison", a different, wrong set
+    # for any hash >= 2**63 (about half of them).
+    distinct_vals = [v & 0xFFFFFFFFFFFFFFFF for v in hash_vec.take(idx.to_pylist()).to_pylist()]
+    if len(distinct_vals) <= k:
+        return sorted(distinct_vals)
+    return heapq.nsmallest(k, distinct_vals)
 
 
 def _compute_column_stats(vec, category: str) -> tuple:
@@ -395,9 +426,9 @@ def _compute_column_stats(vec, category: str) -> tuple:
     try:
         # ARRAY (and possibly other nested/complex types) don't support
         # native hashing — no min-k sketch for those, everything else works.
-        hashes = vec.hash()
+        hash_vec = vec.hash_shaped()
     except ValueError:
-        hashes = []
+        hash_vec = None
     null_count = vec.null_count()
     is_compressible = category in _COMPRESSIBLE_CATEGORIES
     is_boolean = category == "BOOL"
@@ -408,7 +439,7 @@ def _compute_column_stats(vec, category: str) -> tuple:
     # rugo's parquet writer now stores nested ARRAY<ARRAY<UINT64>> with an
     # unsigned leaf annotation, so these are kept as plain ints (no decimal-string
     # workaround) — write_parquet_manifest builds the UINT64 vector directly.
-    col_min_k = _min_k_smallest_distinct(hashes, MIN_K_HASHES)
+    col_min_k = [] if hash_vec is None else _native_min_k_smallest(hash_vec, MIN_K_HASHES)
     col_hist: list = []
     col_min = NULL_FLAG
     col_max = NULL_FLAG
@@ -494,15 +525,25 @@ def _column_uncompressed_estimate(values: list) -> int:
 
 def _column_nbytes_estimate(morsel: Any, name: str, vec: Any) -> int:
     """In-memory byte footprint for one column: validity bitmap + payload
-    (string arena for string columns), read natively off the Morsel.
+    (offsets for ARRAY, string arena for the string family), read natively
+    off the Morsel.
 
-    ``Morsel.nbytes`` already does this accounting via draken's native
-    ``draken_vector_nbytes`` helper -- summed here over a single-column
-    selection rather than decoding every value to a Python object and
-    summing ``sys.getsizeof()`` over them. Falls back to the old estimate
-    only if the running draken build doesn't expose ``select()``/``nbytes``
-    (older pinned versions -- see ``morsel_schema_dict`` for the same kind
-    of cross-version split).
+    ``Morsel.nbytes`` does this accounting via draken's native
+    ``draken_vector_nbytes``/``draken_vector_owner_nbytes`` helpers -- summed
+    here over a single-column selection rather than decoding every value to a
+    Python object and summing ``sys.getsizeof()`` over them. Falls back to the
+    old estimate if the running draken build doesn't expose
+    ``select()``/``nbytes`` (older pinned versions -- see
+    ``morsel_schema_dict`` for the same kind of cross-version split).
+
+    Requires a draken/rugo build with the DRAKEN_ARRAY nbytes fix (buffers.h /
+    vector_owner.h / cxx_morsel.h / _morsel_shim.pyx): earlier builds silently
+    undercounted ARRAY columns to 0 bytes whenever the column happened to have
+    no nulls (no validity bitmap, and the child subtree was unreachable from a
+    bare DrakenVector -- see buffers.h's now-resolved KNOWN LIMITATION note).
+    That fix isn't reflected in this project's ``rugo`` version pin, so an
+    environment installing a real (not locally rebuilt) rugo release could
+    still hit the old bug here.
     """
     try:
         return int(morsel.select([name]).nbytes)
