@@ -36,3 +36,15 @@ class ViewNotFound(ViewError):
 
 class CollectionAlreadyExists(KeyError, CatalogError):
     pass
+
+
+class ManifestRefreshError(CatalogError):
+    """A statistics refresh could not recompute every file's statistics.
+
+    Raised by `SimpleDataset.refresh_manifest` when one or more data files
+    could not be re-read or re-analyzed. No snapshot is committed when this
+    is raised: a manifest where some files carry fresh statistics and others
+    silently kept stale ones is indistinguishable, downstream, from one that
+    fully succeeded — so the refresh fails whole rather than committing a
+    partial result. The message names every file that failed.
+    """

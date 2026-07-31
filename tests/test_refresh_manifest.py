@@ -328,3 +328,204 @@ def test_lengths_in_manifest_roundtrip():
     assert "max_lengths" in entry_dict
     assert entry_dict["min_lengths"] == entry.min_lengths
     assert entry_dict["max_lengths"] == entry.max_lengths
+
+
+# ── refresh_manifest fails whole rather than committing partial statistics ──
+#
+# refresh_manifest used to swallow per-file re-read/stats failures
+# (`except Exception: dent = ent`) and fall back to the file's PREVIOUS
+# manifest entry, then commit a snapshot as if everything had succeeded. A
+# manifest mixing freshly-computed statistics with silently-retained stale
+# ones is indistinguishable downstream from a fully-successful refresh, so a
+# refresh that cannot recompute every file now raises and commits nothing.
+
+
+# `get_arrow_manifest` memoises by manifest PATH, and that path is derived
+# from (snapshot_id, dataset location) — so every fixture built at
+# snapshot_id=1 under "mem://" resolves to ONE cache key and tests silently
+# read each other's manifests. Each fixture below gets its own snapshot id.
+_FIXTURE_SNAPSHOT_ID = iter(range(1000, 100000))
+
+
+def _dataset_with_manifest(mapping, manifest_path, snapshot_id):
+    """A SimpleDataset wired to in-memory IO, sharing this file's fixtures."""
+    meta = DatasetMetadata(
+        dataset_identifier="tests_temp.test", location="mem://", schema=None, properties={}
+    )
+    meta.schemas.append({"schema_id": "s1", "columns": [{"name": "a"}, {"name": "b"}]})
+    meta.current_schema_id = "s1"
+    meta.snapshots.append(
+        Snapshot(snapshot_id=snapshot_id, timestamp_ms=1, manifest_list=manifest_path)
+    )
+    meta.current_snapshot_id = snapshot_id
+
+    ds = SimpleDataset(identifier="tests_temp.test", _metadata=meta)
+    ds.io = _MemIO(mapping)
+    ds.catalog = _FakeCatalog(ds.io)
+    return ds, meta
+
+
+def _two_file_fixture():
+    """Two data files + a manifest describing both, all in memory."""
+    from rugo.parquet import write_parquet
+
+    snapshot_id = next(_FIXTURE_SNAPSHOT_ID)
+
+    t1 = _make_test_morsel([("a", "INTEGER"), ("b", "INTEGER")], [(1, 10), (2, 20)])
+    t2 = _make_test_morsel([("a", "INTEGER"), ("b", "INTEGER")], [(3, 30), (4, 40)])
+    d1 = write_parquet(t1, compression="zstd")
+    d2 = write_parquet(t2, compression="zstd")
+
+    f1 = f"mem://data/{snapshot_id}/f1.parquet"
+    f2 = f"mem://data/{snapshot_id}/f2.parquet"
+
+    e1 = build_parquet_manifest_entry_from_bytes(d1, f1, len(d1), orig_morsel=t1).to_dict()
+    e2 = build_parquet_manifest_entry_from_bytes(d2, f2, len(d2), orig_morsel=t2).to_dict()
+
+    mapping = {f1: d1, f2: d2}
+    manifest_path = _FakeCatalog(_MemIO(mapping)).write_parquet_manifest(
+        snapshot_id, [e1, e2], "mem://"
+    )
+    return mapping, manifest_path, f1, f2, snapshot_id
+
+
+def test_refresh_manifest_raises_when_a_file_cannot_be_read():
+    from opteryx_catalog.exceptions import ManifestRefreshError
+
+    mapping, manifest_path, f1, f2, snapshot_id = _two_file_fixture()
+    ds, meta = _dataset_with_manifest(mapping, manifest_path, snapshot_id)
+
+    # f2's bytes disappear (deleted/unreadable object) AFTER the manifest was written.
+    del mapping[f2]
+    mapping_before = dict(mapping)
+
+    with pytest.raises(ManifestRefreshError) as exc:
+        ds.refresh_manifest(agent="test-agent", author="tester")
+
+    # The failing file is named — an operator shouldn't have to guess which.
+    assert f2 in str(exc.value)
+    # No partial commit: the snapshot pointer and stored objects are untouched.
+    assert meta.current_snapshot_id == snapshot_id
+    assert mapping == mapping_before
+
+
+def test_refresh_manifest_reports_every_failed_file_not_just_the_first():
+    # A bad batch write / bucket issue usually affects many files at once;
+    # surfacing one per re-run would take N runs to discover N bad files.
+    from opteryx_catalog.exceptions import ManifestRefreshError
+
+    mapping, manifest_path, f1, f2, snapshot_id = _two_file_fixture()
+    ds, meta = _dataset_with_manifest(mapping, manifest_path, snapshot_id)
+
+    del mapping[f1]
+    del mapping[f2]
+
+    with pytest.raises(ManifestRefreshError) as exc:
+        ds.refresh_manifest(agent="test-agent", author="tester")
+
+    message = str(exc.value)
+    assert f1 in message
+    assert f2 in message
+    assert "2 of 2" in message
+    assert meta.current_snapshot_id == snapshot_id
+
+
+def test_refresh_manifest_raises_when_the_manifest_itself_is_unreadable():
+    # Previously this degraded to `prev_rows = []`, "refreshed" zero files,
+    # and committed a snapshot describing nothing at all.
+    from opteryx_catalog.exceptions import ManifestRefreshError
+
+    mapping, manifest_path, _f1, _f2, snapshot_id = _two_file_fixture()
+    ds, meta = _dataset_with_manifest(mapping, manifest_path, snapshot_id)
+
+    del mapping[manifest_path]
+
+    with pytest.raises(ManifestRefreshError):
+        ds.refresh_manifest(agent="test-agent", author="tester")
+
+    assert meta.current_snapshot_id == snapshot_id
+
+
+def test_refresh_manifest_succeeds_when_every_file_is_readable():
+    # The positive control for the three failure tests above: the same
+    # two-file fixture, nothing removed, commits a new snapshot.
+    mapping, manifest_path, _f1, _f2, snapshot_id = _two_file_fixture()
+    ds, meta = _dataset_with_manifest(mapping, manifest_path, snapshot_id)
+
+    new_snapshot_id = ds.refresh_manifest(agent="test-agent", author="tester")
+
+    assert new_snapshot_id != snapshot_id
+    assert meta.current_snapshot_id == new_snapshot_id
+
+
+def _entry_from_morsel(morsel):
+    """Manifest entry for an in-memory morsel, via the same bytes-based
+    builder the rest of this file uses (orig_morsel keeps the semantic types
+    Parquet would otherwise flatten)."""
+    from rugo.parquet import write_parquet
+
+    data = write_parquet(morsel, compression="zstd")
+    return build_parquet_manifest_entry_from_bytes(
+        data, "f.parquet", len(data), orig_morsel=morsel
+    )
+
+
+# ── string columns get real min/max + histograms ────────────────────────────
+#
+# Before draken's 2026-07-30 ordinalize rewrite added string support, strings
+# were excluded from _COMPRESSIBLE_CATEGORIES, so every VARCHAR column's
+# bounds were the NULL_FLAG sentinel: a string predicate could never prune,
+# and opteryx-core's local ANALYZE path (which DID compute them) disagreed
+# with this one about the same data. These bounds are ordinalize() keys (an
+# 8-byte content prefix), which is what the reader ordinalizes literals into.
+
+
+def test_string_columns_get_ordinal_min_max_and_histogram():
+    from draken.draken_native import DrakenType
+
+    from opteryx_catalog.catalog.manifest import NULL_FLAG
+
+    morsel = _make_test_morsel(
+        [("id", "INTEGER"), ("name", "VARCHAR")],
+        [(1, "apple"), (2, "pear"), (3, None)],
+    )
+    entry = _entry_from_morsel(morsel)
+
+    assert entry.min_values[1] != NULL_FLAG, "string column left without bounds"
+    assert entry.min_values[1] == DrakenType.VARCHAR.ordinalize("apple")
+    assert entry.max_values[1] == DrakenType.VARCHAR.ordinalize("pear")
+    assert len(entry.histogram_counts[1]) == 32
+
+
+def test_string_bounds_are_monotonic_in_value_order():
+    # The property pruning depends on: a value inside the real range must have
+    # an ordinal key inside the ordinal range, or a file gets wrongly skipped.
+    from draken.draken_native import DrakenType
+
+    morsel = _make_test_morsel(
+        [("name", "VARCHAR")], [("apple",), ("mango",), ("pear",)]
+    )
+    entry = _entry_from_morsel(morsel)
+    lo, hi = entry.min_values[0], entry.max_values[0]
+    assert lo <= DrakenType.VARCHAR.ordinalize("mango") <= hi
+    assert DrakenType.VARCHAR.ordinalize("aaaa") < lo
+    assert DrakenType.VARCHAR.ordinalize("zebra") > hi
+
+
+def test_binary_columns_also_get_bounds():
+    from opteryx_catalog.catalog.manifest import NULL_FLAG
+
+    morsel = _make_test_morsel([("b", "VARBINARY")], [(b"aa",), (b"zz",)])
+    entry = _entry_from_morsel(morsel)
+    assert entry.min_values[0] != NULL_FLAG
+    assert entry.min_values[0] < entry.max_values[0]
+
+
+def test_array_columns_still_have_no_bounds():
+    # ARRAY has no ordinalize kernel; it must degrade to "no stats", not crash.
+    from opteryx_catalog.catalog.manifest import NULL_FLAG
+
+    morsel = _make_test_morsel([("tags", "ARRAY")], [(["a", "b"],), (["c"],)])
+    entry = _entry_from_morsel(morsel)
+    assert entry.min_values[0] == NULL_FLAG
+    assert entry.histogram_counts[0] == []
