@@ -541,21 +541,21 @@ class DatasetCompactor:
         return self._select_brute_consolidation(sub_floor, sort_column_name)
 
     def _select_sort_aware_merge(self, entries: List[dict]) -> Optional[dict]:
-        """Rule B (rule 1 & 3): files over SORT_AWARE_FLOOR_BYTES (500 MB) -
+        """Rule B (rules 1 & 3): files over SORT_AWARE_FLOOR_BYTES (500 MB) -
         deliberately overlapping rule A's < 512 MB pool, see
         SORT_AWARE_FLOOR_BYTES - get sort-aware combine + split toward the 4GB
-        TARGET. Three sub-checks, first applicable wins:
+        TARGET. Two sub-checks, first applicable wins:
 
-          1. Any single file already over the 4.1 GB hard cap (MAX_SIZE_BYTES)
-             gets re-split on its own, regardless of whether it overlaps a
-             neighbour - nothing else in this selector will ever touch a file
-             that large again (bin-pack skips anything >= MIN_SIZE_BYTES as
-             "settled", decluster only acts on overlapping groups), so this
-             must run unconditionally.
-          2. An OVERLAPPING group of >= floor files => sort-aware combine-split
+          1. An OVERLAPPING group of >= floor files => sort-aware combine-split
              that declusters it into disjoint key ranges.
-          3. Consecutive, already-disjoint MEDIUM files (floor..MIN_SIZE_BYTES)
+          2. Consecutive, already-disjoint MEDIUM files (floor..MIN_SIZE_BYTES)
              => sort-aware bin-pack toward TARGET to reduce file count.
+
+        A single file already over the 4.1 GB hard cap is NOT re-split on its
+        own by this selector - being oversized alone is not sufficient reason
+        to rewrite it; it's only touched if it participates in an overlapping
+        group (sub-check 1) or a packable run (sub-check 2), same as any other
+        file at/above the floor.
 
         Independent of rule A - see ``_select_brute_merge`` and ``compact()``.
         Returns None (not a brute fallback) when the sort column can't be
@@ -574,34 +574,16 @@ class DatasetCompactor:
             if e.get("uncompressed_size_in_bytes", 0) > SORT_AWARE_FLOOR_BYTES
         ]
 
-        # Sub-check 1: repair any file already over the hard cap. Checked
-        # directly against `big`, not `file_ranges`, since it doesn't need
-        # range stats - a lone file needs no overlap partner to be re-split.
-        oversized = next(
-            (e for e in big if e.get("uncompressed_size_in_bytes", 0) > MAX_SIZE_BYTES),
-            None,
-        )
-        if oversized is not None:
-            size = oversized.get("uncompressed_size_in_bytes", 0)
-            return {
-                "type": "combine-split",
-                "mode": "sort-aware",
-                "files": [oversized],
-                "reason": "oversize-resplit",
-                "sort_column": sort_column_name,
-                "expected_outputs": max(1, -(-size // TARGET_SIZE_BYTES)),
-            }
-
         file_ranges = self._build_file_ranges(big, sort_field_id, sort_index)
         if not file_ranges:
             return None
 
-        # Sub-check 2: decluster one overlapping group.
+        # Sub-check 1: decluster one overlapping group.
         plan = self._select_overlap_decluster(file_ranges, sort_column_name)
         if plan:
             return plan
 
-        # Sub-check 3: bin-pack consecutive medium files toward target.
+        # Sub-check 2: bin-pack consecutive medium files toward target.
         return self._select_binpack(file_ranges, sort_column_name)
 
     def _build_file_ranges(self, entries, sort_field_id, sort_index):
