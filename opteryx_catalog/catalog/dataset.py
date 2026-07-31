@@ -4,7 +4,7 @@ import os
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 from ..audit import emit_audit
 from .manifest import (
@@ -17,6 +17,42 @@ from .metastore import Dataset
 
 # Stable node identifier for this process (hex-mac-hex-pid)
 _NODE = f"{uuid.getnode():x}-{os.getpid():x}"
+
+
+def select_last_user_snapshot(
+    snapshots: List[Snapshot], lookback: Optional[int] = None
+) -> Optional[Snapshot]:
+    """The most recent USER-created snapshot in `snapshots`, or None.
+
+    Shared by `SimpleDataset.last_user_snapshot` (UI: "when did a human last
+    change this?") and snapshot expiration (which must not delete the last
+    thing a user did). Both need the same answer from the same rule, so the
+    rule lives here once.
+
+    `lookback` bounds the search to that many most-recent snapshots; None
+    searches all of them. Expiration passes a bound deliberately: a dataset
+    written by a human once and then maintained automatically forever would
+    otherwise pin its very first snapshot in storage indefinitely. Bounding
+    the window means a user commit buried under a long tail of automated
+    ones is eventually allowed to expire — imperfect, but a deliberate
+    trade between honest history and unbounded retention.
+
+    `user_created` must be explicitly True. None means "not known to be a
+    user commit" and does not count — guessing would put a system commit in
+    front of a user asking "what did I change?", which is the confusion this
+    exists to prevent.
+
+    Ordering is by `sequence_number` (the monotonic write counter), falling
+    back to `snapshot_id` (a millisecond timestamp) on older rows that
+    predate it — never by Firestore's document iteration order, which is
+    lexicographic on the id string and only coincidentally numeric.
+    """
+    ordered = sorted(
+        snapshots, key=lambda s: (s.sequence_number or 0, s.snapshot_id or 0)
+    )
+    window = ordered if lookback is None else ordered[-lookback:]
+    user_snapshots = [s for s in window if s.user_created is True]
+    return user_snapshots[-1] if user_snapshots else None
 
 
 @dataclass
@@ -173,7 +209,9 @@ class SimpleDataset(Dataset):
             seq = getattr(current, "sequence_number", None)
             return int(seq) + 1 if seq is not None else 1
 
-    def snapshot(self, snapshot_id: Optional[int] = None) -> Optional[Snapshot]:
+    def snapshot(
+        self, snapshot_id: Optional[int] = None, user_only: bool = False
+    ) -> Optional[Snapshot]:
         """Return a Snapshot.
 
         - If `snapshot_id` is None, return the in-memory current snapshot.
@@ -181,7 +219,21 @@ class SimpleDataset(Dataset):
           attached `catalog` (O(1) document get). Fall back to the in-memory
           `metadata.snapshots` list only when no catalog is attached or the
           remote lookup fails.
+        - If `user_only` is True (with no `snapshot_id`), return the most
+          recent USER-created snapshot instead of the current one — see
+          `last_user_snapshot`.
         """
+        if user_only:
+            if snapshot_id is not None:
+                # Contradictory: one asks for a specific snapshot, the other
+                # for whichever is the latest user one. Refuse rather than
+                # silently honouring one and ignoring the other.
+                raise ValueError(
+                    "snapshot(): `user_only=True` cannot be combined with an explicit "
+                    "`snapshot_id`; pass one or the other"
+                )
+            return self.last_user_snapshot()
+
         # Current snapshot: keep in memory for fast access
         if snapshot_id is None:
             return self.metadata.current_snapshot()
@@ -222,6 +274,60 @@ class SimpleDataset(Dataset):
                 return s
 
         return None
+
+    def last_user_snapshot(self, lookback: Optional[int] = None) -> Optional[Snapshot]:
+        """The most recent snapshot a USER created, or None if there is none.
+
+        `lookback` bounds the search to that many most-recent snapshots
+        (None = search all of them). See `select_last_user_snapshot`.
+
+        The current snapshot is frequently NOT one: compaction, expiration and
+        statistics refresh (`refresh_manifest`) all commit snapshots of their
+        own, so a dataset nobody has written to for a week can still show a
+        commit from minutes ago. Surfacing that in a UI as "your last commit"
+        invites the reasonable question of why there are commits the user
+        never made. This answers "when did a HUMAN last change this data?"
+        instead.
+
+        `user_created` is authoritative here: every writer sets it (True for
+        `append`/`overwrite`/`truncate`, False for the maintenance
+        operations), so only an explicit True counts — a missing or None
+        value is treated as "not known to be a user commit" rather than
+        assumed to be one, since guessing wrong reintroduces exactly the
+        confusion this exists to remove.
+
+        Cost: the in-memory `metadata.snapshots` list normally holds only the
+        current snapshot (`load_dataset(load_history=False)` is the default),
+        so when that one is not user-created this streams the snapshots
+        subcollection and picks the winner client-side. That mirrors how the
+        rest of this module reads snapshots — no `where`/`order_by` query, so
+        no composite index to provision — and it is a UI-facing lookup, not a
+        query-plan hot path. When the current snapshot IS user-created, which
+        is the common case, it returns immediately with no extra read.
+        """
+        current = self.metadata.current_snapshot()
+        if current is not None and current.user_created is True:
+            return current
+
+        candidates: list = []
+        if self.catalog:
+            try:
+                collection, dataset_name = self.identifier.split(".")
+                # pylint: disable=protected-access
+                snaps_coll = self.catalog._snapshots_collection(collection, dataset_name)
+                candidates = [
+                    self.catalog._snapshot_from_dict(doc.to_dict() or {})
+                    for doc in snaps_coll.stream()
+                ]
+            except Exception:
+                # Fall through to whatever is already in memory rather than
+                # failing a read-only lookup outright.
+                candidates = []
+
+        if not candidates:
+            candidates = list(self.metadata.snapshots)
+
+        return select_last_user_snapshot(candidates, lookback=lookback)
 
     def _get_node(self) -> str:
         """Return the stable node identifier for this process.
@@ -1371,19 +1477,28 @@ class SimpleDataset(Dataset):
 
         return results
 
-    def refresh_manifest(self, agent: str, author: Optional[str] = None) -> Optional[int]:
+    def refresh_manifest(self, agent: str, author: Optional[str] = None) -> int:
         """Refresh manifest statistics and create a new snapshot.
 
         - `agent`: identifier for the agent performing the refresh (string)
         - `author`: optional author to record; if omitted uses current snapshot author
 
-        This recalculates per-file statistics (min/max, record counts, sizes)
-        for every file in the current manifest, writes a new manifest and
-        creates a new snapshot with `user_created=False` and
-        `operation_type='statistics-refresh'`.
+        This recalculates per-file statistics (min/max, record counts, sizes,
+        null counts, histograms, char-class byte stats) for every file in the
+        current manifest, writes a new manifest and creates a new snapshot
+        with `user_created=False` and `operation_type='statistics-refresh'`.
 
-        Returns the new `snapshot_id` on success or None on failure.
+        Returns the new `snapshot_id`.
+
+        Raises `ManifestRefreshError` if the current manifest cannot be read,
+        or if ANY file's statistics cannot be recomputed — naming every file
+        that failed. No snapshot is committed in that case: a manifest mixing
+        freshly-computed statistics with silently-retained stale ones is
+        indistinguishable downstream from a fully-successful refresh, so this
+        fails whole rather than committing a partial result.
         """
+        from opteryx_catalog.exceptions import ManifestRefreshError
+
         prev = self.snapshot(None)
         if prev is None or not getattr(prev, "manifest_list", None):
             raise ValueError("No current manifest available to refresh")
@@ -1401,13 +1516,20 @@ class SimpleDataset(Dataset):
 
             prev_manifest = get_arrow_manifest(self.io, prev.manifest_list)
             prev_rows = prev_manifest.to_pylist()
-        except Exception:
-            prev_rows = []
+        except Exception as exc:
+            # An unreadable manifest previously degraded to `prev_rows = []`,
+            # which then "refreshed" zero files and committed a snapshot that
+            # looked successful while describing nothing.
+            raise ManifestRefreshError(
+                f"refresh_manifest: could not read the current manifest "
+                f"{prev.manifest_list!r}; no snapshot was committed. Cause: {exc}"
+            ) from exc
 
         total_files = 0
         total_size = 0
         total_data_size = 0
         total_records = 0
+        failures: list = []
 
         for ent in prev_rows:
             if not isinstance(ent, dict):
@@ -1425,15 +1547,26 @@ class SimpleDataset(Dataset):
                     data, fp, file_size, field_id_by_name=self._field_id_by_name()
                 )
                 dent = manifest_entry.to_dict()
-            except Exception:
-                # Fall back to original entry if re-read fails
-                dent = ent
+            except Exception as exc:
+                # Collect and keep going: a bad batch write or bucket issue
+                # usually affects many files at once, and surfacing them one
+                # per re-run would take N runs to discover N bad files.
+                failures.append((fp, exc))
+                continue
 
             entries.append(dent)
             total_files += 1
             total_size += int(dent.get("file_size_in_bytes") or 0)
             total_data_size += int(dent.get("uncompressed_size_in_bytes") or 0)
             total_records += int(dent.get("record_count") or 0)
+
+        if failures:
+            detail = "; ".join(f"{fp}: {exc}" for fp, exc in failures)
+            raise ManifestRefreshError(
+                f"refresh_manifest: failed to recompute statistics for "
+                f"{len(failures)} of {len(prev_rows)} file(s); no snapshot was "
+                f"committed. Failures: {detail}"
+            )
 
         # write new manifest
         manifest_path = self.catalog.write_parquet_manifest(

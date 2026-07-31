@@ -276,6 +276,14 @@ def clear_parsed_manifest_cache() -> None:
 
 import heapq
 
+# Categories that get ordinalize()-based min/max and a value histogram.
+# VARCHAR/NVARCHAR/VARBINARY are in this set as of draken's 2026-07-30
+# ordinalize rewrite, which added string support (an 8-byte big-endian
+# content prefix, monotonic but not a total order — see draken/ops/
+# ordinalize.h). Before that they had no min/max at all and every string
+# column's bounds were the NULL_FLAG sentinel, so a string predicate could
+# never prune and opteryx-core's local ANALYZE path (which does compute
+# them) disagreed with this one about the same data.
 _COMPRESSIBLE_CATEGORIES = {
     "INT8",
     "INT16",
@@ -291,6 +299,9 @@ _COMPRESSIBLE_CATEGORIES = {
     "TIME64",
     "INTERVAL",
     "BOOL",
+    "VARCHAR",
+    "NVARCHAR",
+    "VARBINARY",
 }
 _VARIABLE_WIDTH_CATEGORIES = {"VARCHAR", "NVARCHAR", "VARBINARY", "ARRAY"}
 # The subset of _VARIABLE_WIDTH_CATEGORIES Vector.char_class_stats() accepts

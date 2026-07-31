@@ -16,6 +16,7 @@ from typing import List
 from typing import Optional
 from typing import Set
 
+from .dataset import select_last_user_snapshot
 from .metadata import Snapshot
 
 logger = logging.getLogger(__name__)
@@ -25,6 +26,13 @@ logger = logging.getLogger(__name__)
 # day's snapshot count for datasets on 15-minutely maintenance schedules
 # (~96/day) so same-day runs never trip it.
 MAX_SNAPSHOTS_FOR_ORPHAN_DETECTION = 2500
+
+# How far back expiration looks for a user commit to protect from deletion.
+# See the call site in _expire_dataset: deep enough to survive a burst of
+# maintenance snapshots landing on top of a real write, shallow enough that a
+# write-once/maintain-forever dataset does not pin its first snapshot (and
+# every data file that snapshot references) in storage permanently.
+USER_SNAPSHOT_LOOKBACK = 10
 
 # Manifest orphan cleanup: only delete manifest files older than this (ms)
 MANIFEST_ORPHAN_MIN_AGE_MS = 24 * 60 * 60 * 1000  # 1 day
@@ -123,6 +131,35 @@ class SnapshotExpiration:
                 # Always keep at least the current snapshot
                 if snapshots[-1] not in snapshots_to_keep:
                     snapshots_to_keep.append(snapshots[-1])
+
+            # Always retain the most recent USER commit, in both branches
+            # above. Maintenance writes snapshots of its own — compaction,
+            # statistics refresh, expiration — so the newest snapshot is
+            # routinely not one anybody made by hand. Without this, a dataset
+            # that is written rarely but maintained often loses the last
+            # thing a user actually did, and the UI is left showing only
+            # commits the user never made (or nothing at all).
+            #
+            # Bounded to the last USER_SNAPSHOT_LOOKBACK snapshots on
+            # purpose: a dataset written once by a human and maintained
+            # automatically forever would otherwise pin its very first
+            # snapshot, and everything it references, in storage for good. A
+            # user commit buried deeper than that window is allowed to
+            # expire, leaving the latest snapshot (already retained above) as
+            # what the UI shows. An imperfect trade, chosen deliberately.
+            protected_user_snapshot = select_last_user_snapshot(
+                snapshots, lookback=USER_SNAPSHOT_LOOKBACK
+            )
+            if (
+                protected_user_snapshot is not None
+                and protected_user_snapshot not in snapshots_to_keep
+            ):
+                snapshots_to_keep.append(protected_user_snapshot)
+                logger.info(
+                    "Retaining last user snapshot %s for %s (outside retention window)",
+                    protected_user_snapshot.snapshot_id,
+                    identifier,
+                )
 
             # Decide whether to skip expensive orphan-detection based on snapshot count
             total_snapshots = len(snapshots)

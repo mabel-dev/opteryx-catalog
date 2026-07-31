@@ -104,6 +104,64 @@ def _morsel_type_to_stored(dtype: Any) -> tuple:
     return (category, None, None, None)
 
 
+_SNAPSHOT_SUMMARY_KEYS = (
+    "added-data-files",
+    "added-files-size",
+    "added-records",
+    "deleted-data-files",
+    "deleted-files-size",
+    "deleted-records",
+    "total-data-files",
+    "total-files-size",
+    "total-records",
+)
+
+
+def _snapshot_to_document(snapshot: Snapshot) -> dict:
+    """The canonical Firestore document for one snapshot.
+
+    BOTH writers of a snapshot document — `save_snapshot` and
+    `save_dataset_metadata`'s upsert loop — MUST serialize through here.
+    They write the SAME document id with `.set()`, which REPLACES the
+    document rather than merging it, so any field one writer omits is
+    silently ERASED by the other.
+
+    They previously carried different field sets, and `save_dataset_metadata`
+    runs last in every write path (`SimpleDataset.append`/`overwrite`/
+    `truncate`/`refresh_manifest` all call `save_snapshot` then
+    `save_dataset_metadata`), so the two fields only `save_snapshot` wrote —
+    `operation-type` and `parent-snapshot-id` — were written and then wiped
+    on every commit. Every snapshot in the catalog therefore read back with
+    `operation_type=None` and no parent link: an append, a compaction and a
+    statistics refresh were indistinguishable after the fact, and the
+    snapshot ancestry chain was never persisted at all. The asymmetry cut
+    both ways — `user-created` existed only in `save_dataset_metadata`, so
+    any path where `save_snapshot` ran last would erase that instead.
+    `DatasetCompactor` calls only `save_dataset_metadata`, so its snapshots
+    never recorded an operation type even once.
+
+    `_snapshot_from_dict` is the reader; every key it looks for must be
+    produced here. Keep the three in step.
+    """
+    summary = dict(snapshot.summary or {})
+    for key in _SNAPSHOT_SUMMARY_KEYS:
+        summary.setdefault(key, 0)
+
+    return {
+        "snapshot-id": snapshot.snapshot_id,
+        "timestamp-ms": snapshot.timestamp_ms,
+        "manifest": snapshot.manifest_list,
+        "commit-message": getattr(snapshot, "commit_message", "") or "",
+        "schema-id": getattr(snapshot, "schema_id", None),
+        "summary": summary,
+        "author": getattr(snapshot, "author", None),
+        "sequence-number": getattr(snapshot, "sequence_number", None),
+        "user-created": getattr(snapshot, "user_created", None),
+        "operation-type": getattr(snapshot, "operation_type", None),
+        "parent-snapshot-id": getattr(snapshot, "parent_snapshot_id", None),
+    }
+
+
 class OpteryxCatalog(Metastore):
     """Firestore-backed Metastore implementation.
 
@@ -1131,37 +1189,7 @@ class OpteryxCatalog(Metastore):
         """Persist a single snapshot document for a dataset."""
         namespace, dataset_name = identifier.split(".")
         snaps = self._snapshots_collection(namespace, dataset_name)
-        doc_id = str(snapshot.snapshot_id)
-        # Ensure summary contains all expected keys (zero defaults applied in dataclass)
-        summary = snapshot.summary or {}
-        # Provide explicit keys if missing
-        for k in [
-            "added-data-files",
-            "added-files-size",
-            "added-records",
-            "deleted-data-files",
-            "deleted-files-size",
-            "deleted-records",
-            "total-data-files",
-            "total-files-size",
-            "total-records",
-        ]:
-            summary.setdefault(k, 0)
-
-        data = {
-            "snapshot-id": snapshot.snapshot_id,
-            "timestamp-ms": snapshot.timestamp_ms,
-            "manifest": snapshot.manifest_list,
-            "commit-message": getattr(snapshot, "commit_message", ""),
-            "summary": summary,
-            "author": getattr(snapshot, "author", None),
-            "sequence-number": getattr(snapshot, "sequence_number", None),
-            "operation-type": getattr(snapshot, "operation_type", None),
-            "parent-snapshot-id": getattr(snapshot, "parent_snapshot_id", None),
-        }
-        if getattr(snapshot, "schema_id", None) is not None:
-            data["schema-id"] = snapshot.schema_id
-        snaps.document(doc_id).set(data)
+        snaps.document(str(snapshot.snapshot_id)).set(_snapshot_to_document(snapshot))
 
     def save_dataset_metadata(self, identifier: str, metadata: DatasetMetadata) -> None:
         """Persist dataset-level metadata and snapshots to Firestore.
@@ -1196,20 +1224,11 @@ class OpteryxCatalog(Metastore):
         snaps_coll = self._snapshots_collection(collection, dataset_name)
         # Upsert snapshot documents. Do NOT delete existing snapshot documents
         # here to avoid accidental removal of historical snapshots on save.
+        # Serialized via _snapshot_to_document — the SAME writer save_snapshot
+        # uses. These two both `.set()` the same document, so a field missing
+        # from either one is destroyed by the other (see that function).
         for snap in metadata.snapshots:
-            snaps_coll.document(str(snap.snapshot_id)).set(
-                {
-                    "snapshot-id": snap.snapshot_id,
-                    "timestamp-ms": snap.timestamp_ms,
-                    "manifest": snap.manifest_list,
-                    "commit-message": getattr(snap, "commit_message", ""),
-                    "schema-id": snap.schema_id,
-                    "summary": snap.summary or {},
-                    "author": getattr(snap, "author", None),
-                    "sequence-number": getattr(snap, "sequence_number", None),
-                    "user-created": getattr(snap, "user_created", None),
-                }
-            )
+            snaps_coll.document(str(snap.snapshot_id)).set(_snapshot_to_document(snap))
 
         # Persist schemas subcollection
         schemas_coll = doc_ref.collection("schemas")
