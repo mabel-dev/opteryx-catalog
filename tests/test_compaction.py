@@ -479,6 +479,50 @@ def test_hot_value_group_detected_regardless_of_tie_order():
     assert selected == {e["file_path"] for e in entries}, "all four files share real overlap"
 
 
+def test_oversized_overlap_chain_randomizes_subset_across_passes():
+    """When one overlap chain's combined size exceeds
+    DECLUSTER_MAX_COMBINED_BYTES, only some of its members can be declustered
+    in a single pass. Taking them in sort order every time (the pre-fix
+    behaviour) starves whichever files sort last: observed live on
+    opteryx.test.pypi's `project` key, a single popular package spanning more
+    files than one pass's cap settled into re-selecting the same few files
+    pass after pass with zero net progress. The subset choice is now
+    randomized (an injectable ``rng``, seeded here for reproducibility) so
+    repeated passes sample different members and the cluster converges
+    instead of cycling.
+
+    One wide anchor file (the "boundary" file, e.g. a popular package plus
+    whatever sorts immediately after it) overlapping 5 zero-width files (e.g.
+    files entirely filled by that one package) - all 6 together exceed the
+    cap, but the anchor plus any 3 of the 5 zero-width files fits."""
+    compactor = DatasetCompactor(_perf_dataset(), strategy="performance", author="t", agent="t")
+    from opteryx_catalog.catalog.compaction import DECLUSTER_MAX_COMBINED_BYTES
+
+    anchor_mb = 1000
+    candidate_mb = 4000
+    assert anchor_mb * _MB + 3 * candidate_mb * _MB <= DECLUSTER_MAX_COMBINED_BYTES
+    assert anchor_mb * _MB + 4 * candidate_mb * _MB > DECLUSTER_MAX_COMBINED_BYTES
+
+    entries = [_entry("/tmp/anchor.parquet", 100, 300, anchor_mb)]
+    entries += [_entry(f"/tmp/c{i}.parquet", 100, 100, candidate_mb) for i in range(5)]
+    file_ranges = compactor._build_file_ranges(entries, sort_field_id=1, sort_index=0)
+
+    import random
+
+    picks = set()
+    for seed in range(10):
+        plan = compactor._select_overlap_decluster(
+            file_ranges, "timestamp", rng=random.Random(seed)
+        )
+        assert plan is not None
+        selected = frozenset(f["file_path"] for f in plan["files"])
+        assert "/tmp/anchor.parquet" in selected, "the anchor (defines running_max) is never dropped"
+        assert len(selected) == 4, "anchor + exactly 3 of the 5 candidates fit under the cap"
+        picks.add(selected)
+
+    assert len(picks) > 1, "different seeds must select different subsets, not the same one every time"
+
+
 def test_disjoint_settled_files_left_alone():
     """Disjoint files already near target (>= MIN_SIZE_BYTES) are left alone:
     no overlap to decluster, and bin-pack skips settled files."""

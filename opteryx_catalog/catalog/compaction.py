@@ -35,6 +35,7 @@ order; it is unrelated to the above.
 from __future__ import annotations
 
 import os
+import random
 import time
 import uuid
 from typing import List, Optional
@@ -671,7 +672,7 @@ class DatasetCompactor:
             "sort_column": sort_column_name,
         }
 
-    def _select_overlap_decluster(self, file_ranges, sort_column_name) -> Optional[dict]:
+    def _select_overlap_decluster(self, file_ranges, sort_column_name, rng=None) -> Optional[dict]:
         """Rule 3: among files at/above the floor, find a group whose sort-key
         ranges OVERLAP, bound it so the combined size stays within the memory
         gate, and emit a sort-aware ``combine-split``. The (streaming) executor
@@ -680,6 +681,10 @@ class DatasetCompactor:
         ROW GROUPS only (never a new file under target); k > 1 -> that many
         disjoint-range FILES. Each call tightens one overlapping group; repeated
         passes converge toward non-overlapping files.
+
+        ``rng``: injectable ``random.Random`` (defaults to the ``random``
+        module) - see the oversized-cluster branch below. Tests pass a seeded
+        instance for reproducibility; production leaves it unset.
 
         Overlap uses a STRICT test (``next.min < running_max``): files that
         merely touch at a shared boundary value - the exact artifact of a prior
@@ -713,12 +718,19 @@ class DatasetCompactor:
         except TypeError:
             return None  # sort-key mins/maxes not mutually comparable
 
+        rng = rng or random
+
         i = 0
         m = len(ordered)
         while i < m:
-            group = [ordered[i]]
-            running_max = ordered[i]["max"]
-            total = ordered[i]["size"]
+            anchor = ordered[i]
+            running_max = anchor["max"]
+            # Every file (in sort order, following the anchor) that is part of
+            # this ONE connected overlap chain - size-uncapped for now. Chain
+            # membership is a pure correctness question (does it genuinely
+            # overlap something already in the chain?), independent of how
+            # much of it one pass can afford to rewrite.
+            candidates = []
             j = i + 1
             while j < m:
                 fr = ordered[j]
@@ -728,16 +740,47 @@ class DatasetCompactor:
                     overlaps = False
                 if not overlaps:
                     break
-                if total + fr["size"] > DECLUSTER_MAX_COMBINED_BYTES:
-                    break
-                group.append(fr)
+                candidates.append(fr)
                 try:
                     if fr["max"] > running_max:
                         running_max = fr["max"]
                 except TypeError:
                     pass
-                total += fr["size"]
                 j += 1
+
+            if not candidates:
+                i += 1
+                continue
+
+            combined = anchor["size"] + sum(fr["size"] for fr in candidates)
+            if combined <= DECLUSTER_MAX_COMBINED_BYTES:
+                # Whole chain fits in one pass - take it all, nothing to
+                # choose between, no randomness involved.
+                group = [anchor] + candidates
+            else:
+                # More overlapping data than one pass can hold. Which subset
+                # of `candidates` gets declustered this pass has no
+                # principled "most correct" answer - taking them in sort
+                # order every time (the previous behaviour) starves whatever
+                # sorts last: a cluster bigger than the cap settles into
+                # re-selecting the same few files pass after pass forever
+                # (observed live on opteryx.test.pypi's `project` key - a
+                # popular package spanning more files than one pass's cap,
+                # cycling between the same handful of files with zero net
+                # progress). Shuffling which candidates are offered means
+                # repeated calls sample different members of an oversized
+                # cluster, so it converges over passes instead of cycling.
+                # The anchor always stays in (it defines `running_max`, the
+                # only thing establishing this is a real overlap chain).
+                shuffled = list(candidates)
+                rng.shuffle(shuffled)
+                group = [anchor]
+                total = anchor["size"]
+                for fr in shuffled:
+                    if total + fr["size"] > DECLUSTER_MAX_COMBINED_BYTES:
+                        continue
+                    group.append(fr)
+                    total += fr["size"]
 
             if len(group) >= 2:
                 combined = sum(fr["size"] for fr in group)
