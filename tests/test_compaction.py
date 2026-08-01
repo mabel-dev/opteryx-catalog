@@ -488,7 +488,8 @@ def test_hot_value_group_detected_regardless_of_tie_order():
     alphabetically.
     """
     compactor = DatasetCompactor(_perf_dataset(), strategy="performance", author="t", agent="t")
-    mb = 4096  # settled on both selectors, so only decluster (not bin-pack) can find this
+    mb = 2048  # settled on both selectors, so only decluster (not bin-pack) can find this;
+    # all 4 files (2 GB each) must fit comfortably under the 12 GB decluster cap
 
     zero_width = [_entry(f"/tmp/pure{i}.parquet", 100, 100, mb) for i in range(3)]
     wide = _entry("/tmp/wide.parquet", 100, 300, mb)
@@ -529,7 +530,7 @@ def test_oversized_overlap_chain_capped_by_declustler_max_bytes():
     from opteryx_catalog.catalog.compaction import DECLUSTER_MAX_COMBINED_BYTES
 
     anchor_mb = 1000
-    candidate_mb = 4000
+    candidate_mb = 3500
     assert anchor_mb * _MB + 3 * candidate_mb * _MB <= DECLUSTER_MAX_COMBINED_BYTES
     assert anchor_mb * _MB + 4 * candidate_mb * _MB > DECLUSTER_MAX_COMBINED_BYTES
 
@@ -554,8 +555,8 @@ def test_growth_prefers_most_overlapping_candidate_first():
     compactor = DatasetCompactor(_perf_dataset(), strategy="performance", author="t", agent="t")
     from opteryx_catalog.catalog.compaction import DECLUSTER_MAX_COMBINED_BYTES
 
-    seed_mb = 4000
-    cand_mb = 5000
+    seed_mb = 1000
+    cand_mb = 4200
     assert seed_mb * _MB + 2 * cand_mb * _MB <= DECLUSTER_MAX_COMBINED_BYTES
     assert seed_mb * _MB + 3 * cand_mb * _MB > DECLUSTER_MAX_COMBINED_BYTES
 
