@@ -441,6 +441,44 @@ def test_touching_boundary_is_not_overlap():
     assert plan is not None and plan["reason"] == "overlap-decluster"
 
 
+def test_hot_value_group_detected_regardless_of_tie_order():
+    """A 'hot' sort-key value with more rows than fit in one file (e.g. a
+    Zipfian-popular value like a single dominant `project` name in a PyPI
+    download log) fills several files whose stats are all ``min == max ==
+    <value>`` (zero-width ranges), plus a boundary file that starts at that
+    same value and extends further. All of these genuinely overlap and must
+    decluster together as one group, regardless of which order they happen to
+    appear in the manifest.
+
+    A naive ``sorted(file_ranges, key=lambda fr: fr["min"])`` is stable, so
+    ties keep the manifest's arbitrary original order. If a zero-width file
+    lands first within the tie, `running_max` is pinned to the hot value
+    itself; the STRICT `<` overlap test then sees `next.min == running_max`
+    for every other tied file - including the genuinely wider boundary file -
+    and closes the group at size 1 each time, never finding the real overlap.
+    Reproduces the exact structure found live in opteryx.test.pypi's `project`
+    sort key: three files entirely filled by one popular package plus a
+    fourth file that starts with the same package and continues into the
+    next ones alphabetically.
+    """
+    compactor = DatasetCompactor(_perf_dataset(), strategy="performance", author="t", agent="t")
+    mb = 4096  # settled on both selectors, so only decluster (not bin-pack) can find this
+
+    # Zero-width files (min == max == the hot value) listed BEFORE the wider
+    # file that starts at the same value - the manifest order that defeats a
+    # min-only sort.
+    zero_width = [_entry(f"/tmp/pure{i}.parquet", 100, 100, mb) for i in range(3)]
+    wide = _entry("/tmp/wide.parquet", 100, 300, mb)
+    entries = zero_width + [wide]
+
+    file_ranges = compactor._build_file_ranges(entries, sort_field_id=1, sort_index=0)
+    plan = compactor._select_overlap_decluster(file_ranges, "timestamp")
+
+    assert plan is not None, "the wide file genuinely overlaps every zero-width file at value 100"
+    selected = {f["file_path"] for f in plan["files"]}
+    assert selected == {e["file_path"] for e in entries}, "all four files share real overlap"
+
+
 def test_disjoint_settled_files_left_alone():
     """Disjoint files already near target (>= MIN_SIZE_BYTES) are left alone:
     no overlap to decluster, and bin-pack skips settled files."""

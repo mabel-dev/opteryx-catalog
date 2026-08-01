@@ -36,17 +36,6 @@ def test_min_k_hashes_for_string_and_binary():
     assert len(e.min_k_hashes[1]) > 0
 
 
-# Step 1: Create a local catalog
-catalog = OpteryxCatalog(
-    "opteryx",
-    firestore_project="mabeldev",
-    firestore_database="catalogs",
-    gcs_bucket="opteryx_data",
-)
-
-# print(catalog.load_dataset("ops.stdout_log").describe())
-
-
 class _MemInput:
     def __init__(self, data: bytes):
         self._data = data
