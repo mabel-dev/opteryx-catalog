@@ -475,11 +475,15 @@ def _compute_column_stats(vec, category: str) -> tuple:
                 vmin, vmax = min_max
                 col_min, col_max = int(vmin), int(vmax)
                 if is_boolean:
-                    # No native bool-count kernel (Vector.sum() doesn't support
-                    # BOOL) -- bounded, per-column Python pass, not a Tb-scale one.
-                    values = vec.to_pylist()
-                    true_count = sum(1 for v in values if v is True)
-                    false_count = sum(1 for v in values if v is False)
+                    # BOOL's ordinal domain is always exactly {0, 1} (False,
+                    # True) -- bucketing the already-computed ordinal vector
+                    # against that FIXED range (not this column's own
+                    # ordinal_min_max(), which degenerates to a single bucket
+                    # when every non-null value is the same) gives an exact
+                    # native [false_count, true_count], replacing what used
+                    # to be a to_pylist() decode of the whole column plus two
+                    # Python-level sum() passes over it.
+                    false_count, true_count = ordinal.histogram_bucket(0, 1, 2)
                     col_hist = [int(true_count), int(false_count)]
                 elif vmax > vmin:
                     col_hist = ordinal.histogram_bucket(vmin, vmax, HISTOGRAM_BINS)
@@ -750,7 +754,6 @@ def build_parquet_manifest_entry_from_bytes(
             "char_counts": [0] * 8,
             "char_total_bytes": 0,
             "length_range": None,
-            "bool_values": [],
             "nbytes": 0,
         }
         for name in col_names
@@ -783,19 +786,15 @@ def build_parquet_manifest_entry_from_bytes(
                 if category in _COMPRESSIBLE_CATEGORIES:
                     # ordinalize() doesn't support ARRAY/VECTOR_FP16/DECIMAL128
                     # -- see the identical guard in _compute_column_stats.
+                    # BOOL true/false counts are derived from this same
+                    # buffered ordinal vector at merge time below (see
+                    # _compute_column_stats for why the range is fixed
+                    # (0, 1) rather than this group's own min/max) --
+                    # no separate to_pylist() pass needed here.
                     try:
                         acc["ordinal_vecs"].append(vec.ordinalize())
                     except ValueError:
                         pass
-                    if category == "BOOL":
-                        # No native bool-count kernel -- see _compute_column_stats.
-                        values = vec.to_pylist()
-                        acc["bool_values"].append(
-                            (
-                                sum(1 for v in values if v is True),
-                                sum(1 for v in values if v is False),
-                            )
-                        )
 
                 if category in _STRING_CATEGORIES:
                     counts, total_bytes, length_range = vec.char_class_stats()
@@ -849,8 +848,16 @@ def build_parquet_manifest_entry_from_bytes(
                 vmax = max(p[1] for p in pairs)
                 col_min, col_max = int(vmin), int(vmax)
                 if category == "BOOL":
-                    true_count = sum(t for t, _ in acc["bool_values"])
-                    false_count = sum(f for _, f in acc["bool_values"])
+                    # Fixed (0, 1) range, not (vmin, vmax) -- see the identical
+                    # reasoning in _compute_column_stats. Native per-group
+                    # bucketing on the already-buffered ordinal vectors, no
+                    # to_pylist() decode.
+                    false_count = 0
+                    true_count = 0
+                    for v in vecs:
+                        b0, b1 = v.histogram_bucket(0, 1, 2)
+                        false_count += b0
+                        true_count += b1
                     col_hist = [int(true_count), int(false_count)]
                 elif vmax > vmin:
                     bins = [0] * HISTOGRAM_BINS

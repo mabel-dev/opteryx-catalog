@@ -38,6 +38,7 @@ import os
 import random
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional
 
 from .manifest import ParquetManifestEntry, build_parquet_manifest_entry_from_bytes
@@ -45,6 +46,16 @@ from .metadata import Snapshot
 
 # Stable node identifier for this process (hex-mac-hex-pid)
 _NODE = f"{uuid.getnode():x}-{os.getpid():x}"
+
+# Concurrency for _refresh_manifest_from_data_files: that path can touch
+# every file in a dataset (a full-manifest-rebuild fallback), and each
+# file's read+stats is independent (network I/O plus native decode that
+# releases the GIL), so overlapping them cuts wall time on any dataset
+# bigger than one file. Kept small and fixed rather than scaled to file
+# count or CPU count -- rebuilding one large file's stats can transiently
+# need several GB of native memory (see build_parquet_manifest_entry_from_bytes),
+# so a wide pool would turn a rare recovery path into a memory spike.
+_REFRESH_MANIFEST_MAX_WORKERS = 8
 
 
 def normalize_sort_order(sort_orders) -> Optional[dict]:
@@ -1759,6 +1770,36 @@ class DatasetCompactor:
             # If we can't recover the file, return None
             return None
 
+    def _refresh_one_entry_from_data_file(self, entry: dict) -> dict:
+        """Rebuild a single manifest entry from its data file.
+
+        Same per-entry fallback contract as
+        ``_refresh_manifest_from_data_files`` (below), split out so it can
+        run in a worker thread: any failure (missing path, unreadable file,
+        malformed rebuild) returns ``entry`` unchanged rather than raising,
+        so one bad file can't take down the whole refresh.
+        """
+        file_path = entry.get("file_path")
+        if not file_path:
+            return entry
+
+        try:
+            io = self.dataset.io
+            inp = io.new_input(file_path)
+            with inp.open() as f:
+                data = f.read()
+
+            rebuilt_entry = build_parquet_manifest_entry_from_bytes(
+                data, file_path, len(data), field_id_by_name=self.dataset._field_id_by_name()
+            )
+
+            entry_dict = self._to_dict(rebuilt_entry)
+            if isinstance(entry_dict, dict):
+                return entry_dict
+            return entry  # Fall back to original if rebuild failed
+        except Exception:
+            return entry  # If we can't rebuild, keep the original entry
+
     def _refresh_manifest_from_data_files(self, all_entries: List[dict]) -> List[dict]:
         """
         Refresh entire manifest by reading all data files and rebuilding entries from scratch.
@@ -1766,43 +1807,25 @@ class DatasetCompactor:
         Used as fallback when stats calculation fails. Rebuilds all manifest entries by reading
         the actual parquet files to ensure accuracy and correctness.
 
+        Files are refreshed concurrently (see ``_REFRESH_MANIFEST_MAX_WORKERS``)
+        since each file's read+stats is independent of every other -- this can
+        be the whole dataset, so doing it one file at a time serially wastes
+        wall-clock on network wait that overlapping threads reclaim.
+        ``ThreadPoolExecutor.map`` preserves ``all_entries`` order in the
+        result regardless of which file finishes first.
+
         Args:
             all_entries: All current manifest entries
 
         Returns:
             List of refreshed manifest entries
         """
-        refreshed_entries = []
+        if not all_entries:
+            return []
 
-        for entry in all_entries:
-            file_path = entry.get("file_path")
-            if not file_path:
-                refreshed_entries.append(entry)  # Skip entries without file paths
-                continue
-
-            try:
-                # Read the file and rebuild the entry from scratch
-                io = self.dataset.io
-                inp = io.new_input(file_path)
-                with inp.open() as f:
-                    data = f.read()
-
-                # Rebuild manifest entry from actual file data
-                rebuilt_entry = build_parquet_manifest_entry_from_bytes(
-                    data, file_path, len(data), field_id_by_name=self.dataset._field_id_by_name()
-                )
-
-                # Convert to dict
-                entry_dict = self._to_dict(rebuilt_entry)
-                if isinstance(entry_dict, dict):
-                    refreshed_entries.append(entry_dict)
-                else:
-                    refreshed_entries.append(entry)  # Fall back to original if rebuild failed
-            except Exception:
-                # If we can't rebuild, keep the original entry
-                refreshed_entries.append(entry)
-
-        return refreshed_entries
+        max_workers = min(_REFRESH_MANIFEST_MAX_WORKERS, len(all_entries))
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            return list(pool.map(self._refresh_one_entry_from_data_file, all_entries))
 
     def _calculate_stats_from_entries(
         self, all_entries: List[dict], compacted_files: List[dict]
