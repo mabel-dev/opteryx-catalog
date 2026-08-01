@@ -25,6 +25,24 @@ from opteryx_catalog.catalog.metadata import DatasetMetadata, Snapshot
 _MB = 1024 * 1024
 
 
+class _FixedChoice:
+    """Minimal ``random``-like stub for ``_select_overlap_decluster``'s
+    injectable ``rng``: ``.choice()`` always returns whichever offered
+    ``file_ranges`` entry has this ``file_path``, regardless of what else is
+    offered. Matches by path (not identity) because callers like
+    ``_select_sort_aware_merge`` rebuild ``file_ranges`` internally from
+    ``entries``, so a pre-built object reference wouldn't survive the call.
+    ``_select_overlap_decluster`` only calls ``.choice()`` (the seed-file
+    pick) -- growth from there is deterministic (greedy by overlap amount),
+    so fixing the seed is enough to make a test fully reproducible."""
+
+    def __init__(self, file_path):
+        self._file_path = file_path
+
+    def choice(self, seq):
+        return next(fr for fr in seq if fr["entry"]["file_path"] == self._file_path)
+
+
 def create_test_table(num_rows: int, value_range: tuple = (0, 100)):
     """Create a simple test Morsel with a timestamp column for sorting."""
     import random
@@ -371,14 +389,18 @@ def _entry(path, lo, hi, mb):
 
 def test_overlapping_large_files_decluster():
     """Rule 3: an OVERLAPPING group of at/above-floor files is sort-aware merged
-    (combine-split) so the executor can split it into disjoint key ranges."""
+    (combine-split) so the executor can split it into disjoint key ranges.
+
+    Seed the random pick to A (a fixed rng): A genuinely overlaps B (its
+    range partly contains B's start) but not C, so growing from A must find
+    B and stop there, excluding the disjoint C."""
     compactor = DatasetCompactor(_perf_dataset(), strategy="performance", author="t", agent="t")
     entries = [
         _entry("/tmp/A.parquet", 0, 100, _BIG_MB),
         _entry("/tmp/B.parquet", 50, 200, _BIG_MB),   # overlaps A -> declustered
         _entry("/tmp/C.parquet", 300, 400, _BIG_MB),  # disjoint from A/B
     ]
-    plan = compactor._select_sort_aware_merge(entries)
+    plan = compactor._select_sort_aware_merge(entries, rng=_FixedChoice("/tmp/A.parquet"))
     assert plan is not None, "overlapping big files must be declustered (rule 3)"
     assert plan["type"] == "combine-split"
     assert plan["mode"] == "sort-aware"
@@ -447,54 +469,62 @@ def test_hot_value_group_detected_regardless_of_tie_order():
     download log) fills several files whose stats are all ``min == max ==
     <value>`` (zero-width ranges), plus a boundary file that starts at that
     same value and extends further. All of these genuinely overlap and must
-    decluster together as one group, regardless of which order they happen to
-    appear in the manifest.
+    decluster together as one group.
 
-    A naive ``sorted(file_ranges, key=lambda fr: fr["min"])`` is stable, so
-    ties keep the manifest's arbitrary original order. If a zero-width file
-    lands first within the tie, `running_max` is pinned to the hot value
-    itself; the STRICT `<` overlap test then sees `next.min == running_max`
-    for every other tied file - including the genuinely wider boundary file -
-    and closes the group at size 1 each time, never finding the real overlap.
-    Reproduces the exact structure found live in opteryx.test.pypi's `project`
-    sort key: three files entirely filled by one popular package plus a
-    fourth file that starts with the same package and continues into the
-    next ones alphabetically.
+    A zero-width file's min/max are REAL observed values (every row in it is
+    that exact value), not synthetic split edges - so it genuinely overlaps
+    ANY range that weakly contains that value, including one that starts
+    exactly there. That's different from two non-degenerate ranges sharing a
+    boundary (a clean prior split - see test_touching_boundary_is_not_overlap),
+    which is deliberately NOT treated as overlap so declustering converges.
+
+    Seeded so the random pick lands on the wide file - starting from a
+    zero-width file stops immediately by design (see
+    test_zero_width_seed_stops_immediately), so this test forces the
+    non-degenerate seed to exercise the growth logic. Reproduces the exact
+    structure found live in opteryx.test.pypi's `project` sort key: three
+    files entirely filled by one popular package plus a fourth file that
+    starts with the same package and continues into the next ones
+    alphabetically.
     """
     compactor = DatasetCompactor(_perf_dataset(), strategy="performance", author="t", agent="t")
     mb = 4096  # settled on both selectors, so only decluster (not bin-pack) can find this
 
-    # Zero-width files (min == max == the hot value) listed BEFORE the wider
-    # file that starts at the same value - the manifest order that defeats a
-    # min-only sort.
     zero_width = [_entry(f"/tmp/pure{i}.parquet", 100, 100, mb) for i in range(3)]
     wide = _entry("/tmp/wide.parquet", 100, 300, mb)
     entries = zero_width + [wide]
 
     file_ranges = compactor._build_file_ranges(entries, sort_field_id=1, sort_index=0)
-    plan = compactor._select_overlap_decluster(file_ranges, "timestamp")
+    plan = compactor._select_overlap_decluster(
+        file_ranges, "timestamp", rng=_FixedChoice("/tmp/wide.parquet")
+    )
 
     assert plan is not None, "the wide file genuinely overlaps every zero-width file at value 100"
     selected = {f["file_path"] for f in plan["files"]}
     assert selected == {e["file_path"] for e in entries}, "all four files share real overlap"
 
 
-def test_oversized_overlap_chain_randomizes_subset_across_passes():
-    """When one overlap chain's combined size exceeds
-    DECLUSTER_MAX_COMBINED_BYTES, only some of its members can be declustered
-    in a single pass. Taking them in sort order every time (the pre-fix
-    behaviour) starves whichever files sort last: observed live on
-    opteryx.test.pypi's `project` key, a single popular package spanning more
-    files than one pass's cap settled into re-selecting the same few files
-    pass after pass with zero net progress. The subset choice is now
-    randomized (an injectable ``rng``, seeded here for reproducibility) so
-    repeated passes sample different members and the cluster converges
-    instead of cycling.
+def test_zero_width_seed_stops_immediately():
+    """If the randomly-picked seed is itself a single-value file (min ==
+    max), there's no reordering benefit to chase from it alone - the
+    selector stops without even trying to find a group, regardless of
+    whether a genuinely overlapping wider file exists elsewhere."""
+    compactor = DatasetCompactor(_perf_dataset(), strategy="performance", author="t", agent="t")
+    mb = 4096
+    pure = _entry("/tmp/pure.parquet", 100, 100, mb)
+    wide = _entry("/tmp/wide.parquet", 100, 300, mb)  # genuinely overlaps `pure`, per the test above
+    file_ranges = compactor._build_file_ranges([pure, wide], sort_field_id=1, sort_index=0)
 
-    One wide anchor file (the "boundary" file, e.g. a popular package plus
-    whatever sorts immediately after it) overlapping 5 zero-width files (e.g.
-    files entirely filled by that one package) - all 6 together exceed the
-    cap, but the anchor plus any 3 of the 5 zero-width files fits."""
+    plan = compactor._select_overlap_decluster(
+        file_ranges, "timestamp", rng=_FixedChoice("/tmp/pure.parquet")
+    )
+    assert plan is None
+
+
+def test_oversized_overlap_chain_capped_by_declustler_max_bytes():
+    """When the seed's overlapping candidates combined exceed
+    DECLUSTER_MAX_COMBINED_BYTES, only as many as fit get included - the cap
+    still applies exactly as before, now on top of the random-seed pick."""
     compactor = DatasetCompactor(_perf_dataset(), strategy="performance", author="t", agent="t")
     from opteryx_catalog.catalog.compaction import DECLUSTER_MAX_COMBINED_BYTES
 
@@ -507,20 +537,83 @@ def test_oversized_overlap_chain_randomizes_subset_across_passes():
     entries += [_entry(f"/tmp/c{i}.parquet", 100, 100, candidate_mb) for i in range(5)]
     file_ranges = compactor._build_file_ranges(entries, sort_field_id=1, sort_index=0)
 
-    import random
+    plan = compactor._select_overlap_decluster(
+        file_ranges, "timestamp", rng=_FixedChoice("/tmp/anchor.parquet")
+    )
+    assert plan is not None
+    selected = {f["file_path"] for f in plan["files"]}
+    assert "/tmp/anchor.parquet" in selected, "the seed is never dropped"
+    assert len(selected) == 4, "anchor + exactly 3 of the 5 candidates fit under the cap"
 
-    picks = set()
-    for seed in range(10):
-        plan = compactor._select_overlap_decluster(
-            file_ranges, "timestamp", rng=random.Random(seed)
-        )
-        assert plan is not None
-        selected = frozenset(f["file_path"] for f in plan["files"])
-        assert "/tmp/anchor.parquet" in selected, "the anchor (defines running_max) is never dropped"
-        assert len(selected) == 4, "anchor + exactly 3 of the 5 candidates fit under the cap"
-        picks.add(selected)
 
-    assert len(picks) > 1, "different seeds must select different subsets, not the same one every time"
+def test_growth_prefers_most_overlapping_candidate_first():
+    """Growth adds whichever remaining file overlaps the group's current
+    range the MOST, not just the first one found. Construct candidates whose
+    overlap amounts against the seed clearly differ, with a cap that only
+    lets some of them in, and confirm the biggest-overlap ones win."""
+    compactor = DatasetCompactor(_perf_dataset(), strategy="performance", author="t", agent="t")
+    from opteryx_catalog.catalog.compaction import DECLUSTER_MAX_COMBINED_BYTES
+
+    seed_mb = 4000
+    cand_mb = 5000
+    assert seed_mb * _MB + 2 * cand_mb * _MB <= DECLUSTER_MAX_COMBINED_BYTES
+    assert seed_mb * _MB + 3 * cand_mb * _MB > DECLUSTER_MAX_COMBINED_BYTES
+
+    # Seed spans [0, 1000]. Candidates overlap it by decreasing amounts:
+    # big overlaps [0,900] (900), medium overlaps [0,500] (500), small
+    # overlaps [0,100] (100) - only 2 of the 3 fit under the cap, so the two
+    # LARGEST overlaps (big, medium) must be the ones chosen, not `small`.
+    seed = _entry("/tmp/seed.parquet", 0, 1000, seed_mb)
+    big = _entry("/tmp/big.parquet", 0, 900, cand_mb)
+    medium = _entry("/tmp/medium.parquet", 0, 500, cand_mb)
+    small = _entry("/tmp/small.parquet", 0, 100, cand_mb)
+    entries = [seed, big, medium, small]
+    file_ranges = compactor._build_file_ranges(entries, sort_field_id=1, sort_index=0)
+
+    plan = compactor._select_overlap_decluster(
+        file_ranges, "timestamp", rng=_FixedChoice("/tmp/seed.parquet")
+    )
+    assert plan is not None
+    selected = {f["file_path"] for f in plan["files"]}
+    assert selected == {"/tmp/seed.parquet", "/tmp/big.parquet", "/tmp/medium.parquet"}, (
+        "the two largest-overlap candidates must win over `small`, not whichever sorts first"
+    )
+
+
+def test_different_seed_choice_reaches_different_overlap_clusters():
+    """The actual anti-starvation mechanism: picking the STARTING file at
+    random (rather than always scanning from the smallest sort-key value)
+    means different calls can address different overlapping regions of the
+    dataset. Two independent, non-overlapping clusters exist here; forcing
+    the seed into each one in turn must produce a plan scoped to THAT
+    cluster only - proving a deterministic first-cluster-wins scan (the
+    pre-fix behaviour) isn't what's happening anymore. This is what actually
+    fixes the live starvation case: an earlier cluster that can never fully
+    resolve no longer permanently blocks every other cluster from ever
+    getting a turn."""
+    compactor = DatasetCompactor(_perf_dataset(), strategy="performance", author="t", agent="t")
+    mb = 4096
+
+    cluster1 = [
+        _entry("/tmp/c1a.parquet", 0, 100, mb),
+        _entry("/tmp/c1b.parquet", 50, 200, mb),
+    ]
+    cluster2 = [
+        _entry("/tmp/c2a.parquet", 1000, 1100, mb),
+        _entry("/tmp/c2b.parquet", 1050, 1200, mb),
+    ]
+    entries = cluster1 + cluster2
+    file_ranges = compactor._build_file_ranges(entries, sort_field_id=1, sort_index=0)
+
+    plan1 = compactor._select_overlap_decluster(
+        file_ranges, "timestamp", rng=_FixedChoice("/tmp/c1a.parquet")
+    )
+    plan2 = compactor._select_overlap_decluster(
+        file_ranges, "timestamp", rng=_FixedChoice("/tmp/c2a.parquet")
+    )
+
+    assert {f["file_path"] for f in plan1["files"]} == {"/tmp/c1a.parquet", "/tmp/c1b.parquet"}
+    assert {f["file_path"] for f in plan2["files"]} == {"/tmp/c2a.parquet", "/tmp/c2b.parquet"}
 
 
 def test_disjoint_settled_files_left_alone():

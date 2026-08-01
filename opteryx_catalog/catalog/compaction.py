@@ -541,7 +541,7 @@ class DatasetCompactor:
         ]
         return self._select_brute_consolidation(sub_floor, sort_column_name)
 
-    def _select_sort_aware_merge(self, entries: List[dict]) -> Optional[dict]:
+    def _select_sort_aware_merge(self, entries: List[dict], rng=None) -> Optional[dict]:
         """Rule B (rules 1 & 3): files over SORT_AWARE_FLOOR_BYTES (500 MB) -
         deliberately overlapping rule A's < 512 MB pool, see
         SORT_AWARE_FLOOR_BYTES - get sort-aware combine + split toward the 4GB
@@ -580,7 +580,7 @@ class DatasetCompactor:
             return None
 
         # Sub-check 1: decluster one overlapping group.
-        plan = self._select_overlap_decluster(file_ranges, sort_column_name)
+        plan = self._select_overlap_decluster(file_ranges, sort_column_name, rng=rng)
         if plan:
             return plan
 
@@ -673,128 +673,113 @@ class DatasetCompactor:
         }
 
     def _select_overlap_decluster(self, file_ranges, sort_column_name, rng=None) -> Optional[dict]:
-        """Rule 3: among files at/above the floor, find a group whose sort-key
-        ranges OVERLAP, bound it so the combined size stays within the memory
-        gate, and emit a sort-aware ``combine-split``. The (streaming) executor
-        sorts the merged rows and splits them into k = ceil(combined / TARGET)
-        disjoint key ranges: k == 1 -> one file whose disjoint ranges are sorted
-        ROW GROUPS only (never a new file under target); k > 1 -> that many
-        disjoint-range FILES. Each call tightens one overlapping group; repeated
-        passes converge toward non-overlapping files.
+        """Rule 3: pick a random file, grow it into an overlapping group, emit
+        a sort-aware ``combine-split``. The (streaming) executor sorts the
+        merged rows and splits them into k = ceil(combined / TARGET) disjoint
+        key ranges: k == 1 -> one file whose disjoint ranges are sorted ROW
+        GROUPS only (never a new file under target); k > 1 -> that many
+        disjoint-range FILES.
 
         ``rng``: injectable ``random.Random`` (defaults to the ``random``
-        module) - see the oversized-cluster branch below. Tests pass a seeded
-        instance for reproducibility; production leaves it unset.
+        module). Tests pass a seeded instance, or a stub with a fixed
+        ``choice()``, for reproducibility; production leaves it unset.
 
-        Overlap uses a STRICT test (``next.min < running_max``): files that
-        merely touch at a shared boundary value - the exact artifact of a prior
-        split on a tie - are NOT treated as overlapping, so declustering
-        converges instead of endlessly re-merging its own outputs.
+        Algorithm:
+          1. Pick one file at random from ``file_ranges``.
+          2. If it's a single-value file (min == max), there's no reordering
+             benefit to chase from it alone - stop, no plan this call.
+          3. Otherwise repeatedly add whichever remaining file overlaps the
+             group's current combined range the MOST (a strict test: touching
+             at a shared boundary value, the artifact of a prior split on a
+             tie, does not count - ``overlap <= 0`` is excluded), until either
+             nothing overlaps at all, or the next file would push the
+             combined size over DECLUSTER_MAX_COMBINED_BYTES (a work-per-pass
+             bound, not a memory bound - the streaming executor is
+             window-bounded, so two overlapping ~4 GB files fully fits:
+             combined 8 GB -> two disjoint ~4 GB outputs).
 
-        The combined group is capped at DECLUSTER_MAX_COMBINED_BYTES, a
-        work-per-pass bound (NOT a memory bound): the streaming executor is
-        window-bounded, so declustering two overlapping ~4 GB files is fully
-        supported (combined 8 GB -> two disjoint ~4 GB files). A cluster larger
-        than the cap is declustered a chunk per pass and converges over passes.
+        Picking the STARTING file at random (rather than always scanning from
+        the smallest sort-key value) matters when one overlap region can
+        never fully resolve in a single pass (e.g. a Zipfian-popular
+        sort-key value whose boundary file structurally always overlaps its
+        pure siblings): a deterministic scan-from-the-start would land on
+        that same unresolvable region every single call and starve every
+        other overlapping region in the dataset of a turn forever - observed
+        live on opteryx.test.pypi, where a small, fully-resolvable cluster
+        and a much larger one both sat completely untouched the entire
+        session because an earlier, structurally-unresolvable cluster kept
+        winning every call.
         """
-        try:
-            # Two-pass STABLE sort: by max descending, then by min ascending.
-            # Sorting by min alone leaves ties (files sharing the exact same
-            # min - e.g. several files entirely filled by one "hot"/Zipfian
-            # sort-key value) in arbitrary manifest order. If a zero-width
-            # file (min == max) lands first within such a tie, `running_max`
-            # below gets pinned to the tied value itself; the strict `<` test
-            # then sees `next.min == running_max` for every other tied file -
-            # including a genuinely wider file that also starts at that value
-            # - and the group closes at size 1 without ever detecting the
-            # real overlap. Pre-sorting by max descending guarantees the
-            # widest file in any min-tie is visited first, so its max
-            # correctly anchors `running_max` and every other tied file is
-            # then evaluated against it. Files with distinct mins are
-            # unaffected (the second, min-ascending sort is stable and
-            # dominates whenever mins differ).
-            ordered = sorted(file_ranges, key=lambda fr: fr["max"], reverse=True)
-            ordered = sorted(ordered, key=lambda fr: fr["min"])
-        except TypeError:
-            return None  # sort-key mins/maxes not mutually comparable
+        if not file_ranges:
+            return None
 
         rng = rng or random
+        seed = rng.choice(file_ranges)
 
-        i = 0
-        m = len(ordered)
-        while i < m:
-            anchor = ordered[i]
-            running_max = anchor["max"]
-            # Every file (in sort order, following the anchor) that is part of
-            # this ONE connected overlap chain - size-uncapped for now. Chain
-            # membership is a pure correctness question (does it genuinely
-            # overlap something already in the chain?), independent of how
-            # much of it one pass can afford to rewrite.
-            candidates = []
-            j = i + 1
-            while j < m:
-                fr = ordered[j]
-                try:
-                    overlaps = fr["min"] < running_max
-                except TypeError:
-                    overlaps = False
-                if not overlaps:
-                    break
-                candidates.append(fr)
-                try:
-                    if fr["max"] > running_max:
-                        running_max = fr["max"]
-                except TypeError:
-                    pass
-                j += 1
+        if seed["min"] == seed["max"]:
+            return None  # single-value file: every other file at that same value adds nothing
 
-            if not candidates:
-                i += 1
-                continue
+        group = [seed]
+        total = seed["size"]
+        remaining = [fr for fr in file_ranges if fr is not seed]
 
-            combined = anchor["size"] + sum(fr["size"] for fr in candidates)
-            if combined <= DECLUSTER_MAX_COMBINED_BYTES:
-                # Whole chain fits in one pass - take it all, nothing to
-                # choose between, no randomness involved.
-                group = [anchor] + candidates
-            else:
-                # More overlapping data than one pass can hold. Which subset
-                # of `candidates` gets declustered this pass has no
-                # principled "most correct" answer - taking them in sort
-                # order every time (the previous behaviour) starves whatever
-                # sorts last: a cluster bigger than the cap settles into
-                # re-selecting the same few files pass after pass forever
-                # (observed live on opteryx.test.pypi's `project` key - a
-                # popular package spanning more files than one pass's cap,
-                # cycling between the same handful of files with zero net
-                # progress). Shuffling which candidates are offered means
-                # repeated calls sample different members of an oversized
-                # cluster, so it converges over passes instead of cycling.
-                # The anchor always stays in (it defines `running_max`, the
-                # only thing establishing this is a real overlap chain).
-                shuffled = list(candidates)
-                rng.shuffle(shuffled)
-                group = [anchor]
-                total = anchor["size"]
-                for fr in shuffled:
-                    if total + fr["size"] > DECLUSTER_MAX_COMBINED_BYTES:
-                        continue
-                    group.append(fr)
-                    total += fr["size"]
+        def _overlap_amount(fr, group_min, group_max):
+            """How much ``fr`` overlaps [group_min, group_max]; <= 0 means it
+            doesn't.
 
-            if len(group) >= 2:
-                combined = sum(fr["size"] for fr in group)
-                k = max(1, -(-combined // TARGET_SIZE_BYTES))
-                return {
-                    "type": "combine-split",
-                    "mode": "sort-aware",
-                    "files": [fr["entry"] for fr in group],
-                    "reason": "overlap-decluster",
-                    "sort_column": sort_column_name,
-                    "expected_outputs": k,
-                }
-            i += 1
-        return None
+            ``fr`` degenerate (min == max, a single value with more rows than
+            fit in one file - see the seed check above): min/max are REAL
+            observed values, not synthetic split edges, so touching either
+            edge of the group's range IS genuine overlap (the group provably
+            contains that same value) - inclusive containment on both sides.
+
+            ``fr`` non-degenerate: the standard strict interval-overlap test.
+            A boundary shared with a non-degenerate neighbour is the artifact
+            of a clean prior split (see test_touching_boundary_is_not_overlap),
+            not real overlap - without excluding it, declustering would never
+            converge, endlessly re-merging its own disjoint outputs.
+            """
+            if fr["min"] == fr["max"]:
+                if group_min <= fr["min"] <= group_max:
+                    return group_max - group_min  # always > 0: the seed is never degenerate
+                return -1
+            lo = max(fr["min"], group_min)
+            hi = min(fr["max"], group_max)
+            return hi - lo
+
+        while remaining:
+            try:
+                group_min = min(fr["min"] for fr in group)
+                group_max = max(fr["max"] for fr in group)
+                best = max(remaining, key=lambda fr: _overlap_amount(fr, group_min, group_max))
+                best_overlap = _overlap_amount(best, group_min, group_max)
+            except TypeError:
+                break  # sort-key values not mutually comparable
+
+            if best_overlap <= 0:
+                break  # nothing left genuinely overlaps the group
+
+            if total + best["size"] > DECLUSTER_MAX_COMBINED_BYTES:
+                remaining.remove(best)
+                continue  # this one doesn't fit; a smaller, less-overlapping file still might
+
+            group.append(best)
+            total += best["size"]
+            remaining.remove(best)
+
+        if len(group) < 2:
+            return None
+
+        combined = sum(fr["size"] for fr in group)
+        k = max(1, -(-combined // TARGET_SIZE_BYTES))
+        return {
+            "type": "combine-split",
+            "mode": "sort-aware",
+            "files": [fr["entry"] for fr in group],
+            "reason": "overlap-decluster",
+            "sort_column": sort_column_name,
+            "expected_outputs": k,
+        }
 
     def _select_binpack(self, file_ranges, sort_column_name) -> Optional[dict]:
         """Rule 1: reduce file count by packing CONSECUTIVE (in sort-key order),
