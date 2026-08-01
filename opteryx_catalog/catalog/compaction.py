@@ -693,9 +693,25 @@ class DatasetCompactor:
         than the cap is declustered a chunk per pass and converges over passes.
         """
         try:
-            ordered = sorted(file_ranges, key=lambda fr: fr["min"])
+            # Two-pass STABLE sort: by max descending, then by min ascending.
+            # Sorting by min alone leaves ties (files sharing the exact same
+            # min - e.g. several files entirely filled by one "hot"/Zipfian
+            # sort-key value) in arbitrary manifest order. If a zero-width
+            # file (min == max) lands first within such a tie, `running_max`
+            # below gets pinned to the tied value itself; the strict `<` test
+            # then sees `next.min == running_max` for every other tied file -
+            # including a genuinely wider file that also starts at that value
+            # - and the group closes at size 1 without ever detecting the
+            # real overlap. Pre-sorting by max descending guarantees the
+            # widest file in any min-tie is visited first, so its max
+            # correctly anchors `running_max` and every other tied file is
+            # then evaluated against it. Files with distinct mins are
+            # unaffected (the second, min-ascending sort is stable and
+            # dominates whenever mins differ).
+            ordered = sorted(file_ranges, key=lambda fr: fr["max"], reverse=True)
+            ordered = sorted(ordered, key=lambda fr: fr["min"])
         except TypeError:
-            return None  # sort-key mins not mutually comparable
+            return None  # sort-key mins/maxes not mutually comparable
 
         i = 0
         m = len(ordered)

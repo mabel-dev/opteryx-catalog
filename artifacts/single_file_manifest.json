@@ -3,10 +3,10 @@
   "file_format": "parquet",
   "record_count": 2,
   "file_size_in_bytes": 392,
-  "uncompressed_size_in_bytes": 112,
+  "uncompressed_size_in_bytes": 32,
   "column_uncompressed_sizes_in_bytes": [
-    56,
-    56
+    16,
+    16
   ],
   "null_counts": [
     0,
