@@ -225,10 +225,10 @@ MAX_MEMORY_BYTES = MAX_SELECTED_BUDGET_BYTES
 # memory: it keeps a single decluster op from rewriting the whole dataset at
 # once (resumability, and less contention with a live compactor). A larger
 # overlapping cluster is declustered a chunk at a time and converges over passes.
-# At 4x target a pass declusters up to ~four target-sized files into ~four
+# At 3x target a pass declusters up to ~three target-sized files into ~three
 # disjoint outputs. Tunable; raising it only trades bigger snapshots for fewer
 # passes, never memory (streaming is window-bounded).
-DECLUSTER_MAX_COMBINED_BYTES = 4 * TARGET_SIZE_BYTES
+DECLUSTER_MAX_COMBINED_BYTES = 3 * TARGET_SIZE_BYTES
 
 # --- Three-pass streaming execution --------------------------------------------
 #

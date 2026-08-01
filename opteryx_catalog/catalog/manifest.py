@@ -733,20 +733,25 @@ def build_parquet_manifest_entry_from_bytes(
     # than re-reading the file a second time -- one pass over the on-disk
     # data, min/max derived natively from the buffered vectors, then
     # histogram bucketing natively against that range. Every per-row
-    # reduction (hash, null count, ordinalize, char-class counts, min/max,
-    # histogram) is a native kernel; "values"/"bool_values" are the two
-    # documented exceptions with no native equivalent (see
-    # _compute_column_stats and _column_uncompressed_estimate).
+    # reduction (hash/min-k, null count, nbytes, ordinalize, char-class
+    # counts, min/max, histogram) is a native kernel; "bool_values" is the
+    # one documented exception with no native equivalent (see
+    # _compute_column_stats).
     accum: dict = {
         name: {
-            "hashes": set(),
+            # Bounded to <= MIN_K_HASHES candidates per row group (see
+            # _native_min_k_smallest below), not a full-cardinality set of
+            # every hash in the column -- for a multi-million-row column
+            # that set was the dominant cost (CPU and, worse, retained
+            # memory) of this whole function.
+            "min_k_candidates": [],
             "null_count": 0,
             "ordinal_vecs": [],
             "char_counts": [0] * 8,
             "char_total_bytes": 0,
             "length_range": None,
             "bool_values": [],
-            "values": [],
+            "nbytes": 0,
         }
         for name in col_names
     }
@@ -762,13 +767,18 @@ def build_parquet_manifest_entry_from_bytes(
                 category = col_info[name]
                 acc = accum[name]
                 try:
-                    acc["hashes"].update(vec.hash())
+                    hash_vec = vec.hash_shaped()
                 except ValueError:
-                    pass
+                    hash_vec = None
+                if hash_vec is not None:
+                    # Per-row-group min-k (native, see _native_min_k_smallest),
+                    # merged into a small cross-group candidate pool below --
+                    # never a Python set sized to the column's row count.
+                    acc["min_k_candidates"].extend(_native_min_k_smallest(hash_vec, MIN_K_HASHES))
                 acc["null_count"] += vec.null_count()
-                # Kept only for _column_uncompressed_estimate below -- no
-                # longer used for null count / lengths / bool histogram.
-                acc["values"].extend(vec.to_pylist())
+                # Native byte accounting (see _column_nbytes_estimate) -- not
+                # a to_pylist() decode of every row held for the whole file.
+                acc["nbytes"] += _column_nbytes_estimate(morsel, name, vec)
 
                 if category in _COMPRESSIBLE_CATEGORIES:
                     # ordinalize() doesn't support ARRAY/VECTOR_FP16/DECIMAL128
@@ -814,9 +824,17 @@ def build_parquet_manifest_entry_from_bytes(
         category = col_info[name]
         acc = accum[name]
 
-        # Native uint64 (see _compute_column_stats): kept as ints, not strings —
-        # rugo's writer stores them as an unsigned nested array.
-        col_min_k = sorted(heapq.nsmallest(MIN_K_HASHES, acc["hashes"]))
+        # Merge each row group's own (already <= MIN_K_HASHES, already-unsigned)
+        # min-k into one file-wide min-k -- the candidate pool is bounded by
+        # MIN_K_HASHES * row_group_count, never by the column's row count, so
+        # this dedupe+sort is cheap regardless of file size.
+        candidates = acc["min_k_candidates"]
+        distinct = set(candidates)
+        col_min_k = (
+            sorted(distinct)
+            if len(distinct) <= MIN_K_HASHES
+            else heapq.nsmallest(MIN_K_HASHES, distinct)
+        )
         col_hist: list = []
         col_min = NULL_FLAG
         col_max = NULL_FLAG
@@ -856,7 +874,7 @@ def build_parquet_manifest_entry_from_bytes(
         char_class_counts.append(acc["char_counts"] if category in _STRING_CATEGORIES else [])
         char_total_bytes_list.append(acc["char_total_bytes"] if category in _STRING_CATEGORIES else 0)
 
-        col_bytes = _column_uncompressed_estimate(acc["values"])
+        col_bytes = acc["nbytes"]
         column_uncompressed[col_names.index(name)] = col_bytes
         uncompressed_size += col_bytes
 
