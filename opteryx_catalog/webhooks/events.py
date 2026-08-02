@@ -173,6 +173,54 @@ def view_updated_payload(
     }
 
 
+def workspace_deleted_payload(dropped_by: Optional[str] = None) -> dict[str, Any]:
+    """Build payload for workspace soft-delete event.
+
+    Args:
+        dropped_by: identity that soft-deleted the workspace
+
+    Returns:
+        Payload dictionary describing the soft-delete
+    """
+    return {"dropped_by": dropped_by}
+
+
+def workspace_restored_payload(restored_by: Optional[str] = None) -> dict[str, Any]:
+    """Build payload for workspace restore event.
+
+    Args:
+        restored_by: identity that restored the workspace
+
+    Returns:
+        Payload dictionary describing the restore
+    """
+    return {"restored_by": restored_by}
+
+
+def workspace_locked_payload(locked_by: Optional[str] = None) -> dict[str, Any]:
+    """Build payload for workspace lock event.
+
+    Args:
+        locked_by: identity that locked the workspace
+
+    Returns:
+        Payload dictionary describing the lock
+    """
+    return {"locked_by": locked_by}
+
+
+def workspace_unlocked_payload(unlocked_by: Optional[str] = None) -> dict[str, Any]:
+    """Build payload for workspace unlock event.
+
+    Args:
+        unlocked_by: identity that unlocked the workspace
+
+    Returns:
+        Payload dictionary describing the unlock
+    """
+    return {"unlocked_by": unlocked_by}
+
+
 def view_executed_payload(
     execution_time_ms: Optional[int] = None,
     row_count: Optional[int] = None,

@@ -46,6 +46,19 @@ class CollectionNotEmpty(CatalogError):
     pass
 
 
+class CollectionLocked(CatalogError):
+    """Raised by `drop_collection` when the collection's `locked-by` field is set."""
+
+
+class DatasetLocked(CatalogError):
+    """Raised by `drop_dataset` when the dataset's `locked-by` field is set."""
+
+
+class WorkspaceDeleted(CatalogError):
+    """Raised by `OpteryxCatalog.__init__` when the workspace's `$properties`
+    document has `deleted-at-ms` set and `include_deleted` was not passed."""
+
+
 class ManifestRefreshError(CatalogError):
     """A statistics refresh could not recompute every file's statistics.
 
