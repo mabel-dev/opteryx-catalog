@@ -584,6 +584,49 @@ class SimpleDataset(Dataset):
             **detail,
         )
 
+    def _sort_for_write(self, table: Any):
+        """Physically sort `table` by the dataset's configured sort order, if any.
+
+        Compaction only clusters files once they've grown large enough for
+        "sort-aware" merges (see compaction.py); left alone, freshly written
+        files are never internally sorted. Since a single write's row count
+        is small relative to compaction's thresholds, sorting here is cheap
+        (draken's native sort is single-threaded, in-place-permutation, no
+        Python object materialization) and gives every file - however small -
+        real key locality plus honest `sorted_by` row-group metadata from the
+        moment it's written.
+
+        Returns (table, sort_column_name, sort_descending). On any resolution
+        or sort failure, returns the input table unchanged with sort_column
+        None - a write must never fail because sorting couldn't happen.
+        """
+        try:
+            from .compaction import normalize_sort_order, resolve_sort_column
+
+            sort_order = normalize_sort_order(getattr(self.metadata, "sort_orders", None))
+            if sort_order is None:
+                return table, None, False
+
+            schema = self.schema()
+            columns = schema.columns if schema is not None else None
+            if not columns:
+                return table, None, False
+
+            sort_column, _field_id, _index = resolve_sort_column(sort_order, columns)
+            if sort_column is None:
+                return table, None, False
+
+            ascending = sort_order.get("ascending", True)
+
+            from draken.morsels.sort import morsel_sort
+
+            perm = morsel_sort(table, [sort_column], [ascending])
+            table = table.take(list(perm))
+            return table, sort_column, not ascending
+        except Exception:
+            # Never let a sort failure block the write itself.
+            return table, None, False
+
     def _write_table_and_build_entry(self, table: Any):
         """Write a draken Morsel to storage and return a ParquetManifestEntry.
 
@@ -598,7 +641,14 @@ class SimpleDataset(Dataset):
 
         from ..iops.fileio import WRITE_PARQUET_OPTIONS
 
-        pdata = write_parquet(table, **WRITE_PARQUET_OPTIONS)
+        table, sort_column, sort_descending = self._sort_for_write(table)
+
+        write_options = dict(WRITE_PARQUET_OPTIONS)
+        if sort_column is not None:
+            write_options["sorted_by"] = sort_column
+            write_options["sorted_descending"] = sort_descending
+
+        pdata = write_parquet(table, **write_options)
 
         out = self.io.new_output(data_path).create()
         out.write(pdata)
