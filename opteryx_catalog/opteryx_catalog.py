@@ -1033,6 +1033,82 @@ class OpteryxCatalog(Metastore):
             updates["describer"] = describer
         doc_ref.update(updates)
 
+    def update_dataset_sort_order(
+        self,
+        identifier: str | tuple,
+        columns: List[str],
+        author: Optional[str] = None,
+    ) -> None:
+        """Set the clustering columns for a dataset (``ALTER TABLE ... CLUSTER BY``).
+
+        Persists a single Iceberg-style sort-order entry naming ``columns`` in
+        the given order, ascending. Replaces any previously configured sort
+        order outright - CLUSTER BY re-declares the physical layout, it does
+        not append to it. See ``catalog.compaction.normalize_sort_order`` for
+        how this shape is consumed (only the first field is currently used as
+        the primary sort key for compaction).
+
+        Args:
+            identifier: Dataset identifier in format 'collection.dataset_name'
+            columns: Column names to cluster by, in priority order. Must be
+                non-empty and must all exist in the dataset's current schema.
+            author: The identity making the change - None when unauthenticated,
+                never substituted (see audit.emit_audit).
+
+        Raises:
+            DatasetNotFound: If the dataset does not exist.
+            ValueError: If ``columns`` is empty or names a column that is not
+                in the dataset's current schema.
+        """
+        if not columns:
+            raise ValueError("columns must be a non-empty list of column names")
+
+        if isinstance(identifier, tuple) or isinstance(identifier, list):
+            collection, dataset_name = identifier[0], identifier[1]
+        else:
+            collection, dataset_name = identifier.split(".")
+
+        doc_ref = self._dataset_doc_ref(collection, dataset_name)
+        doc = doc_ref.get()
+        if not doc.exists:
+            raise DatasetNotFound(f"Dataset not found: {collection}.{dataset_name}")
+
+        data = doc.to_dict() or {}
+        current_schema_id = data.get("current-schema-id")
+        known_columns = set()
+        if current_schema_id:
+            schema_doc = doc_ref.collection("schemas").document(str(current_schema_id)).get()
+            if schema_doc.exists:
+                known_columns = {
+                    c.get("name") for c in (schema_doc.to_dict() or {}).get("columns", [])
+                }
+        unknown = [c for c in columns if c not in known_columns]
+        if unknown:
+            raise ValueError(
+                f"Unknown column(s) for CLUSTER BY on {collection}.{dataset_name}: {unknown}"
+            )
+
+        doc_ref.update(
+            {
+                "sort-orders": [
+                    {
+                        "order-id": 1,
+                        "fields": [{"name": c, "direction": "asc"} for c in columns],
+                    }
+                ],
+            }
+        )
+
+        emit_audit(
+            "update_sort_order",
+            resource_type="dataset",
+            workspace=self.workspace,
+            collection=collection,
+            resource=dataset_name,
+            author=author,
+            columns=columns,
+        )
+
     def write_parquet_manifest(
         self, snapshot_id: int, entries: List[dict], dataset_location: str
     ) -> Optional[str]:
