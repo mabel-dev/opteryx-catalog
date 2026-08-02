@@ -15,12 +15,15 @@ from .catalog.metadata import Snapshot
 from .catalog.metastore import Metastore
 from .catalog.view import View as CatalogView
 from .exceptions import CollectionAlreadyExists
+from .exceptions import CollectionLocked
 from .exceptions import CollectionNotEmpty
 from .exceptions import CollectionNotFound
 from .exceptions import DatasetAlreadyExists
+from .exceptions import DatasetLocked
 from .exceptions import DatasetNotFound
 from .exceptions import ViewAlreadyExists
 from .exceptions import ViewNotFound
+from .exceptions import WorkspaceDeleted
 from .iops.base import FileIO
 from .audit import emit_audit
 from .webhooks import send_webhook
@@ -28,11 +31,25 @@ from .webhooks.events import dataset_created_payload
 from .webhooks.events import dataset_deleted_payload
 from .webhooks.events import view_created_payload
 from .webhooks.events import view_deleted_payload
+from .webhooks.events import workspace_deleted_payload
+from .webhooks.events import workspace_locked_payload
+from .webhooks.events import workspace_restored_payload
+from .webhooks.events import workspace_unlocked_payload
 
 # Workspace-level document holding drop tombstones. The `$` prefix keeps it out of
 # `list_collections()`, which filters `$`-prefixed documents, so tombstones are
 # invisible to normal catalog enumeration.
 DROPPED_DOC = "$dropped"
+
+# Root-level Firestore collection (a sibling to every workspace's own top-level
+# collection, not nested under any single workspace) holding tombstones for
+# workspaces that have been soft-deleted. Dataset tombstones live *inside* the
+# workspace they were dropped from (`DROPPED_DOC` above) - that doesn't work
+# for a workspace tombstoning itself, since a hard-deleted workspace's own
+# top-level collection may no longer be a safe place to look. The 24h sweep
+# reads this collection to find candidates without enumerating every
+# workspace name blindly.
+DROPPED_WORKSPACES_COLLECTION = "$dropped-workspaces"
 
 
 def _core_type_to_stored(column_type: Any) -> tuple:
@@ -182,6 +199,7 @@ class OpteryxCatalog(Metastore):
         firestore_database: Optional[str] = None,
         gcs_bucket: Optional[str] = None,
         io: Optional[FileIO] = None,
+        include_deleted: bool = False,
     ):
         # `workspace` is the configured catalog/workspace name
         self.workspace = workspace
@@ -191,25 +209,45 @@ class OpteryxCatalog(Metastore):
             project=firestore_project, database=firestore_database
         )
         self._catalog_ref = self.firestore_client.collection(workspace)
-        # Ensure workspace-level properties document exists in Firestore.
-        # The $properties doc records metadata for the workspace such as
-        # 'timestamp-ms', 'author', 'billing-account-id' and 'owner'.
+        # Ensure workspace-level properties document exists in Firestore, and
+        # gate construction on workspace soft-delete state. The $properties doc
+        # records metadata for the workspace such as 'timestamp-ms', 'author',
+        # 'billing-account-id', 'owner', and the soft-delete/lock fields below.
+        #
+        # The existence-check read and the deleted-at-ms gate are deliberately
+        # NOT under the same broad `except Exception: pass` - a Firestore read
+        # failure here is tolerated (conservative: don't fail catalog init on
+        # transient Firestore errors), but a WorkspaceDeleted raise is a real
+        # business-logic decision and must always propagate, never be swallowed.
+        props_doc = None
         try:
             props_ref = self._catalog_ref.document("$properties")
-            if not props_ref.get().exists:
-                now_ms = int(time.time() * 1000)
-                billing = None
-                owner = None
-                props_ref.set(
-                    {
-                        "timestamp-ms": now_ms,
-                        "billing-account-id": billing,
-                        "owner": owner,
-                    }
-                )
+            props_doc = props_ref.get()
         except Exception:
-            # Be conservative: don't fail catalog initialization on Firestore errors
-            pass
+            props_doc = None
+
+        if props_doc is not None:
+            if not props_doc.exists:
+                try:
+                    now_ms = int(time.time() * 1000)
+                    props_ref.set(
+                        {
+                            "timestamp-ms": now_ms,
+                            "billing-account-id": None,
+                            "owner": None,
+                            "deleted-at-ms": None,
+                            "deleted-by": None,
+                            "locked-by": None,
+                            "locked-at-ms": None,
+                        }
+                    )
+                except Exception:
+                    # Be conservative: don't fail catalog initialization on Firestore errors
+                    pass
+            elif not include_deleted:
+                data = props_doc.to_dict() or {}
+                if data.get("deleted-at-ms") is not None:
+                    raise WorkspaceDeleted(f"Workspace has been deleted: {workspace}")
         self.gcs_bucket = gcs_bucket
         self._storage_client = storage.Client() if gcs_bucket else None
         # Caches for immutable, version-addressed artifacts. Snapshots, schemas
@@ -257,6 +295,16 @@ class OpteryxCatalog(Metastore):
     def _tombstones_collection(self):
         """Subcollection of drop tombstones for this workspace."""
         return self._catalog_ref.document(DROPPED_DOC).collection("datasets")
+
+    def _dropped_workspaces_collection(self):
+        """Root-level collection of workspace-drop tombstones.
+
+        A sibling to every workspace's own top-level collection, in the same
+        Firestore database - NOT nested under `self._catalog_ref`. See
+        `DROPPED_WORKSPACES_COLLECTION` for why this can't live inside the
+        workspace it tombstones.
+        """
+        return self.firestore_client.collection(DROPPED_WORKSPACES_COLLECTION)
 
     @staticmethod
     def _delete_subcollection(coll_ref) -> None:
@@ -315,6 +363,8 @@ class OpteryxCatalog(Metastore):
                 "annotations": metadata.annotations,
                 "refresh-frequency-mins": None,
                 "next-field-id": metadata.next_field_id,
+                "locked-by": None,
+                "locked-at-ms": None,
             }
         )
 
@@ -574,6 +624,9 @@ class OpteryxCatalog(Metastore):
         datasets it can still list. Without a record of the location, the files
         under it would be unreachable by any later sweep. The tombstone is that
         record; see `list_dropped_datasets()`.
+
+        Raises `DatasetLocked` if the dataset's `locked-by` field is set -
+        the two-person deniability lock takes precedence over the drop.
         """
         collection, dataset_name = identifier.split(".")
         doc_ref = self._dataset_doc_ref(collection, dataset_name)
@@ -582,7 +635,11 @@ class OpteryxCatalog(Metastore):
             # Nothing to drop, so nothing to reclaim and nothing to announce.
             return
 
-        location = (doc.to_dict() or {}).get("location")
+        data = doc.to_dict() or {}
+        if data.get("locked-by") is not None:
+            raise DatasetLocked(f"Dataset is locked: {identifier}")
+
+        location = data.get("location")
 
         # Tombstone FIRST: a failure between here and the final delete leaves a
         # reclaimable record, whereas the reverse order would leak the location.
@@ -648,6 +705,165 @@ class OpteryxCatalog(Metastore):
         """Remove a tombstone once its storage location has been reclaimed."""
         self._tombstones_collection().document(tombstone_id).delete()
 
+    # --- Workspace lifecycle (soft-delete / lock) ----------------------
+    #
+    # These methods execute the state change and record who asked - they do
+    # NOT enforce identity rules (e.g. "a different owner must unlock",
+    # "billing_admin required to delete"). That authorization decision lives
+    # in the calling service (billing.opteryx), which originates both the
+    # decision and the call with nothing in between.
+
+    def soft_delete_workspace(self, author: str) -> None:
+        """Mark this workspace deleted, and tombstone it for the 24h sweep.
+
+        Sets `deleted-at-ms`/`deleted-by` on the `$properties` doc, which is
+        what `__init__`'s construction-time gate checks - once this is set, no
+        new `OpteryxCatalog` handle for this workspace can be obtained without
+        `include_deleted=True`. Also writes an entry to the root-level
+        `$dropped-workspaces` collection so the sweep can find this workspace
+        without enumerating every workspace name blindly.
+        """
+        if author is None:
+            raise ValueError("author must be provided when soft-deleting a workspace")
+
+        now_ms = int(time.time() * 1000)
+        self._catalog_ref.document("$properties").update(
+            {"deleted-at-ms": now_ms, "deleted-by": author}
+        )
+
+        self._dropped_workspaces_collection().document(self.workspace).set(
+            {
+                "workspace": self.workspace,
+                "dropped-at-ms": now_ms,
+                "dropped-by": author,
+            }
+        )
+
+        send_webhook(
+            action="delete",
+            workspace=self.workspace,
+            collection=None,
+            resource_type="workspace",
+            resource_name=self.workspace,
+            payload=workspace_deleted_payload(dropped_by=author),
+        )
+
+        emit_audit(
+            "soft_delete_workspace",
+            resource_type="workspace",
+            workspace=self.workspace,
+            resource=self.workspace,
+            author=author,
+        )
+
+    def restore_workspace(self, author: str) -> None:
+        """Clear a workspace's soft-delete state.
+
+        Clears `deleted-at-ms`/`deleted-by` on `$properties`, and removes the
+        `$dropped-workspaces` tombstone written by `soft_delete_workspace` -
+        without that, the workspace would still be a candidate for the 24h
+        sweep despite having been restored.
+        """
+        if author is None:
+            raise ValueError("author must be provided when restoring a workspace")
+
+        self._catalog_ref.document("$properties").update(
+            {"deleted-at-ms": None, "deleted-by": None}
+        )
+
+        self.delete_workspace_tombstone(self.workspace)
+
+        send_webhook(
+            action="restore",
+            workspace=self.workspace,
+            collection=None,
+            resource_type="workspace",
+            resource_name=self.workspace,
+            payload=workspace_restored_payload(restored_by=author),
+        )
+
+        emit_audit(
+            "restore_workspace",
+            resource_type="workspace",
+            workspace=self.workspace,
+            resource=self.workspace,
+            author=author,
+        )
+
+    def lock_workspace(self, author: str) -> None:
+        """Set the two-person-deniability lock on this workspace."""
+        if author is None:
+            raise ValueError("author must be provided when locking a workspace")
+
+        now_ms = int(time.time() * 1000)
+        self._catalog_ref.document("$properties").update(
+            {"locked-by": author, "locked-at-ms": now_ms}
+        )
+
+        send_webhook(
+            action="lock",
+            workspace=self.workspace,
+            collection=None,
+            resource_type="workspace",
+            resource_name=self.workspace,
+            payload=workspace_locked_payload(locked_by=author),
+        )
+
+        emit_audit(
+            "lock_workspace",
+            resource_type="workspace",
+            workspace=self.workspace,
+            resource=self.workspace,
+            author=author,
+        )
+
+    def unlock_workspace(self, author: str) -> None:
+        """Clear the lock set by `lock_workspace`."""
+        if author is None:
+            raise ValueError("author must be provided when unlocking a workspace")
+
+        self._catalog_ref.document("$properties").update(
+            {"locked-by": None, "locked-at-ms": None}
+        )
+
+        send_webhook(
+            action="unlock",
+            workspace=self.workspace,
+            collection=None,
+            resource_type="workspace",
+            resource_name=self.workspace,
+            payload=workspace_unlocked_payload(unlocked_by=author),
+        )
+
+        emit_audit(
+            "unlock_workspace",
+            resource_type="workspace",
+            workspace=self.workspace,
+            resource=self.workspace,
+            author=author,
+        )
+
+    def list_dropped_workspaces(self) -> List[dict]:
+        """Tombstones for workspaces soft-deleted anywhere in this Firestore
+        database - not scoped to `self.workspace`. Root-level, mirroring
+        `list_dropped_datasets()` one level up. Consumed by the 24h sweep,
+        which walks each overdue workspace and then calls
+        `delete_workspace_tombstone()`.
+        """
+        return [
+            {**(doc.to_dict() or {}), "id": doc.id}
+            for doc in self._dropped_workspaces_collection().stream()
+        ]
+
+    def delete_workspace_tombstone(self, workspace: str) -> None:
+        """Remove a workspace's `$dropped-workspaces` tombstone.
+
+        Takes an explicit `workspace` name (rather than always using
+        `self.workspace`) since the sweep operates across workspaces from a
+        single catalog handle.
+        """
+        self._dropped_workspaces_collection().document(workspace).delete()
+
     def list_datasets(self, collection: str) -> Iterable[str]:
         coll = self._datasets_collection(collection)
         return [doc.id for doc in coll.stream()]
@@ -686,6 +902,8 @@ class OpteryxCatalog(Metastore):
                 "timestamp-ms": now_ms,
                 "author": author,
                 "annotations": [],
+                "locked-by": None,
+                "locked-at-ms": None,
             }
         )
 
@@ -720,10 +938,17 @@ class OpteryxCatalog(Metastore):
         if any datasets or views remain, since deleting a non-empty collection
         would otherwise silently orphan them (still tombstoned/reclaimed
         individually, but no longer reachable through `list_collections()`).
+        Raises `CollectionLocked` if the collection's `locked-by` field is
+        set - the two-person deniability lock takes precedence over the drop.
         """
         doc_ref = self._collection_ref(collection)
-        if not doc_ref.get().exists:
+        doc = doc_ref.get()
+        if not doc.exists:
             raise CollectionNotFound(f"Collection not found: {collection}")
+
+        data = doc.to_dict() or {}
+        if data.get("locked-by") is not None:
+            raise CollectionLocked(f"Collection is locked: {collection}")
 
         if any(True for _ in self._datasets_collection(collection).stream()) or any(
             True for _ in self._views_collection(collection).stream()
