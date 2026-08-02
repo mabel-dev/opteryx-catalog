@@ -15,6 +15,8 @@ from .catalog.metadata import Snapshot
 from .catalog.metastore import Metastore
 from .catalog.view import View as CatalogView
 from .exceptions import CollectionAlreadyExists
+from .exceptions import CollectionNotEmpty
+from .exceptions import CollectionNotFound
 from .exceptions import DatasetAlreadyExists
 from .exceptions import DatasetNotFound
 from .exceptions import ViewAlreadyExists
@@ -700,6 +702,43 @@ class OpteryxCatalog(Metastore):
     ) -> None:
         """Convenience wrapper that creates the collection only if missing."""
         self.create_collection(collection, properties=properties, exists_ok=True, author=author)
+
+    def collection_exists(self, collection: str) -> bool:
+        """Return True if the collection exists."""
+        try:
+            return self._collection_ref(collection).get().exists
+        except Exception:
+            # On any error, be conservative and return False
+            return False
+
+    def drop_collection(self, collection: str, author: Optional[str] = None) -> None:
+        """Drop a collection.
+
+        A collection owns no storage of its own - only its datasets and views
+        do - so unlike `drop_dataset` this needs no tombstone/sweep; deleting
+        the catalog document is the whole operation. Raises CollectionNotEmpty
+        if any datasets or views remain, since deleting a non-empty collection
+        would otherwise silently orphan them (still tombstoned/reclaimed
+        individually, but no longer reachable through `list_collections()`).
+        """
+        doc_ref = self._collection_ref(collection)
+        if not doc_ref.get().exists:
+            raise CollectionNotFound(f"Collection not found: {collection}")
+
+        if any(True for _ in self._datasets_collection(collection).stream()) or any(
+            True for _ in self._views_collection(collection).stream()
+        ):
+            raise CollectionNotEmpty(f"Collection is not empty: {collection}")
+
+        doc_ref.delete()
+
+        emit_audit(
+            "drop_collection",
+            resource_type="collection",
+            workspace=self.workspace,
+            resource=collection,
+            author=author,
+        )
 
     def dataset_exists(
         self, identifier_or_collection: str, dataset_name: Optional[str] = None
