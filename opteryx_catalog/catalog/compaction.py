@@ -122,6 +122,50 @@ def normalize_sort_order(sort_orders) -> Optional[dict]:
         return None
     return None
 
+
+def resolve_sort_column(sort_order: dict, columns):
+    """Resolve a canonical sort key (from ``normalize_sort_order``) against
+    schema ``columns``.
+
+    Precedence: field_id → name → positional index. ``columns`` entries may
+    be objects with ``.name``/``.id`` or dicts with ``"name"``/``"id"``.
+    Returns ``(column_name, field_id, index)`` where ``index`` is the
+    column's schema position (used to read positional min/max stats when a
+    manifest entry carries no field_ids). ``column_name`` is None when the
+    key cannot be resolved (caller falls back to brute/unsorted).
+
+    Shared by compaction (``DatasetCompactor._resolve_sort_column``) and
+    write-time sorting (``SimpleDataset._write_table_and_build_entry``) so
+    the two stay consistent about how a stored sort order maps to a column.
+    """
+
+    def col_name(c):
+        return getattr(c, "name", None) or (c.get("name") if isinstance(c, dict) else None)
+
+    def col_id(c):
+        cid = getattr(c, "id", None)
+        if cid is None and isinstance(c, dict):
+            cid = c.get("id")
+        return cid
+
+    target_fid = sort_order.get("field_id")
+    target_name = sort_order.get("name")
+    target_index = sort_order.get("index")
+
+    sort_index = None
+    if target_fid is not None:
+        sort_index = next((i for i, c in enumerate(columns) if col_id(c) == target_fid), None)
+    if sort_index is None and target_name is not None:
+        sort_index = next((i for i, c in enumerate(columns) if col_name(c) == target_name), None)
+    if sort_index is None and target_index is not None and 0 <= target_index < len(columns):
+        sort_index = target_index
+
+    if sort_index is None:
+        return None, None, None
+    sort_col = columns[sort_index]
+    return col_name(sort_col), col_id(sort_col), sort_index
+
+
 # Constants
 #
 # All size thresholds below are compared against `uncompressed_size_in_bytes`,
@@ -465,41 +509,9 @@ class DatasetCompactor:
         return None
 
     def _resolve_sort_column(self, sort_order: dict, columns):
-        """Resolve a canonical sort key against schema ``columns``.
-
-        Precedence: field_id → name → positional index. ``columns`` entries may
-        be objects with ``.name``/``.id`` or dicts with ``"name"``/``"id"``.
-        Returns ``(column_name, field_id, index)`` where ``index`` is the
-        column's schema position (used to read positional min/max stats when a
-        manifest entry carries no field_ids). ``column_name`` is None when the
-        key cannot be resolved (caller falls back to brute).
-        """
-
-        def col_name(c):
-            return getattr(c, "name", None) or (c.get("name") if isinstance(c, dict) else None)
-
-        def col_id(c):
-            cid = getattr(c, "id", None)
-            if cid is None and isinstance(c, dict):
-                cid = c.get("id")
-            return cid
-
-        target_fid = sort_order.get("field_id")
-        target_name = sort_order.get("name")
-        target_index = sort_order.get("index")
-
-        sort_index = None
-        if target_fid is not None:
-            sort_index = next((i for i, c in enumerate(columns) if col_id(c) == target_fid), None)
-        if sort_index is None and target_name is not None:
-            sort_index = next((i for i, c in enumerate(columns) if col_name(c) == target_name), None)
-        if sort_index is None and target_index is not None and 0 <= target_index < len(columns):
-            sort_index = target_index
-
-        if sort_index is None:
-            return None, None, None
-        sort_col = columns[sort_index]
-        return col_name(sort_col), col_id(sort_col), sort_index
+        """Resolve a canonical sort key against schema ``columns``. See
+        module-level ``resolve_sort_column`` (shared with write-time sorting)."""
+        return resolve_sort_column(sort_order, columns)
 
     def _resolve_sort_columns_for_entries(self, entries: List[dict]):
         """Shared prep for both rule selectors: resolve the sort column against
