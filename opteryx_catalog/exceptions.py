@@ -38,6 +38,14 @@ class CollectionAlreadyExists(KeyError, CatalogError):
     pass
 
 
+class CollectionNotFound(KeyError, CatalogError):
+    pass
+
+
+class CollectionNotEmpty(CatalogError):
+    pass
+
+
 class ManifestRefreshError(CatalogError):
     """A statistics refresh could not recompute every file's statistics.
 
