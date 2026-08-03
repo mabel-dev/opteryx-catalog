@@ -59,6 +59,16 @@ class WorkspaceDeleted(CatalogError):
     document has `deleted-at-ms` set and `include_deleted` was not passed."""
 
 
+class WorkspaceDeleteProtected(CatalogError):
+    """Raised by `soft_delete_workspace` when the workspace's `$properties`
+    document has `delete_protection` set true.
+
+    Scope is the workspace itself: dropping datasets, collections and views
+    inside a protected workspace is unaffected. Per-asset protection is the
+    `locked-by` two-person lock (`DatasetLocked`/`CollectionLocked`), a separate
+    mechanism cleared by an unlock rather than by a property change."""
+
+
 class ManifestRefreshError(CatalogError):
     """A statistics refresh could not recompute every file's statistics.
 

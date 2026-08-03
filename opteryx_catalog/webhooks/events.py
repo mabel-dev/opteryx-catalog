@@ -63,6 +63,39 @@ def dataset_deleted_payload(
     }
 
 
+def dataset_renamed_payload(
+    old_identifier: str,
+    new_identifier: str,
+    old_location: Optional[str] = None,
+    new_location: Optional[str] = None,
+    renamed_by: Optional[str] = None,
+) -> dict[str, Any]:
+    """Build payload for dataset rename event.
+
+    Both identifiers and both locations are carried because a rename may move
+    the dataset between collections and always moves its files: a consumer
+    tracking either the catalog name or the storage prefix needs the old and
+    new value to follow it.
+
+    Args:
+        old_identifier: 'collection.dataset' the dataset was addressed by
+        new_identifier: 'collection.dataset' it is addressed by now
+        old_location: GCS prefix its files were under, now awaiting reclamation
+        new_location: GCS prefix its files are under now
+        renamed_by: identity that renamed the dataset
+
+    Returns:
+        Payload dictionary describing the rename
+    """
+    return {
+        "old_identifier": old_identifier,
+        "new_identifier": new_identifier,
+        "old_location": old_location,
+        "new_location": new_location,
+        "renamed_by": renamed_by,
+    }
+
+
 def dataset_updated_payload(
     description: Optional[str] = None,
     properties: Optional[dict[str, Any]] = None,
