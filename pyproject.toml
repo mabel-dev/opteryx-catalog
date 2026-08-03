@@ -29,7 +29,7 @@ dependencies = [
     "google-cloud-firestore==2.*",
     "google-cloud-storage==3.*",
     "requests==2.*",
-    "rugo>=0.4.21"
+    "rugo>=0.4.22"
 ]
 
 [project.optional-dependencies]
