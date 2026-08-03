@@ -23,12 +23,14 @@ from .exceptions import DatasetLocked
 from .exceptions import DatasetNotFound
 from .exceptions import ViewAlreadyExists
 from .exceptions import ViewNotFound
+from .exceptions import WorkspaceDeleteProtected
 from .exceptions import WorkspaceDeleted
 from .iops.base import FileIO
 from .audit import emit_audit
 from .webhooks import send_webhook
 from .webhooks.events import dataset_created_payload
 from .webhooks.events import dataset_deleted_payload
+from .webhooks.events import dataset_renamed_payload
 from .webhooks.events import view_created_payload
 from .webhooks.events import view_deleted_payload
 from .webhooks.events import workspace_deleted_payload
@@ -627,6 +629,10 @@ class OpteryxCatalog(Metastore):
 
         Raises `DatasetLocked` if the dataset's `locked-by` field is set -
         the two-person deniability lock takes precedence over the drop.
+
+        The workspace's `delete_protection` does NOT apply here: it protects the
+        workspace from being deleted, not the assets inside it. Per-asset
+        protection is `locked-by`.
         """
         collection, dataset_name = identifier.split(".")
         doc_ref = self._dataset_doc_ref(collection, dataset_name)
@@ -671,6 +677,234 @@ class OpteryxCatalog(Metastore):
             resource=dataset_name,
             author=author,
             location=location,
+        )
+
+    def _blob_name(self, path: str) -> str:
+        """Strip the `gs://<bucket>/` prefix off a path, leaving the blob name."""
+        prefix = f"gs://{self.gcs_bucket}/"
+        if path.startswith(prefix):
+            return path[len(prefix) :]
+        return path
+
+    def _copy_object(self, source_path: str, target_path: str) -> None:
+        """Copy one object, preferring a server-side copy.
+
+        `copy_blob` is server-side: the bytes never travel through this process,
+        which is what makes moving a large dataset merely slow rather than
+        impossible. The FileIO read/write path is the fallback for a catalog
+        with no GCS bucket configured (local/test FileIO).
+        """
+        if self._storage_client is not None and self.gcs_bucket:
+            bucket = self._storage_client.bucket(self.gcs_bucket)
+            bucket.copy_blob(
+                bucket.blob(self._blob_name(source_path)),
+                bucket,
+                self._blob_name(target_path),
+            )
+            return
+
+        with self.io.new_input(source_path).open() as handle:
+            data = handle.read()
+        out = self.io.new_output(target_path).create()
+        out.write(data)
+        out.close()
+
+    def _read_bytes(self, path: str) -> bytes:
+        with self.io.new_input(path).open() as handle:
+            return handle.read()
+
+    def _write_bytes(self, path: str, data: bytes) -> None:
+        out = self.io.new_output(path).create()
+        out.write(data)
+        out.close()
+
+    def rename_dataset(
+        self, identifier: str, new_identifier: str, author: Optional[str] = None
+    ) -> None:
+        """Rename a dataset, moving its files, manifests and catalog entry.
+
+        A dataset's `location` is assigned once at creation and never re-derived
+        from its name, so a catalog-only rename would leave the files under the
+        old prefix - and creating a new dataset under the vacated name would
+        then derive that same prefix, putting two datasets on one location where
+        dropping either reclaims the other's files. This moves everything so
+        name and storage stay in step and no prefix is ever shared.
+
+        All snapshots move, not just the current one: every historical manifest
+        is rewritten at the new location with remapped file paths, so
+        time-travel keeps working across a rename.
+
+        Cost: this copies every data file the dataset references. It is
+        server-side (see `_copy_object`) but still O(all bytes) and O(all
+        objects) - a rename of a large dataset is a long-running job, not the
+        instant metadata edit the SQL makes it look like.
+
+        Ordering, since Firestore and GCS share no transaction:
+        copy files -> rewrite manifests -> write new catalog entry -> delete old
+        entry -> tombstone the old location. A failure before the new entry is
+        written leaves the dataset untouched and some orphan copies at the new
+        location (a re-run overwrites them). A failure after it leaves the old
+        entry present alongside the new one, both readable, until re-run. No
+        ordering here loses data; the old files are handed to the existing 24h
+        reclamation sweep rather than deleted inline.
+
+        Files the dataset references from *outside* its own location are left
+        exactly where they are and referenced unchanged - they were never this
+        dataset's to move.
+
+        Args:
+            identifier: Current identifier, 'collection.dataset'
+            new_identifier: New identifier, 'collection.dataset'. May name a
+                different collection; the workspace is always this catalog's.
+            author: The identity making the change - None when unauthenticated,
+                never substituted (see audit.emit_audit).
+
+        Raises:
+            DatasetNotFound: If the source does not exist.
+            DatasetAlreadyExists: If the target already exists.
+            DatasetLocked: If the source's `locked-by` field is set.
+            ValueError: If source and target are the same.
+        """
+        if identifier == new_identifier:
+            raise ValueError(f"rename source and target are the same: {identifier}")
+
+        collection, dataset_name = identifier.split(".")
+        new_collection, new_dataset_name = new_identifier.split(".")
+
+        doc_ref = self._dataset_doc_ref(collection, dataset_name)
+        doc = doc_ref.get()
+        if not doc.exists:
+            raise DatasetNotFound(f"Dataset not found: {identifier}")
+
+        data = doc.to_dict() or {}
+        # Same precedence as drop_dataset - the two-person deniability lock
+        # outranks any operation that would move the dataset out from under it.
+        if data.get("locked-by") is not None:
+            raise DatasetLocked(f"Dataset is locked: {identifier}")
+
+        new_doc_ref = self._dataset_doc_ref(new_collection, new_dataset_name)
+        if new_doc_ref.get().exists:
+            raise DatasetAlreadyExists(f"Dataset already exists: {new_identifier}")
+
+        old_location = data.get("location")
+        new_location = (
+            f"gs://{self.gcs_bucket}/{self.workspace}/{new_collection}/{new_dataset_name}"
+        )
+
+        def _remap(path: str) -> str:
+            """Move a path from under old_location to under new_location.
+
+            Anything not under old_location is returned unchanged - see the
+            note about externally-referenced files above.
+            """
+            if old_location and path.startswith(old_location + "/"):
+                return new_location + path[len(old_location) :]
+            return path
+
+        from .catalog.manifest import read_manifest_rows
+
+        snapshot_docs = list(self._snapshots_collection(collection, dataset_name).stream())
+
+        # 1. Copy data files, and 2. rewrite manifests. One pass per snapshot;
+        # a file referenced by several snapshots is copied once (copied_paths).
+        copied_paths = set()
+        rewritten_manifests = {}
+        for snapshot_doc in snapshot_docs:
+            snapshot_data = snapshot_doc.to_dict() or {}
+            manifest_path = snapshot_data.get("manifest")
+            if not manifest_path:
+                continue
+
+            manifest_bytes = self._read_bytes(manifest_path)
+            rows = read_manifest_rows(manifest_bytes)
+
+            for row in rows:
+                source_path = row.get("file_path")
+                if not source_path:
+                    continue
+                target_path = _remap(source_path)
+                if target_path == source_path or target_path in copied_paths:
+                    continue
+                self._copy_object(source_path, target_path)
+                copied_paths.add(target_path)
+                row["file_path"] = target_path
+
+            snapshot_id = snapshot_data.get("snapshot-id")
+            new_manifest_path = self.write_parquet_manifest(
+                snapshot_id, rows, new_location
+            )
+            rewritten_manifests[snapshot_doc.id] = (snapshot_data, new_manifest_path)
+
+        # 3. Write the new catalog entry: dataset doc, schemas, snapshots. This
+        # is the point the rename becomes visible under the new name.
+        new_doc_ref.set(
+            {
+                **data,
+                "name": new_dataset_name,
+                "collection": new_collection,
+                "location": new_location,
+                "timestamp-ms": int(time.time() * 1000),
+            }
+        )
+
+        for schema_doc in doc_ref.collection("schemas").stream():
+            new_doc_ref.collection("schemas").document(schema_doc.id).set(
+                schema_doc.to_dict() or {}
+            )
+
+        new_snapshots = self._snapshots_collection(new_collection, new_dataset_name)
+        for snapshot_doc in snapshot_docs:
+            snapshot_data, new_manifest_path = rewritten_manifests.get(
+                snapshot_doc.id, (snapshot_doc.to_dict() or {}, None)
+            )
+            payload = dict(snapshot_data)
+            if new_manifest_path is not None:
+                payload["manifest"] = new_manifest_path
+            new_snapshots.document(snapshot_doc.id).set(payload)
+
+        # 4. Remove the old catalog entry.
+        self._delete_subcollection(self._snapshots_collection(collection, dataset_name))
+        self._delete_subcollection(doc_ref.collection("schemas"))
+        doc_ref.delete()
+
+        # 5. Hand the vacated prefix to the existing reclamation sweep rather
+        # than deleting inline - same mechanism drop_dataset uses, so the files
+        # are removed on the established 24h grace period instead of instantly.
+        self._write_tombstone(
+            collection=collection,
+            dataset_name=dataset_name,
+            location=old_location,
+            author=author,
+        )
+
+        send_webhook(
+            action="rename",
+            workspace=self.workspace,
+            collection=new_collection,
+            resource_type="dataset",
+            resource_name=new_dataset_name,
+            payload=dataset_renamed_payload(
+                old_identifier=identifier,
+                new_identifier=new_identifier,
+                old_location=old_location,
+                new_location=new_location,
+                renamed_by=author,
+            ),
+        )
+
+        emit_audit(
+            "rename_dataset",
+            resource_type="dataset",
+            workspace=self.workspace,
+            collection=new_collection,
+            resource=new_dataset_name,
+            author=author,
+            old_identifier=identifier,
+            new_identifier=new_identifier,
+            old_location=old_location,
+            new_location=new_location,
+            files_copied=len(copied_paths),
+            snapshots_moved=len(snapshot_docs),
         )
 
     def _write_tombstone(
@@ -722,9 +956,15 @@ class OpteryxCatalog(Metastore):
         `include_deleted=True`. Also writes an entry to the root-level
         `$dropped-workspaces` collection so the sweep can find this workspace
         without enumerating every workspace name blindly.
+
+        Raises `WorkspaceDeleteProtected` if the workspace is delete-protected.
+        This is the only operation that flag guards - it protects the workspace
+        from deletion, not the assets inside it.
         """
         if author is None:
             raise ValueError("author must be provided when soft-deleting a workspace")
+
+        self._assert_not_delete_protected()
 
         now_ms = int(time.time() * 1000)
         self._catalog_ref.document("$properties").update(
@@ -843,6 +1083,110 @@ class OpteryxCatalog(Metastore):
             author=author,
         )
 
+    def _assert_not_delete_protected(self) -> None:
+        """Refuse deletion of this workspace while it is delete-protected.
+
+        Scope is the workspace itself and nothing else: `delete_protection`
+        does not guard the datasets, collections or views inside it. Per-asset
+        protection is the `locked-by` two-person lock, which is a separate
+        mechanism with separate semantics.
+
+        Read fresh from Firestore every time rather than cached on the handle: a
+        cached flag would let a long-lived catalog object delete the workspace
+        after protection was switched on elsewhere, which is exactly the case
+        the setting exists to prevent.
+
+        A Firestore read error propagates rather than being swallowed into
+        "not protected".
+        """
+        if self.get_workspace_properties().get("delete_protection"):
+            raise WorkspaceDeleteProtected(
+                f"Cannot delete workspace '{self.workspace}': it is delete-protected. "
+                f"Clear it with ALTER WORKSPACE {self.workspace} "
+                "SET delete_protection TO OFF."
+            )
+
+    def get_workspace_properties(self) -> dict:
+        """Return the workspace's `$properties` document as a plain dict.
+
+        This is the whole document, lifecycle fields included, so callers can
+        read `owner`, `billing-account-id`, `deleted-at-ms`, `locked-by` and any
+        settable property in one go. Returns `{}` when the document does not
+        exist - a workspace whose `$properties` never got written (the
+        constructor's write is best-effort) reads as "no properties", not as an
+        error, because every field it holds is optional.
+
+        Unlike the constructor's read this does NOT gate on `deleted-at-ms`;
+        reading a deleted workspace's properties is exactly how a caller finds
+        out that it is deleted.
+        """
+        doc = self._catalog_ref.document("$properties").get()
+        if not doc.exists:
+            return {}
+        return doc.to_dict() or {}
+
+    # Fields on `$properties` that only their own dedicated methods may write.
+    # Each one gates real control flow - `deleted-at-ms` makes the constructor
+    # raise WorkspaceDeleted, `locked-by` makes drop_dataset/drop_collection
+    # raise Locked - so letting a generic property setter touch them would let
+    # a caller resurrect a deleted workspace or clear a lock while bypassing
+    # drop_workspace/restore_workspace/lock_workspace/unlock_workspace and the
+    # audit records and webhooks those emit.
+    _RESERVED_WORKSPACE_PROPERTIES = frozenset(
+        {
+            "timestamp-ms",
+            "deleted-at-ms",
+            "deleted-by",
+            "locked-by",
+            "locked-at-ms",
+        }
+    )
+
+    def set_workspace_properties(
+        self, properties: dict, author: Optional[str] = None
+    ) -> None:
+        """Merge `properties` into the workspace's `$properties` document.
+
+        A merge, not a replace: keys absent from `properties` are left as they
+        are, so a caller setting one property cannot blank the rest by omission.
+        To remove a property, set it to None explicitly.
+
+        Args:
+            properties: Property names to values. Must be non-empty.
+            author: The identity making the change - None when unauthenticated,
+                never substituted (see audit.emit_audit).
+
+        Raises:
+            ValueError: If `properties` is empty or names a reserved lifecycle
+                field (see `_RESERVED_WORKSPACE_PROPERTIES`).
+        """
+        if not properties:
+            raise ValueError("properties must be a non-empty mapping")
+
+        reserved = sorted(set(properties) & self._RESERVED_WORKSPACE_PROPERTIES)
+        if reserved:
+            raise ValueError(
+                f"Cannot set reserved workspace lifecycle field(s) {reserved} through "
+                "set_workspace_properties; use the dedicated drop/restore/lock/unlock methods."
+            )
+
+        updates = dict(properties)
+        updates["timestamp-ms"] = int(time.time() * 1000)
+
+        # set(merge=True) rather than update() so a workspace whose $properties
+        # doc was never written (the constructor's write is best-effort and
+        # swallows Firestore errors) gets one here instead of raising NotFound.
+        self._catalog_ref.document("$properties").set(updates, merge=True)
+
+        emit_audit(
+            "set_workspace_properties",
+            resource_type="workspace",
+            workspace=self.workspace,
+            resource=self.workspace,
+            author=author,
+            properties=sorted(properties),
+        )
+
     def list_dropped_workspaces(self) -> List[dict]:
         """Tombstones for workspaces soft-deleted anywhere in this Firestore
         database - not scoped to `self.workspace`. Root-level, mirroring
@@ -940,6 +1284,8 @@ class OpteryxCatalog(Metastore):
         individually, but no longer reachable through `list_collections()`).
         Raises `CollectionLocked` if the collection's `locked-by` field is
         set - the two-person deniability lock takes precedence over the drop.
+        The workspace's `delete_protection` does not apply; it protects the
+        workspace itself, not the assets inside it.
         """
         doc_ref = self._collection_ref(collection)
         doc = doc_ref.get()
@@ -1156,6 +1502,9 @@ class OpteryxCatalog(Metastore):
 
         No tombstone: a view owns no storage, so dropping it leaves nothing to
         reclaim - unlike `drop_dataset`.
+
+        The workspace's `delete_protection` does not apply; it protects the
+        workspace itself, not the assets inside it.
         """
         if isinstance(identifier, tuple) or isinstance(identifier, list):
             collection, view_name = identifier[0], identifier[1]
