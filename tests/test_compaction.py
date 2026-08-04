@@ -844,6 +844,196 @@ def test_iceberg_dict_sort_order_does_not_crash():
     assert plan["sort_column"] == "timestamp"
 
 
+# --- streaming chunk groups, sort direction, and the commit invariant ---------
+
+
+def _chunked(values, size=3):
+    """Feed a value sequence to _compute_chunk_groups the way the executor
+    does: in windows, so a run straddling a window boundary is exercised."""
+    return [values[i : i + size] for i in range(0, len(values), size)]
+
+
+def test_chunk_groups_cover_every_row_ascending():
+    """Groups must partition the sorted keys exactly - no value uncovered, none
+    counted twice - whatever the window boundaries fall on."""
+    compactor = DatasetCompactor(_perf_dataset(), strategy="performance")
+    values = [1, 1, 2, 3, 3, 3, 4, 5, 5, 6, 7, 8, 8, 9]
+    groups = compactor._compute_chunk_groups(_chunked(values))
+
+    assert all(g["type"] == "range" for g in groups)
+    covered = []
+    for group in groups:
+        lo, hi = group["lo"], group["hi"]
+        covered.extend(v for v in values if v >= lo and (hi is None or v < hi))
+    assert covered == values
+
+
+def test_chunk_groups_cover_every_row_descending():
+    """Same invariant for a descending sort, where lo is the LARGER bound.
+
+    The bug this pins: predicates were built as `>= lo AND < hi` regardless of
+    direction, so on a descending sort every range group selected an empty,
+    inverted interval and its rows were dropped from the merge.
+    """
+    compactor = DatasetCompactor(_perf_dataset(), strategy="performance")
+    values = [9, 8, 8, 7, 6, 5, 5, 4, 3, 3, 3, 2, 1, 1]
+    groups = compactor._compute_chunk_groups(_chunked(values))
+
+    covered = []
+    for group in groups:
+        lo, hi = group["lo"], group["hi"]
+        covered.extend(v for v in values if v <= lo and (hi is None or v > hi))
+    assert covered == values
+
+
+def test_group_predicates_follow_sort_direction():
+    compactor = DatasetCompactor(_perf_dataset(), strategy="performance")
+    group = {"type": "range", "lo": 10, "hi": 20}
+
+    assert compactor._group_predicates("ts", group, True) == [
+        ("ts", ">=", 10),
+        ("ts", "<", 20),
+    ]
+    # Descending: lo is the larger value, so the interval is (hi, lo].
+    desc = {"type": "range", "lo": 20, "hi": 10}
+    assert compactor._group_predicates("ts", desc, False) == [
+        ("ts", "<=", 20),
+        ("ts", ">", 10),
+    ]
+    # Final group carries no second bound in either direction.
+    assert compactor._group_predicates("ts", {"lo": 5, "hi": None}, True) == [("ts", ">=", 5)]
+    assert compactor._group_predicates("ts", {"lo": 5, "hi": None}, False) == [("ts", "<=", 5)]
+
+
+def test_chunk_groups_isolate_nulls_and_hot_values():
+    from opteryx_catalog.catalog import compaction as c
+
+    compactor = DatasetCompactor(_perf_dataset(), strategy="performance")
+    hot = [7] * (c.ROW_GROUP_HARD_CAP_ROWS + 1)
+    values = [None, None, 1, 2] + hot + [8, 9]
+    groups = compactor._compute_chunk_groups(_chunked(values, 1000))
+
+    assert groups[0] == {"type": "nulls", "count": 2}
+    hots = [g for g in groups if g["type"] == "hot"]
+    assert hots == [{"type": "hot", "value": 7}]
+    # The range before the hot value stops AT it, so the two never double-read.
+    before = [g for g in groups if g["type"] == "range" and g["lo"] == 1]
+    assert before and before[0]["hi"] == 7
+
+
+def test_file_pruning_never_drops_a_candidate_it_cannot_rule_out():
+    compactor = DatasetCompactor(_perf_dataset(), strategy="performance")
+    # [10, 20): a file ending at 9 and one starting at 20 cannot contribute.
+    assert not compactor._file_can_contribute((0, 9), 10, True, 20, False)
+    assert not compactor._file_can_contribute((20, 30), 10, True, 20, False)
+    assert compactor._file_can_contribute((5, 15), 10, True, 20, False)
+    # No stats, or values that can't be compared, always read.
+    assert compactor._file_can_contribute(None, 10, True, 20, False)
+    assert compactor._file_can_contribute(("a", "b"), 10, True, 20, False)
+
+
+def test_commit_refused_when_rows_go_missing():
+    """The invariant gate: outputs holding fewer rows than the inputs must
+    abort the pass, leave the input files referenced, and clean up the orphans
+    it wrote."""
+    dataset = _perf_dataset()
+    compactor = DatasetCompactor(dataset, strategy="performance", author="t", agent="t")
+
+    inputs = [
+        {"file_path": "/tmp/test_data/data/a.parquet", "record_count": 100},
+        {"file_path": "/tmp/test_data/data/b.parquet", "record_count": 100},
+    ]
+    outputs = [{"file_path": "/tmp/test_data/data/c.parquet", "record_count": 150}]
+
+    result = compactor._finalize_compaction_snapshot(
+        list(inputs), inputs, outputs, 1234, 200, 0, "native"
+    )
+
+    assert result is None
+    assert "row-count mismatch" in compactor._last_error
+    dataset.catalog.save_dataset_metadata.assert_not_called()
+    dataset.io.delete.assert_called_once_with("/tmp/test_data/data/c.parquet")
+
+
+def test_commit_proceeds_when_rows_balance():
+    dataset = _perf_dataset()
+    # _perf_dataset stores current_snapshot as a value; the commit path calls it.
+    dataset.metadata.current_snapshot = Mock(return_value=None)
+    compactor = DatasetCompactor(dataset, strategy="performance", author="t", agent="t")
+    dataset.catalog.write_parquet_manifest = Mock(return_value="/tmp/manifest2.parquet")
+
+    inputs = [
+        {"file_path": "/tmp/test_data/data/a.parquet", "record_count": 100},
+        {"file_path": "/tmp/test_data/data/b.parquet", "record_count": 100},
+    ]
+    outputs = [{"file_path": "/tmp/test_data/data/c.parquet", "record_count": 200}]
+
+    snapshot = compactor._finalize_compaction_snapshot(
+        list(inputs), inputs, outputs, 1234, 200, 0, "native"
+    )
+
+    assert snapshot is not None
+    assert snapshot.summary["deleted-records"] == 200
+    dataset.io.delete.assert_not_called()
+
+
+def test_reconcile_failure_aborts_instead_of_dropping_rows():
+    """An unreconcilable morsel used to be skipped, so its rows vanished from
+    the output while its source file was still deleted by the commit."""
+    compactor = DatasetCompactor(_perf_dataset(), strategy="performance")
+
+    class _BrokenMorsel:
+        """Schema-visible (so it needs reconciling against the other morsel)
+        but its columns can't be read back out."""
+
+        num_rows = 4
+        column_names = ["timestamp"]  # missing "value" -> needs a rebuild
+        column_types = ["INTEGER"]
+
+        def column(self, name):
+            raise RuntimeError("unreadable")
+
+    assert compactor._reconcile_schemas([create_test_table(4), _BrokenMorsel()]) is None
+
+
+def test_commit_refused_when_another_writer_committed_first():
+    """save_dataset_metadata has no compare-and-swap, so a pass that started
+    before a concurrent commit must discard its work rather than overwrite it."""
+    dataset = _perf_dataset()
+    dataset.metadata.current_snapshot = Mock(return_value=None)
+    dataset.identifier = "test.dataset"
+    compactor = DatasetCompactor(dataset, strategy="performance", author="t", agent="t")
+    dataset.catalog.write_parquet_manifest = Mock(return_value="/tmp/manifest2.parquet")
+
+    compactor._baseline_snapshot_id = 1000
+    fresh = Mock()
+    fresh.metadata.current_snapshot_id = 2000  # someone else committed meanwhile
+    dataset.catalog.load_dataset = Mock(return_value=fresh)
+
+    inputs = [
+        {"file_path": "/tmp/test_data/data/a.parquet", "record_count": 100},
+        {"file_path": "/tmp/test_data/data/b.parquet", "record_count": 100},
+    ]
+    outputs = [{"file_path": "/tmp/test_data/data/c.parquet", "record_count": 200}]
+
+    result = compactor._finalize_compaction_snapshot(
+        list(inputs), inputs, outputs, 1234, 200, 0, "native"
+    )
+
+    assert result is None
+    assert "changed during compaction" in compactor._last_error
+    dataset.catalog.save_dataset_metadata.assert_not_called()
+    dataset.io.delete.assert_called_once_with("/tmp/test_data/data/c.parquet")
+
+    # Unchanged dataset: the same pass commits normally.
+    fresh.metadata.current_snapshot_id = 1000
+    dataset.io.delete.reset_mock()
+    assert compactor._finalize_compaction_snapshot(
+        list(inputs), inputs, outputs, 1235, 200, 0, "native"
+    ) is not None
+    dataset.io.delete.assert_not_called()
+
+
 if __name__ == "__main__":
     print("Running compaction tests...\n")
     test_brute_compaction()
@@ -865,4 +1055,13 @@ if __name__ == "__main__":
     test_normalize_sort_order_iceberg_dict()
     test_normalize_sort_order_edge_shapes()
     test_iceberg_dict_sort_order_does_not_crash()
+    test_chunk_groups_cover_every_row_ascending()
+    test_chunk_groups_cover_every_row_descending()
+    test_group_predicates_follow_sort_direction()
+    test_chunk_groups_isolate_nulls_and_hot_values()
+    test_file_pruning_never_drops_a_candidate_it_cannot_rule_out()
+    test_commit_refused_when_rows_go_missing()
+    test_commit_proceeds_when_rows_balance()
+    test_reconcile_failure_aborts_instead_of_dropping_rows()
+    test_commit_refused_when_another_writer_committed_first()
     print("\n✅ All tests passed!")
