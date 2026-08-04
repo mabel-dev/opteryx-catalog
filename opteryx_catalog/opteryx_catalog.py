@@ -57,36 +57,67 @@ DROPPED_WORKSPACES_COLLECTION = "$dropped-workspaces"
 def _core_type_to_stored(column_type: Any) -> tuple:
     """Map an Opteryx ``ColumnType`` to ``(type_name, element_type, precision, scale)``.
 
-    ``type_name`` is the dispatch-category name (``INTEGER``, ``DECIMAL``,
-    ``ARRAY``, ...) so it round-trips through ``parse_column_type`` on read.
+    ``type_name`` is the EXACT type string — ``str(ColumnType)`` — which is what
+    ``parse_column_type`` reads back unchanged: ``IPV4``, ``UINT32``, ``INT8``,
+    ``FLOAT32``, ``TIMESTAMP[ms]``, ``DECIMAL(10, 2)``, ``ARRAY<VARCHAR>``.
+
+    It used to store the dispatch CATEGORY name, which is lossy in the direction
+    that silently WIDENS and cannot be detected downstream: IPv4's category is
+    INTEGER (deliberately — that is what makes ordering, grouping and joins run
+    on the raw uint32), and so is every unsigned and narrow width's, so IPV4,
+    UINT32, UINT64 and INT8 all persisted as ``INTEGER`` and came back as a
+    signed INT64. A stored address then rendered as a number, and an unsigned
+    column silently became signed.
+
+    ``precision``/``scale``/``element_type`` stay populated alongside it. They are
+    redundant with the parameterized name now, but they are separate stored
+    columns other readers consume, and the engine's reader still falls back to
+    them for the bare ``DECIMAL``/``ARRAY`` spellings written before this.
     """
     if column_type is None:
         return ("VARCHAR", None, None, None)
 
+    type_name = str(column_type)
     category = column_type.category.name
     if category == "DECIMAL":
         logical = column_type.logical
         precision = getattr(logical, "precision", None) if logical is not None else None
         scale = getattr(logical, "scale", None) if logical is not None else None
-        return ("DECIMAL", None, precision, scale)
+        return (type_name, None, precision, scale)
     if category == "ARRAY":
         element = column_type.element
         element_name = element.category.name if element is not None else None
-        return ("ARRAY", element_name, None, None)
-    return (category, None, None, None)
+        return (type_name, element_name, None, None)
+    return (type_name, None, None, None)
 
 
-# draken physical type name (DrakenType.name, from Morsel.schema) -> the same
-# category names _core_type_to_stored uses.
-_DRAKEN_CATEGORY_OF = {
-    "INT8": "INTEGER",
-    "INT16": "INTEGER",
-    "INT32": "INTEGER",
-    "INT64": "INTEGER",
+# draken physical type name (DrakenType.name, from Morsel.schema) -> the name to
+# STORE. Every entry must be a spelling opteryx's parse_column_type reads back,
+# which is why this is not simply `DrakenType.name`: DATE32, TIMESTAMP64, TIME32,
+# TIME64 and VECTOR_FP16 do not parse, and a stored name that does not parse
+# falls through the reader to its VARCHAR default — a timestamp column silently
+# becoming a string, which is worse than the widening this change fixes.
+#
+# The EXACT widths map to themselves. That is the whole point: they used to
+# collapse to INTEGER/FLOAT, so a UINT32 column read back signed and 64-bit.
+#
+# The rest keep the category spelling they always had, because a Morsel's schema
+# exposes only the physical tag — no DECIMAL precision/scale, no VECTOR
+# dimension, no TIMESTAMP unit — so there is nothing more exact to write. The
+# reader's parameter-aware branches handle those bare names, as they always did.
+_DRAKEN_STORED_NAME = {
+    "INT8": "INT8",
+    "INT16": "INT16",
+    "INT32": "INT32",
+    "INT64": "INT64",
+    "UINT8": "UINT8",
+    "UINT16": "UINT16",
+    "UINT32": "UINT32",
+    "UINT64": "UINT64",
+    "FLOAT32": "FLOAT32",
+    "FLOAT64": "FLOAT64",
     "DECIMAL": "DECIMAL",
     "DECIMAL128": "DECIMAL",
-    "FLOAT32": "FLOAT",
-    "FLOAT64": "FLOAT",
     "DATE32": "DATE",
     "TIMESTAMP64": "TIMESTAMP",
     "TIME32": "TIME",
@@ -117,12 +148,12 @@ def _morsel_type_to_stored(dtype: Any) -> tuple:
     same defaults used on read (see ``dataset.py``'s ``_stored_type_display``).
     """
     name = getattr(dtype, "name", str(dtype))
-    category = _DRAKEN_CATEGORY_OF.get(name, "VARCHAR")
-    if category == "DECIMAL":
+    stored = _DRAKEN_STORED_NAME.get(name, "VARCHAR")
+    if stored == "DECIMAL":
         return ("DECIMAL", None, 38, 9)
-    if category == "ARRAY":
+    if stored == "ARRAY":
         return ("ARRAY", "VARIANT", None, None)
-    return (category, None, None, None)
+    return (stored, None, None, None)
 
 
 _SNAPSHOT_SUMMARY_KEYS = (
