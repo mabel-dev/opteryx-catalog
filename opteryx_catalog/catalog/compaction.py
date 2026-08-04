@@ -27,6 +27,11 @@ split step).
      floor (e.g. a 200 MB tail) is acceptable and expected.
   5. Execution streams row groups (see ``_execute_compaction_streaming``):
      constant memory, so a merge can be larger than RAM.
+  6. Nothing commits unless the outputs hold exactly the rows the inputs did
+     (``_row_counts_balance``) and no other writer committed while the merge was
+     running (``_dataset_moved_under_us``). Every other failure path aborts the
+     pass, removes the files it wrote, and records why in ``_last_error`` - the
+     inputs are always left intact for a later pass.
 
 ``brute`` strategy is a separate, older fallback for datasets with no sort
 order; it is unrelated to the above.
@@ -34,6 +39,7 @@ order; it is unrelated to the above.
 
 from __future__ import annotations
 
+import logging
 import os
 import random
 import time
@@ -43,6 +49,8 @@ from typing import List, Optional
 
 from .manifest import ParquetManifestEntry, build_parquet_manifest_entry_from_bytes
 from .metadata import Snapshot
+
+logger = logging.getLogger(__name__)
 
 # Stable node identifier for this process (hex-mac-hex-pid)
 _NODE = f"{uuid.getnode():x}-{os.getpid():x}"
@@ -310,7 +318,10 @@ DECLUSTER_MAX_COMBINED_BYTES = 3 * TARGET_SIZE_BYTES
 #           candidate file once per window it contributes to (read
 #           amplification, paid deliberately to avoid write amplification: see
 #           the accretive-merge measurement showing a ~21x total-bytes-rewritten
-#           blowup from repeated whole-file rewrites).
+#           blowup from repeated whole-file rewrites). That re-reading is served
+#           from a local cache (_SourceFileCache) and pruned against each file's
+#           manifest min/max, so the amplification lands on local storage, not
+#           on repeated object-store downloads.
 #
 # Two cases a value predicate cannot express, both handled by falling back to
 # row-group-native accumulation (stream row groups, slice by row count instead
@@ -332,6 +343,71 @@ DECLUSTER_MAX_COMBINED_BYTES = 3 * TARGET_SIZE_BYTES
 # restriction remains.) On any failure it falls back to hold-everything.
 ROW_GROUP_TARGET_ROWS = 256_000
 ROW_GROUP_HARD_CAP_ROWS = 272_000
+
+# Sorted keys are consumed from pass 1 in chunks of this many rows rather than
+# as one `to_pylist()` of the whole sequence: at github.events scale the full
+# list is tens of millions of Python objects (gigabytes) on the very path whose
+# purpose is bounded memory. See ``DatasetCompactor._iter_key_runs``.
+KEY_SCAN_CHUNK_ROWS = 1_000_000
+
+# How much of the candidate files' COMPRESSED bytes the source cache may hold in
+# RAM before spilling the rest to local disk. See ``_SourceFileCache``.
+SOURCE_CACHE_RAM_BYTES = int(
+    os.environ.get("OPTERYX_COMPACTION_SOURCE_CACHE_MB", 2048)
+) * 1024 * 1024
+
+
+class _SourceFileCache:
+    """Fetch each candidate file's bytes from object storage AT MOST ONCE per
+    compaction, then serve them locally for every window that needs them.
+
+    Streaming execution reads each candidate file once per chunk group it
+    contributes to. Reading straight from ``io`` meant re-DOWNLOADING the whole
+    file every time: a 3-file, ~24M-row decluster walks ~90 windows, so ~270
+    full-file fetches - hundreds of gigabytes of network traffic to compact 12
+    GB. The read amplification is inherent to the design (it is what buys
+    bounded memory and avoids write amplification), but it should be paid
+    against local storage, not the network.
+
+    Bytes are kept in RAM up to ``SOURCE_CACHE_RAM_BYTES`` and spilled to files
+    under ``tmpdir`` beyond it, so the cache never competes with the window
+    budget that makes streaming viable in the first place.
+    """
+
+    def __init__(self, io, tmpdir: str, ram_budget: int = SOURCE_CACHE_RAM_BYTES):
+        self._io = io
+        self._tmpdir = tmpdir
+        self._ram_budget = ram_budget
+        self._ram_used = 0
+        self._memory: dict = {}
+        self._spilled: dict = {}
+
+    def read(self, file_path: str) -> bytes:
+        cached = self._memory.get(file_path)
+        if cached is not None:
+            return cached
+
+        local = self._spilled.get(file_path)
+        if local is not None:
+            with open(local, "rb") as fh:
+                return fh.read()
+
+        with self._io.new_input(file_path).open() as f:
+            data = bytes(f.read())
+
+        if self._ram_used + len(data) <= self._ram_budget:
+            self._memory[file_path] = data
+            self._ram_used += len(data)
+        else:
+            local = os.path.join(self._tmpdir, f"src-{len(self._spilled):x}.parquet")
+            try:
+                with open(local, "wb") as fh:
+                    fh.write(data)
+                self._spilled[file_path] = local
+            except OSError as exc:
+                # No local space; fall back to re-fetching this file next time.
+                logger.debug("compaction: could not spill %s locally (%s)", file_path, exc)
+        return data
 
 
 class DatasetCompactor:
@@ -364,6 +440,16 @@ class DatasetCompactor:
         self.dataset = dataset
         self.author = author
         self.agent = agent or "compactor"
+        # Why the last pass declined to commit, if it did. Nearly every failure
+        # here is a deliberate "abort and leave the data alone", which is safe
+        # but invisible - a dataset can go weeks without compacting and look
+        # identical to one with nothing to compact. Callers (and the cron job)
+        # can read this; everything is logged as well.
+        self._last_error: Optional[str] = None
+        # Snapshot id this pass is based on; set by compact(), checked before
+        # the commit. None means "no baseline recorded", which disables the
+        # staleness check (e.g. an execute path driven directly by a test).
+        self._baseline_snapshot_id = None
 
         # Auto-detect strategy if not specified
         if strategy is None:
@@ -429,6 +515,11 @@ class DatasetCompactor:
         if not current_snapshot or not current_snapshot.manifest_list:
             return None
 
+        # The snapshot this pass is based on. Re-checked immediately before the
+        # commit (see _dataset_moved_under_us) so a concurrent writer's work is
+        # not clobbered by a merge that started before it landed.
+        self._baseline_snapshot_id = current_snapshot.snapshot_id
+
         entries = self._read_manifest(current_snapshot.manifest_list)
         if not entries:
             return None
@@ -459,7 +550,8 @@ class DatasetCompactor:
 
         try:
             return get_parsed_manifest(self.dataset.io, manifest_path)
-        except Exception:
+        except Exception as exc:
+            self._abort(f"could not read manifest {manifest_path}", exc)
             return []
 
     def _select_brute_compaction(self, entries: List[dict]) -> Optional[dict]:
@@ -867,7 +959,13 @@ class DatasetCompactor:
             morsels: List of draken Morsels with potentially mismatched schemas
 
         Returns:
-            List of morsels with unified schemas
+            List of morsels with unified schemas, or None if any morsel could
+            not be reconciled. Returning None (rather than dropping the
+            offending morsel) is deliberate: a dropped morsel's rows would
+            vanish from the merged output while its input file was still
+            deleted by the commit - silent data loss. The caller aborts the
+            whole compaction instead, leaving the inputs intact for a later
+            pass.
         """
         if not morsels or len(morsels) <= 1:
             return morsels
@@ -915,10 +1013,12 @@ class DatasetCompactor:
                         )
                 reconciled.append(rebuilt)
             except Exception:
-                # Failed to reconcile, skip this morsel
-                continue
+                # Cannot reconcile this morsel. Dropping it would silently lose
+                # its rows while the commit still deletes its source file, so
+                # abort the compaction instead.
+                return None
 
-        return reconciled if reconciled else morsels
+        return reconciled
 
     def _execute_compaction(self, all_entries: List[dict], plan: dict) -> Optional[Snapshot]:
         """
@@ -962,7 +1062,10 @@ class DatasetCompactor:
                 e.get("uncompressed_size_in_bytes", 0) for e in files_to_compact
             )
             if combined_budget > MAX_SELECTED_BUDGET_BYTES:
-                return None
+                return self._abort(
+                    f"streaming declined and the {combined_budget >> 20} MB merge "
+                    f"exceeds the {MAX_SELECTED_BUDGET_BYTES >> 20} MB in-memory gate"
+                )
             # Small enough to hold in memory - fall through to hold-everything
             # rather than losing the compaction outright.
 
@@ -990,15 +1093,18 @@ class DatasetCompactor:
                 )
                 tables.append(file_morsel)
                 total_size += entry.get("uncompressed_size_in_bytes", 0)
-            except Exception:
+            except Exception as exc:
                 # Failed to read file, abort this compaction
-                return None
+                return self._abort(f"could not read input file {file_path}", exc)
 
         if not tables:
-            return None
+            return self._abort("no input files could be read")
 
-        # Reconcile schemas before concatenation
+        # Reconcile schemas before concatenation. None means a morsel could not
+        # be brought to the unified schema; abort rather than silently drop it.
         tables = self._reconcile_schemas(tables)
+        if not tables:
+            return self._abort("could not reconcile input schemas")
 
         # Combine morsels
         combined = Morsel.combine(tables) if len(tables) > 1 else tables[0]
@@ -1094,9 +1200,11 @@ class DatasetCompactor:
                 out = io.new_output(file_path).create()
                 out.write(pdata)
                 out.close()
-            except Exception:
-                # Failed to write or upload, abort
-                return None
+            except Exception as exc:
+                # Failed to write or upload. Anything already written this pass
+                # is unreferenced now, so clean it up before aborting.
+                self._delete_written_files(new_entries)
+                return self._abort(f"could not write output file {file_path}", exc)
 
             # Build manifest entry with full statistics directly from the
             # in-memory Morsel (avoids re-reading and losing temporal/decimal
@@ -1137,7 +1245,31 @@ class DatasetCompactor:
         know about manifest/Firestore mechanics - they just produce
         ``new_entries`` (already-built manifest dicts for the files they wrote)
         and call this.
+
+        Every commit is gated on a row-count invariant: compaction only ever
+        rewrites rows, so the outputs must hold exactly as many records as the
+        inputs did. This is the one check that turns a silent data-loss bug into
+        a no-op - an inverted predicate, a rugo regression on some column type,
+        a mis-derived chunk group all show up here as a count mismatch, and the
+        pass aborts with the input files still intact.
         """
+        if not self._row_counts_balance(files_to_compact, new_entries):
+            self._delete_written_files(new_entries)
+            return None
+
+        if self._dataset_moved_under_us():
+            # ``save_dataset_metadata`` has no compare-and-swap, so committing
+            # now would unconditionally clobber whatever landed while we were
+            # reading and rewriting - including that writer's new data files,
+            # which our manifest knows nothing about. This is a read-back, not
+            # a real CAS: it cannot close the window between this check and the
+            # write, only the (much longer) one covering the merge itself.
+            self._delete_written_files(new_entries)
+            return self._abort(
+                "dataset changed during compaction; discarding this pass rather "
+                "than overwriting a concurrent commit"
+            )
+
         # Create new manifest with updated entries
         # Remove old entries, add new entries
         # Also validate remaining entries - recover corrupted ones by reading files
@@ -1179,8 +1311,9 @@ class DatasetCompactor:
         # Don't rely on potentially corrupted manifest entries
         try:
             deleted_files = len(files_to_compact)
-            deleted_size = 0
-            # Input stats captured before the input morsels were freed.
+            deleted_size = sum(e.get("file_size_in_bytes", 0) for e in files_to_compact)
+            # Input record/byte counts come from the morsels themselves (captured
+            # before they were freed); on-disk size is only in the manifest.
             deleted_records = input_records
             deleted_data_size = input_data_size
 
@@ -1271,9 +1404,88 @@ class DatasetCompactor:
 
         return snapshot
 
+    def _dataset_moved_under_us(self) -> bool:
+        """Whether the dataset's current snapshot changed since this pass read
+        the manifest.
+
+        Compaction's read-to-commit window spans a whole multi-GB merge, so a
+        concurrent append is entirely plausible. Re-reading the catalog just
+        before the commit turns "silently overwrite the other writer" into
+        "skip this pass and retry next tick", which is the right trade: the
+        work is idempotent and cheap to redo, the lost data is not.
+
+        Returns False when the check itself can't run (no catalog, no loader,
+        read fails) - an unavailable check is not evidence of a conflict, and
+        must not stall compaction on every pass.
+        """
+        baseline = getattr(self, "_baseline_snapshot_id", None)
+        if baseline is None:
+            return False
+        catalog = getattr(self.dataset, "catalog", None)
+        loader = getattr(catalog, "load_dataset", None)
+        if not callable(loader):
+            return False
+        try:
+            fresh = loader(self.dataset.identifier)
+            current = fresh.metadata.current_snapshot_id
+        except Exception as exc:
+            logger.debug("compaction: staleness check unavailable (%s)", exc)
+            return False
+        return current is not None and current != baseline
+
+    def _abort(self, reason: str, exc: Optional[BaseException] = None):
+        """Record and log why this pass is declining to commit, then return
+        None so callers can ``return self._abort(...)``. Every abort path used
+        to be a bare ``return None``, which made a compactor that had silently
+        done nothing for weeks indistinguishable from one with no work to do."""
+        self._last_error = reason
+        if exc is not None:
+            logger.warning("compaction aborted: %s (%s: %s)", reason, type(exc).__name__, exc)
+        else:
+            logger.warning("compaction aborted: %s", reason)
+
+    def _row_counts_balance(self, files_to_compact: List[dict], new_entries: List[dict]) -> bool:
+        """Whether the outputs account for exactly the input rows.
+
+        Skipped (returns True) when any input entry carries no ``record_count``:
+        an absent count is unknown, not zero, and refusing to compact on missing
+        stats would be worse than not checking. Output entries are freshly built
+        from the files just written, so their counts are always present.
+        """
+        input_counts = [e.get("record_count") for e in files_to_compact]
+        if any(c is None for c in input_counts):
+            return True
+        expected = sum(input_counts)
+        actual = sum(e.get("record_count", 0) for e in new_entries)
+        if expected == actual:
+            return True
+        self._abort(
+            f"row-count mismatch: {expected} input rows vs {actual} written "
+            f"across {len(new_entries)} file(s)"
+        )
+        return False
+
+    def _delete_written_files(self, new_entries: List[dict]) -> None:
+        """Best-effort removal of output files written by an aborted pass.
+
+        Nothing references them once the snapshot is not committed, so leaving
+        them behind is pure orphaned storage. Failures are ignored: losing the
+        cleanup is not a reason to turn a safe abort into an exception.
+        """
+        for entry in new_entries or ():
+            path = entry.get("file_path") if isinstance(entry, dict) else None
+            if not path:
+                continue
+            try:
+                self.dataset.io.delete(path)
+            except Exception as exc:
+                logger.debug("compaction: could not remove orphan %s (%s)", path, exc)
+
     # --- Streaming execution (see the module comment above ROW_GROUP_TARGET_ROWS) ---
 
-    def _read_sort_column_combined(self, files_to_compact: List[dict], sort_column: str):
+    def _read_sort_column_combined(
+        self, files_to_compact: List[dict], sort_column: str, source_cache
+    ):
         """Pass 1: project ONLY the sort column from every candidate file,
         streaming row-group by row-group, and combine into one small morsel.
         Cheap regardless of total merge size (measured: 60MB for 7.9M rows on
@@ -1289,9 +1501,10 @@ class DatasetCompactor:
             if not file_path:
                 return None
             try:
-                with self.dataset.io.new_input(file_path).open() as f:
-                    data = f.read()
-                with read_parquet(bytes(data), columns=[sort_column]) as reader:
+                # Reading through the cache means pass 2 gets these files for
+                # free - pass 1 already had to fetch every one of them.
+                data = source_cache.read(file_path)
+                with read_parquet(data, columns=[sort_column]) as reader:
                     parts.extend(reader)
             except Exception:
                 return None
@@ -1299,79 +1512,140 @@ class DatasetCompactor:
             return None
         return Morsel.combine(parts) if len(parts) > 1 else parts[0]
 
-    def _compute_chunk_groups(self, sorted_keys: list, ascending: bool) -> list:
+    @staticmethod
+    def _iter_key_runs(key_chunks):
+        """Collapse a stream of sorted key CHUNKS (lists of values) into a
+        stream of ``(value, run_length)`` runs, correctly joining a run that
+        straddles a chunk boundary.
+
+        Consuming the sorted keys in chunks rather than as one list is what
+        keeps this bounded: materialising every key via ``to_pylist()`` on a
+        multi-GB merge is gigabytes of Python objects on the very path whose
+        purpose is bounded memory.
+        """
+        have = False
+        current = None
+        length = 0
+        for chunk in key_chunks:
+            for value in chunk:
+                if have and value == current:
+                    length += 1
+                    continue
+                # `None == None` is True, so null runs coalesce here too.
+                if have and value is None and current is None:
+                    length += 1
+                    continue
+                if have:
+                    yield current, length
+                current = value
+                length = 1
+                have = True
+        if have:
+            yield current, length
+
+    def _compute_chunk_groups(self, key_chunks) -> list:
         """Turn the exact, fully sorted key sequence into an ordered list of
         chunk-group descriptors for pass 2+. Each group is one of:
 
           {"type": "nulls", "count": N}            - always first, if N>0
-          {"type": "range", "lo": v, "hi": v|None}  - half-open [lo,hi); hi=None
-                                                       for the final group (no
-                                                       upper bound needed)
+          {"type": "range", "lo": v, "hi": v|None}  - the sort-key interval
+                                                       between two distinct
+                                                       values; hi=None on the
+                                                       final group (no further
+                                                       bound needed)
           {"type": "hot", "value": v}               - a single value whose run
                                                        alone exceeds the hard cap
 
+        ``lo``/``hi`` are given in SORT ORDER, not in ascending value order: on
+        a descending sort ``lo`` is the larger value and ``hi`` the smaller.
+        ``_group_predicates`` is the single place that turns them into
+        comparison operators, so the direction is handled once.
+
         Boundaries snap to distinct-value edges so a predicate range never
         needs to split a run of equal keys (predicates match by value, not row
-        position). Target ROW_GROUP_TARGET_ROWS per group; hard cap
-        ROW_GROUP_HARD_CAP_ROWS - if extending to the next distinct value would
-        exceed the cap, cut earlier instead (undershoot, never overshoot),
-        except for a single run that alone exceeds the cap, which becomes its
-        own "hot" group (pass 2+ falls back to row-count slicing for that one,
-        since no value-based predicate can split it further).
+        position). Hard cap ROW_GROUP_HARD_CAP_ROWS - if extending to the next
+        distinct value would exceed the cap, cut earlier instead (undershoot,
+        never overshoot), except for a single run that alone exceeds the cap,
+        which becomes its own "hot" group (pass 2+ falls back to row-count
+        slicing for that one, since no value-based predicate can split it
+        further).
+
+        ``key_chunks`` is an iterable of lists of keys in sorted order; see
+        ``_iter_key_runs``.
         """
-        n = len(sorted_keys)
-        # draken's morsel_sort is NULLS-FIRST on ascending, NULLS-LAST on
-        # descending; nulls cluster entirely to one end either way. Bring them
-        # to logical position 0 regardless of sort direction (project policy,
-        # not draken's own semantics).
-        if ascending:
-            null_count = 0
-            while null_count < n and sorted_keys[null_count] is None:
-                null_count += 1
-            values = sorted_keys[null_count:]
-        else:
-            null_count = 0
-            while null_count < n and sorted_keys[n - 1 - null_count] is None:
-                null_count += 1
-            values = sorted_keys[: n - null_count] if null_count else sorted_keys
-
         groups = []
-        if null_count > 0:
-            groups.append({"type": "nulls", "count": null_count})
+        null_count = 0
+        pending_lo = None
+        pending_count = 0
 
-        m = len(values)
-        i = 0
-        while i < m:
-            run_end = i + 1
-            while run_end < m and values[run_end] == values[i]:
-                run_end += 1
-            run_len = run_end - i
+        for value, run_len in self._iter_key_runs(key_chunks):
+            if value is None:
+                # draken's morsel_sort is NULLS-FIRST ascending, NULLS-LAST
+                # descending; either way the nulls form one contiguous run.
+                # Project policy places them at logical position 0 regardless,
+                # so the group is inserted at the front below.
+                null_count += run_len
+                continue
+
             if run_len > ROW_GROUP_HARD_CAP_ROWS:
                 # A single value spans more rows than one chunk can safely
                 # hold, and predicates can't slice within it - hand the whole
-                # run to the row-count-slicing fallback.
-                groups.append({"type": "hot", "value": values[i]})
-                i = run_end
+                # run to the row-count-slicing fallback. Close any open range
+                # at this value first so the two stay disjoint.
+                if pending_count:
+                    groups.append({"type": "range", "lo": pending_lo, "hi": value})
+                    pending_count = 0
+                groups.append({"type": "hot", "value": value})
                 continue
 
-            # Normal case: extend from i, snapping to run boundaries, until
-            # adding the next run would cross the hard cap.
-            j = run_end
-            count = run_len
-            while j < m:
-                next_end = j + 1
-                while next_end < m and values[next_end] == values[j]:
-                    next_end += 1
-                next_run_len = next_end - j
-                if count + next_run_len > ROW_GROUP_HARD_CAP_ROWS:
-                    break
-                j = next_end
-                count += next_run_len
-            hi = values[j] if j < m else None
-            groups.append({"type": "range", "lo": values[i], "hi": hi})
-            i = j
+            if pending_count == 0:
+                pending_lo = value
+                pending_count = run_len
+            elif pending_count + run_len > ROW_GROUP_HARD_CAP_ROWS:
+                groups.append({"type": "range", "lo": pending_lo, "hi": value})
+                pending_lo = value
+                pending_count = run_len
+            else:
+                pending_count += run_len
+
+        if pending_count:
+            groups.append({"type": "range", "lo": pending_lo, "hi": None})
+        if null_count:
+            groups.insert(0, {"type": "nulls", "count": null_count})
 
         return groups
+
+    @staticmethod
+    def _group_predicates(sort_column: str, group: dict, ascending: bool) -> list:
+        """Predicates selecting exactly the rows of a "range" group.
+
+        ``lo``/``hi`` come out of ``_compute_chunk_groups`` in SORT order, so on
+        a descending sort ``lo`` is the LARGER value. Emitting ``>= lo AND
+        < hi`` unconditionally (as an earlier version did) therefore produced an
+        empty, inverted interval on every descending-sorted dataset: each range
+        group read zero rows, and if the merge also had a hot/null group the
+        snapshot committed with only those rows and deleted the rest.
+        """
+        lo, hi = group["lo"], group["hi"]
+        if ascending:
+            preds = [(sort_column, ">=", lo)]
+            if hi is not None:
+                preds.append((sort_column, "<", hi))
+        else:
+            preds = [(sort_column, "<=", lo)]
+            if hi is not None:
+                preds.append((sort_column, ">", hi))
+        return preds
+
+    @staticmethod
+    def _group_value_bounds(group: dict, ascending: bool):
+        """The group's extent as ``(low, low_inclusive, high, high_inclusive)``
+        in ASCENDING value space (None = unbounded), for pruning candidate files
+        against their manifest min/max. Mirrors ``_group_predicates``."""
+        lo, hi = group["lo"], group["hi"]
+        if ascending:
+            return lo, True, hi, False  # [lo, hi)
+        return hi, False, lo, True  # (hi, lo]
 
     def _entry_field_idx(self, entry: dict, sort_field_id, sort_index):
         """Resolve the sort column's positional index within one manifest
@@ -1384,8 +1658,41 @@ class DatasetCompactor:
             return sort_index
         return None
 
+    @staticmethod
+    def _file_can_contribute(bounds, low, low_inclusive, high, high_inclusive) -> bool:
+        """Whether a file whose sort-key extent is ``bounds`` ((min, max) from
+        its manifest entry, or None when it carries no usable stats) can hold
+        any row inside the given ascending-space interval.
+
+        Pruning here is what stops pass 2 from touching every candidate file for
+        every window: on a mostly-disjoint dataset each window is served by one
+        or two files instead of all of them. ``None`` bounds (no stats) and
+        incomparable values both fall through to "yes", so pruning can only ever
+        avoid work, never drop rows.
+        """
+        if bounds is None:
+            return True
+        file_min, file_max = bounds
+        if file_min is None or file_max is None:
+            return True
+        try:
+            if low is not None and (file_max < low or (not low_inclusive and file_max == low)):
+                return False
+            if high is not None and (file_min > high or (not high_inclusive and file_min == high)):
+                return False
+        except TypeError:
+            return True  # values not mutually comparable; read it to be safe
+        return True
+
     def _iter_group_morsels(
-        self, files_to_compact, sort_column, ascending, group, null_bearing_paths
+        self,
+        files_to_compact,
+        sort_column,
+        ascending,
+        group,
+        null_bearing_paths,
+        source_cache,
+        bounds_by_path,
     ):
         """Yield one or more sorted, <=ROW_GROUP_HARD_CAP_ROWS-row Morsels for
         a single chunk group. Dispatches on group type:
@@ -1421,15 +1728,16 @@ class DatasetCompactor:
 
         if group["type"] == "range":
             parts = []
-            lo, hi = group["lo"], group["hi"]
-            preds = [(sort_column, ">=", lo)]
-            if hi is not None:
-                preds.append((sort_column, "<", hi))
+            preds = self._group_predicates(sort_column, group, ascending)
+            low, low_inc, high, high_inc = self._group_value_bounds(group, ascending)
             for entry in files_to_compact:
                 file_path = entry.get("file_path")
-                with self.dataset.io.new_input(file_path).open() as f:
-                    data = f.read()
-                with read_parquet(bytes(data), predicates=preds) as reader:
+                if not self._file_can_contribute(
+                    bounds_by_path.get(file_path), low, low_inc, high, high_inc
+                ):
+                    continue
+                data = source_cache.read(file_path)
+                with read_parquet(data, predicates=preds) as reader:
                     parts.extend(reader)
             if parts:
                 combined = Morsel.combine(parts) if len(parts) > 1 else parts[0]
@@ -1443,9 +1751,12 @@ class DatasetCompactor:
             acc_rows = 0
             for entry in files_to_compact:
                 file_path = entry.get("file_path")
-                with self.dataset.io.new_input(file_path).open() as f:
-                    data = f.read()
-                with read_parquet(bytes(data), predicates=preds) as reader:
+                if not self._file_can_contribute(
+                    bounds_by_path.get(file_path), value, True, value, True
+                ):
+                    continue
+                data = source_cache.read(file_path)
+                with read_parquet(data, predicates=preds) as reader:
                     for rg in reader:
                         acc.append(rg)
                         acc_rows += rg.num_rows
@@ -1467,9 +1778,8 @@ class DatasetCompactor:
                 file_path = entry.get("file_path")
                 if file_path not in null_bearing_paths:
                     continue
-                with self.dataset.io.new_input(file_path).open() as f:
-                    data = f.read()
-                with read_parquet(bytes(data)) as reader:
+                data = source_cache.read(file_path)
+                with read_parquet(data) as reader:
                     for rg in reader:
                         col = rg.column(sort_column)
                         mask_bytes = col.is_null()
@@ -1503,6 +1813,19 @@ class DatasetCompactor:
         Returns None (never raises) if anything about this path can't proceed,
         so the caller can fall back to hold-everything.
         """
+        import tempfile
+
+        # One cache for the whole execution: every candidate file is fetched
+        # from object storage at most once, however many windows read it.
+        with tempfile.TemporaryDirectory(prefix="opteryx-compact-") as tmpdir:
+            source_cache = _SourceFileCache(self.dataset.io, tmpdir)
+            return self._execute_compaction_streaming_inner(all_entries, plan, source_cache)
+
+    def _execute_compaction_streaming_inner(
+        self, all_entries: List[dict], plan: dict, source_cache
+    ) -> Optional[Snapshot]:
+        """Body of ``_execute_compaction_streaming``, split out so the source
+        cache's temp directory is torn down on every exit path."""
         plan_type = plan["type"]
         files_to_compact = plan["files"]
         sort_column = plan.get("sort_column")
@@ -1514,21 +1837,34 @@ class DatasetCompactor:
             ascending = self.sort_order.get("ascending", True)
 
         # Pass 1: exact global sort of the key column alone.
-        key_morsel = self._read_sort_column_combined(files_to_compact, sort_column)
+        key_morsel = self._read_sort_column_combined(
+            files_to_compact, sort_column, source_cache
+        )
         if key_morsel is None or key_morsel.num_rows == 0:
             return None
         try:
             from draken.morsels.sort import morsel_sort
 
             perm = morsel_sort(key_morsel, [sort_column], [ascending])
+            sorted_key_morsel = key_morsel.take(list(perm))
         except Exception:
             return None
-        sorted_keys = key_morsel.take(list(perm)).column(sort_column).to_pylist()
-        n = len(sorted_keys)
+        n = sorted_key_morsel.num_rows
         del key_morsel, perm
 
-        groups = self._compute_chunk_groups(sorted_keys, ascending)
-        del sorted_keys
+        def key_chunks(morsel):
+            # Materialise the sorted keys a window at a time; the full
+            # to_pylist() is gigabytes of Python objects at scale.
+            offset = 0
+            while offset < n:
+                take = min(KEY_SCAN_CHUNK_ROWS, n - offset)
+                yield morsel.slice(offset, take).column(sort_column).to_pylist()
+                offset += take
+
+        # _compute_chunk_groups drains the generator, so the keys are free to
+        # drop before pass 2 starts reading real data.
+        groups = self._compute_chunk_groups(key_chunks(sorted_key_morsel))
+        del sorted_key_morsel
         if not groups:
             return None
 
@@ -1555,6 +1891,14 @@ class DatasetCompactor:
                 # than risk silently dropping null rows.
                 null_bearing_paths.add(entry.get("file_path"))
 
+        # Per-file sort-key extent, so each window only reads the files that can
+        # actually hold rows in its range (see ``_file_can_contribute``). Files
+        # with no usable stats are simply absent and are always read.
+        bounds_by_path = {
+            fr["entry"].get("file_path"): (fr["min"], fr["max"])
+            for fr in self._build_file_ranges(files_to_compact, sort_field_id, sort_index)
+        }
+
         total_size = sum(e.get("uncompressed_size_in_bytes", 0) for e in files_to_compact)
         k = max(1, -(-total_size // TARGET_SIZE_BYTES))
         target_rows_per_file = max(1, -(-n // k))
@@ -1562,7 +1906,13 @@ class DatasetCompactor:
         def master_chunks():
             for group in groups:
                 yield from self._iter_group_morsels(
-                    files_to_compact, sort_column, ascending, group, null_bearing_paths
+                    files_to_compact,
+                    sort_column,
+                    ascending,
+                    group,
+                    null_bearing_paths,
+                    source_cache,
+                    bounds_by_path,
                 )
 
         def file_chunk_source(gen, target_rows):
@@ -1617,11 +1967,14 @@ class DatasetCompactor:
                 )
                 new_entries.append(self._to_dict(entry_obj))
                 del written
-        except Exception:
-            return None
+        except Exception as exc:
+            # Outputs written before the failure are unreferenced; remove them
+            # rather than leaving orphans in the data directory.
+            self._delete_written_files(new_entries)
+            return self._abort("streaming execution failed", exc)
 
         if not new_entries:
-            return None
+            return self._abort("streaming execution produced no output files")
 
         input_records = n
         input_data_size = sum(e.get("uncompressed_size_in_bytes", 0) for e in files_to_compact)
@@ -1653,52 +2006,6 @@ class DatasetCompactor:
         if k <= 1 or n == 0:
             return [table]
         return [table.slice(lo, hi - lo) for lo, hi in self._split_ranges(n, k)]
-
-    def _split_table(self, table, target_size: int, max_files: int = None) -> list:
-        """
-        Split a Morsel into multiple Morsels of approximately target size.
-
-        Args:
-            table: draken Morsel to split
-            target_size: Target size in bytes (uncompressed)
-            max_files: Maximum number of output files to create (optional)
-
-        Returns:
-            List of Morsels
-        """
-        if not table or table.num_rows == 0:
-            return [table]
-
-        # Estimate size per row
-        total_size = table.nbytes
-
-        if total_size <= target_size:
-            return [table]
-
-        # Calculate number of splits needed
-        avg_row_size = total_size / table.num_rows
-        rows_per_split = int(target_size / avg_row_size)
-
-        if rows_per_split <= 0:
-            rows_per_split = 1
-
-        # Calculate how many splits we'd produce
-        num_splits = (table.num_rows + rows_per_split - 1) // rows_per_split
-
-        # If max_files is set and we'd exceed it, increase rows_per_split to stay within limit
-        if max_files and num_splits > max_files:
-            rows_per_split = (table.num_rows + max_files - 1) // max_files
-
-        # Split into chunks
-        splits = []
-        offset = 0
-        while offset < table.num_rows:
-            end = min(offset + rows_per_split, table.num_rows)
-            split = table.slice(offset, end - offset)
-            splits.append(split)
-            offset = end
-
-        return splits if splits else [table]
 
     def _to_dict(self, obj):
         """
@@ -1838,69 +2145,3 @@ class DatasetCompactor:
         max_workers = min(_REFRESH_MANIFEST_MAX_WORKERS, len(all_entries))
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             return list(pool.map(self._refresh_one_entry_from_data_file, all_entries))
-
-    def _calculate_stats_from_entries(
-        self, all_entries: List[dict], compacted_files: List[dict]
-    ) -> tuple:
-        """
-        Calculate statistics from manifest entries.
-
-        Used when direct calculation from PyArrow tables fails.
-
-        Args:
-            all_entries: All manifest entries after compaction
-            compacted_files: Files that were compacted (to calculate deleted stats)
-
-        Returns:
-            Tuple of (deleted_files, deleted_size, deleted_data_size, deleted_records,
-                    added_files, added_size, added_data_size, added_records,
-                    total_files, total_size, total_data_size, total_records)
-        """
-        compacted_paths = {f.get("file_path") for f in compacted_files}
-
-        deleted_files = len(compacted_files)
-        deleted_size = 0
-        deleted_data_size = 0
-        deleted_records = 0
-
-        # Sum stats for deleted files
-        for entry in compacted_files:
-            deleted_size += entry.get("file_size_in_bytes", 0)
-            deleted_data_size += entry.get("uncompressed_size_in_bytes", 0)
-            deleted_records += entry.get("record_count", 0)
-
-        # The new files are those in all_entries that weren't compacted
-        added_files = 0
-        added_size = 0
-        added_data_size = 0
-        added_records = 0
-
-        for entry in all_entries:
-            if entry.get("file_path") not in compacted_paths:
-                continue
-            # This is a new (non-compacted) file
-            added_files += 1
-            added_size += entry.get("file_size_in_bytes", 0)
-            added_data_size += entry.get("uncompressed_size_in_bytes", 0)
-            added_records += entry.get("record_count", 0)
-
-        # Total stats from all entries
-        total_files = len(all_entries)
-        total_size = sum(e.get("file_size_in_bytes", 0) for e in all_entries)
-        total_data_size = sum(e.get("uncompressed_size_in_bytes", 0) for e in all_entries)
-        total_records = sum(e.get("record_count", 0) for e in all_entries)
-
-        return (
-            deleted_files,
-            deleted_size,
-            deleted_data_size,
-            deleted_records,
-            added_files,
-            added_size,
-            added_data_size,
-            added_records,
-            total_files,
-            total_size,
-            total_data_size,
-            total_records,
-        )
