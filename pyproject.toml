@@ -36,6 +36,11 @@ dependencies = [
 webhooks = [
     "google-cloud-tasks>=2.16.0"
 ]
+# Only the GitHub alert sink needs this, and only to read the token from Secret
+# Manager. The default stdout sink needs nothing beyond the core dependencies.
+alerts = [
+    "google-cloud-secret-manager>=2.20.0"
+]
 
 [tool.setuptools.package-dir]
 "" = "."

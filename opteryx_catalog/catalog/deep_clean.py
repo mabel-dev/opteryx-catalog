@@ -18,7 +18,16 @@ from typing import List
 from typing import Optional
 from typing import Set
 
+from ..alerts import report as _alert
+from ..exceptions import ManifestProtectionError
+from .orphan_quarantine import OrphanQuarantine
+
 logger = logging.getLogger(__name__)
+
+# Minimum age before an unreferenced file may be deleted. Shares expiration's
+# constant deliberately: the two modules delete from the same storage on the
+# same basis, and a file that is too new for one to reclaim is too new for the
+# other. Imported lazily inside `_age_gate` to avoid a circular import.
 
 
 class DatasetDeepClean:
@@ -29,7 +38,13 @@ class DatasetDeepClean:
     referenced by any snapshot manifest.
     """
 
-    def __init__(self, catalog, author: Optional[str] = None, agent: Optional[str] = None):
+    def __init__(
+        self,
+        catalog,
+        author: Optional[str] = None,
+        agent: Optional[str] = None,
+        quarantine: Optional[OrphanQuarantine] = None,
+    ):
         """
         Initialize deep clean.
 
@@ -37,12 +52,15 @@ class DatasetDeepClean:
             catalog: OpteryxCatalog instance
             author: Author name for tracking
             agent: Agent identifier (e.g., "deep-cleaner")
+            quarantine: Two-strike record for orphaned files. Shares expiration's
+                record for the dataset on purpose - see `clean_dataset`.
         """
         self.catalog = catalog
         self.author = author or "system"
         self.agent = agent or "deep-clean"
+        self.quarantine = quarantine or OrphanQuarantine(catalog)
 
-    def clean_dataset(self, identifier: str, dry_run: bool = False) -> Optional[Dict]:
+    def clean_dataset(self, identifier: str, *, dry_run: bool) -> Optional[Dict]:
         """
         Perform deep clean on a single dataset.
 
@@ -78,13 +96,46 @@ class DatasetDeepClean:
                 return None
 
             if not physical_files:
-                # No files in storage
+                # Deliberately NOT treated as "nothing is orphaned":
+                # `get_all_physical_files` returns an empty set on a listing
+                # error too, so this is an ambiguous result. Leave the
+                # quarantine record alone rather than exonerate from it.
                 return None
 
             # Step 3: Find orphaned (physical but not in manifests)
-            orphaned_files = physical_files - manifest_files
+            #
+            # Age-gated on the same terms as expiration. Without this, a file
+            # written between the snapshot read above and the storage listing
+            # is unreferenced-but-live, and gets deleted seconds after it
+            # lands; the gate also covers files an in-flight commit has
+            # written but not yet referenced. A file whose age can't be
+            # determined is kept.
+            candidates = self._age_gate(dataset_location, physical_files - manifest_files)
 
-            if not orphaned_files:
+            # Step 4: require a second, independent sighting before deleting.
+            #
+            # Shares expiration's record for this dataset rather than keeping
+            # its own, so a file flagged by one pass and then by the other has
+            # been condemned by two different implementations reading storage at
+            # two different times - stronger evidence than the same code running
+            # twice. The two disagree in one direction by design: deep clean
+            # protects files referenced by EVERY snapshot, expiration only those
+            # referenced by RETAINED ones, so deep clean's candidates are always
+            # a subset. That means deep clean can exonerate a file expiration
+            # flagged, whose snapshot is condemned but not yet deleted. This
+            # costs a cycle or two of reclamation and converges once the
+            # snapshot is gone; it never deletes anything early, which is the
+            # direction that matters.
+            #
+            # Called even when `candidates` is empty. An empty set from a
+            # complete observation is a real statement - "nothing here is
+            # orphaned" - and it has to clear stale sightings, or a path that is
+            # deleted and later recreated inherits the old file's strike.
+            orphaned_files, quarantine_fields = self.quarantine.review_for_deletion(
+                identifier, candidates, dry_run
+            )
+
+            if not candidates:
                 # All files are accounted for
                 return None
 
@@ -94,6 +145,7 @@ class DatasetDeepClean:
                 "manifest_files_count": len(manifest_files),
                 "orphaned_files_count": len(orphaned_files),
                 "deleted_files": [],
+                **quarantine_fields,
             }
 
             if dry_run:
@@ -107,7 +159,7 @@ class DatasetDeepClean:
             logger.error(f"Error cleaning dataset {identifier}: {e}")
             return None
 
-    def clean_collection(self, collection: str, dry_run: bool = False) -> Dict[str, any]:
+    def clean_collection(self, collection: str, *, dry_run: bool) -> Dict[str, any]:
         """
         Deep clean all datasets in a collection.
 
@@ -127,12 +179,33 @@ class DatasetDeepClean:
             "total_manifest_files": 0,
             "total_orphaned_files": 0,
             "total_deleted_files": 0,
+            # Unreferenced files held back for a second sighting.
+            "total_orphans_quarantined": 0,
+            "datasets_skipped_unprotectable": [],
             "details": [],
         }
 
         for dataset_name in datasets:
             identifier = f"{collection}.{dataset_name}"
-            summary = self.clean_dataset(identifier, dry_run=dry_run)
+            # A dataset whose protected-file set can't be established is
+            # skipped, not silently cleaned: the failure is confined to that
+            # dataset so one unreadable manifest doesn't stop the sweep, but
+            # nothing is deleted for it either.
+            try:
+                summary = self.clean_dataset(identifier, dry_run=dry_run)
+            except ManifestProtectionError as e:
+                logger.error("Skipping deep clean of %s: %s", identifier, e)
+                # See the matching site in expiration.py: the exception is
+                # raised and then absorbed here so the sweep can continue, so
+                # without an alert the skip is invisible.
+                _alert(
+                    e,
+                    fingerprint=("gc-unprotectable-deep-clean", identifier),
+                    context={"dataset": identifier, "sweep": "deep-clean"},
+                )
+                results["datasets_skipped_unprotectable"].append(identifier)
+                results["datasets_processed"] += 1
+                continue
             results["datasets_processed"] += 1
 
             if summary:
@@ -141,11 +214,12 @@ class DatasetDeepClean:
                 results["total_manifest_files"] += summary.get("manifest_files_count", 0)
                 results["total_orphaned_files"] += summary.get("orphaned_files_count", 0)
                 results["total_deleted_files"] += len(summary.get("deleted_files", []))
+                results["total_orphans_quarantined"] += summary.get("orphans_quarantined", 0)
                 results["details"].append(summary)
 
         return results
 
-    def clean_workspace(self, dry_run: bool = False) -> Dict[str, any]:
+    def clean_workspace(self, *, dry_run: bool) -> Dict[str, any]:
         """
         Deep clean all datasets in workspace.
 
@@ -165,6 +239,8 @@ class DatasetDeepClean:
             "total_manifest_files": 0,
             "total_orphaned_files": 0,
             "total_deleted_files": 0,
+            # Unreferenced files held back for a second sighting.
+            "total_orphans_quarantined": 0,
             "details": [],
         }
 
@@ -177,11 +253,50 @@ class DatasetDeepClean:
             results["total_manifest_files"] += collection_result.get("total_manifest_files", 0)
             results["total_orphaned_files"] += collection_result.get("total_orphaned_files", 0)
             results["total_deleted_files"] += collection_result.get("total_deleted_files", 0)
+            results["total_orphans_quarantined"] += collection_result.get(
+                "total_orphans_quarantined", 0
+            )
 
             if collection_result.get("details"):
                 results["details"].extend(collection_result["details"])
 
         return results
+
+    def _age_gate(self, dataset_location: str, candidates: Set[str]) -> Set[str]:
+        """
+        Drop candidates that are too new, or whose age can't be determined.
+
+        Deep clean decides orphanhood by diffing storage against the manifests,
+        and those two observations are taken at different moments - so anything
+        committed in between looks orphaned while being perfectly live. The age
+        gate is what makes that race survivable. A file whose age can't be
+        determined is treated as too new and kept.
+
+        Args:
+            dataset_location: Base path of dataset
+            candidates: File paths proposed for deletion
+
+        Returns:
+            The subset old enough to delete
+        """
+        if not candidates:
+            return set()
+
+        from .expiration import DATA_FILE_ORPHAN_MIN_AGE_MS
+
+        ages = self.get_physical_file_ages_ms(dataset_location)
+        eligible = {f for f in candidates if ages.get(f, 0) >= DATA_FILE_ORPHAN_MIN_AGE_MS}
+
+        held_back = len(candidates) - len(eligible)
+        if held_back:
+            logger.info(
+                "Deep clean holding back %d of %d unreferenced file(s) under %s as too new "
+                "(or age unknown) to reclaim.",
+                held_back,
+                len(candidates),
+                dataset_location,
+            )
+        return eligible
 
     def get_all_manifest_files(self, snapshots: List) -> Set[str]:
         """
@@ -220,8 +335,19 @@ class DatasetDeepClean:
                         manifest_files.add(file_path)
 
                 logger.debug(f"Read manifest {snapshot.manifest_list}: {len(entries)} files")
-            except (ValueError, OSError) as e:
-                logger.error(f"Error reading manifest {snapshot.manifest_list}: {e}")
+            except Exception as e:
+                # This set is the protection list: `clean_dataset` deletes
+                # every physical file NOT in it. A manifest we failed to read
+                # therefore doesn't mean "no files to protect", it means we
+                # cannot tell what to protect - and continuing would delete
+                # every file that manifest was holding. Note a missing object
+                # raises FileNotFoundError, which is an OSError, so the old
+                # narrow catch swallowed precisely the case that matters.
+                raise ManifestProtectionError(
+                    f"Cannot read manifest {snapshot.manifest_list} of snapshot "
+                    f"{snapshot.snapshot_id}: {e}. Refusing to delete anything for this "
+                    "dataset while the set of protected files is incomplete."
+                ) from e
 
         return manifest_files
 

@@ -47,6 +47,8 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional
 
+from ..alerts import report as _alert
+from ..exceptions import CompactionInvariantError
 from .manifest import ParquetManifestEntry, build_parquet_manifest_entry_from_bytes
 from .metadata import Snapshot
 
@@ -1286,7 +1288,30 @@ class DatasetCompactor:
                     # Entry is corrupted, rebuild from source (100%)
                     recovered = self._recover_entry(e)
                     if not recovered:
-                        # Rebuild failed - catastrophic, abort entire compaction
+                        # Rebuild failed - catastrophic, abort entire compaction.
+                        #
+                        # This used to be a bare `return None`. Every other abort
+                        # in this function deletes what the pass wrote and records
+                        # why; this one did neither, so the abort its own comment
+                        # calls catastrophic left its output files orphaned in
+                        # storage and read, to any caller, as "nothing to compact".
+                        self._delete_written_files(new_entries)
+                        reason = (
+                            "could not rebuild corrupted manifest entry for "
+                            f"{e.get('file_path')}"
+                        )
+                        self._abort(reason)
+                        _alert(
+                            CompactionInvariantError(reason),
+                            fingerprint=(
+                                "compaction-entry-recovery",
+                                self.dataset.identifier,
+                            ),
+                            context={
+                                "dataset": self.dataset.identifier,
+                                "file_path": e.get("file_path"),
+                            },
+                        )
                         return None
                     updated_entries.append(recovered)
 
@@ -1459,9 +1484,25 @@ class DatasetCompactor:
         actual = sum(e.get("record_count", 0) for e in new_entries)
         if expected == actual:
             return True
-        self._abort(
+        reason = (
             f"row-count mismatch: {expected} input rows vs {actual} written "
             f"across {len(new_entries)} file(s)"
+        )
+        self._abort(reason)
+        # The abort above is a warning, which is where this signal has sat
+        # while being the one check that distinguishes a silent data-loss bug
+        # from a no-op. The data is intact - the pass declined to commit - but
+        # something is producing the wrong number of rows and nobody would know.
+        _alert(
+            CompactionInvariantError(reason),
+            fingerprint=("compaction-row-count-mismatch", self.dataset.identifier),
+            context={
+                "dataset": self.dataset.identifier,
+                "expected_rows": expected,
+                "written_rows": actual,
+                "input_files": len(files_to_compact),
+                "output_files": len(new_entries),
+            },
         )
         return False
 

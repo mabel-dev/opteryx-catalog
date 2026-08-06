@@ -6,7 +6,10 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional
 
+from ..alerts import report as _alert
 from ..audit import emit_audit
+from ..exceptions import ManifestReadError
+from ..exceptions import SummaryInconsistencyError
 from .manifest import (
     ParquetManifestEntry,
     build_parquet_manifest_entry_from_bytes,
@@ -447,32 +450,18 @@ class SimpleDataset(Dataset):
         manifest_entry = self._write_table_and_build_entry(table)
         entries = [manifest_entry.to_dict()]
 
-        # persist manifest: for append, merge previous manifest entries
-        # with the new entries so the snapshot's manifest is cumulative.
+        # Build the cumulative entry list for this snapshot: the previous
+        # manifest's entries followed by the new one. A previous manifest that
+        # cannot be read stops the commit — see `_parent_manifest_entries`.
+        merged_entries = list(entries)
+        prev_snap = self.snapshot(None)
+        if prev_snap and getattr(prev_snap, "manifest_list", None):
+            prev_rows = self._parent_manifest_entries(prev_snap)
+            self._warn_if_summary_disagrees(prev_snap, prev_rows)
+            merged_entries = prev_rows + merged_entries
+
         manifest_path = None
         if self.catalog and hasattr(self.catalog, "write_parquet_manifest"):
-            merged_entries = list(entries)
-
-            # If there is a previous snapshot with a manifest, try to read
-            # it and prepend its entries. Any read error is non-fatal and we
-            # fall back to writing only the new entries.
-            prev_snap = self.snapshot(None)
-            if prev_snap and getattr(prev_snap, "manifest_list", None):
-                prev_manifest_path = prev_snap.manifest_list
-                try:
-                    # Prefer FileIO when available
-                    inp = self.io.new_input(prev_manifest_path)
-                    with inp.open() as f:
-                        prev_data = f.read()
-                    from .manifest import read_manifest_rows
-
-                    prev_rows = read_manifest_rows(prev_data)
-                    merged_entries = prev_rows + merged_entries
-                except Exception:
-                    # If we can't read the previous manifest, continue with
-                    # just the new entries (don't fail the append).
-                    pass
-
             manifest_path = self.catalog.write_parquet_manifest(
                 snapshot_id, merged_entries, self.metadata.location
             )
@@ -499,23 +488,8 @@ class SimpleDataset(Dataset):
         deleted_data_size = 0
         deleted_records = 0
 
-        prev = self.snapshot()
-        if prev and prev.summary:
-            prev_total_files = int(prev.summary.get("total-data-files", 0))
-            prev_total_size = int(prev.summary.get("total-files-size", 0))
-            prev_total_data_size = int(prev.summary.get("total-data-size", 0))
-            prev_total_records = int(prev.summary.get("total-records", 0))
-        else:
-            prev_total_files = 0
-            prev_total_size = 0
-            prev_total_data_size = 0
-            prev_total_records = 0
-
-        total_data_files = prev_total_files + added_data_files - deleted_data_files
-        total_files_size = prev_total_size + added_files_size - deleted_files_size
-        total_data_size = prev_total_data_size + added_data_size - deleted_data_size
-        total_records = prev_total_records + added_records - deleted_records
-
+        # Totals describe the manifest just written, so they are computed from
+        # it rather than accumulated from the parent's counters.
         summary = {
             "added-data-files": added_data_files,
             "added-files-size": added_files_size,
@@ -525,10 +499,7 @@ class SimpleDataset(Dataset):
             "deleted-files-size": deleted_files_size,
             "deleted-data-size": deleted_data_size,
             "deleted-records": deleted_records,
-            "total-data-files": total_data_files,
-            "total-files-size": total_files_size,
-            "total-data-size": total_data_size,
-            "total-records": total_records,
+            **self._totals_from_entries(merged_entries),
         }
 
         # sequence number
@@ -569,6 +540,98 @@ class SimpleDataset(Dataset):
             record_count=recs,
             files_added=added_data_files,
             bytes_added=added_files_size,
+        )
+
+    def _parent_manifest_entries(self, snapshot) -> List[dict]:
+        """Read the manifest entries a new commit must carry forward.
+
+        Manifests are cumulative, so this list is the entire history of the
+        dataset as far as the next snapshot is concerned. A read failure here
+        used to be swallowed and treated as "no previous entries", which wrote
+        a manifest containing only the newly added files — silently orphaning
+        every file committed before it, with the totals in the snapshot summary
+        left reading as though nothing had happened.
+
+        Let the failure stop the commit. The previous snapshot keeps
+        referencing its files, and the ingest can retry once the manifest is
+        readable again.
+        """
+        manifest_path = snapshot.manifest_list
+        try:
+            from .manifest import read_manifest_rows
+
+            inp = self.io.new_input(manifest_path)
+            with inp.open() as f:
+                data = f.read()
+            return read_manifest_rows(data)
+        except Exception as err:
+            raise ManifestReadError(
+                f"Cannot read parent manifest {manifest_path} for {self.identifier}: {err}. "
+                "Refusing to commit a manifest that would drop its entries."
+            ) from err
+
+    def _totals_from_entries(self, entries: List[dict]) -> Dict[str, int]:
+        """Derive the snapshot summary totals from the manifest being written.
+
+        These used to be carried forward as running counters (parent total +
+        added - deleted), which made the summary an independent second source
+        of truth that could — and did — drift arbitrarily far from the manifest
+        it claimed to describe. Deriving them from the entries makes drift
+        impossible by construction, and means a commit that follows a
+        previously truncated manifest self-corrects the counters rather than
+        inheriting the wrong ones. `DatasetCompactor` already computes its
+        totals this way.
+        """
+        total_files_size = 0
+        total_data_size = 0
+        total_records = 0
+        for entry in entries:
+            total_files_size += int(entry.get("file_size_in_bytes") or 0)
+            total_data_size += int(entry.get("uncompressed_size_in_bytes") or 0)
+            total_records += int(entry.get("record_count") or 0)
+        return {
+            "total-data-files": len(entries),
+            "total-files-size": total_files_size,
+            "total-data-size": total_data_size,
+            "total-records": total_records,
+        }
+
+    def _warn_if_summary_disagrees(self, snapshot, entries: List[dict]) -> None:
+        """Log when a parent's recorded totals don't match its actual manifest.
+
+        Evidence that an earlier commit wrote a manifest inconsistent with its
+        summary. Deliberately not fatal: the totals for the snapshot being
+        written are derived from the manifest, so proceeding repairs the
+        counters, whereas refusing would strand the dataset in its corrupt
+        state with no way to commit its way out.
+        """
+        summary = getattr(snapshot, "summary", None) or {}
+        recorded = summary.get("total-data-files")
+        if recorded is None or int(recorded) == len(entries):
+            return
+        import logging
+
+        message = (
+            f"Snapshot {snapshot.snapshot_id} of {self.identifier} records "
+            f"total-data-files={recorded} but its manifest {snapshot.manifest_list} holds "
+            f"{len(entries)} entries; totals for the new snapshot will be recomputed "
+            "from the manifest."
+        )
+        logging.getLogger(__name__).error(message)
+        # The only place in the package that compares recorded metadata against
+        # reality, and it has only ever been a log line - which is why the
+        # 2026-08-05 truncation kept reporting the pre-loss row count for hours.
+        # Reported, not raised: see the docstring above.
+        _alert(
+            SummaryInconsistencyError(message),
+            fingerprint=("summary-disagreement", self.identifier),
+            context={
+                "dataset": self.identifier,
+                "snapshot_id": snapshot.snapshot_id,
+                "manifest": snapshot.manifest_list,
+                "recorded_total_data_files": recorded,
+                "actual_manifest_entries": len(entries),
+            },
         )
 
     def _emit_audit(self, action: str, *, author: Optional[str], **detail: Any) -> None:
@@ -782,27 +845,14 @@ class SimpleDataset(Dataset):
 
         snapshot_id = int(time.time() * 1000)
 
-        # Gather previous summary and manifest entries
+        # Gather the previous manifest entries this commit must carry forward.
+        # A previous manifest that cannot be read stops the commit — see
+        # `_parent_manifest_entries`.
         prev = self.snapshot(None)
-        prev_total_files = 0
-        prev_total_size = 0
-        prev_total_records = 0
         prev_entries = []
-        if prev and prev.summary:
-            prev_total_files = int(prev.summary.get("total-data-files", 0))
-            prev_total_size = int(prev.summary.get("total-files-size", 0))
-            prev_total_records = int(prev.summary.get("total-records", 0))
         if prev and getattr(prev, "manifest_list", None):
-            # try to read prev manifest entries
-            try:
-                from .manifest import read_manifest_rows
-
-                inp = self.io.new_input(prev.manifest_list)
-                with inp.open() as f:
-                    data = f.read()
-                prev_entries = read_manifest_rows(data)
-            except Exception:
-                prev_entries = []
+            prev_entries = self._parent_manifest_entries(prev)
+            self._warn_if_summary_disagrees(prev, prev_entries)
 
         existing = {
             e.get("file_path") for e in prev_entries if isinstance(e, dict) and e.get("file_path")
@@ -890,15 +940,8 @@ class SimpleDataset(Dataset):
         deleted_data_size = 0
         deleted_records = 0
 
-        prev_total_data_size = (
-            int(prev.summary.get("total-data-size", 0)) if prev and prev.summary else 0
-        )
-
-        total_data_files = prev_total_files + added_data_files - deleted_data_files
-        total_files_size = prev_total_size + added_files_size - deleted_files_size
-        total_data_size = prev_total_data_size + added_data_size - deleted_data_size
-        total_records = prev_total_records + added_records - deleted_records
-
+        # Totals describe the manifest just written, so they are computed from
+        # it rather than accumulated from the parent's counters.
         summary = {
             "added-data-files": added_data_files,
             "added-files-size": added_files_size,
@@ -908,10 +951,7 @@ class SimpleDataset(Dataset):
             "deleted-files-size": deleted_files_size,
             "deleted-data-size": deleted_data_size,
             "deleted-records": deleted_records,
-            "total-data-files": total_data_files,
-            "total-files-size": total_files_size,
-            "total-data-size": total_data_size,
-            "total-records": total_records,
+            **self._totals_from_entries(merged_entries),
         }
 
         # Sequence number
