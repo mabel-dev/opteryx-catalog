@@ -14,6 +14,7 @@ from opteryx_catalog.exceptions import CollectionLocked
 from opteryx_catalog.exceptions import CollectionNotFound
 from opteryx_catalog.exceptions import DatasetLocked
 from opteryx_catalog.exceptions import WorkspaceDeleted
+from opteryx_catalog.exceptions import WorkspaceNotFound
 from opteryx_catalog.opteryx_catalog import OpteryxCatalog
 
 
@@ -141,10 +142,33 @@ def test_init_succeeds_for_non_deleted_existing_workspace():
     assert catalog.workspace == "ws"
 
 
+def test_init_raises_for_unknown_workspace():
+    client, _cc, _log = _properties_client(props_exists=False)
+    with patch("opteryx_catalog.opteryx_catalog.firestore.Client", return_value=client):
+        with pytest.raises(WorkspaceNotFound):
+            OpteryxCatalog(workspace="ws")
+
+
+def test_init_does_not_write_for_unknown_workspace():
+    """A mistyped workspace name must not conjure the workspace into being.
+
+    In Firestore a collection exists only because a document in it does, so
+    writing `$properties` here is what created the empty workspace behind a
+    failed `banana.banana.banana` query.
+    """
+    client, catalog_collection, log = _properties_client(props_exists=False)
+    with patch("opteryx_catalog.opteryx_catalog.firestore.Client", return_value=client):
+        with pytest.raises(WorkspaceNotFound):
+            OpteryxCatalog(workspace="ws")
+
+    assert catalog_collection.document("$properties").written is None
+    assert log == []
+
+
 def test_init_creates_properties_doc_with_all_fields_when_missing():
     client, catalog_collection, _log = _properties_client(props_exists=False)
     with patch("opteryx_catalog.opteryx_catalog.firestore.Client", return_value=client):
-        OpteryxCatalog(workspace="ws")
+        OpteryxCatalog(workspace="ws", create_if_missing=True)
 
     written = catalog_collection.document("$properties").written
     assert written["billing-account-id"] is None

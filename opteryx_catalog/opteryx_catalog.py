@@ -24,13 +24,17 @@ from .exceptions import CollectionNotFound
 from .exceptions import DatasetAlreadyExists
 from .exceptions import DatasetLocked
 from .exceptions import DatasetNotFound
+from .exceptions import MaterializedViewError
 from .exceptions import SnapshotMissingError
+from .exceptions import TriggerNotFound
 from .exceptions import ViewAlreadyExists
 from .exceptions import ViewNotFound
 from .exceptions import WorkspaceDeleteProtected
 from .exceptions import WorkspaceDeleted
+from .exceptions import WorkspaceNotFound
 from .iops.base import FileIO
 from .audit import emit_audit
+from .resource_types import ResourceType
 from .webhooks import send_webhook
 from .webhooks.events import dataset_created_payload
 from .webhooks.events import dataset_deleted_payload
@@ -56,6 +60,21 @@ DROPPED_DOC = "$dropped"
 # reads this collection to find candidates without enumerating every
 # workspace name blindly.
 DROPPED_WORKSPACES_COLLECTION = "$dropped-workspaces"
+
+# Subcollection under a dataset document holding that dataset's triggers - one
+# document per trigger, keyed by trigger name. A subcollection rather than a
+# doc field for the same reason as `maintenance`: `load_dataset` reads the
+# dataset document on every call and must not pay for opt-in state. The commit
+# path reads this subcollection to decide what to fire.
+TRIGGERS_SUBCOLLECTION = "triggers"
+
+# The only trigger kind in v1: re-run a materialized view's defining SQL when
+# the dataset carrying the trigger takes a user-created commit.
+MV_REFRESH_TRIGGER_KIND = "materialized_view_refresh"
+
+# Value of a dataset document's `dataset-type` field marking it as the backing
+# table of a materialized view. Plain datasets have no `dataset-type` field.
+MATERIALIZED_VIEW_TYPE = "materialized_view"
 
 
 def _core_type_to_stored(column_type: Any) -> tuple:
@@ -227,6 +246,11 @@ class OpteryxCatalog(Metastore):
     Snapshots are stored in a `snapshots` subcollection under each
     dataset's document. Parquet manifests are written to GCS under the
     dataset location's `metadata/manifest-<snapshot_id>.parquet` path.
+
+    The workspace must already exist: constructing a handle for an unknown
+    workspace raises `WorkspaceNotFound` rather than provisioning one, so a
+    mistyped name in a query can't create an empty workspace. Provisioning is
+    explicit - pass `create_if_missing=True`.
     """
 
     def __init__(
@@ -237,6 +261,7 @@ class OpteryxCatalog(Metastore):
         gcs_bucket: Optional[str] = None,
         io: Optional[FileIO] = None,
         include_deleted: bool = False,
+        create_if_missing: bool = False,
     ):
         # `workspace` is the configured catalog/workspace name
         self.workspace = workspace
@@ -246,16 +271,23 @@ class OpteryxCatalog(Metastore):
             project=firestore_project, database=firestore_database
         )
         self._catalog_ref = self.firestore_client.collection(workspace)
-        # Ensure workspace-level properties document exists in Firestore, and
-        # gate construction on workspace soft-delete state. The $properties doc
-        # records metadata for the workspace such as 'timestamp-ms', 'author',
-        # 'billing-account-id', 'owner', and the soft-delete/lock fields below.
+        # Gate construction on the workspace existing, and on its soft-delete
+        # state. The $properties doc records metadata for the workspace such as
+        # 'timestamp-ms', 'author', 'billing-account-id', 'owner', and the
+        # soft-delete/lock fields below.
         #
-        # The existence-check read and the deleted-at-ms gate are deliberately
-        # NOT under the same broad `except Exception: pass` - a Firestore read
+        # Constructing a handle is a READ, not a provisioning step. Writing
+        # $properties here for an unknown name is what makes the workspace
+        # exist in Firestore (a collection is implied by its documents), so a
+        # mistyped workspace name in a query used to silently conjure an empty
+        # workspace. Provisioning is now opt-in via `create_if_missing`.
+        #
+        # The existence-check read and the gates below are deliberately NOT
+        # under the same broad `except Exception: pass` - a Firestore read
         # failure here is tolerated (conservative: don't fail catalog init on
-        # transient Firestore errors), but a WorkspaceDeleted raise is a real
-        # business-logic decision and must always propagate, never be swallowed.
+        # transient Firestore errors, and don't claim a workspace is missing
+        # when we simply couldn't look), but WorkspaceNotFound/WorkspaceDeleted
+        # are real business-logic decisions and must always propagate.
         props_doc = None
         try:
             props_ref = self._catalog_ref.document("$properties")
@@ -265,6 +297,8 @@ class OpteryxCatalog(Metastore):
 
         if props_doc is not None:
             if not props_doc.exists:
+                if not create_if_missing:
+                    raise WorkspaceNotFound(f"Workspace does not exist: {workspace}")
                 try:
                     now_ms = int(time.time() * 1000)
                     props_ref.set(
@@ -441,7 +475,7 @@ class OpteryxCatalog(Metastore):
             action="create",
             workspace=self.workspace,
             collection=collection,
-            resource_type="dataset",
+            resource_type=ResourceType.DATASET,
             resource_name=dataset_name,
             payload=dataset_created_payload(
                 schema=schema,
@@ -452,7 +486,7 @@ class OpteryxCatalog(Metastore):
 
         emit_audit(
             "create_dataset",
-            resource_type="dataset",
+            resource_type=ResourceType.DATASET,
             workspace=self.workspace,
             collection=collection,
             resource=dataset_name,
@@ -591,6 +625,17 @@ class OpteryxCatalog(Metastore):
         stored_maintenance_policy = data.get("maintenance-policy")
         if stored_maintenance_policy:
             metadata.maintenance_policy = stored_maintenance_policy
+        # Absent on plain datasets; "materialized_view" on an MV's backing
+        # table. Read back so callers can distinguish the two from a dataset
+        # they already hold, without a second catalog round trip - and, with
+        # the registration fields below, so a commit round-trips them instead
+        # of destroying them (see DatasetMetadata).
+        metadata.dataset_type = data.get("dataset-type")
+        metadata.statement_id = data.get("statement-id")
+        metadata.source_tables = data.get("source-tables") or []
+        metadata.last_refreshed_at_ms = data.get("last-refreshed-at-ms")
+        metadata.last_refresh_status = data.get("last-refresh-status")
+        metadata.last_refresh_execution_id = data.get("last-refresh-execution-id")
 
         schemas_coll = self._dataset_doc_ref(collection, dataset_name).collection("schemas")
 
@@ -731,23 +776,34 @@ class OpteryxCatalog(Metastore):
             author=author,
         )
 
+        # A dropped dataset takes its own triggers with it. If it is itself a
+        # materialized view, its refresh triggers live on *other* datasets and
+        # must be chased down too - Firestore cannot cascade across documents
+        # any more than it can into subcollections.
+        if data.get("dataset-type") == MATERIALIZED_VIEW_TYPE:
+            trigger_name = self._mv_trigger_name(collection, dataset_name)
+            for source in data.get("source-tables") or []:
+                self.drop_trigger(source, trigger_name, author=author, missing_ok=True)
+
         self._delete_subcollection(self._snapshots_collection(collection, dataset_name))
         self._delete_subcollection(doc_ref.collection("schemas"))
         self._delete_subcollection(doc_ref.collection(MAINTENANCE_SUBCOLLECTION))
+        self._delete_subcollection(doc_ref.collection("statement"))
+        self._delete_subcollection(doc_ref.collection(TRIGGERS_SUBCOLLECTION))
         doc_ref.delete()
 
         send_webhook(
             action="delete",
             workspace=self.workspace,
             collection=collection,
-            resource_type="dataset",
+            resource_type=ResourceType.DATASET,
             resource_name=dataset_name,
             payload=dataset_deleted_payload(location=location, dropped_by=author),
         )
 
         emit_audit(
             "drop_dataset",
-            resource_type="dataset",
+            resource_type=ResourceType.DATASET,
             workspace=self.workspace,
             collection=collection,
             resource=dataset_name,
@@ -858,6 +914,17 @@ class OpteryxCatalog(Metastore):
         if data.get("locked-by") is not None:
             raise DatasetLocked(f"Dataset is locked: {identifier}")
 
+        # v1: a materialized view, or any dataset wearing triggers, cannot be
+        # renamed. Trigger documents and MV source lists reference names, and
+        # chasing that reference graph through a rename is not worth it yet -
+        # drop the MV (or its triggers) first, recreate under the new name.
+        if data.get("dataset-type") == MATERIALIZED_VIEW_TYPE:
+            raise MaterializedViewError(f"Cannot rename a materialized view: {identifier}")
+        if any(True for _ in self._triggers_collection(collection, dataset_name).stream()):
+            raise MaterializedViewError(
+                f"Cannot rename a dataset with triggers attached: {identifier}"
+            )
+
         new_doc_ref = self._dataset_doc_ref(new_collection, new_dataset_name)
         if new_doc_ref.get().exists:
             raise DatasetAlreadyExists(f"Dataset already exists: {new_identifier}")
@@ -961,7 +1028,7 @@ class OpteryxCatalog(Metastore):
             action="rename",
             workspace=self.workspace,
             collection=new_collection,
-            resource_type="dataset",
+            resource_type=ResourceType.DATASET,
             resource_name=new_dataset_name,
             payload=dataset_renamed_payload(
                 old_identifier=identifier,
@@ -974,7 +1041,7 @@ class OpteryxCatalog(Metastore):
 
         emit_audit(
             "rename_dataset",
-            resource_type="dataset",
+            resource_type=ResourceType.DATASET,
             workspace=self.workspace,
             collection=new_collection,
             resource=new_dataset_name,
@@ -1063,14 +1130,14 @@ class OpteryxCatalog(Metastore):
             action="delete",
             workspace=self.workspace,
             collection=None,
-            resource_type="workspace",
+            resource_type=ResourceType.WORKSPACE,
             resource_name=self.workspace,
             payload=workspace_deleted_payload(dropped_by=author),
         )
 
         emit_audit(
             "soft_delete_workspace",
-            resource_type="workspace",
+            resource_type=ResourceType.WORKSPACE,
             workspace=self.workspace,
             resource=self.workspace,
             author=author,
@@ -1097,14 +1164,14 @@ class OpteryxCatalog(Metastore):
             action="restore",
             workspace=self.workspace,
             collection=None,
-            resource_type="workspace",
+            resource_type=ResourceType.WORKSPACE,
             resource_name=self.workspace,
             payload=workspace_restored_payload(restored_by=author),
         )
 
         emit_audit(
             "restore_workspace",
-            resource_type="workspace",
+            resource_type=ResourceType.WORKSPACE,
             workspace=self.workspace,
             resource=self.workspace,
             author=author,
@@ -1124,14 +1191,14 @@ class OpteryxCatalog(Metastore):
             action="lock",
             workspace=self.workspace,
             collection=None,
-            resource_type="workspace",
+            resource_type=ResourceType.WORKSPACE,
             resource_name=self.workspace,
             payload=workspace_locked_payload(locked_by=author),
         )
 
         emit_audit(
             "lock_workspace",
-            resource_type="workspace",
+            resource_type=ResourceType.WORKSPACE,
             workspace=self.workspace,
             resource=self.workspace,
             author=author,
@@ -1150,14 +1217,14 @@ class OpteryxCatalog(Metastore):
             action="unlock",
             workspace=self.workspace,
             collection=None,
-            resource_type="workspace",
+            resource_type=ResourceType.WORKSPACE,
             resource_name=self.workspace,
             payload=workspace_unlocked_payload(unlocked_by=author),
         )
 
         emit_audit(
             "unlock_workspace",
-            resource_type="workspace",
+            resource_type=ResourceType.WORKSPACE,
             workspace=self.workspace,
             resource=self.workspace,
             author=author,
@@ -1260,7 +1327,7 @@ class OpteryxCatalog(Metastore):
 
         emit_audit(
             "set_workspace_properties",
-            resource_type="workspace",
+            resource_type=ResourceType.WORKSPACE,
             workspace=self.workspace,
             resource=self.workspace,
             author=author,
@@ -1333,7 +1400,7 @@ class OpteryxCatalog(Metastore):
 
         emit_audit(
             "create_collection",
-            resource_type="collection",
+            resource_type=ResourceType.COLLECTION,
             workspace=self.workspace,
             resource=collection,
             author=author,
@@ -1385,7 +1452,7 @@ class OpteryxCatalog(Metastore):
 
         emit_audit(
             "drop_collection",
-            resource_type="collection",
+            resource_type=ResourceType.COLLECTION,
             workspace=self.workspace,
             resource=collection,
             author=author,
@@ -1499,7 +1566,7 @@ class OpteryxCatalog(Metastore):
             action="create" if not update_if_exists else "update",
             workspace=self.workspace,
             collection=collection,
-            resource_type="view",
+            resource_type=ResourceType.VIEW,
             resource_name=view_name,
             payload=view_created_payload(
                 definition=sql,
@@ -1509,7 +1576,7 @@ class OpteryxCatalog(Metastore):
 
         emit_audit(
             "update_view" if update_if_exists else "create_view",
-            resource_type="view",
+            resource_type=ResourceType.VIEW,
             workspace=self.workspace,
             collection=collection,
             resource=view_name,
@@ -1602,14 +1669,14 @@ class OpteryxCatalog(Metastore):
             action="delete",
             workspace=self.workspace,
             collection=collection,
-            resource_type="view",
+            resource_type=ResourceType.VIEW,
             resource_name=view_name,
             payload=view_deleted_payload(dropped_by=author),
         )
 
         emit_audit(
             "drop_view",
-            resource_type="view",
+            resource_type=ResourceType.VIEW,
             workspace=self.workspace,
             collection=collection,
             resource=view_name,
@@ -1650,6 +1717,397 @@ class OpteryxCatalog(Metastore):
             return doc_ref.get().exists
         except Exception:
             return False
+
+    # ------------------------------------------------------------------
+    # Triggers
+    # ------------------------------------------------------------------
+
+    def _triggers_collection(self, collection: str, dataset_name: str):
+        return self._dataset_doc_ref(collection, dataset_name).collection(TRIGGERS_SUBCOLLECTION)
+
+    def _relative_identifier(self, table: str) -> str:
+        """Reduce a possibly workspace-qualified table name to 'collection.dataset'.
+
+        The engine hands over fully-qualified names (workspace.collection.dataset,
+        where the dataset part may itself contain dots). A leading segment equal
+        to this catalog's workspace is stripped; any other 2+-part name is taken
+        as already relative - if the first segment was actually a *different*
+        workspace, the source-existence check fails with a clear DatasetNotFound
+        rather than silently attaching a trigger in the wrong place.
+        """
+        parts = table.split(".")
+        if len(parts) >= 3 and parts[0] == self.workspace:
+            return ".".join(parts[1:])
+        if len(parts) >= 2:
+            return table
+        raise MaterializedViewError(
+            f"source table must be at least 'collection.dataset': {table}"
+        )
+
+    def create_trigger(
+        self,
+        dataset_identifier: str,
+        name: str,
+        target_view: str,
+        statement_id: Optional[str] = None,
+        author: str = None,
+        kind: str = MV_REFRESH_TRIGGER_KIND,
+    ) -> None:
+        """Attach a trigger to a dataset.
+
+        A trigger is an instruction to the commit path: when this dataset takes
+        a user-created data commit, enqueue the reaction described by `kind` -
+        in v1 always a materialized-view refresh of `target_view`. Creating a
+        trigger is an update to the dataset that carries it, which is why the
+        caller-side permission model demands writer on that dataset, not on the
+        target view.
+        """
+        if author is None:
+            raise ValueError("author must be provided when creating a trigger")
+        collection, dataset_name = self._relative_identifier(dataset_identifier).split(".", 1)
+        if not self._dataset_doc_ref(collection, dataset_name).get().exists:
+            raise DatasetNotFound(f"Dataset not found: {collection}.{dataset_name}")
+
+        self._triggers_collection(collection, dataset_name).document(name).set(
+            {
+                "name": name,
+                "kind": kind,
+                "target-view": target_view,
+                "statement-id": statement_id,
+                "created-by": author,
+                "created-at-ms": int(time.time() * 1000),
+                "last-fired-at-ms": None,
+                "last-fired-status": None,
+            }
+        )
+
+        emit_audit(
+            "create_trigger",
+            resource_type=ResourceType.DATASET,
+            workspace=self.workspace,
+            collection=collection,
+            resource=dataset_name,
+            author=author,
+            trigger=name,
+            kind=kind,
+            target_view=target_view,
+        )
+
+    def drop_trigger(
+        self,
+        dataset_identifier: str,
+        name: str,
+        author: str = None,
+        missing_ok: bool = False,
+    ) -> None:
+        """Remove a trigger from a dataset.
+
+        Dropping a materialized view's refresh trigger orphans the view: it
+        stays queryable but stops refreshing. That is the supported way to
+        pause an MV, and `information_schema.triggers` is where the absence
+        shows.
+        """
+        collection, dataset_name = self._relative_identifier(dataset_identifier).split(".", 1)
+        doc_ref = self._triggers_collection(collection, dataset_name).document(name)
+        if not doc_ref.get().exists:
+            if missing_ok:
+                return
+            raise TriggerNotFound(f"Trigger not found: {name} on {collection}.{dataset_name}")
+        doc_ref.delete()
+
+        emit_audit(
+            "drop_trigger",
+            resource_type=ResourceType.DATASET,
+            workspace=self.workspace,
+            collection=collection,
+            resource=dataset_name,
+            author=author,
+            trigger=name,
+        )
+
+    def list_triggers(self, dataset_identifier: str) -> List[dict]:
+        """All triggers attached to a dataset, as plain dicts."""
+        collection, dataset_name = self._relative_identifier(dataset_identifier).split(".", 1)
+        results = []
+        for doc in self._triggers_collection(collection, dataset_name).stream():
+            data = doc.to_dict() or {}
+            data.setdefault("name", doc.id)
+            results.append(data)
+        return results
+
+    def mark_trigger_fired(
+        self, dataset_identifier: str, name: str, status: str
+    ) -> None:
+        """Stamp a trigger's last-fired fields. Called by the enqueue path."""
+        collection, dataset_name = self._relative_identifier(dataset_identifier).split(".", 1)
+        self._triggers_collection(collection, dataset_name).document(name).update(
+            {
+                "last-fired-at-ms": int(time.time() * 1000),
+                "last-fired-status": status,
+            }
+        )
+
+    # ------------------------------------------------------------------
+    # Materialized views
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _mv_trigger_name(collection: str, dataset_name: str) -> str:
+        """The auto-generated name of an MV's refresh trigger on a source."""
+        return f"refresh__{collection}__{dataset_name}"
+
+    def _assert_no_materialized_view_cycle(
+        self, identifier: str, source_tables: List[str]
+    ) -> None:
+        """Reject a source graph that reaches back to the MV being registered.
+
+        Checked at creation rather than fire time: MV-over-MV chains are legal
+        and refresh by construction (a refresh commit is user-created and fires
+        downstream triggers), so a cycle would refresh forever.
+        """
+        stack = list(source_tables)
+        seen = set()
+        while stack:
+            current = stack.pop()
+            if current == identifier:
+                raise MaterializedViewError(
+                    f"materialized view source cycle: {identifier} would (transitively) "
+                    "depend on itself"
+                )
+            if current in seen:
+                continue
+            seen.add(current)
+            coll, name = current.split(".", 1)
+            doc = self._dataset_doc_ref(coll, name).get()
+            if not doc.exists:
+                continue
+            data = doc.to_dict() or {}
+            if data.get("dataset-type") == MATERIALIZED_VIEW_TYPE:
+                stack.extend(
+                    self._relative_identifier(s) for s in data.get("source-tables") or []
+                )
+
+    def create_materialized_view(
+        self,
+        identifier: str,
+        sql: str,
+        source_tables: List[str],
+        author: str = None,
+        update_if_exists: bool = False,
+    ) -> None:
+        """Register an existing dataset as a materialized view.
+
+        The backing table is created by the engine's CTAS write path before
+        this is called - this registers what makes it an MV: the defining SQL
+        (versioned in the dataset's `statement` subcollection, exactly as views
+        version theirs), the source list, and one refresh trigger on each
+        source dataset. Re-registration (`update_if_exists`, the CoRTAS path)
+        writes a new statement version and reconciles triggers against the new
+        source list.
+
+        Args:
+            identifier: 'collection.dataset' of the (existing) backing table.
+            sql: the defining SELECT, as executable text.
+            source_tables: every catalog table the SELECT reads - triggers land
+                on each. Workspace-qualified names are accepted and reduced.
+            author: the identity registering the MV.
+            update_if_exists: allow re-registration of an existing MV.
+        """
+        if author is None:
+            raise ValueError("author must be provided when creating a materialized view")
+
+        collection, dataset_name = identifier.split(".", 1)
+        doc_ref = self._dataset_doc_ref(collection, dataset_name)
+        doc = doc_ref.get()
+        if not doc.exists:
+            raise DatasetNotFound(
+                f"Materialized view backing table not found: {identifier} "
+                "(the CTAS creates it before registration)"
+            )
+        data = doc.to_dict() or {}
+        already_mv = data.get("dataset-type") == MATERIALIZED_VIEW_TYPE
+        if already_mv and not update_if_exists:
+            raise MaterializedViewError(f"Materialized view already exists: {identifier}")
+
+        # Normalize, dedupe (order-preserving), and validate sources.
+        relative_sources: List[str] = []
+        for table in source_tables:
+            relative = self._relative_identifier(table)
+            if relative == identifier:
+                raise MaterializedViewError(
+                    f"materialized view cannot read itself: {identifier}"
+                )
+            if relative not in relative_sources:
+                relative_sources.append(relative)
+        if not relative_sources:
+            raise MaterializedViewError(
+                "a materialized view needs at least one catalog-resident source table "
+                "- nothing could ever fire its refresh"
+            )
+        for relative in relative_sources:
+            src_coll, src_name = relative.split(".", 1)
+            if not self._dataset_doc_ref(src_coll, src_name).get().exists:
+                raise DatasetNotFound(f"Source dataset not found: {relative}")
+        self._assert_no_materialized_view_cycle(identifier, relative_sources)
+
+        # Statement version, following the view convention exactly.
+        now_ms = int(time.time() * 1000)
+        current_statement_id = data.get("statement-id")
+        sequence_number = 1
+        if current_statement_id:
+            stmt_doc = doc_ref.collection("statement").document(str(current_statement_id)).get()
+            if stmt_doc.exists:
+                sequence_number = (stmt_doc.to_dict() or {}).get("sequence-number", 0) + 1
+        statement_id = str(now_ms)
+        doc_ref.collection("statement").document(statement_id).set(
+            {
+                "sql": sql,
+                "timestamp-ms": now_ms,
+                "author": author,
+                "sequence-number": sequence_number,
+            }
+        )
+
+        doc_ref.update(
+            {
+                "dataset-type": MATERIALIZED_VIEW_TYPE,
+                "statement-id": statement_id,
+                "source-tables": relative_sources,
+                "last-refreshed-at-ms": data.get("last-refreshed-at-ms"),
+                "last-refresh-status": data.get("last-refresh-status"),
+                "last-refresh-execution-id": data.get("last-refresh-execution-id"),
+            }
+        )
+
+        # Reconcile triggers: one per current source, none on former sources.
+        trigger_name = self._mv_trigger_name(collection, dataset_name)
+        previous_sources = [
+            self._relative_identifier(s) for s in data.get("source-tables") or []
+        ]
+        for removed in (s for s in previous_sources if s not in relative_sources):
+            self.drop_trigger(removed, trigger_name, author=author, missing_ok=True)
+        for source in relative_sources:
+            self.create_trigger(
+                source,
+                trigger_name,
+                target_view=identifier,
+                statement_id=statement_id,
+                author=author,
+            )
+
+        emit_audit(
+            "update_materialized_view" if already_mv else "create_materialized_view",
+            resource_type=ResourceType.MATERIALIZED_VIEW,
+            workspace=self.workspace,
+            collection=collection,
+            resource=dataset_name,
+            author=author,
+            statement_id=statement_id,
+            source_tables=relative_sources,
+        )
+
+    def get_materialized_view(self, identifier: str) -> dict:
+        """The MV's registration record: defining SQL, sources, refresh state."""
+        collection, dataset_name = identifier.split(".", 1)
+        doc_ref = self._dataset_doc_ref(collection, dataset_name)
+        doc = doc_ref.get()
+        if not doc.exists:
+            raise DatasetNotFound(f"Dataset not found: {identifier}")
+        data = doc.to_dict() or {}
+        if data.get("dataset-type") != MATERIALIZED_VIEW_TYPE:
+            raise MaterializedViewError(f"Not a materialized view: {identifier}")
+
+        statement_id = data.get("statement-id")
+        sql = None
+        if statement_id:
+            stmt_doc = doc_ref.collection("statement").document(str(statement_id)).get()
+            sql = (stmt_doc.to_dict() or {}).get("sql")
+
+        return {
+            "name": dataset_name,
+            "collection": collection,
+            "workspace": self.workspace,
+            "sql": sql,
+            "statement-id": statement_id,
+            "source-tables": data.get("source-tables") or [],
+            "last-refreshed-at-ms": data.get("last-refreshed-at-ms"),
+            "last-refresh-status": data.get("last-refresh-status"),
+            "last-refresh-execution-id": data.get("last-refresh-execution-id"),
+        }
+
+    def list_materialized_views(self, collection: str) -> List[str]:
+        """Names of the materialized views in a collection.
+
+        Client-side filter over the datasets subcollection rather than a
+        Firestore `where`: no composite index, and dataset listings are
+        already full-collection streams everywhere else in this catalog.
+        """
+        results = []
+        for doc in self._datasets_collection(collection).stream():
+            if (doc.to_dict() or {}).get("dataset-type") == MATERIALIZED_VIEW_TYPE:
+                results.append(doc.id)
+        return results
+
+    def drop_materialized_view(self, identifier: str, author: str = None) -> None:
+        """Drop a materialized view: its triggers, then its backing dataset.
+
+        Trigger removal happens first, while the MV document's source list is
+        still readable; the dataset drop then handles tombstoning and
+        subcollection cleanup exactly as any other dataset drop.
+        """
+        collection, dataset_name = identifier.split(".", 1)
+        doc = self._dataset_doc_ref(collection, dataset_name).get()
+        if not doc.exists:
+            return
+        data = doc.to_dict() or {}
+        if data.get("dataset-type") != MATERIALIZED_VIEW_TYPE:
+            raise MaterializedViewError(
+                f"Not a materialized view: {identifier} (use drop_dataset)"
+            )
+
+        trigger_name = self._mv_trigger_name(collection, dataset_name)
+        for source in data.get("source-tables") or []:
+            self.drop_trigger(source, trigger_name, author=author, missing_ok=True)
+
+        emit_audit(
+            "drop_materialized_view",
+            resource_type=ResourceType.MATERIALIZED_VIEW,
+            workspace=self.workspace,
+            collection=collection,
+            resource=dataset_name,
+            author=author,
+        )
+
+        self.drop_dataset(identifier, author=author)
+
+    def mark_materialized_view_refreshed(
+        self,
+        identifier: str,
+        status: str,
+        execution_id: Optional[str] = None,
+        author: str = None,
+    ) -> None:
+        """Stamp refresh state on an MV. Called by the worker when a refresh
+        job completes (or is denied - a denial is a status, not silence)."""
+        collection, dataset_name = identifier.split(".", 1)
+        self._dataset_doc_ref(collection, dataset_name).update(
+            {
+                "last-refreshed-at-ms": int(time.time() * 1000),
+                "last-refresh-status": status,
+                "last-refresh-execution-id": execution_id,
+            }
+        )
+
+        emit_audit(
+            "refresh_materialized_view",
+            resource_type=ResourceType.MATERIALIZED_VIEW,
+            workspace=self.workspace,
+            collection=collection,
+            resource=dataset_name,
+            author=author,
+            status=status,
+            execution_id=execution_id,
+        )
 
     def update_view_execution_metadata(
         self,
@@ -1794,7 +2252,7 @@ class OpteryxCatalog(Metastore):
 
         emit_audit(
             "update_sort_order",
-            resource_type="dataset",
+            resource_type=ResourceType.DATASET,
             workspace=self.workspace,
             collection=collection,
             resource=dataset_name,
@@ -1987,6 +2445,15 @@ class OpteryxCatalog(Metastore):
                 "maintenance-policy": metadata.maintenance_policy,
                 "sort-orders": metadata.sort_orders,
                 "refresh-frequency-mins": metadata.refresh_frequency_mins,
+                # Materialized-view registration. This `set()` replaces the
+                # whole document, so omitting these would de-register a
+                # materialized view on its very first refresh commit.
+                "dataset-type": metadata.dataset_type,
+                "statement-id": metadata.statement_id,
+                "source-tables": metadata.source_tables,
+                "last-refreshed-at-ms": metadata.last_refreshed_at_ms,
+                "last-refresh-status": metadata.last_refresh_status,
+                "last-refresh-execution-id": metadata.last_refresh_execution_id,
             }
         )
 

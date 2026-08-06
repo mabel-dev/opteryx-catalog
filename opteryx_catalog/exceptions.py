@@ -108,6 +108,16 @@ class ViewNotFound(ViewError):
     pass
 
 
+class TriggerNotFound(KeyError, CatalogError):
+    pass
+
+
+class MaterializedViewError(CatalogError):
+    """A materialized-view registration or drop that cannot proceed:
+    the named dataset is not a materialized view, a source is invalid,
+    or the source graph would contain a cycle."""
+
+
 class CollectionAlreadyExists(KeyError, CatalogError):
     pass
 
@@ -131,6 +141,15 @@ class DatasetLocked(CatalogError):
 class WorkspaceDeleted(CatalogError):
     """Raised by `OpteryxCatalog.__init__` when the workspace's `$properties`
     document has `deleted-at-ms` set and `include_deleted` was not passed."""
+
+
+class WorkspaceNotFound(KeyError, CatalogError):
+    """Raised by `OpteryxCatalog.__init__` when the workspace has no
+    `$properties` document and `create_if_missing` was not passed.
+
+    Constructing a handle is a read, not a provisioning step: a mistyped
+    workspace name must not bring a workspace into existence. Callers that
+    genuinely provision pass `create_if_missing=True`."""
 
 
 class WorkspaceDeleteProtected(CatalogError):

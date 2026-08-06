@@ -9,6 +9,7 @@ from typing import Any, Dict, Iterable, List, Optional
 from ..alerts import report as _alert
 from ..audit import emit_audit
 from ..exceptions import ManifestReadError
+from ..resource_types import ResourceType
 from ..exceptions import SummaryInconsistencyError
 from .manifest import (
     ParquetManifestEntry,
@@ -542,6 +543,8 @@ class SimpleDataset(Dataset):
             bytes_added=added_files_size,
         )
 
+        self._after_commit(author, snap)
+
     def _parent_manifest_entries(self, snapshot) -> List[dict]:
         """Read the manifest entries a new commit must carry forward.
 
@@ -639,13 +642,44 @@ class SimpleDataset(Dataset):
         collection, _, name = self.identifier.partition(".")
         emit_audit(
             action,
-            resource_type="dataset",
+            resource_type=ResourceType.DATASET,
             workspace=getattr(self.catalog, "workspace", None),
             collection=collection,
             resource=name or None,
             author=author,
             **detail,
         )
+
+    def _after_commit(self, author: Optional[str], snapshot: Snapshot) -> None:
+        """Fire this dataset's triggers for a just-landed commit.
+
+        Only user-created snapshots fire - `refresh_manifest`, compaction and
+        expiration also land snapshots, and a housekeeping pass must not
+        re-run every materialized view (`user_created` is authoritative, see
+        `snapshot()`). Never raises into the commit path: `fire_triggers`
+        alerts and audits its own failures, and this guard catches anything
+        above it.
+        """
+        if getattr(snapshot, "user_created", None) is not True:
+            return
+        if self.catalog is None:
+            return
+        try:
+            from ..trigger_firing import fire_triggers
+
+            fire_triggers(
+                self.catalog,
+                self.identifier,
+                author=author,
+                snapshot_id=snapshot.snapshot_id,
+            )
+        except Exception as exc:  # noqa: BLE001 - the commit already landed
+            _alert(
+                exc,
+                note="trigger firing failed after commit",
+                fingerprint=("after-commit-firing", self.identifier),
+                context={"dataset": self.identifier},
+            )
 
     def _sort_for_write(self, table: Any):
         """Physically sort `table` by the dataset's configured sort order, if any.
@@ -830,6 +864,8 @@ class SimpleDataset(Dataset):
         if self.catalog and hasattr(self.catalog, "save_dataset_metadata"):
             self.catalog.save_dataset_metadata(self.identifier, self.metadata)
 
+        self._after_commit(author, snap)
+
     def add_files(self, files: list[str], author: str = None, commit_message: Optional[str] = None):
         """Add filenames to the dataset manifest without writing the files.
 
@@ -986,6 +1022,8 @@ class SimpleDataset(Dataset):
             self.catalog.save_snapshot(self.identifier, snap)
         if self.catalog and hasattr(self.catalog, "save_dataset_metadata"):
             self.catalog.save_dataset_metadata(self.identifier, self.metadata)
+
+        self._after_commit(author, snap)
 
     def truncate_and_add_files(
         self, files: list[str], author: str = None, commit_message: Optional[str] = None
@@ -1167,6 +1205,8 @@ class SimpleDataset(Dataset):
             self.catalog.save_snapshot(self.identifier, snap)
         if self.catalog and hasattr(self.catalog, "save_dataset_metadata"):
             self.catalog.save_dataset_metadata(self.identifier, self.metadata)
+
+        self._after_commit(author, snap)
 
     def scan(self, row_filter=None, snapshot_id: Optional[int] = None) -> Iterable[Datafile]:
         """Return Datafile objects for the given snapshot.
@@ -1871,3 +1911,8 @@ class SimpleDataset(Dataset):
             files_removed=deleted_count,
             bytes_removed=removed_total_size,
         )
+
+        # An uncommitted truncation moved no version pointer - nothing for a
+        # trigger to react to yet.
+        if commit_truncation:
+            self._after_commit(author, snap)

@@ -17,9 +17,11 @@ from .catalog.metastore import Dataset
 from .catalog.metastore import Metastore
 from .catalog.metastore import View
 from .opteryx_catalog import OpteryxCatalog
+from .resource_types import ResourceType
 
 __all__ = [
     "OpteryxCatalog",
+    "ResourceType",
     "Metastore",
     "Dataset",
     "View",
