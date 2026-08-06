@@ -85,10 +85,11 @@ class _GcsAdapterOutputFile(OutputFile):
 
             def close(self):
                 if self._stream is not None:
-                    try:
-                        self._stream.close()
-                    except Exception:
-                        pass
+                    # Underlying streams buffer and upload on close, so this is
+                    # where a write actually succeeds or fails - for data files
+                    # as well as manifests. Swallowing it let a write report
+                    # success while the object was never created. Let it raise.
+                    self._stream.close()
 
         return _Writer(self._location, self._gcs_fileio)
 

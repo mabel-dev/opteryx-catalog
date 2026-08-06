@@ -7,6 +7,28 @@ from typing import List
 from typing import Optional
 
 
+# Field stamped onto a snapshot document when expiration retires it. The
+# document is NOT deleted at that point: it becomes a tombstone that keeps the
+# manifest path (and through it, the data-file paths) addressable while the
+# storage tier can still produce the bytes - GCS soft-delete holds deleted
+# objects for 7 days, so within that window an expired snapshot is restorable.
+# Tombstones are purged for good only after EXPIRED_SNAPSHOT_RETENTION_MS
+# (see expiration.py), which matches that recovery window - the record lives
+# exactly as long as acting on it is possible.
+SNAPSHOT_EXPIRED_AT_KEY = "expired-at-ms"
+
+
+def snapshot_is_tombstoned(doc: dict) -> bool:
+    """True when a snapshot document has been retired by expiration.
+
+    Shared by the dataset loader (which must hide tombstones from normal
+    reads - every consumer of `metadata.snapshots`, including expiration's own
+    retention maths and the orphan-detection size threshold, means LIVE
+    snapshots) and the purge sweep (which must see them).
+    """
+    return doc.get(SNAPSHOT_EXPIRED_AT_KEY) is not None
+
+
 @dataclass
 class Snapshot:
     snapshot_id: int

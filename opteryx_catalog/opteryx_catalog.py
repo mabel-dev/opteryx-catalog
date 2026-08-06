@@ -12,8 +12,11 @@ from google.cloud import storage
 from .catalog.dataset import SimpleDataset
 from .catalog.metadata import DatasetMetadata
 from .catalog.metadata import Snapshot
+from .catalog.metadata import snapshot_is_tombstoned
 from .catalog.metastore import Metastore
+from .catalog.orphan_quarantine import MAINTENANCE_SUBCOLLECTION
 from .catalog.view import View as CatalogView
+from .alerts import report as _alert
 from .exceptions import CollectionAlreadyExists
 from .exceptions import CollectionLocked
 from .exceptions import CollectionNotEmpty
@@ -21,6 +24,7 @@ from .exceptions import CollectionNotFound
 from .exceptions import DatasetAlreadyExists
 from .exceptions import DatasetLocked
 from .exceptions import DatasetNotFound
+from .exceptions import SnapshotMissingError
 from .exceptions import ViewAlreadyExists
 from .exceptions import ViewNotFound
 from .exceptions import WorkspaceDeleteProtected
@@ -577,13 +581,34 @@ class OpteryxCatalog(Metastore):
         # always sees an empty sort_orders and falls back to the (non-locality-
         # preserving) brute strategy — i.e. order-aware compaction never runs.
         metadata.sort_orders = data.get("sort-orders") or []
+        # Load the configured maintenance policy. Same failure mode as
+        # sort-orders above: save_dataset_metadata writes 'maintenance-policy'
+        # but nothing read it back, so every dataset presented the class
+        # default of {'retained-snapshot-age-days': None} - which SnapshotExpiry
+        # reads as "keep only the latest snapshot". Retention was therefore
+        # ignored everywhere, and every expiration run condemned the entire
+        # history regardless of what was configured.
+        stored_maintenance_policy = data.get("maintenance-policy")
+        if stored_maintenance_policy:
+            metadata.maintenance_policy = stored_maintenance_policy
 
         schemas_coll = self._dataset_doc_ref(collection, dataset_name).collection("schemas")
 
         if load_history:
             snaps = []
             for snap_doc in self._snapshots_collection(collection, dataset_name).stream():
-                snaps.append(self._snapshot_from_dict(snap_doc.to_dict() or {}))
+                snap_data = snap_doc.to_dict() or {}
+                # Tombstoned snapshots stay out of every normal read. They are
+                # records for the restore path, not history: if they appeared
+                # here, expiration would re-condemn them each run, the orphan-
+                # detection threshold would count them (a 15-minutely dataset
+                # accrues ~2,880 tombstones per 30-day window - enough on its
+                # own to trip MAX_SNAPSHOTS_FOR_ORPHAN_DETECTION and silently
+                # disable orphan cleanup), and their manifests would count as
+                # referenced, pinning the very files expiration just released.
+                if snapshot_is_tombstoned(snap_data):
+                    continue
+                snaps.append(self._snapshot_from_dict(snap_data))
             if snaps:
                 metadata.current_snapshot_id = snaps[-1].snapshot_id
             metadata.snapshots = snaps
@@ -636,6 +661,25 @@ class OpteryxCatalog(Metastore):
         if snap_obj is not None:
             snaps.append(snap_obj)
             metadata.current_snapshot_id = current_snap_id
+        elif current_snap_id:
+            # The dataset names a current snapshot whose document we could not
+            # resolve. The metastore-side analogue of a manifest 404: the
+            # dataset loads as empty rather than failing, so every reader sees a
+            # table with no data and no error, and garbage collection sees
+            # nothing to protect.
+            #
+            # Reported, not raised: making this fatal would change what
+            # `load_dataset` returns to callers who currently get an empty
+            # dataset, which needs its own change.
+            _alert(
+                SnapshotMissingError(
+                    f"Dataset {identifier} names current-snapshot-id {current_snap_id} "
+                    "but that snapshot document could not be resolved; the dataset "
+                    "will load as empty."
+                ),
+                fingerprint=("snapshot-missing", identifier),
+                context={"dataset": identifier, "current_snapshot_id": current_snap_id},
+            )
         metadata.snapshots = snaps
 
         if schema_entry is None and schema_ref is not None:
@@ -689,6 +733,7 @@ class OpteryxCatalog(Metastore):
 
         self._delete_subcollection(self._snapshots_collection(collection, dataset_name))
         self._delete_subcollection(doc_ref.collection("schemas"))
+        self._delete_subcollection(doc_ref.collection(MAINTENANCE_SUBCOLLECTION))
         doc_ref.delete()
 
         send_webhook(
@@ -893,9 +938,13 @@ class OpteryxCatalog(Metastore):
                 payload["manifest"] = new_manifest_path
             new_snapshots.document(snapshot_doc.id).set(payload)
 
-        # 4. Remove the old catalog entry.
+        # 4. Remove the old catalog entry. The orphan quarantine is dropped
+        # rather than carried over: its entries name paths under the old
+        # location, which no longer exist, so the renamed dataset starts with a
+        # clean record and its files each need two fresh sightings.
         self._delete_subcollection(self._snapshots_collection(collection, dataset_name))
         self._delete_subcollection(doc_ref.collection("schemas"))
+        self._delete_subcollection(doc_ref.collection(MAINTENANCE_SUBCOLLECTION))
         doc_ref.delete()
 
         # 5. Hand the vacated prefix to the existing reclamation sweep rather
@@ -1893,11 +1942,13 @@ class OpteryxCatalog(Metastore):
             if self.io:
                 out = self.io.new_output(parquet_path).create()
                 out.write(data)
-                try:
-                    # Some OutputFile implementations buffer and require close()
-                    out.close()
-                except Exception:
-                    pass
+                # close() is where the upload actually happens - the GCS output
+                # stream buffers into memory and flushes on close - so a failure
+                # here means the manifest object does not exist. Swallowing it
+                # returned this path to the caller, which committed a snapshot
+                # pointing at a manifest that was never written; the next commit
+                # then couldn't read its parent. Let it raise.
+                out.close()
 
             return parquet_path
         except Exception as e:

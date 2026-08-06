@@ -35,12 +35,12 @@ def api_methods():
             "description": "Clean one dataset",
             "identifier": "collection.dataset_name",
             "returns": "Dict with deleted_snapshots, deleted_manifests, deleted_files",
-            "example": "expiration.expire_dataset('analytics.events')",
+            "example": "expiration.expire_dataset('analytics.events', dry_run=False)",
         },
         "expire_collection(collection, dry_run=False)": {
             "description": "Clean all datasets in collection",
             "returns": "Dict with aggregate stats",
-            "example": "expiration.expire_collection('analytics')",
+            "example": "expiration.expire_collection('analytics', dry_run=False)",
         },
         "expire_workspace(dry_run=False)": {
             "description": "Clean entire workspace",
@@ -101,7 +101,7 @@ else:
 """,
         "Cleanup entire collection": """
 expiration = SnapshotExpiration(catalog, agent="cleanup-service")
-result = expiration.expire_collection("analytics")
+result = expiration.expire_collection("analytics", dry_run=False)
 
 print(f"Processed {result[\"datasets_processed\"]} datasets")
 print(f"Deleted {result[\"total_files_deleted\"]} orphaned files")
@@ -111,7 +111,7 @@ import schedule
 
 def nightly_cleanup():
     expiration = SnapshotExpiration(catalog)
-    result = expiration.expire_workspace()
+    result = expiration.expire_workspace(dry_run=False)
     logging.info(f"Cleanup: {result[\"total_files_deleted\"]} files deleted")
 
 schedule.every().day.at("02:00").do(nightly_cleanup)
