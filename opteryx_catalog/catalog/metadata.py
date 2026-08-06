@@ -99,6 +99,21 @@ class DatasetMetadata:
     annotations: List[dict] = field(default_factory=list)
     # Refresh frequency in minutes; None means no automatic refresh
     refresh_frequency_mins: Optional[int] = None
+    # What kind of dataset this is. None for a plain dataset (the field is
+    # absent on their documents); "materialized_view" for the backing table of
+    # a materialized view. Carried on the metadata so readers - the OData
+    # service, describe, any UI - can tell them apart without a second lookup.
+    dataset_type: Optional[str] = None
+    # Materialized-view registration, mirrored here for the same reason
+    # sort_orders and maintenance_policy are: `save_dataset_metadata` writes
+    # the whole dataset document with `set()`, so a field it does not carry is
+    # DESTROYED by the next commit. For a materialized view that commit is its
+    # own refresh - the registration would not survive the first one.
+    statement_id: Optional[str] = None
+    source_tables: List[str] = field(default_factory=list)
+    last_refreshed_at_ms: Optional[int] = None
+    last_refresh_status: Optional[str] = None
+    last_refresh_execution_id: Optional[str] = None
 
     def current_snapshot(self) -> Optional[Snapshot]:
         if self.current_snapshot_id is None:

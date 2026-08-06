@@ -81,6 +81,94 @@ export GOOGLE_APPLICATION_CREDENTIALS="/path/to/service-account.json"
 export GOOGLE_CLOUD_PROJECT="my-gcp-project"
 ```
 
+### Trigger firing (materialized-view refresh) ⚡
+
+A user-created commit on a dataset carrying triggers enqueues a refresh job
+for each target materialized view: a `jobs/{execution_id}` document plus an
+OIDC-authenticated Cloud Task to worker.opteryx (see
+`MATERIALIZED_VIEWS_TRIGGERS_PLAN.md`). Firing environments need:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `OPTERYX_TRIGGER_FIRING` | on | `0` disables commit-time firing entirely (local scripts, tests) |
+| `GCP_PROJECT_ID` / `GCP_PROJECT` / `GOOGLE_CLOUD_PROJECT` | catalog's Firestore project | Project holding the `jobs` collection and the task queue |
+| `OPTERYX_JOBS_DATABASE` | *(default database)* | Firestore database for the `jobs` collection — jobs.opteryx/worker.opteryx use the project default, not `catalogs` |
+| `TASKS_LOCATION` | `us-east1` | Cloud Tasks queue location |
+| `TASKS_QUEUE` | `worker-dispatch` | Cloud Tasks queue name |
+| `TASKS_TARGET_URL` | `https://worker.opteryx.app/api/v1/submit` | Where the task is pushed |
+| `TASKS_OIDC_SA` | — | Service account for the task's OIDC token. **Must be the same SA jobs.opteryx enqueues as** — worker.opteryx pins that OIDC subject. Without it the task is enqueued unauthenticated and the worker rejects it |
+| `TASKS_OIDC_AUDIENCE` | the target URL | OIDC audience — the worker checks exact equality with its submit URL |
+| `JOB_TTL_DAYS` | `14` | `purge_at` horizon on refresh job documents, matching jobs.opteryx |
+
+Enqueue failures never break the commit that triggered them — they alert and
+write a `trigger.fire_failed` audit record instead. A missed fire is a stale
+materialized view, so keep alerting configured wherever firing is enabled.
+
+### Alerting 🚨
+
+When the catalog detects a *platform inconsistency* — a state that should be impossible, like a
+snapshot summary disagreeing with the manifest it describes — it raises or reports an exception
+carrying the `Alertable` mixin (`opteryx_catalog/exceptions.py`). Those are delivered by
+`opteryx_catalog/alerts/`.
+
+Caller errors (`DatasetNotFound`, `DatasetLocked`, …) are deliberately **not** alertable — otherwise
+every 404 files a ticket.
+
+Delivery is by sink. **stdout is the guarantee**: one structured JSON line, written synchronously, so
+the record survives the process being killed. Everything else is an addition and is best-effort.
+
+| Sink | What it does | Default |
+|---|---|---|
+| `stdout` | One GCP-structured JSON line per alert, routed to `ops.stdout_logs` by its severity | on |
+| `github` | Files, or folds into, one issue per distinct failure | off |
+| `discord` | Posts to a channel webhook. Severity-gated — it interrupts people | off |
+
+```bash
+# Which channels. Comma-separated; 'both' is an alias for 'stdout,github'.
+export OPTERYX_ALERTS_SINK="stdout,discord"
+
+# Identifies the reporting job. Prefixes titles, becomes a label, and is SALTED
+# INTO THE FINGERPRINT - changing it later gives every failure a new identity,
+# orphaning open issues and re-alerting everything once. Pick it and leave it.
+export OPTERYX_ALERTS_COMPONENT="catalog-maintenance"
+export OPTERYX_ALERTS_ENVIRONMENT="production"
+```
+
+Everything below has a working default; set it only to change that default.
+
+| Variable | Default | Notes |
+|---|---|---|
+| `OPTERYX_ALERTS_ENABLED` | on | `false` silences alerting entirely |
+| `OPTERYX_ALERTS_COOLOFF_HOURS` | `24` | How long a known failure stays quiet. Applies to every sink |
+| `OPTERYX_ALERTS_LABELS` | — | Extra labels, comma separated |
+| `OPTERYX_ALERTS_REPO` | — | `owner/repo`, or a GitHub URL. Required by the `github` sink |
+| `OPTERYX_ALERTS_TOKEN_SECRET` | `GITHUB_TOKEN` | Secret Manager secret holding the token. A `GITHUB_TOKEN` env var wins — the dev path |
+| `OPTERYX_ALERTS_API_URL` | `https://api.github.com` | For GitHub Enterprise |
+| `OPTERYX_ALERTS_DISCORD_WEBHOOK` | — | The webhook URL directly. Skips Secret Manager, so no IAM grant needed |
+| `OPTERYX_ALERTS_DISCORD_WEBHOOK_SECRET` | `DISCORD_NOTIFICATION_WEBHOOK` | Used when the URL isn't set directly |
+| `OPTERYX_ALERTS_DISCORD_MIN_SEVERITY` | `CRITICAL` | `WARNING`, `ERROR` or `CRITICAL` |
+| `OPTERYX_ALERTS_DISCORD_MENTION` | — | `<@&ROLE_ID>` or `@here`. **Without this a Discord message posts silently and won't reach a phone.** Get the role ID from Discord → Settings → Advanced → Developer Mode, then right-click the role → Copy ID |
+
+The legacy `PLATFORM_ISSUES_*` names are still read as a fallback, with a one-time warning — the
+GitHub reporter these were moved from was configured that way. Check for stale ones on a deployed
+service: an old `PLATFORM_ISSUES_COMPONENT` silently wins over an unset `OPTERYX_ALERTS_COMPONENT`
+and changes your fingerprints.
+
+Reading a secret needs `roles/secretmanager.secretAccessor` on it for the runtime service account.
+Setting `OPTERYX_ALERTS_DISCORD_WEBHOOK` directly avoids that entirely.
+
+To verify delivery end to end against a real channel:
+
+```bash
+python3 scripts/send_test_alert.py
+```
+
+The `alerts` extra installs `google-cloud-secret-manager`, needed only for the Secret Manager path:
+
+```bash
+pip install "opteryx-catalog[alerts]"
+```
+
 ### Manifest format
 
 This catalog writes consolidated Parquet manifests for fast query planning and stores table metadata in Firestore. Manifests and data files are stored in GCS. If you need different artifact formats, use the provided export/import utilities to convert manifests outside the hot path.
@@ -88,6 +176,20 @@ This catalog writes consolidated Parquet manifests for fast query planning and s
 ## API overview 📚
 
 The package exports a factory helper `create_catalog` and the `FirestoreCatalog` class.
+
+### Workspaces are not created implicitly
+
+`OpteryxCatalog(workspace=...)` is a read: the workspace must already exist, or
+construction raises `WorkspaceNotFound`. This keeps a mistyped workspace name in
+a query from bringing an empty workspace into existence — in Firestore a
+collection exists only because a document in it does, so writing the workspace's
+`$properties` document *is* creating the workspace.
+
+Provisioning is explicit:
+
+```python
+OpteryxCatalog(workspace="new_workspace", create_if_missing=True)
+```
 
 Key methods include:
 - `create_collection(collection, properties={}, exists_ok=False)`
@@ -106,6 +208,13 @@ Key methods include:
 - `view_exists(identifier)`
 - `drop_view(identifier)`
 - `update_view_execution_metadata(identifier, row_count=None, execution_time=None)`
+- `create_materialized_view(identifier, sql, source_tables, author, update_if_exists=False)`
+- `get_materialized_view(identifier)` / `list_materialized_views(collection)`
+- `drop_materialized_view(identifier, author)`
+- `mark_materialized_view_refreshed(identifier, status, execution_id=None, author=None)`
+- `create_trigger(dataset_identifier, name, target_view, statement_id=None, author=None)`
+- `list_triggers(dataset_identifier)` / `drop_trigger(dataset_identifier, name, author, missing_ok=False)`
+- `mark_trigger_fired(dataset_identifier, name, status)`
 
 ### Views 👁️
 
@@ -147,6 +256,58 @@ catalog.update_view_execution_metadata(
     execution_time=0.45
 )
 ```
+
+### Materialized views and triggers ⚡
+
+A materialized view is a normal dataset document — readable as a table, with
+its own location, schema and snapshots — that additionally carries
+`dataset-type: "materialized_view"`, its defining SQL (versioned in the same
+`statement` subcollection views use), and a `source-tables` list. Registration
+also writes one **trigger** document under each source dataset:
+
+```
+{workspace}/{collection}/datasets/{source}/triggers/{trigger-name}
+```
+
+Triggers live in a subcollection, not on the dataset document, for the same
+reason maintenance state does: `load_dataset` reads that document on every
+call and must not pay for opt-in state.
+
+The engine creates the backing table first (`CREATE MATERIALIZED VIEW` runs as
+a CTAS), then registers it:
+
+```python
+catalog.create_materialized_view(
+    "mart.daily_orders",
+    "SELECT customer_id, COUNT(*) FROM sales.orders GROUP BY customer_id",
+    source_tables=["sales.orders"],   # one refresh trigger per source
+    author="data_team",
+)
+
+catalog.list_triggers("sales.orders")
+# [{'name': 'refresh__mart__daily_orders', 'kind': 'materialized_view_refresh', ...}]
+```
+
+Refresh is event-driven. When a source dataset takes a **user-created** commit
+(`append`, `overwrite`, `add_files`, `truncate_and_add_files`, committed
+`truncate`), the commit path reads that dataset's triggers and enqueues one
+refresh job per target view — see *Trigger firing* above for the environment it
+needs. Housekeeping snapshots (compaction, expiration, `refresh_manifest`) are
+excluded via `Snapshot.user_created`, so maintenance never re-runs every view.
+
+Behavior worth knowing:
+- **Invoker semantics**: the refresh runs as the author of the commit that
+  fired it, with policies re-read at fire time. A committer without rights on
+  the view gets a denied refresh — recorded in `last-refresh-status`, never
+  silent.
+- **Cycles are rejected at registration**; a materialized view reading another
+  materialized view is fine and refreshes by construction.
+- `drop_materialized_view` removes the triggers from every source before
+  dropping the dataset; `drop_dataset` on a materialized view does the same
+  cleanup, so a raw drop cannot strand triggers.
+- Datasets carrying triggers, and materialized views themselves, **cannot be
+  renamed** — trigger documents and source lists reference names. Drop and
+  recreate instead.
 
 Notes about behavior:
 - `create_dataset` will try to infer a default GCS location using the provided `gcs_bucket` property if `location` is omitted.

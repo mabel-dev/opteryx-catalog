@@ -110,7 +110,8 @@ def emit_audit(
 
     Args:
         action: what happened, e.g. "create_dataset", "drop_view", "append"
-        resource_type: "dataset" | "view" | "collection"
+        resource_type: a `ResourceType` member (or its string value):
+            "dataset" | "view" | "collection" | "workspace" | "materialized_view"
         workspace: catalog workspace the resource belongs to
         resource: the dataset/view/collection name
         collection: parent collection, where the resource is not itself one
