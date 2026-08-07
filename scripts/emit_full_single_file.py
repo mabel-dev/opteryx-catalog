@@ -9,9 +9,9 @@ from google.cloud import storage
 from opteryx_catalog.catalog.manifest import build_parquet_manifest_entry_from_bytes
 
 # Add local paths to sys.path to use local code instead of installed packages
-sys.path.insert(0, os.path.join(sys.path[0], ".."))  # Add parent dir for pyiceberg_firestore_gcs
+sys.path.insert(0, os.path.join(sys.path[0], ".."))  # Add parent dir for opteryx_catalog
 sys.path.insert(1, os.path.join(sys.path[0], "../opteryx-core"))
-sys.path.insert(1, os.path.join(sys.path[0], "../pyiceberg-firestore-gcs"))
+sys.path.insert(1, os.path.join(sys.path[0], "../opteryx-catalog"))
 
 
 TARGET = "gs://opteryx_data/opteryx/ops/audit_log/data/188fa239430f10c3-59275747aed0-2.parquet"

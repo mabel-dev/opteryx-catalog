@@ -96,35 +96,46 @@ Reads and sorts data before rewriting:
 Explicit API call to compact a table:
 
 ```python
-from pyiceberg_firestore_gcs.compaction import compact_table
+from opteryx_catalog.catalog import DatasetCompactor
 
-catalog = create_catalog(...)
-compact_table(catalog, ("namespace", "table_name"))
+dataset = catalog.load_dataset("my_collection.my_dataset")
+DatasetCompactor(dataset, author="me").compact()
 ```
 
 #### 2. Scheduled Trigger
 
-Background job that periodically scans tables:
+Scheduling lives outside this library, in the `xb500.opteryx` housekeeping
+service: Cloud Scheduler calls its `/housekeeping/trigger_compaction`
+endpoint, which discovers workspaces from Firestore, walks the allowlisted
+collections, and calls `compact()` per dataset — writing one audit row per
+dataset evaluated to `opteryx.ops.compaction_log`. See
+`xb500.opteryx/app/operations/trigger_compaction.py`.
 
-```python
-from pyiceberg_firestore_gcs.compaction import CompactionScheduler
+Compaction there is opt-in per collection: only `workspace.collection` names
+in `COMPACTION_ALLOWED_COLLECTIONS` (default `opteryx.ops`) are ever
+rewritten, with `COMPACTION_BLOCKED_WORKSPACES` (default `benchmarks`)
+applied on top, so a newly discovered workspace is inert by default.
 
-scheduler = CompactionScheduler(
-    catalog=catalog,
-    check_interval_seconds=3600,  # Check every hour
-    auto_compact=True
-)
-scheduler.start()
-```
+For working through a backlog outside the request-timeout of a container,
+`scripts/catchup_compaction.py` loops `compact()` per dataset on a
+long-running VM until a pass finds nothing left to do.
 
 #### 3. Threshold-Based Trigger
 
-Automatically compact when thresholds are exceeded:
+Thresholds are enforced inside `compact()` itself rather than by a separate
+`should_compact()` check — file selection is driven by `SMALL_FILE_BYTES`,
+`MIN_FILE_SIZE_BYTES`, and `SORT_AWARE_FLOOR_BYTES`, and the pass returns
+`None` when no group clears them. So "compact when thresholds are exceeded"
+is simply calling `compact()` and letting it decline:
 
 ```python
-# After commit, check if compaction is needed
-if should_compact(table):
-    schedule_async_compaction(table)
+# `dry_run=True` returns the PLAN DICT (what would be compacted, and why),
+# or None when nothing clears the thresholds. Only `dry_run=False` returns
+# a Snapshot.
+plan = compactor.compact(dry_run=True)
+if plan is not None:
+    print(plan["type"], plan["reason"])
+    compactor.compact(dry_run=False)
 ```
 
 ### Implementation Components
@@ -206,49 +217,50 @@ Track compaction metrics:
 ### Basic Compaction
 
 ```python
-from pyiceberg_firestore_gcs import create_catalog
-from pyiceberg_firestore_gcs.compaction import compact_table
+from opteryx_catalog import OpteryxCatalog
+from opteryx_catalog.catalog import DatasetCompactor
 
-catalog = create_catalog(
-    "my_catalog",
+catalog = OpteryxCatalog(
+    workspace="my_workspace",
     firestore_project="my-project",
-    gcs_bucket="my-bucket"
+    gcs_bucket="my-bucket",
 )
 
-# Compact a specific dataset
-result = compact_table(
-    catalog,
-    identifier=("my_namespace", "my_dataset"),
-    strategy="binpack"
-)
+# Compact a specific dataset. Valid strategies are 'brute' and 'performance';
+# omit the argument to auto-detect from the dataset's sort order.
+dataset = catalog.load_dataset("my_collection.my_dataset")
+compactor = DatasetCompactor(dataset, strategy="brute", author="me")
 
-print(f"Compacted {result.files_rewritten} files")
+snapshot = compactor.compact()
+if snapshot is None:
+    print("declined to commit:", compactor._last_error)
+else:
+    print("committed snapshot", snapshot.snapshot_id)
 ```
 
 ### Automatic Compaction
 
-```python
-# Enable auto-compaction when creating dataset
-dataset = catalog.create_dataset(
-    identifier=("my_namespace", "my_dataset"),
-    schema=schema,
-    properties={
-        "compaction.enabled": "true",
-        "compaction.min-file-count": "20",
-        "compaction.strategy": "binpack"
-    }
-)
-```
+The per-dataset policy lives on the dataset's `maintenance_policy` block as
+`compaction-policy` (defaulting to `"performance"`), alongside
+`retained-snapshot-age-days`. It is persisted with the dataset metadata and
+reported by `scripts/inspect_snapshots.py`.
+
+> **Caveat:** `DatasetCompactor` does not currently read
+> `maintenance_policy["compaction-policy"]`. Strategy comes from its
+> `strategy` argument, or is auto-detected from the dataset's sort order when
+> that argument is `None`; the housekeeping service passes
+> `strategy="performance"` explicitly. So the stored policy is descriptive
+> today rather than load-bearing — wiring it into `__init__` is the gap.
+
+Sizing is not property-driven either: it comes from the module constants in
+`opteryx_catalog.catalog.compaction` (`TARGET_SIZE_BYTES` 4 GB,
+`MIN_SIZE_BYTES` 3.5 GB, `MAX_SIZE_BYTES` 4.1 GB), with
+`OPTERYX_COMPACTION_RAM_MB` (default 16384) as the runtime memory budget.
 
 ### Scheduled Compaction
 
-```python
-from pyiceberg_firestore_gcs.compaction import CompactionScheduler
-
-# Run compaction hourly
-scheduler = CompactionScheduler(catalog)
-scheduler.run_periodic(interval_seconds=3600)
-```
+Driven by Cloud Scheduler against the `xb500.opteryx` housekeeping service —
+see "Scheduled Trigger" above for the endpoint, allowlist, and audit log.
 
 ## Future Enhancements
 

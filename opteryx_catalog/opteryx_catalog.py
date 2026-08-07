@@ -2326,6 +2326,16 @@ class OpteryxCatalog(Metastore):
                 if not isinstance(ent, dict):
                     continue
                 e = dict(ent)
+                # Ensure the numeric scalars exist AND are non-None: every
+                # column below is written for every row, so a key an entry
+                # didn't carry lands as SQL NULL and reads back as None, not
+                # as the 0 that `entry.get(col, 0)` readers assume. That is
+                # how manifests grew NULL sizes that later raised
+                # `'<' not supported between instances of 'NoneType' and 'int'`
+                # inside compaction's size comparisons.
+                for _numeric in ("record_count", "file_size_in_bytes", "uncompressed_size_in_bytes"):
+                    if e.get(_numeric) is None:
+                        e[_numeric] = 0
                 # Ensure list fields exist
                 e.setdefault("min_k_hashes", [])
                 e.setdefault("histogram_counts", [])

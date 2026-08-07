@@ -6,9 +6,9 @@ from draken.interop.vector_sequence import vector_from_sequence
 from draken.morsels.morsel import Morsel
 
 # Add local paths to sys.path to use local code instead of installed packages
-sys.path.insert(0, os.path.join(sys.path[0], ".."))  # Add parent dir for pyiceberg_firestore_gcs
+sys.path.insert(0, os.path.join(sys.path[0], ".."))  # Add parent dir for opteryx_catalog
 sys.path.insert(1, os.path.join(sys.path[0], "../opteryx-core"))
-sys.path.insert(1, os.path.join(sys.path[0], "../pyiceberg-firestore-gcs"))
+sys.path.insert(1, os.path.join(sys.path[0], "../opteryx-catalog"))
 
 
 import pytest

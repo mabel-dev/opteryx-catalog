@@ -97,16 +97,19 @@ class _GcsAdapterOutputFile(OutputFile):
 class GcsFileIO(FileIO):
     """GCS-backed FileIO adapter that wraps the existing GCS implementation.
 
-    This adapter delegates to `pyiceberg_firestore_gcs.fileio.gcs_fileio.GcsFileIO`
+    This adapter delegates to `opteryx_catalog.iops.gcs.GcsFileIO`
     for actual network operations but exposes the small `opteryx_catalog.iops`
     `FileIO` interface used by the catalog layer.
     """
 
     def __init__(self, properties=None):
         # Lazy import to avoid pulling google libs unless used
-        from pyiceberg_firestore_gcs.fileio.gcs_fileio import GcsFileIO as _GcsImpl
+        from opteryx_catalog.iops.gcs import GcsFileIO as _GcsImpl
 
-        self._impl = _GcsImpl(properties or {})
+        # `properties` is accepted for interface parity with other FileIO
+        # implementations; the GCS impl reads its config from the ambient
+        # credentials and takes no constructor arguments.
+        self._impl = _GcsImpl()
 
     def new_input(self, location: str) -> InputFile:
         # Read full bytes from the underlying InputFile and return an in-memory InputFile

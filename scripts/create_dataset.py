@@ -1,4 +1,4 @@
-"""Create test tables using the `FirestoreCatalog` and write Parquet-only
+"""Create test tables using the `OpteryxCatalog` and write Parquet-only
 manifests/files (no Avro). This script creates a small deterministic set of
 tables under `tests_temp`, writes a single Parquet data file per table, writes
 a Parquet manifest for each snapshot, and records a minimal snapshot document
@@ -25,7 +25,7 @@ def _morsel(columns: dict) -> Morsel:
         m.append_vector(name, vector_from_sequence(values, dtype=dtype))
     return m
 
-sys.path.insert(0, os.path.join(sys.path[0], ".."))  # Add parent dir for pyiceberg_firestore_gcs
+sys.path.insert(0, os.path.join(sys.path[0], ".."))  # Add parent dir for opteryx_catalog
 sys.path.insert(1, os.path.join(sys.path[0], "../opteryx-core"))
 
 

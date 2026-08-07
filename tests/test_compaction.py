@@ -8,7 +8,7 @@ import sys
 
 sys.path.insert(0, os.path.join(sys.path[0], ".."))
 sys.path.insert(1, os.path.join(sys.path[0], "../opteryx-core"))
-sys.path.insert(1, os.path.join(sys.path[0], "../pyiceberg-firestore-gcs"))
+sys.path.insert(1, os.path.join(sys.path[0], "../opteryx-catalog"))
 
 from unittest.mock import Mock
 
@@ -844,6 +844,31 @@ def test_iceberg_dict_sort_order_does_not_crash():
     assert plan["sort_column"] == "timestamp"
 
 
+def test_null_sizes_in_manifest_do_not_crash():
+    """A manifest column an entry never carried is written as SQL NULL, so
+    ``uncompressed_size_in_bytes`` reads back as None (the key is PRESENT,
+    holding None - ``.get(key, 0)`` does not save you). Every size comparison
+    used to raise ``'<' not supported between instances of 'NoneType' and
+    'int'`` straight out of compact(). A NULL size is now read as 0, i.e. a
+    sub-floor merge candidate: merging rewrites it with real stats."""
+    entries = _perf_entries()
+    for e in entries:
+        e["uncompressed_size_in_bytes"] = None
+        e["file_size_in_bytes"] = None
+
+    dataset = _perf_dataset()
+    compactor = DatasetCompactor(dataset, strategy=None, author="t", agent="t")
+
+    # Both rule selectors, plus the no-sort-key legacy path.
+    plan = compactor._select_brute_merge(entries)
+    assert plan is not None, "zero-sized (NULL) files are sub-floor merge candidates"
+    assert len(plan["files"]) == len(entries)
+    assert compactor._select_sort_aware_merge(entries) is None, (
+        "NULL sizes read as 0, which is below the sort-aware floor"
+    )
+    assert compactor._select_brute_compaction(entries) is not None
+
+
 # --- streaming chunk groups, sort direction, and the commit invariant ---------
 
 
@@ -1055,6 +1080,7 @@ if __name__ == "__main__":
     test_normalize_sort_order_iceberg_dict()
     test_normalize_sort_order_edge_shapes()
     test_iceberg_dict_sort_order_does_not_crash()
+    test_null_sizes_in_manifest_do_not_crash()
     test_chunk_groups_cover_every_row_ascending()
     test_chunk_groups_cover_every_row_descending()
     test_group_predicates_follow_sort_direction()
