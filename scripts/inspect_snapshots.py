@@ -16,9 +16,9 @@ from opteryx_catalog.catalog.expiration import SnapshotExpiration
 from opteryx_catalog.catalog.expiration import identify_expiring_datasets
 
 # Add local paths to sys.path to use local code instead of installed packages
-sys.path.insert(0, os.path.join(sys.path[0], ".."))  # Add parent dir for pyiceberg_firestore_gcs
+sys.path.insert(0, os.path.join(sys.path[0], ".."))  # Add parent dir for opteryx_catalog
 sys.path.insert(1, os.path.join(sys.path[0], "../opteryx-core"))
-sys.path.insert(1, os.path.join(sys.path[0], "../pyiceberg-firestore-gcs"))
+sys.path.insert(1, os.path.join(sys.path[0], "../opteryx-catalog"))
 
 
 FIRESTORE_DATABASE = os.environ.get("FIRESTORE_DATABASE")

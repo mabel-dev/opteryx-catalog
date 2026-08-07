@@ -5,7 +5,7 @@ from google.cloud import firestore
 
 from opteryx_catalog import OpteryxCatalog
 
-sys.path.insert(0, os.path.join(sys.path[0], ".."))  # Add parent dir for pyiceberg_firestore_gcs
+sys.path.insert(0, os.path.join(sys.path[0], ".."))  # Add parent dir for opteryx_catalog
 sys.path.insert(1, os.path.join(sys.path[0], "../opteryx-core"))
 
 

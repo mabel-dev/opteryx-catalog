@@ -282,9 +282,9 @@ if __name__ == "__main__":
     import sys
 
     # Allow using local packages (same logic as tests) so we can exercise local OpteryxCatalog
-    sys.path.insert(0, os.path.join(sys.path[0], ".."))  # parent dir (pyiceberg_firestore_gcs)
+    sys.path.insert(0, os.path.join(sys.path[0], ".."))  # parent dir (opteryx_catalog)
     sys.path.insert(1, os.path.join(sys.path[0], "../opteryx-core"))
-    sys.path.insert(1, os.path.join(sys.path[0], "../pyiceberg-firestore-gcs"))
+    sys.path.insert(1, os.path.join(sys.path[0], "../opteryx-catalog"))
 
     # Default to the same test-friendly defaults when env vars are unset
     catalog_kwargs = {

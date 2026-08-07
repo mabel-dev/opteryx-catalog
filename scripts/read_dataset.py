@@ -7,9 +7,9 @@ from opteryx_catalog.catalog.manifest import read_manifest_rows
 from opteryx_catalog.opteryx_catalog import OpteryxCatalog
 
 # Add local paths to sys.path to use local code instead of installed packages
-sys.path.insert(0, os.path.join(sys.path[0], ".."))  # Add parent dir for pyiceberg_firestore_gcs
+sys.path.insert(0, os.path.join(sys.path[0], ".."))  # Add parent dir for opteryx_catalog
 sys.path.insert(1, os.path.join(sys.path[0], "../opteryx-core"))
-sys.path.insert(1, os.path.join(sys.path[0], "../pyiceberg-firestore-gcs"))
+sys.path.insert(1, os.path.join(sys.path[0], "../opteryx-catalog"))
 
 
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = (
@@ -49,7 +49,7 @@ table = "test_table_0_1767300842"
 #    prefix="_default",
 #    connector=IcebergConnector,
 #    remove_prefix=True,
-#    catalog=FirestoreCatalog,
+#    catalog=OpteryxCatalog,
 #    firestore_project="mabeldev",
 #    firestore_database="catalogs",
 #    gcs_bucket="opteryx_data",
@@ -75,7 +75,7 @@ s = catalog.load_dataset(f"{collection_name}.{table}")
 
 
 def _read_parquet_manifest(io, manifest_path: str) -> list:
-    """Read a Parquet manifest produced by `FirestoreCatalog.write_parquet_manifest`.
+    """Read a Parquet manifest produced by `OpteryxCatalog.write_parquet_manifest`.
 
     Returns a list of entry dicts.
     """

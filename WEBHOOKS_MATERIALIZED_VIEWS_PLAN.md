@@ -69,7 +69,7 @@ wiring in Phase 3.
 
 ## Phase 1 — Catalog: resource type + event completeness
 
-Repo: `pyiceberg-firestore-gcs`.
+Repo: `opteryx-catalog`.
 
 1. Introduce a real `ResourceType` (today `"dataset"` / `"view"` / `"collection"` are bare
    strings repeated at each call site — `opteryx_catalog/opteryx_catalog.py:293,540,750,850` and
@@ -97,7 +97,7 @@ Repo: `pyiceberg-firestore-gcs`.
 
 ## Phase 2 — Catalog: webhook subscription storage
 
-Repo: `pyiceberg-firestore-gcs`.
+Repo: `opteryx-catalog`.
 
 Mirror policy.opteryx's Firestore shape (`policy.opteryx/app/routes/v1/access.py:92-94`,
 `db.collection(workspace).document("$policies").collection("access")`) into a parallel `$hooks`
@@ -127,7 +127,7 @@ to fake here.)
 
 ## Phase 3 — Catalog: Cloud Tasks as the only delivery path
 
-Repo: `pyiceberg-firestore-gcs`.
+Repo: `opteryx-catalog`.
 
 `WebhookManager.send()` (`opteryx_catalog/webhooks/__init__.py:109-113`) already branches to
 `_send_via_cloud_tasks` (lines 165-205) when `OPTERYX_WEBHOOK_QUEUE` is set, falling back to

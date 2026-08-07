@@ -806,9 +806,9 @@ class SimpleDataset(Dataset):
         deleted_records = prev_total_records
 
         added_data_files = len(new_entries)
-        added_files_size = sum(e.get("file_size_in_bytes", 0) for e in new_entries)
-        added_data_size = sum(e.get("uncompressed_size_in_bytes", 0) for e in new_entries)
-        added_records = sum(e.get("record_count", 0) for e in new_entries)
+        added_files_size = sum(int(e.get("file_size_in_bytes") or 0) for e in new_entries)
+        added_data_size = sum(int(e.get("uncompressed_size_in_bytes") or 0) for e in new_entries)
+        added_records = sum(int(e.get("record_count") or 0) for e in new_entries)
 
         total_data_files = added_data_files
         total_files_size = added_files_size
@@ -968,9 +968,9 @@ class SimpleDataset(Dataset):
         added_records = 0
         # Sum statistics from new entries
         for entry in new_entries:
-            added_files_size += entry.get("file_size_in_bytes", 0)
-            added_data_size += entry.get("uncompressed_size_in_bytes", 0)
-            added_records += entry.get("record_count", 0)
+            added_files_size += int(entry.get("file_size_in_bytes") or 0)
+            added_data_size += int(entry.get("uncompressed_size_in_bytes") or 0)
+            added_records += int(entry.get("record_count") or 0)
         deleted_data_files = 0
         deleted_files_size = 0
         deleted_data_size = 0
@@ -1148,9 +1148,9 @@ class SimpleDataset(Dataset):
         added_records = 0
         # Sum statistics from new entries
         for entry in new_entries:
-            added_files_size += entry.get("file_size_in_bytes", 0)
-            added_data_size += entry.get("uncompressed_size_in_bytes", 0)
-            added_records += entry.get("record_count", 0)
+            added_files_size += int(entry.get("file_size_in_bytes") or 0)
+            added_data_size += int(entry.get("uncompressed_size_in_bytes") or 0)
+            added_records += int(entry.get("record_count") or 0)
 
         total_data_files = added_data_files
         total_files_size = added_files_size

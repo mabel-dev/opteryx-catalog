@@ -7,7 +7,7 @@ import sys
 
 sys.path.insert(0, os.path.join(sys.path[0], ".."))
 sys.path.insert(1, os.path.join(sys.path[0], "../opteryx-core"))
-sys.path.insert(1, os.path.join(sys.path[0], "../pyiceberg-firestore-gcs"))
+sys.path.insert(1, os.path.join(sys.path[0], "../opteryx-catalog"))
 
 from opteryx_catalog.catalog.metadata import DatasetMetadata, Snapshot
 from opteryx_catalog.catalog.dataset import SimpleDataset

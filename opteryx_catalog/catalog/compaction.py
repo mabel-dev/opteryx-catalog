@@ -68,6 +68,28 @@ _NODE = f"{uuid.getnode():x}-{os.getpid():x}"
 _REFRESH_MANIFEST_MAX_WORKERS = 8
 
 
+def entry_int(entry, key: str) -> int:
+    """Read a numeric manifest column off an entry, treating SQL NULL as 0.
+
+    ``write_parquet_manifest`` writes a fixed column set and fills any key an
+    entry dict didn't carry with NULL, so a manifest row can come back with
+    ``uncompressed_size_in_bytes``/``file_size_in_bytes``/``record_count`` set
+    to ``None`` rather than merely absent. ``.get(key, 0)`` does NOT cover that
+    - the key IS present, holding None - and every size comparison in the
+    selectors then raised ``'<' not supported between instances of 'NoneType'
+    and 'int'`` out of ``compact()``. A missing size is treated as 0, which
+    makes the file a sub-floor merge candidate; merging rewrites it with real
+    stats, so the dataset heals itself. Same ``int(x or 0)`` convention the
+    dataset/expiration modules already use on these columns.
+    """
+    return int(entry.get(key) or 0)
+
+
+def entry_size(entry) -> int:
+    """Uncompressed (in-memory) size of a manifest entry, NULL-safe. See ``entry_int``."""
+    return int(entry.get("uncompressed_size_in_bytes") or 0)
+
+
 def normalize_sort_order(sort_orders) -> Optional[dict]:
     """Reduce a ``sort_orders`` value to the primary sort key in canonical form.
 
@@ -570,7 +592,7 @@ class DatasetCompactor:
         small_files = []
 
         for entry in entries:
-            size = entry.get("uncompressed_size_in_bytes", 0)
+            size = entry_size(entry)
             if size < SMALL_FILE_BYTES:
                 small_files.append(entry)
 
@@ -581,13 +603,13 @@ class DatasetCompactor:
             total_size = 0
 
             # Sort by size ascending to prioritize eliminating smallest files
-            sorted_files = sorted(small_files, key=lambda x: x.get("uncompressed_size_in_bytes", 0))
+            sorted_files = sorted(small_files, key=entry_size)
 
             for entry in sorted_files:
-                entry_size = entry.get("uncompressed_size_in_bytes", 0)
-                if total_size + entry_size <= MAX_SELECTED_BUDGET_BYTES:
+                size = entry_size(entry)
+                if total_size + size <= MAX_SELECTED_BUDGET_BYTES:
                     selected.append(entry)
-                    total_size += entry_size
+                    total_size += size
                     # Continue accumulating files until we hit target, don't stop early
                     if total_size >= TARGET_SIZE_BYTES and len(selected) >= 2:
                         break
@@ -651,11 +673,7 @@ class DatasetCompactor:
 
         # No range stats needed here - brute merge doesn't sort, so files
         # without min/max still qualify.
-        sub_floor = [
-            e
-            for e in entries
-            if e.get("uncompressed_size_in_bytes", 0) < MIN_FILE_SIZE_BYTES
-        ]
+        sub_floor = [e for e in entries if entry_size(e) < MIN_FILE_SIZE_BYTES]
         return self._select_brute_consolidation(sub_floor, sort_column_name)
 
     def _select_sort_aware_merge(self, entries: List[dict], rng=None) -> Optional[dict]:
@@ -686,11 +704,7 @@ class DatasetCompactor:
         if not sort_column_name:
             return None
 
-        big = [
-            e
-            for e in entries
-            if e.get("uncompressed_size_in_bytes", 0) > SORT_AWARE_FLOOR_BYTES
-        ]
+        big = [e for e in entries if entry_size(e) > SORT_AWARE_FLOOR_BYTES]
 
         file_ranges = self._build_file_ranges(big, sort_field_id, sort_index)
         if not file_ranges:
@@ -742,7 +756,7 @@ class DatasetCompactor:
                     "entry": entry,
                     "min": min_val,
                     "max": max_val,
-                    "size": entry.get("uncompressed_size_in_bytes", 0),
+                    "size": entry_size(entry),
                 }
             )
         return file_ranges
@@ -767,13 +781,11 @@ class DatasetCompactor:
         if len(sub_floor) < 2:
             return None  # need at least two sub-floor files to combine
 
-        ordered = sorted(
-            sub_floor, key=lambda e: e.get("uncompressed_size_in_bytes", 0)
-        )
+        ordered = sorted(sub_floor, key=entry_size)
         selected = []
         total = 0
         for e in ordered:
-            size = e.get("uncompressed_size_in_bytes", 0)
+            size = entry_size(e)
             if selected and total + size > TARGET_SIZE_BYTES:
                 break
             selected.append(e)
@@ -1060,9 +1072,7 @@ class DatasetCompactor:
             # can now be far larger than RAM (that is the point of streaming), so
             # for an oversized merge we ABORT this compaction - leaving the data
             # intact for a later pass - rather than OOM by reading it all in.
-            combined_budget = sum(
-                e.get("uncompressed_size_in_bytes", 0) for e in files_to_compact
-            )
+            combined_budget = sum(entry_size(e) for e in files_to_compact)
             if combined_budget > MAX_SELECTED_BUDGET_BYTES:
                 return self._abort(
                     f"streaming declined and the {combined_budget >> 20} MB merge "
@@ -1094,7 +1104,7 @@ class DatasetCompactor:
                     Morsel.combine(row_group_morsels) if len(row_group_morsels) > 1 else row_group_morsels[0]
                 )
                 tables.append(file_morsel)
-                total_size += entry.get("uncompressed_size_in_bytes", 0)
+                total_size += entry_size(entry)
             except Exception as exc:
                 # Failed to read file, abort this compaction
                 return self._abort(f"could not read input file {file_path}", exc)
@@ -1336,42 +1346,40 @@ class DatasetCompactor:
         # Don't rely on potentially corrupted manifest entries
         try:
             deleted_files = len(files_to_compact)
-            deleted_size = sum(e.get("file_size_in_bytes", 0) for e in files_to_compact)
+            deleted_size = sum(entry_int(e, "file_size_in_bytes") for e in files_to_compact)
             # Input record/byte counts come from the morsels themselves (captured
             # before they were freed); on-disk size is only in the manifest.
             deleted_records = input_records
             deleted_data_size = input_data_size
 
             added_files = len(new_entries)
-            added_size = sum(e.get("file_size_in_bytes", 0) for e in new_entries)
-            added_data_size = sum(e.get("uncompressed_size_in_bytes", 0) for e in new_entries)
-            added_records = sum(e.get("record_count", 0) for e in new_entries)
+            added_size = sum(entry_int(e, "file_size_in_bytes") for e in new_entries)
+            added_data_size = sum(entry_size(e) for e in new_entries)
+            added_records = sum(entry_int(e, "record_count") for e in new_entries)
 
             total_files = len(final_entries)
-            total_size = sum(e.get("file_size_in_bytes", 0) for e in final_entries)
-            total_data_size = sum(e.get("uncompressed_size_in_bytes", 0) for e in final_entries)
-            total_records = sum(e.get("record_count", 0) for e in final_entries)
+            total_size = sum(entry_int(e, "file_size_in_bytes") for e in final_entries)
+            total_data_size = sum(entry_size(e) for e in final_entries)
+            total_records = sum(entry_int(e, "record_count") for e in final_entries)
         except Exception:
             # If stats calculation fails, refresh the entire manifest from data files
             final_entries = self._refresh_manifest_from_data_files(final_entries)
 
             # Use what we know directly since we still have new_entries in scope
             deleted_files = len(files_to_compact)
-            deleted_size = sum(e.get("file_size_in_bytes", 0) for e in files_to_compact)
-            deleted_data_size = sum(
-                e.get("uncompressed_size_in_bytes", 0) for e in files_to_compact
-            )
-            deleted_records = sum(e.get("record_count", 0) for e in files_to_compact)
+            deleted_size = sum(entry_int(e, "file_size_in_bytes") for e in files_to_compact)
+            deleted_data_size = sum(entry_size(e) for e in files_to_compact)
+            deleted_records = sum(entry_int(e, "record_count") for e in files_to_compact)
 
             added_files = len(new_entries)
-            added_size = sum(e.get("file_size_in_bytes", 0) for e in new_entries)
-            added_data_size = sum(e.get("uncompressed_size_in_bytes", 0) for e in new_entries)
-            added_records = sum(e.get("record_count", 0) for e in new_entries)
+            added_size = sum(entry_int(e, "file_size_in_bytes") for e in new_entries)
+            added_data_size = sum(entry_size(e) for e in new_entries)
+            added_records = sum(entry_int(e, "record_count") for e in new_entries)
 
             total_files = len(final_entries)
-            total_size = sum(e.get("file_size_in_bytes", 0) for e in final_entries)
-            total_data_size = sum(e.get("uncompressed_size_in_bytes", 0) for e in final_entries)
-            total_records = sum(e.get("record_count", 0) for e in final_entries)
+            total_size = sum(entry_int(e, "file_size_in_bytes") for e in final_entries)
+            total_data_size = sum(entry_size(e) for e in final_entries)
+            total_records = sum(entry_int(e, "record_count") for e in final_entries)
 
         # Build snapshot with agent metadata
         current = self.dataset.metadata.current_snapshot()
@@ -1481,7 +1489,7 @@ class DatasetCompactor:
         if any(c is None for c in input_counts):
             return True
         expected = sum(input_counts)
-        actual = sum(e.get("record_count", 0) for e in new_entries)
+        actual = sum(entry_int(e, "record_count") for e in new_entries)
         if expected == actual:
             return True
         reason = (
@@ -1940,7 +1948,7 @@ class DatasetCompactor:
             for fr in self._build_file_ranges(files_to_compact, sort_field_id, sort_index)
         }
 
-        total_size = sum(e.get("uncompressed_size_in_bytes", 0) for e in files_to_compact)
+        total_size = sum(entry_size(e) for e in files_to_compact)
         k = max(1, -(-total_size // TARGET_SIZE_BYTES))
         target_rows_per_file = max(1, -(-n // k))
 
@@ -2018,7 +2026,7 @@ class DatasetCompactor:
             return self._abort("streaming execution produced no output files")
 
         input_records = n
-        input_data_size = sum(e.get("uncompressed_size_in_bytes", 0) for e in files_to_compact)
+        input_data_size = sum(entry_size(e) for e in files_to_compact)
 
         return self._finalize_compaction_snapshot(
             all_entries, files_to_compact, new_entries, snapshot_id,

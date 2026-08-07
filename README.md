@@ -1,4 +1,4 @@
-# pyiceberg-firestore-gcs
+# opteryx-catalog
 
 A Firestore + Google Cloud Storage (GCS) backed implementation of a
 lightweight catalog interface. This package provides an opinionated
@@ -34,30 +34,30 @@ metastore and **GCS** for data and manifest storage.
 python -m pip install -e .
 ```
 
-3. Create a `FirestoreCatalog` and use it in your application:
+3. Create an `OpteryxCatalog` and use it in your application:
 
 ```python
-from pyiceberg_firestore_gcs import create_catalog
-from pyiceberg.schema import Schema, NestedField
-from pyiceberg.types import IntegerType, StringType
+from draken.interop.vector_sequence import vector_from_sequence
+from draken.morsels.morsel import Morsel
 
-catalog = create_catalog(
-	"my_catalog",
+from opteryx_catalog import OpteryxCatalog
+
+catalog = OpteryxCatalog(
+	workspace="my_workspace",
 	firestore_project="my-gcp-project",
 	gcs_bucket="my-default-bucket",
 )
 
 # Create a collection
-catalog.create_collection("example_collection")
+catalog.create_collection("example_collection", author="me")
 
-# Create a simple PyIceberg schema
-schema = Schema(
-	NestedField(field_id=1, name="id", field_type=IntegerType(), required=True),
-	NestedField(field_id=2, name="name", field_type=StringType(), required=False),
-)
+# Schemas are described by an empty Morsel carrying the column types
+schema = Morsel()
+schema.append_vector("id", vector_from_sequence([], dtype="INTEGER"))
+schema.append_vector("name", vector_from_sequence([], dtype="VARCHAR"))
 
 # Create a new dataset (metadata written to a GCS path derived from the bucket property)
-table = catalog.create_dataset(("example_collection", "users"), schema)
+dataset = catalog.create_dataset("example_collection.users", schema, author="me")
 
 # Or register a table if you already have a metadata JSON in GCS
 catalog.register_table(("example_namespace", "events"), "gs://my-bucket/path/to/events/metadata/00000001.json")
@@ -175,7 +175,11 @@ This catalog writes consolidated Parquet manifests for fast query planning and s
 
 ## API overview 📚
 
-The package exports a factory helper `create_catalog` and the `FirestoreCatalog` class.
+The package's entry point is the `OpteryxCatalog` class; there is no factory
+helper. Alongside it, the top level exports the metastore interface (`Metastore`,
+`Dataset`, `View`), the dataset and metadata types (`SimpleDataset`,
+`DatasetMetadata`, `Snapshot`, `DataFile`, `ManifestEntry`), and `ResourceType`.
+`DatasetCompactor` is exported from `opteryx_catalog.catalog`.
 
 ### Workspaces are not created implicitly
 
@@ -339,37 +343,50 @@ This catalog supports small file compaction to improve query performance. See [C
 ### Quick Start
 
 ```python
-from pyiceberg_firestore_gcs import create_catalog
-from pyiceberg_firestore_gcs.compaction import compact_table, get_compaction_stats
+from opteryx_catalog import OpteryxCatalog
+from opteryx_catalog.catalog import DatasetCompactor
 
-catalog = create_catalog(...)
+catalog = OpteryxCatalog(workspace="my_workspace", gcs_bucket="my-bucket")
 
-# Check if compaction is needed
-table = catalog.load_dataset(("namespace", "dataset_name"))
-stats = get_compaction_stats(table)
-print(f"Small files: {stats['small_file_count']}")
+dataset = catalog.load_dataset("my_collection.my_dataset")
 
-# Run compaction
-result = compact_table(catalog, ("namespace", "table_name"))
-print(f"Compacted {result.files_rewritten} files")
+# `strategy=None` auto-detects: 'performance' when the dataset has a usable
+# sort order, otherwise 'brute'.
+compactor = DatasetCompactor(dataset, author="me")
+
+# Each compact() call performs ONE read -> select -> execute -> commit pass.
+# dry_run=True returns the plan dict (what would be compacted, and why);
+# dry_run=False returns the committed Snapshot. Either returns None when
+# nothing clears the size thresholds.
+plan = compactor.compact(dry_run=True)
+if plan is None:
+    print("nothing to do")
+else:
+    print(plan["type"], plan["reason"])
+    snapshot = compactor.compact(dry_run=False)
+```
+
+Scheduling is handled by the `xb500.opteryx` housekeeping service (Cloud
+Scheduler → `/housekeeping/trigger_compaction`), which walks allowlisted
+collections and audits every dataset it evaluates. See
+[COMPACTION.md](COMPACTION.md).
+
+Rules `brute` and `sort_aware` are independent. To attempt both in one tick,
+call `compact()` twice in series rather than chaining them in a single call:
+
+```python
+compactor.compact(rule="brute")
+compactor.compact(rule="sort_aware")
 ```
 
 ### Configuration
 
-Control compaction behavior via table properties:
-
-```python
-table = catalog.create_dataset(
-    identifier=("namespace", "table_name"),
-    schema=schema,
-    properties={
-        "compaction.enabled": "true",
-        "compaction.min-file-count": "10",
-        "compaction.max-small-file-size-bytes": "33554432",  # 32 MB
-        "write.target-file-size-bytes": "134217728"  # 128 MB
-    }
-)
-```
+Compaction sizing is set by module constants in
+`opteryx_catalog.catalog.compaction`, not by dataset properties — the target
+output size is `TARGET_SIZE_BYTES` (4 GB), with `MIN_SIZE_BYTES` (3.5 GB) as
+the lower bound of the acceptable band and `MAX_SIZE_BYTES` (4.1 GB) a hard
+cap. The memory budget is the one runtime-tunable value, via the
+`OPTERYX_COMPACTION_RAM_MB` environment variable (default 16384).
 
 ## Limitations & KNOWN ISSUES ⚠️
 
