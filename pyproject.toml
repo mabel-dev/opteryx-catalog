@@ -41,6 +41,13 @@ webhooks = [
 alerts = [
     "google-cloud-secret-manager>=2.20.0"
 ]
+# The test suite writes and reads real Parquet through rugo/draken morsels, so
+# draken is a hard requirement for collection even though nothing under
+# opteryx_catalog/ imports it at runtime.
+test = [
+    "pytest>=8",
+    "draken"
+]
 
 [tool.setuptools.package-dir]
 "" = "."

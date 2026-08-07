@@ -7,15 +7,44 @@ on:
 
 jobs:
 
+  # Hard gate. The full test matrix must pass before anything is built or
+  # published -- a red suite fails the tag and PyPI is never reached.
+  test:
+    uses: ./.github/workflows/tests.yaml
+
+  # Guards against tagging v1.2.3 while pyproject.toml still says 1.2.2, which
+  # would publish a version nobody asked for under a tag that misdescribes it.
+  version-check:
+    name: tag matches pyproject version
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.13"
+
+    - name: compare
+      run: |
+        TAG="${GITHUB_REF_NAME#v}"
+        PROJECT=$(python -c "import tomllib;print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+        echo "tag=${TAG} pyproject=${PROJECT}"
+        if [ "${TAG}" != "${PROJECT}" ]; then
+          echo "::error::tag ${GITHUB_REF_NAME} does not match pyproject version ${PROJECT}"
+          exit 1
+        fi
+
   build:
+    needs: [test, version-check]
     runs-on: ubuntu-latest
     permissions:
       id-token: write
 
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
 
-    - uses: actions/setup-python@v4
+    - uses: actions/setup-python@v5
       with:
         python-version: "3.x"
 

@@ -1,0 +1,69 @@
+name: Tests
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  # Lets release.yaml gate publishing on this exact suite, so the release
+  # check can never drift from the one that runs on PRs.
+  workflow_call:
+
+# A newer push to the same branch makes the in-flight run irrelevant. Releases
+# are keyed on the tag ref, so a release run is never cancelled by branch work.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+
+  pytest:
+    name: pytest (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      # Don't let one version failing hide the result on the others.
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+        cache: pip
+
+    - name: deps
+      run: |
+        python -m pip install -U pip
+        python -m pip install -e ".[test,webhooks,alerts]"
+
+    - name: test
+      # opteryx_catalog/maki_nage/tests is vendored upstream and imports
+      # opteryx.third_party, not this package -- it is not ours to run.
+      run: python -m pytest tests/ -v --durations=10
+
+  lint:
+    name: lint (advisory)
+    runs-on: ubuntu-latest
+    # The codebase is not ruff-clean yet, so this reports without gating
+    # merges -- same posture as `make lint`, which runs with --exit-zero.
+    continue-on-error: true
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.13"
+        cache: pip
+
+    - name: deps
+      run: python -m pip install -U ruff
+
+    - name: ruff check
+      run: python -m ruff check --output-format=github
+
+    - name: ruff format
+      run: python -m ruff format --check
