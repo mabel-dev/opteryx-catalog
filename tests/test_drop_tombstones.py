@@ -204,7 +204,7 @@ def test_drop_missing_view_is_silent():
     catalog._view_doc_ref = lambda c, n: _DocRef("v", exists=False, log=log)
 
     with patch("opteryx_catalog.opteryx_catalog.send_webhook") as hook:
-        catalog.drop_view("coll.v")
+        catalog.drop_view("coll.v", author="bob")
 
     assert hook.call_count == 0
     assert log == []
