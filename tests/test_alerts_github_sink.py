@@ -53,9 +53,10 @@ def _report(**kwargs):
 def test_no_http_at_all_without_a_repo():
     alerts.reset()
     alerts.configure(component="expiration", repo=None, sink="github")
-    with patch("opteryx_catalog.alerts.github.requests.post") as post, patch(
-        "opteryx_catalog.alerts.github.requests.get"
-    ) as get:
+    with (
+        patch("opteryx_catalog.alerts.github.requests.post") as post,
+        patch("opteryx_catalog.alerts.github.requests.get") as get,
+    ):
         _report()
         post.assert_not_called()
         get.assert_not_called()
@@ -65,9 +66,10 @@ def test_no_http_at_all_without_a_repo():
 def test_create_payload_and_labels():
     _setup()
     try:
-        with patch("opteryx_catalog.alerts.github.requests.get") as get, patch(
-            "opteryx_catalog.alerts.github.requests.post"
-        ) as post:
+        with (
+            patch("opteryx_catalog.alerts.github.requests.get") as get,
+            patch("opteryx_catalog.alerts.github.requests.post") as post,
+        ):
             get.return_value = _response(200, [])
             post.return_value = _response(201, {"number": 7})
             _report(fingerprint=("gc-unprotectable", "landing.http"))
@@ -87,9 +89,10 @@ def test_create_payload_and_labels():
 def test_body_carries_the_fingerprint_marker():
     _setup()
     try:
-        with patch("opteryx_catalog.alerts.github.requests.get") as get, patch(
-            "opteryx_catalog.alerts.github.requests.post"
-        ) as post:
+        with (
+            patch("opteryx_catalog.alerts.github.requests.get") as get,
+            patch("opteryx_catalog.alerts.github.requests.post") as post,
+        ):
             get.return_value = _response(200, [])
             post.return_value = _response(201, {"number": 7})
             _report()
@@ -102,9 +105,10 @@ def test_body_carries_the_fingerprint_marker():
 def test_existing_open_issue_is_commented_not_recreated():
     _setup()
     try:
-        with patch("opteryx_catalog.alerts.github.requests.get") as get, patch(
-            "opteryx_catalog.alerts.github.requests.post"
-        ) as post:
+        with (
+            patch("opteryx_catalog.alerts.github.requests.get") as get,
+            patch("opteryx_catalog.alerts.github.requests.post") as post,
+        ):
             post.return_value = _response(201, {"number": 7})
 
             # First call files; capture the marker it used.
@@ -135,9 +139,10 @@ def test_a_closed_issue_is_not_matched():
     """A failure that was fixed, closed, and came back deserves its own ticket."""
     _setup()
     try:
-        with patch("opteryx_catalog.alerts.github.requests.get") as get, patch(
-            "opteryx_catalog.alerts.github.requests.post"
-        ) as post:
+        with (
+            patch("opteryx_catalog.alerts.github.requests.get") as get,
+            patch("opteryx_catalog.alerts.github.requests.post") as post,
+        ):
             get.return_value = _response(200, [])
             post.return_value = _response(201, {"number": 9})
             _report()
@@ -151,9 +156,10 @@ def test_a_closed_issue_is_not_matched():
 def test_pull_requests_in_the_listing_are_skipped():
     _setup()
     try:
-        with patch("opteryx_catalog.alerts.github.requests.get") as get, patch(
-            "opteryx_catalog.alerts.github.requests.post"
-        ) as post:
+        with (
+            patch("opteryx_catalog.alerts.github.requests.get") as get,
+            patch("opteryx_catalog.alerts.github.requests.post") as post,
+        ):
             post.return_value = _response(201, {"number": 11})
             get.return_value = _response(200, [])
             _report()
@@ -167,9 +173,7 @@ def test_pull_requests_in_the_listing_are_skipped():
                 cooloff_seconds=0,
             )
             # A PR carrying the same marker must not be treated as the issue.
-            get.return_value = _response(
-                200, [{"number": 3, "body": marker, "pull_request": {}}]
-            )
+            get.return_value = _response(200, [{"number": 3, "body": marker, "pull_request": {}}])
             post.reset_mock()
             _report()
             assert post.call_args.args[0].endswith("/issues")
@@ -180,9 +184,10 @@ def test_pull_requests_in_the_listing_are_skipped():
 def test_listing_stops_paging_when_a_page_is_short():
     _setup()
     try:
-        with patch("opteryx_catalog.alerts.github.requests.get") as get, patch(
-            "opteryx_catalog.alerts.github.requests.post"
-        ) as post:
+        with (
+            patch("opteryx_catalog.alerts.github.requests.get") as get,
+            patch("opteryx_catalog.alerts.github.requests.post") as post,
+        ):
             get.return_value = _response(200, [{"number": 1, "body": "unrelated"}])
             post.return_value = _response(201, {"number": 12})
             _report()
@@ -195,9 +200,10 @@ def test_listing_pages_through_full_pages():
     _setup()
     try:
         full_page = [{"number": n, "body": "unrelated"} for n in range(100)]
-        with patch("opteryx_catalog.alerts.github.requests.get") as get, patch(
-            "opteryx_catalog.alerts.github.requests.post"
-        ) as post:
+        with (
+            patch("opteryx_catalog.alerts.github.requests.get") as get,
+            patch("opteryx_catalog.alerts.github.requests.post") as post,
+        ):
             get.return_value = _response(200, full_page)
             post.return_value = _response(201, {"number": 13})
             _report()
@@ -209,9 +215,10 @@ def test_listing_pages_through_full_pages():
 def test_hourly_cap_drops_further_creates():
     _setup()
     try:
-        with patch("opteryx_catalog.alerts.github.requests.get") as get, patch(
-            "opteryx_catalog.alerts.github.requests.post"
-        ) as post:
+        with (
+            patch("opteryx_catalog.alerts.github.requests.get") as get,
+            patch("opteryx_catalog.alerts.github.requests.post") as post,
+        ):
             get.return_value = _response(200, [])
             post.return_value = _response(201, {"number": 1})
             for n in range(github_module.MAX_ISSUES_PER_HOUR):
@@ -228,9 +235,11 @@ def test_hourly_cap_drops_further_creates():
 def test_hourly_cap_releases_once_the_window_moves():
     _setup()
     try:
-        with patch("opteryx_catalog.alerts.github.requests.get") as get, patch(
-            "opteryx_catalog.alerts.github.requests.post"
-        ) as post, patch("opteryx_catalog.alerts.github._now") as now:
+        with (
+            patch("opteryx_catalog.alerts.github.requests.get") as get,
+            patch("opteryx_catalog.alerts.github.requests.post") as post,
+            patch("opteryx_catalog.alerts.github._now") as now,
+        ):
             get.return_value = _response(200, [])
             post.return_value = _response(201, {"number": 1})
             now.return_value = 1000.0
@@ -249,9 +258,10 @@ def test_a_failed_create_is_retried_next_occurrence():
     """Being deduped against an issue that was never created silences the failure."""
     _setup(cooloff_seconds=3600)
     try:
-        with patch("opteryx_catalog.alerts.github.requests.get") as get, patch(
-            "opteryx_catalog.alerts.github.requests.post"
-        ) as post:
+        with (
+            patch("opteryx_catalog.alerts.github.requests.get") as get,
+            patch("opteryx_catalog.alerts.github.requests.post") as post,
+        ):
             get.return_value = _response(200, [])
             post.return_value = _response(500, {})
             _report(fingerprint=("retry", "landing.http"))
@@ -267,9 +277,11 @@ def test_a_failed_create_is_retried_next_occurrence():
 def test_429_backs_off_once_then_gives_up():
     _setup()
     try:
-        with patch("opteryx_catalog.alerts.github.requests.get") as get, patch(
-            "opteryx_catalog.alerts.github.requests.post"
-        ) as post, patch("opteryx_catalog.alerts.github._sleep") as sleep:
+        with (
+            patch("opteryx_catalog.alerts.github.requests.get") as get,
+            patch("opteryx_catalog.alerts.github.requests.post") as post,
+            patch("opteryx_catalog.alerts.github._sleep") as sleep,
+        ):
             get.return_value = _response(200, [])
             post.return_value = _response(429, {}, headers={"Retry-After": "3"})
             _report()
@@ -281,8 +293,12 @@ def test_429_backs_off_once_then_gives_up():
 
 
 def test_retry_after_is_clamped():
-    assert github_module._retry_after_seconds(_response(429, headers={"Retry-After": "99999"})) == 60.0
-    assert github_module._retry_after_seconds(_response(429, headers={"Retry-After": "junk"})) == 1.0
+    assert (
+        github_module._retry_after_seconds(_response(429, headers={"Retry-After": "99999"})) == 60.0
+    )
+    assert (
+        github_module._retry_after_seconds(_response(429, headers={"Retry-After": "junk"})) == 1.0
+    )
     assert github_module._retry_after_seconds(_response(429)) == 1.0
 
 

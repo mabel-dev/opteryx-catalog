@@ -7,15 +7,13 @@ sys.path.insert(0, os.path.join(sys.path[0], ".."))
 import io
 
 from opteryx_catalog.catalog.dataset import SimpleDataset
-from opteryx_catalog.catalog.metadata import DatasetMetadata, Snapshot
-
-from opteryx_catalog.catalog.manifest import (
-    get_parsed_manifest,
-    invalidate_parsed_manifest,
-    clear_parsed_manifest_cache,
-    get_manifest_metrics,
-    reset_manifest_metrics,
-)
+from opteryx_catalog.catalog.manifest import clear_parsed_manifest_cache
+from opteryx_catalog.catalog.manifest import get_manifest_metrics
+from opteryx_catalog.catalog.manifest import get_parsed_manifest
+from opteryx_catalog.catalog.manifest import invalidate_parsed_manifest
+from opteryx_catalog.catalog.manifest import reset_manifest_metrics
+from opteryx_catalog.catalog.metadata import DatasetMetadata
+from opteryx_catalog.catalog.metadata import Snapshot
 
 
 class _MemInput:

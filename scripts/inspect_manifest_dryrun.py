@@ -15,10 +15,8 @@ import json
 import sys
 import time
 
-from opteryx_catalog.catalog.manifest import (
-    build_parquet_manifest_entry_from_bytes,
-    read_manifest_rows,
-)
+from opteryx_catalog.catalog.manifest import build_parquet_manifest_entry_from_bytes
+from opteryx_catalog.catalog.manifest import read_manifest_rows
 from opteryx_catalog.opteryx_catalog import OpteryxCatalog
 
 

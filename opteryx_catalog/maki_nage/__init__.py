@@ -5,4 +5,4 @@ from .distogram import load
 from .distogram import merge
 from .distogram import quantile
 
-__all__ = ["Distogram", "load", "merge", "histogram", "quantile"]
+__all__ = ["Distogram", "histogram", "load", "merge", "quantile"]

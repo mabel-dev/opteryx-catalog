@@ -30,7 +30,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import sys
 import time
 
 
@@ -63,9 +62,9 @@ def _sketch_missing(entry: dict) -> bool:
 
 
 def rewrite_one_file(io, file_path: str, dry_run: bool) -> dict:
+    from draken.morsels.morsel import Morsel
     from rugo.parquet import read_parquet
     from rugo.parquet import write_parquet
-    from draken.morsels.morsel import Morsel
 
     from opteryx_catalog.iops.fileio import WRITE_PARQUET_OPTIONS
 
@@ -78,7 +77,9 @@ def rewrite_one_file(io, file_path: str, dry_run: bool) -> dict:
         row_group_morsels = list(reader)
     if not row_group_morsels:
         raise RuntimeError(f"{file_path}: rugo read back zero row groups")
-    morsel = Morsel.combine(row_group_morsels) if len(row_group_morsels) > 1 else row_group_morsels[0]
+    morsel = (
+        Morsel.combine(row_group_morsels) if len(row_group_morsels) > 1 else row_group_morsels[0]
+    )
     orig_rows = morsel.num_rows
 
     new_bytes = write_parquet(morsel, **WRITE_PARQUET_OPTIONS)
@@ -180,23 +181,53 @@ def cmd_refresh_manifest(args) -> None:
 
     new_snapshot_id = ds.refresh_manifest(agent="rewrite_dataset_files_rugo.py")
     if new_snapshot_id is None:
-        raise RuntimeError(f"{identifier}: refresh_manifest returned None (no manifest to refresh?)")
+        raise RuntimeError(
+            f"{identifier}: refresh_manifest returned None (no manifest to refresh?)"
+        )
     print(f"{identifier}: committed statistics-refresh snapshot {new_snapshot_id}")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument("--collection", required=True, help="e.g. public")
-    parser.add_argument("--dataset", required=True, help="e.g. github.events (or 'events' with --collection public)")
+    parser.add_argument(
+        "--dataset", required=True, help="e.g. github.events (or 'events' with --collection public)"
+    )
     parser.add_argument("--env-file", default="/Users/justin/Nextcloud/opteryx-core/.env")
     mode = parser.add_mutually_exclusive_group(required=True)
-    mode.add_argument("--dry-run", action="store_true", help="rewrite in memory + verify, do not upload")
-    mode.add_argument("--execute", action="store_true", help="rewrite and overwrite the live objects in place")
-    mode.add_argument("--refresh-manifest", action="store_true", help="rebuild manifest stats for every file, commit new snapshot")
-    parser.add_argument("--limit", type=int, default=None, help="only process the first N files (sorted by file_path)")
-    parser.add_argument("--offset", type=int, default=0, help="skip the first N files (sorted by file_path)")
-    parser.add_argument("--report-every", type=int, default=None, help="print a cumulative storage-savings summary every N files")
-    parser.add_argument("--only-missing-stats", action="store_true", help="restrict to files whose NDV/histogram sketches are empty")
+    mode.add_argument(
+        "--dry-run", action="store_true", help="rewrite in memory + verify, do not upload"
+    )
+    mode.add_argument(
+        "--execute", action="store_true", help="rewrite and overwrite the live objects in place"
+    )
+    mode.add_argument(
+        "--refresh-manifest",
+        action="store_true",
+        help="rebuild manifest stats for every file, commit new snapshot",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="only process the first N files (sorted by file_path)",
+    )
+    parser.add_argument(
+        "--offset", type=int, default=0, help="skip the first N files (sorted by file_path)"
+    )
+    parser.add_argument(
+        "--report-every",
+        type=int,
+        default=None,
+        help="print a cumulative storage-savings summary every N files",
+    )
+    parser.add_argument(
+        "--only-missing-stats",
+        action="store_true",
+        help="restrict to files whose NDV/histogram sketches are empty",
+    )
     args = parser.parse_args()
 
     _load_env(args.env_file)

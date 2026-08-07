@@ -25,6 +25,7 @@ def _morsel(columns: dict) -> Morsel:
         m.append_vector(name, vector_from_sequence(values, dtype=dtype))
     return m
 
+
 sys.path.insert(0, os.path.join(sys.path[0], ".."))  # Add parent dir for opteryx_catalog
 sys.path.insert(1, os.path.join(sys.path[0], "../opteryx-core"))
 

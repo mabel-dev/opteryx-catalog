@@ -149,7 +149,9 @@ class _Config:
             _env("OPTERYX_ALERTS_API_URL", "PLATFORM_ISSUES_API_URL") or "https://api.github.com"
         ).rstrip("/")
         try:
-            hours = float(_env("OPTERYX_ALERTS_COOLOFF_HOURS", "PLATFORM_ISSUES_COOLOFF_HOURS") or 24)
+            hours = float(
+                _env("OPTERYX_ALERTS_COOLOFF_HOURS", "PLATFORM_ISSUES_COOLOFF_HOURS") or 24
+            )
         except ValueError:
             hours = 24.0
         self.cooloff_seconds = max(hours, 0.0) * 3600
@@ -163,8 +165,10 @@ class _Config:
         )
         self.discord_mention = _env("OPTERYX_ALERTS_DISCORD_MENTION", "") or ""
         self.discord_min_severity = (
-            _env("OPTERYX_ALERTS_DISCORD_MIN_SEVERITY", "") or AlertSeverity.CRITICAL
-        ).strip().upper()
+            (_env("OPTERYX_ALERTS_DISCORD_MIN_SEVERITY", "") or AlertSeverity.CRITICAL)
+            .strip()
+            .upper()
+        )
         self.sink = (_env("OPTERYX_ALERTS_SINK", "") or "stdout").strip().lower()
         self.sinks = self._build_sinks()
 
@@ -190,9 +194,7 @@ class _Config:
         if "github" in selected:
             if self.repo:
                 sinks.append(
-                    GitHubSink(
-                        repo=self.repo, api_url=self.api_url, token_secret=self.token_secret
-                    )
+                    GitHubSink(repo=self.repo, api_url=self.api_url, token_secret=self.token_secret)
                 )
             else:
                 logger.warning("alerts: github sink selected but no repo configured")

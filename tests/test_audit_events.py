@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
-
 from unittest.mock import patch
 
 from opteryx_catalog.audit import AUDIT_SEVERITY
@@ -41,8 +40,15 @@ def test_severity_is_not_a_real_cloud_logging_level():
     """If AUDIT ever became a valid severity, GCP would strip it from the
     payload and the downstream filter would silently match nothing."""
     cloud_logging_severities = {
-        "DEFAULT", "DEBUG", "INFO", "NOTICE",
-        "WARNING", "ERROR", "CRITICAL", "ALERT", "EMERGENCY",
+        "DEFAULT",
+        "DEBUG",
+        "INFO",
+        "NOTICE",
+        "WARNING",
+        "ERROR",
+        "CRITICAL",
+        "ALERT",
+        "EMERGENCY",
     }
     assert AUDIT_SEVERITY not in cloud_logging_severities
 
@@ -91,6 +97,7 @@ def test_avoids_cloud_logging_reserved_timestamp_keys(capsys):
 
 def test_non_serialisable_detail_does_not_break_the_caller(capsys):
     """An audit record must never turn a completed write into an exception."""
+
     class Odd:
         def __repr__(self):
             return "<odd>"

@@ -185,13 +185,13 @@ def inspect_dataset(catalog, identifier: str):
     if len(snapshots) > len(snapshots_to_keep):
         to_delete = [s for s in snapshots if s not in snapshots_to_keep]
 
-        print("\n❌ Snapshots to delete ({}):\n".format(len(to_delete)))
+        print(f"\n❌ Snapshots to delete ({len(to_delete)}):\n")
         for i, snap in enumerate(to_delete):
             print(f"  {i + 1}. ID {snap.snapshot_id} (timestamp: {snap.timestamp_ms})")
             if snap.manifest_list:
                 print(f"     Manifest: {snap.manifest_list}")
 
-        print("\n✓ Snapshots to keep ({}):\n".format(len(snapshots_to_keep)))
+        print(f"\n✓ Snapshots to keep ({len(snapshots_to_keep)}):\n")
         for i, snap in enumerate(snapshots_to_keep):
             print(f"  {i + 1}. ID {snap.snapshot_id} (timestamp: {snap.timestamp_ms})")
             if snap.manifest_list:

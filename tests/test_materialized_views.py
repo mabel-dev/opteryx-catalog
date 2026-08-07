@@ -9,15 +9,16 @@ cascade rules in drop/rename.
 
 from __future__ import annotations
 
-import pytest
 from unittest.mock import patch
+
+import pytest
 
 from opteryx_catalog.exceptions import DatasetNotFound
 from opteryx_catalog.exceptions import MaterializedViewError
 from opteryx_catalog.exceptions import TriggerNotFound
 from opteryx_catalog.opteryx_catalog import MATERIALIZED_VIEW_TYPE
-from opteryx_catalog.opteryx_catalog import OpteryxCatalog
 from opteryx_catalog.opteryx_catalog import TRIGGERS_SUBCOLLECTION
+from opteryx_catalog.opteryx_catalog import OpteryxCatalog
 
 
 class _Doc:
@@ -208,18 +209,13 @@ def test_create_mv_registers_and_creates_triggers():
     doc = mv_ref.get().to_dict()
     assert doc["dataset-type"] == MATERIALIZED_VIEW_TYPE
     assert doc["source-tables"] == ["src.a", "src.b"]
-    statement = (
-        mv_ref.collection("statement").document(doc["statement-id"]).get().to_dict()
-    )
+    statement = mv_ref.collection("statement").document(doc["statement-id"]).get().to_dict()
     assert statement["sql"].startswith("SELECT")
     assert statement["sequence-number"] == 1
 
     for src in (src_a, src_b):
         trigger = (
-            src.collection(TRIGGERS_SUBCOLLECTION)
-            .document("refresh__mart__daily")
-            .get()
-            .to_dict()
+            src.collection(TRIGGERS_SUBCOLLECTION).document("refresh__mart__daily").get().to_dict()
         )
         assert trigger["target-view"] == "mart.daily"
         assert trigger["statement-id"] == doc["statement-id"]
@@ -229,18 +225,14 @@ def test_create_mv_requires_backing_table():
     catalog = _catalog()
     _add_dataset(catalog, "src.a")
     with pytest.raises(DatasetNotFound):
-        catalog.create_materialized_view(
-            "mart.missing", "SELECT 1", ["src.a"], author="alice"
-        )
+        catalog.create_materialized_view("mart.missing", "SELECT 1", ["src.a"], author="alice")
 
 
 def test_create_mv_requires_sources_exist():
     catalog = _catalog()
     _add_dataset(catalog, "mart.daily")
     with pytest.raises(DatasetNotFound):
-        catalog.create_materialized_view(
-            "mart.daily", "SELECT 1", ["src.missing"], author="alice"
-        )
+        catalog.create_materialized_view("mart.daily", "SELECT 1", ["src.missing"], author="alice")
 
 
 def test_create_mv_rejects_empty_and_self_sources():
@@ -249,9 +241,7 @@ def test_create_mv_rejects_empty_and_self_sources():
     with pytest.raises(MaterializedViewError):
         catalog.create_materialized_view("mart.daily", "SELECT 1", [], author="alice")
     with pytest.raises(MaterializedViewError):
-        catalog.create_materialized_view(
-            "mart.daily", "SELECT 1", ["mart.daily"], author="alice"
-        )
+        catalog.create_materialized_view("mart.daily", "SELECT 1", ["mart.daily"], author="alice")
 
 
 def test_create_mv_twice_needs_update_if_exists():
@@ -268,9 +258,7 @@ def test_update_mv_reconciles_triggers_and_bumps_sequence():
     src_b = _add_dataset(catalog, "src.b")
     mv_ref = _add_dataset(catalog, "mart.daily")
 
-    catalog.create_materialized_view(
-        "mart.daily", "SELECT * FROM src.a", ["src.a"], author="alice"
-    )
+    catalog.create_materialized_view("mart.daily", "SELECT * FROM src.a", ["src.a"], author="alice")
     catalog.create_materialized_view(
         "mart.daily",
         "SELECT * FROM src.b",
@@ -284,9 +272,7 @@ def test_update_mv_reconciles_triggers_and_bumps_sequence():
     assert src_b.collection(TRIGGERS_SUBCOLLECTION).document(trigger_name).get().exists
 
     doc = mv_ref.get().to_dict()
-    statement = (
-        mv_ref.collection("statement").document(doc["statement-id"]).get().to_dict()
-    )
+    statement = mv_ref.collection("statement").document(doc["statement-id"]).get().to_dict()
     assert statement["sequence-number"] == 2
 
 

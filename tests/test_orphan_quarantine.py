@@ -100,9 +100,7 @@ def test_exonerated_file_starts_from_zero_when_flagged_again():
 
     # A year later, another transient failure flags the same live file.
     later = 400 * DAY_MS
-    reflagged = review_candidates(
-        cleared.held, {"live.parquet"}, now_ms=later, min_age_ms=DAY_MS
-    )
+    reflagged = review_candidates(cleared.held, {"live.parquet"}, now_ms=later, min_age_ms=DAY_MS)
 
     assert reflagged.to_delete == set()
     assert reflagged.held == {"live.parquet": later}

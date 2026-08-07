@@ -20,14 +20,14 @@ from .opteryx_catalog import OpteryxCatalog
 from .resource_types import ResourceType
 
 __all__ = [
+    "DataFile",
+    "Dataset",
+    "DatasetMetadata",
+    "ManifestEntry",
+    "Metastore",
     "OpteryxCatalog",
     "ResourceType",
-    "Metastore",
-    "Dataset",
-    "View",
     "SimpleDataset",
-    "DatasetMetadata",
     "Snapshot",
-    "DataFile",
-    "ManifestEntry",
+    "View",
 ]

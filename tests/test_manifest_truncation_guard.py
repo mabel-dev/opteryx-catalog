@@ -19,8 +19,10 @@ sys.path.insert(0, os.path.join(sys.path[0], ".."))
 
 from opteryx_catalog.catalog.dataset import SimpleDataset
 from opteryx_catalog.catalog.expiration import SnapshotExpiration
-from opteryx_catalog.catalog.metadata import DatasetMetadata, Snapshot
-from opteryx_catalog.exceptions import ManifestProtectionError, ManifestReadError
+from opteryx_catalog.catalog.metadata import DatasetMetadata
+from opteryx_catalog.catalog.metadata import Snapshot
+from opteryx_catalog.exceptions import ManifestProtectionError
+from opteryx_catalog.exceptions import ManifestReadError
 
 
 def _build_manifest_bytes(file_path="f1.parquet", record_count=10, file_size=100):

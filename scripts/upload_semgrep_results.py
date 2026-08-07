@@ -20,8 +20,8 @@ Depends on the `rugo` and `opteryx-upload` packages (PyPI).
 import json
 import os
 import sys
+from datetime import UTC
 from datetime import datetime
-from datetime import timezone
 
 from opteryx_upload import ConflictResolution
 from opteryx_upload import PATAuthenticator
@@ -33,7 +33,9 @@ from rugo.parquet import write_parquet
 UPLOAD_TARGET = Target(workspace="opteryx", collection="ops", dataset="sast_findings")
 
 
-def flatten_report(report: dict, *, scan_time: str, repo: str, commit_sha: str, ref: str) -> list[dict]:
+def flatten_report(
+    report: dict, *, scan_time: str, repo: str, commit_sha: str, ref: str
+) -> list[dict]:
     rows = []
     for result in report.get("results", []) or []:
         extra = result.get("extra", {}) or {}
@@ -68,7 +70,7 @@ def main() -> int:
     with open(report_path, "r", encoding="utf-8") as fh:
         report = json.load(fh)
 
-    scan_time = datetime.now(tz=timezone.utc).isoformat()
+    scan_time = datetime.now(tz=UTC).isoformat()
     rows = flatten_report(
         report,
         scan_time=scan_time,
@@ -83,8 +85,7 @@ def main() -> int:
 
     ndjson_path = "semgrep_findings.ndjson"
     with open(ndjson_path, "w", encoding="utf-8") as fh:
-        for row in rows:
-            fh.write(json.dumps(row) + "\n")
+        fh.writelines(json.dumps(row) + "\n" for row in rows)
 
     parquet_path = "semgrep_findings.parquet"
     with read_jsonl(ndjson_path) as reader:

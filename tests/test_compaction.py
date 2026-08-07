@@ -3,6 +3,7 @@ Test script for compaction functionality.
 
 This tests the DatasetCompactor class with both brute and performance strategies.
 """
+
 import os
 import sys
 
@@ -12,15 +13,14 @@ sys.path.insert(1, os.path.join(sys.path[0], "../opteryx-catalog"))
 
 from unittest.mock import Mock
 
-from opteryx_catalog.catalog.compaction import (
-    MIN_FILE_SIZE_BYTES,
-    MIN_SIZE_BYTES,
-    SMALL_FILE_BYTES,
-    SORT_AWARE_FLOOR_BYTES,
-    TARGET_SIZE_BYTES,
-    DatasetCompactor,
-)
-from opteryx_catalog.catalog.metadata import DatasetMetadata, Snapshot
+from opteryx_catalog.catalog.compaction import MIN_FILE_SIZE_BYTES
+from opteryx_catalog.catalog.compaction import MIN_SIZE_BYTES
+from opteryx_catalog.catalog.compaction import SMALL_FILE_BYTES
+from opteryx_catalog.catalog.compaction import SORT_AWARE_FLOOR_BYTES
+from opteryx_catalog.catalog.compaction import TARGET_SIZE_BYTES
+from opteryx_catalog.catalog.compaction import DatasetCompactor
+from opteryx_catalog.catalog.metadata import DatasetMetadata
+from opteryx_catalog.catalog.metadata import Snapshot
 
 _MB = 1024 * 1024
 
@@ -178,7 +178,8 @@ def _perf_dataset(*, schema_via_method=True, field_id=1):
     ``dataset.schema()`` (metadata.schema attribute is None) — the real
     freshly-loaded-dataset case.
     """
-    from opteryx_catalog.catalog.dataset import RelationSchema, SchemaColumn
+    from opteryx_catalog.catalog.dataset import RelationSchema
+    from opteryx_catalog.catalog.dataset import SchemaColumn
 
     dataset = Mock()
     dataset.metadata = DatasetMetadata(
@@ -331,7 +332,10 @@ def test_normalize_sort_order_positional_int():
     from opteryx_catalog.catalog.compaction import normalize_sort_order
 
     assert normalize_sort_order([0]) == {
-        "name": None, "field_id": None, "index": 0, "ascending": True,
+        "name": None,
+        "field_id": None,
+        "index": 0,
+        "ascending": True,
     }
     assert normalize_sort_order([7])["index"] == 7
 
@@ -341,14 +345,10 @@ def test_normalize_sort_order_iceberg_dict():
     previously crashed compact() with an uncaught ``dict >= int`` TypeError."""
     from opteryx_catalog.catalog.compaction import normalize_sort_order
 
-    got = normalize_sort_order(
-        [{"order-id": 1, "fields": [{"name": "id", "direction": "asc"}]}]
-    )
+    got = normalize_sort_order([{"order-id": 1, "fields": [{"name": "id", "direction": "asc"}]}])
     assert got == {"name": "id", "field_id": None, "index": None, "ascending": True}
 
-    desc = normalize_sort_order(
-        [{"order-id": 1, "fields": [{"name": "ts", "direction": "desc"}]}]
-    )
+    desc = normalize_sort_order([{"order-id": 1, "fields": [{"name": "ts", "direction": "desc"}]}])
     assert desc["name"] == "ts" and desc["ascending"] is False
 
 
@@ -358,11 +358,14 @@ def test_normalize_sort_order_edge_shapes():
 
     assert normalize_sort_order([]) is None
     assert normalize_sort_order(None) is None
-    assert normalize_sort_order([{}]) is None            # empty dict, no field
-    assert normalize_sort_order([True]) is None          # bool is not a column index
+    assert normalize_sort_order([{}]) is None  # empty dict, no field
+    assert normalize_sort_order([True]) is None  # bool is not a column index
     # source-id (field id) form
     assert normalize_sort_order([{"fields": [{"source-id": 42}]}]) == {
-        "name": None, "field_id": 42, "index": None, "ascending": True,
+        "name": None,
+        "field_id": 42,
+        "index": None,
+        "ascending": True,
     }
     # bare column name
     assert normalize_sort_order(["ts"])["name"] == "ts"
@@ -397,7 +400,7 @@ def test_overlapping_large_files_decluster():
     compactor = DatasetCompactor(_perf_dataset(), strategy="performance", author="t", agent="t")
     entries = [
         _entry("/tmp/A.parquet", 0, 100, _BIG_MB),
-        _entry("/tmp/B.parquet", 50, 200, _BIG_MB),   # overlaps A -> declustered
+        _entry("/tmp/B.parquet", 50, 200, _BIG_MB),  # overlaps A -> declustered
         _entry("/tmp/C.parquet", 300, 400, _BIG_MB),  # disjoint from A/B
     ]
     plan = compactor._select_sort_aware_merge(entries, rng=_FixedChoice("/tmp/A.parquet"))
@@ -416,10 +419,8 @@ def test_overlapping_target_sized_files_decluster():
     (target-sized) files combine to ~8 GB and decluster into two disjoint files.
     This is well above the hold-everything RAM gate - streaming makes it work, so
     selection must NOT refuse it."""
-    from opteryx_catalog.catalog.compaction import (
-        DECLUSTER_MAX_COMBINED_BYTES,
-        MAX_SELECTED_BUDGET_BYTES,
-    )
+    from opteryx_catalog.catalog.compaction import DECLUSTER_MAX_COMBINED_BYTES
+    from opteryx_catalog.catalog.compaction import MAX_SELECTED_BUDGET_BYTES
 
     compactor = DatasetCompactor(_perf_dataset(), strategy="performance", author="t", agent="t")
     target_mb = TARGET_SIZE_BYTES // _MB  # ~4 GB each
@@ -513,7 +514,9 @@ def test_zero_width_seed_stops_immediately():
     compactor = DatasetCompactor(_perf_dataset(), strategy="performance", author="t", agent="t")
     mb = 4096
     pure = _entry("/tmp/pure.parquet", 100, 100, mb)
-    wide = _entry("/tmp/wide.parquet", 100, 300, mb)  # genuinely overlaps `pure`, per the test above
+    wide = _entry(
+        "/tmp/wide.parquet", 100, 300, mb
+    )  # genuinely overlaps `pure`, per the test above
     file_ranges = compactor._build_file_ranges([pure, wide], sort_field_id=1, sort_index=0)
 
     plan = compactor._select_overlap_decluster(
@@ -671,7 +674,7 @@ def test_subfloor_and_decluster_are_independent():
     compactor = DatasetCompactor(_perf_dataset(), strategy="performance", author="t", agent="t")
     entries = [
         _entry("/tmp/big1.parquet", 0, 100, _BIG_MB),
-        _entry("/tmp/big2.parquet", 50, 200, _BIG_MB),   # overlaps big1
+        _entry("/tmp/big2.parquet", 50, 200, _BIG_MB),  # overlaps big1
         _entry("/tmp/s1.parquet", 0, 1, _SMALL_MB),
         _entry("/tmp/s2.parquet", 5, 6, _SMALL_MB),
     ]
@@ -680,14 +683,16 @@ def test_subfloor_and_decluster_are_independent():
     assert brute_plan is not None
     assert brute_plan["mode"] == "brute"
     assert {f["file_path"] for f in brute_plan["files"]} == {
-        "/tmp/s1.parquet", "/tmp/s2.parquet",
+        "/tmp/s1.parquet",
+        "/tmp/s2.parquet",
     }
 
     sort_aware_plan = compactor._select_sort_aware_merge(entries)
     assert sort_aware_plan is not None, "the big overlap is not starved by rule A"
     assert sort_aware_plan["reason"] == "overlap-decluster"
     assert {f["file_path"] for f in sort_aware_plan["files"]} == {
-        "/tmp/big1.parquet", "/tmp/big2.parquet",
+        "/tmp/big1.parquet",
+        "/tmp/big2.parquet",
     }
 
 
@@ -712,7 +717,10 @@ def test_overlap_band_reachable_by_both_pools():
 
     sort_aware_plan = compactor._select_sort_aware_merge(entries)
     assert sort_aware_plan is not None, "over 500MB -> ALSO visible to rule B"
-    assert {f["file_path"] for f in sort_aware_plan["files"]} == {"/tmp/A.parquet", "/tmp/B.parquet"}
+    assert {f["file_path"] for f in sort_aware_plan["files"]} == {
+        "/tmp/A.parquet",
+        "/tmp/B.parquet",
+    }
 
 
 def test_subfloor_brute_bin_packs_to_target():
@@ -738,7 +746,7 @@ def test_tiny_files_brute_merge_immediately():
     problem. Rule 2 says brute (no sort)."""
     compactor = DatasetCompactor(_perf_dataset(), strategy="performance", author="t", agent="t")
     entries = [
-        _entry("/tmp/A.parquet", 0, 1, 1),      # 1MB
+        _entry("/tmp/A.parquet", 0, 1, 1),  # 1MB
         _entry("/tmp/B.parquet", 500, 501, 1),  # 1MB
         _entry("/tmp/C.parquet", 1000, 1001, 1),
     ]
@@ -818,7 +826,7 @@ def test_split_into_k_disjoint_and_complete():
     ranges = [(p.column("k").min(), p.column("k").max()) for p in parts]
     for i in range(len(ranges) - 1):
         # sorted-slice boundaries: each slice's max <= next slice's min
-        assert ranges[i][1] <= ranges[i + 1][0], f"overlap between {ranges[i]} and {ranges[i+1]}"
+        assert ranges[i][1] <= ranges[i + 1][0], f"overlap between {ranges[i]} and {ranges[i + 1]}"
 
     # k=1 is a no-op; k > rows stays bounded by row count and preserves all rows
     assert len(compactor._split_into_k(m, 1)) == 1
@@ -1053,9 +1061,12 @@ def test_commit_refused_when_another_writer_committed_first():
     # Unchanged dataset: the same pass commits normally.
     fresh.metadata.current_snapshot_id = 1000
     dataset.io.delete.reset_mock()
-    assert compactor._finalize_compaction_snapshot(
-        list(inputs), inputs, outputs, 1235, 200, 0, "native"
-    ) is not None
+    assert (
+        compactor._finalize_compaction_snapshot(
+            list(inputs), inputs, outputs, 1235, 200, 0, "native"
+        )
+        is not None
+    )
     dataset.io.delete.assert_not_called()
 
 

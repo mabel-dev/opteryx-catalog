@@ -94,26 +94,28 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-@app.route('/event', methods=['POST'])
+
+@app.route("/event", methods=["POST"])
 def handle_webhook():
     payload = request.json
-    
-    action = payload['event']['action']
-    resource_type = payload['event']['resource_type']
-    resource_name = payload['event']['resource_name']
-    workspace = payload['event']['workspace']
-    collection = payload['event']['collection']
-    
+
+    action = payload["event"]["action"]
+    resource_type = payload["event"]["resource_type"]
+    resource_name = payload["event"]["resource_name"]
+    workspace = payload["event"]["workspace"]
+    collection = payload["event"]["collection"]
+
     print(f"Received {action} event for {resource_type} {resource_name}")
     print(f"Workspace: {workspace}, Collection: {collection}")
     print(f"Timestamp: {payload['event']['timestamp']}")
     print(f"Data: {payload['data']}")
-    
+
     # Process the event
     # ...
-    
+
     return jsonify({"status": "ok"}), 200
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8080)
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080)
 ```

@@ -29,10 +29,9 @@ from __future__ import annotations
 import json
 import os
 import sys
+from datetime import UTC
 from datetime import datetime
-from datetime import timezone
 from typing import Any
-from typing import Optional
 
 # Discriminator the ingestion pipeline matches on. See the module docstring
 # before changing it - both sides of the pipeline key off this exact string.
@@ -56,7 +55,7 @@ EVENT_TIME_KEY = "event_time"
 
 def _now_iso() -> str:
     """Current UTC instant, e.g. 2026-07-27T15:40:02.583478+00:00."""
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _relocate_reserved(payload: dict) -> dict:
@@ -100,10 +99,10 @@ def emit_audit(
     action: str,
     *,
     resource_type: str,
-    workspace: Optional[str],
-    resource: Optional[str] = None,
-    collection: Optional[str] = None,
-    author: Optional[str] = None,
+    workspace: str | None,
+    resource: str | None = None,
+    collection: str | None = None,
+    author: str | None = None,
     **detail: Any,
 ) -> None:
     """Record one catalog mutation.

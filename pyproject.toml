@@ -29,7 +29,16 @@ dependencies = [
     "google-cloud-firestore==2.*",
     "google-cloud-storage==3.*",
     "requests==2.*",
-    "rugo>=0.4.21"
+    # Hard pin. rugo's compiled extension links draken's C ABI but declares no
+    # dependency on it, and its per-cpXX wheels are not all built against the
+    # same draken -- so the working pairing varies by Python version. Observed
+    # against the published draken 0.4.2:
+    #   0.4.26  ImportError "undefined symbol: draken_vector_own_string" (CI, 3.14)
+    #   0.4.22  ValueError "Vector size changed (40 vs 32)" (3.11-3.13)
+    # 0.4.21 is what the known-good development environment runs. This pin is a
+    # workaround: the durable fix is for rugo to declare its draken version and
+    # build every wheel against it. Re-test the full matrix before moving it.
+    "rugo==0.4.21"
 ]
 
 [project.optional-dependencies]
@@ -73,5 +82,10 @@ target-version = 'py313'
 [tool.ruff.format]
 docstring-code-format = true
 docstring-code-line-length = 100
+
+# Mirrors [tool.isort] above. ruff's I001 fix does not read isort's config, so
+# without this ruff and `make lint` re-sort the same imports against each other.
+[tool.ruff.lint.isort]
+force-single-line = true
 [tool.pylint.logging]
 logging-format-style = "new"

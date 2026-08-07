@@ -57,8 +57,12 @@ def _sweep_for(catalog):
 
 def test_reclaims_files_and_clears_tombstone():
     """An aged tombstone has its whole prefix deleted, then is cleared."""
-    files = {"gs://bucket/ws/coll/tbl": ["gs://bucket/ws/coll/tbl/a.parquet",
-                                         "gs://bucket/ws/coll/tbl/metadata/m.parquet"]}
+    files = {
+        "gs://bucket/ws/coll/tbl": [
+            "gs://bucket/ws/coll/tbl/a.parquet",
+            "gs://bucket/ws/coll/tbl/metadata/m.parquet",
+        ]
+    }
     catalog = _FakeCatalog([_tombstone()], files)
 
     result = _sweep_for(catalog).sweep(dry_run=False)

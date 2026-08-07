@@ -7,8 +7,7 @@ import logging
 import os
 import urllib.parse
 from collections import OrderedDict
-from typing import Callable
-from typing import Union
+from collections.abc import Callable
 
 import requests
 from google.auth.transport.requests import Request
@@ -41,8 +40,7 @@ class _GcsInputStream(io.BytesIO):
         self, path: str, session: requests.Session, access_token_getter: Callable[[], str]
     ):
         # Strip gs://
-        if path.startswith("gs://"):
-            path = path[5:]
+        path = path.removeprefix("gs://")
         bucket = path.split("/", 1)[0]
         object_full_path = urllib.parse.quote(path[(len(bucket) + 1) :], safe="")
         url = f"https://storage.googleapis.com/{bucket}/{object_full_path}"
@@ -81,8 +79,7 @@ class _GcsOutputStream(io.BytesIO):
             return
 
         path = self._path
-        if path.startswith("gs://"):
-            path = path[5:]
+        path = path.removeprefix("gs://")
 
         bucket = path.split("/", 1)[0]
         url = f"https://storage.googleapis.com/upload/storage/v1/b/{bucket}/o"
@@ -107,7 +104,7 @@ class _GcsOutputStream(io.BytesIO):
         )
 
         if response.status_code not in (200, 201):
-            raise IOError(
+            raise OSError(
                 f"Failed to write '{self._path}' - status {response.status_code}: {response.text}"
             )
 
@@ -214,7 +211,7 @@ class GcsFileIO(FileIO):
 
         return _GcsOutputFile(location, self._session, self.get_access_token)
 
-    def delete(self, location: Union[str, InputFile, OutputFile]) -> None:
+    def delete(self, location: str | InputFile | OutputFile) -> None:
         if isinstance(location, (InputFile, OutputFile)):
             location = location.location
 
@@ -222,8 +219,7 @@ class GcsFileIO(FileIO):
         self._read_cache.pop(location, None)
 
         path = location
-        if path.startswith("gs://"):
-            path = path[5:]
+        path = path.removeprefix("gs://")
 
         bucket = path.split("/", 1)[0]
         object_full_path = urllib.parse.quote(path[(len(bucket) + 1) :], safe="")
@@ -236,12 +232,11 @@ class GcsFileIO(FileIO):
         response = self._session.delete(url, headers=headers, timeout=10)
 
         if response.status_code not in (204, 404):
-            raise IOError(f"Failed to delete '{location}' - status {response.status_code}")
+            raise OSError(f"Failed to delete '{location}' - status {response.status_code}")
 
     def exists(self, location: str) -> bool:
         path = location
-        if path.startswith("gs://"):
-            path = path[5:]
+        path = path.removeprefix("gs://")
 
         bucket = path.split("/", 1)[0]
         object_full_path = urllib.parse.quote(path[(len(bucket) + 1) :], safe="")

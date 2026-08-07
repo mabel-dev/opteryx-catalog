@@ -38,12 +38,10 @@ import re
 import secrets
 import string
 import time
+from datetime import UTC
 from datetime import datetime
 from datetime import timedelta
-from datetime import timezone
 from typing import Any
-from typing import List
-from typing import Optional
 
 from .alerts import report as _alert
 from .audit import write_audit_record
@@ -73,7 +71,7 @@ def firing_enabled() -> bool:
     return value not in ("0", "false", "no", "off")
 
 
-def _project_id(catalog) -> Optional[str]:
+def _project_id(catalog) -> str | None:
     """The GCP project for the jobs collection and task queue.
 
     Env wins (the deployed convention, same names jobs.opteryx reads);
@@ -103,21 +101,21 @@ def _jobs_client(catalog):
     return firestore.Client(**kwargs)
 
 
-def _make_job_id(now: Optional[datetime] = None) -> str:
+def _make_job_id(now: datetime | None = None) -> str:
     """Job id of the form YYYYMMDDHHMMSS-{16 lowercase alphanums}.
 
     Same shape `jobs.opteryx._make_job_id` mints, so refresh jobs are
     indistinguishable infrastructure-wise from user submissions.
     """
     if now is None:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
     prefix = now.strftime("%Y%m%d%H%M%S")
     chars = string.ascii_lowercase + string.digits
     rand = "".join(secrets.choice(chars) for _ in range(16))
     return f"{prefix}-{rand}"
 
 
-def _policies_for(catalog, principal: Optional[str]) -> Optional[List[dict]]:
+def _policies_for(catalog, principal: str | None) -> list[dict] | None:
     """The principal's current access policies, in job-document shape.
 
     Read from `{workspace}/$policies/access` - policy.opteryx's storage,
@@ -145,7 +143,7 @@ def _policies_for(catalog, principal: Optional[str]) -> Optional[List[dict]]:
     return policies or None
 
 
-def _task_id(workspace: str, trigger_name: str, now_s: Optional[float] = None) -> str:
+def _task_id(workspace: str, trigger_name: str, now_s: float | None = None) -> str:
     """Deterministic per-window task id - the dedup key.
 
     Two commits inside the same window produce the same id; Cloud Tasks
@@ -174,9 +172,7 @@ def _enqueue_refresh_task(catalog, execution_id: str, task_id: str) -> str:
     project = _project_id(catalog)
     location = os.environ.get("TASKS_LOCATION", "us-east1")
     queue = os.environ.get("TASKS_QUEUE", "worker-dispatch")
-    target_url = os.environ.get(
-        "TASKS_TARGET_URL", "https://worker.opteryx.app/api/v1/submit"
-    )
+    target_url = os.environ.get("TASKS_TARGET_URL", "https://worker.opteryx.app/api/v1/submit")
 
     client = tasks_v2.CloudTasksClient()
     parent = client.queue_path(project, location, queue)
@@ -208,17 +204,17 @@ def _write_refresh_job(
     catalog,
     execution_id: str,
     sql_text: str,
-    author: Optional[str],
-    policies: Optional[List[dict]],
+    author: str | None,
+    policies: list[dict] | None,
     source_dataset: str,
     trigger_name: str,
     target_view: str,
-    snapshot_id: Optional[Any],
+    snapshot_id: Any | None,
 ) -> None:
     """Write the jobs/{execution_id} document the worker will execute from."""
     from google.cloud import firestore
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     job_doc = {
         "execution_id": execution_id,
         "sql_text": sql_text,
@@ -260,16 +256,14 @@ def _fire_refresh(
     catalog,
     dataset_identifier: str,
     trigger: dict,
-    author: Optional[str],
-    snapshot_id: Optional[Any],
+    author: str | None,
+    snapshot_id: Any | None,
 ) -> None:
     target_view = trigger["target-view"]
     mv = catalog.get_materialized_view(target_view)
     sql = mv.get("sql")
     if not sql:
-        raise MaterializedViewError(
-            f"materialized view has no defining SQL: {target_view}"
-        )
+        raise MaterializedViewError(f"materialized view has no defining SQL: {target_view}")
 
     qualified_target = f"{catalog.workspace}.{mv['collection']}.{mv['name']}"
     sql_text = f"CREATE OR REPLACE TABLE {qualified_target} AS\n{sql}"
@@ -308,8 +302,8 @@ def _fire_refresh(
 def fire_triggers(
     catalog,
     dataset_identifier: str,
-    author: Optional[str],
-    snapshot_id: Optional[Any] = None,
+    author: str | None,
+    snapshot_id: Any | None = None,
 ) -> None:
     """Fire every refresh trigger on a dataset that just took a user commit.
 

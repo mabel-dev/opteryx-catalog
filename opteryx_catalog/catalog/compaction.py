@@ -45,11 +45,11 @@ import random
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from typing import List, Optional
 
 from ..alerts import report as _alert
 from ..exceptions import CompactionInvariantError
-from .manifest import ParquetManifestEntry, build_parquet_manifest_entry_from_bytes
+from .manifest import ParquetManifestEntry
+from .manifest import build_parquet_manifest_entry_from_bytes
 from .metadata import Snapshot
 
 logger = logging.getLogger(__name__)
@@ -90,7 +90,7 @@ def entry_size(entry) -> int:
     return int(entry.get("uncompressed_size_in_bytes") or 0)
 
 
-def normalize_sort_order(sort_orders) -> Optional[dict]:
+def normalize_sort_order(sort_orders) -> dict | None:
     """Reduce a ``sort_orders`` value to the primary sort key in canonical form.
 
     ``sort_orders`` has been written in two incompatible shapes:
@@ -283,9 +283,9 @@ MAX_MEMORY_FILES = 1
 # container size for non-16 GB deployments via OPTERYX_COMPACTION_RAM_MB.
 CONTAINER_RAM_MB = int(os.environ.get("OPTERYX_COMPACTION_RAM_MB", 16 * 1024))
 CONTAINER_RAM_BYTES = CONTAINER_RAM_MB * 1024 * 1024
-RUNTIME_WARMUP_BYTES = 768 * 1024 * 1024   # native lib/arena/threadpool floor (~measured)
-PEAK_RAM_PER_BUDGET_BYTE = 2.0             # combine transient dominates (~2x combined budget-unit)
-RAM_SAFETY_FRACTION = 0.85                 # headroom for Python/GC/other allocations
+RUNTIME_WARMUP_BYTES = 768 * 1024 * 1024  # native lib/arena/threadpool floor (~measured)
+PEAK_RAM_PER_BUDGET_BYTE = 2.0  # combine transient dominates (~2x combined budget-unit)
+RAM_SAFETY_FRACTION = 0.85  # headroom for Python/GC/other allocations
 # Largest combined (uncompressed/budget-unit) input a single merge may hold.
 # Never gated below one TARGET, so a legitimate single-target merge always fits.
 MAX_SELECTED_BUDGET_BYTES = int(
@@ -376,9 +376,9 @@ KEY_SCAN_CHUNK_ROWS = 1_000_000
 
 # How much of the candidate files' COMPRESSED bytes the source cache may hold in
 # RAM before spilling the rest to local disk. See ``_SourceFileCache``.
-SOURCE_CACHE_RAM_BYTES = int(
-    os.environ.get("OPTERYX_COMPACTION_SOURCE_CACHE_MB", 2048)
-) * 1024 * 1024
+SOURCE_CACHE_RAM_BYTES = (
+    int(os.environ.get("OPTERYX_COMPACTION_SOURCE_CACHE_MB", 2048)) * 1024 * 1024
+)
 
 
 class _SourceFileCache:
@@ -448,9 +448,9 @@ class DatasetCompactor:
     def __init__(
         self,
         dataset,
-        strategy: Optional[str] = None,
-        author: Optional[str] = None,
-        agent: Optional[str] = None,
+        strategy: str | None = None,
+        author: str | None = None,
+        agent: str | None = None,
     ):
         """
         Initialize compactor for a dataset.
@@ -469,7 +469,7 @@ class DatasetCompactor:
         # but invisible - a dataset can go weeks without compacting and look
         # identical to one with nothing to compact. Callers (and the cron job)
         # can read this; everything is logged as well.
-        self._last_error: Optional[str] = None
+        self._last_error: str | None = None
         # Snapshot id this pass is based on; set by compact(), checked before
         # the commit. None means "no baseline recorded", which disables the
         # staleness check (e.g. an execute path driven directly by a test).
@@ -495,15 +495,13 @@ class DatasetCompactor:
         # ``{"name", "field_id", "index", "ascending"}`` or None.
         self.sort_order = None
         if self.strategy == "performance":
-            self.sort_order = normalize_sort_order(
-                getattr(dataset.metadata, "sort_orders", [])
-            )
+            self.sort_order = normalize_sort_order(getattr(dataset.metadata, "sort_orders", []))
             if self.sort_order is None:
                 # Performance mode needs a usable sort key; fall back to brute.
                 self.strategy = "brute"
                 self.decision = "no-sort"
 
-    def compact(self, dry_run: bool = False, rule: Optional[str] = None) -> Optional[Snapshot]:
+    def compact(self, dry_run: bool = False, rule: str | None = None) -> Snapshot | None:
         """
         Perform ONE compaction pass: a single read -> select -> execute ->
         commit cycle, same critical-section shape as before rule A/B existed.
@@ -567,7 +565,7 @@ class DatasetCompactor:
             return compaction_plan
         return self._execute_compaction(entries, compaction_plan)
 
-    def _read_manifest(self, manifest_path: str) -> List[dict]:
+    def _read_manifest(self, manifest_path: str) -> list[dict]:
         """Read manifest entries from manifest file."""
         # Prefer parsed-manifest cache to avoid repeated rugo parsing
         from .manifest import get_parsed_manifest
@@ -578,7 +576,7 @@ class DatasetCompactor:
             self._abort(f"could not read manifest {manifest_path}", exc)
             return []
 
-    def _select_brute_compaction(self, entries: List[dict]) -> Optional[dict]:
+    def _select_brute_compaction(self, entries: list[dict]) -> dict | None:
         """
         Select files for brute force compaction.
 
@@ -629,7 +627,7 @@ class DatasetCompactor:
         module-level ``resolve_sort_column`` (shared with write-time sorting)."""
         return resolve_sort_column(sort_order, columns)
 
-    def _resolve_sort_columns_for_entries(self, entries: List[dict]):
+    def _resolve_sort_columns_for_entries(self, entries: list[dict]):
         """Shared prep for both rule selectors: resolve the sort column against
         the dataset's stored schema. Returns (sort_column_name, sort_field_id,
         sort_index), all None if it can't be resolved (caller falls back to
@@ -656,7 +654,7 @@ class DatasetCompactor:
 
         return self._resolve_sort_column(self.sort_order, columns)
 
-    def _select_brute_merge(self, entries: List[dict]) -> Optional[dict]:
+    def _select_brute_merge(self, entries: list[dict]) -> dict | None:
         """Rule A (rules 2 & 4): two or more sub-floor (< MIN_FILE_SIZE_BYTES)
         files => BRUTE-force merge (no sort), bin-packed toward TARGET. Tiny
         scattered files hurt reads most and are cheapest to fix; sorting them
@@ -676,7 +674,7 @@ class DatasetCompactor:
         sub_floor = [e for e in entries if entry_size(e) < MIN_FILE_SIZE_BYTES]
         return self._select_brute_consolidation(sub_floor, sort_column_name)
 
-    def _select_sort_aware_merge(self, entries: List[dict], rng=None) -> Optional[dict]:
+    def _select_sort_aware_merge(self, entries: list[dict], rng=None) -> dict | None:
         """Rule B (rules 1 & 3): files over SORT_AWARE_FLOOR_BYTES (500 MB) -
         deliberately overlapping rule A's < 512 MB pool, see
         SORT_AWARE_FLOOR_BYTES - get sort-aware combine + split toward the 4GB
@@ -698,8 +696,8 @@ class DatasetCompactor:
         resolved: without a sort key there is nothing sort-aware to do, and
         rule A already covers the no-sort-key dataset case.
         """
-        sort_column_name, sort_field_id, sort_index = (
-            self._resolve_sort_columns_for_entries(entries)
+        sort_column_name, sort_field_id, sort_index = self._resolve_sort_columns_for_entries(
+            entries
         )
         if not sort_column_name:
             return None
@@ -761,7 +759,7 @@ class DatasetCompactor:
             )
         return file_ranges
 
-    def _select_brute_consolidation(self, sub_floor, sort_column_name) -> Optional[dict]:
+    def _select_brute_consolidation(self, sub_floor, sort_column_name) -> dict | None:
         """Rules 2 & 4: whenever two or more sub-floor (< MIN_FILE_SIZE_BYTES)
         files exist, BRUTE-force merge them - concatenate, NO sort - bin-packing
         the smallest first toward TARGET_SIZE_BYTES (rule 1: never exceed target),
@@ -801,7 +799,7 @@ class DatasetCompactor:
             "sort_column": sort_column_name,
         }
 
-    def _select_overlap_decluster(self, file_ranges, sort_column_name, rng=None) -> Optional[dict]:
+    def _select_overlap_decluster(self, file_ranges, sort_column_name, rng=None) -> dict | None:
         """Rule 3: pick a random file, grow it into an overlapping group, emit
         a sort-aware ``combine-split``. The (streaming) executor sorts the
         merged rows and splits them into k = ceil(combined / TARGET) disjoint
@@ -910,7 +908,7 @@ class DatasetCompactor:
             "expected_outputs": k,
         }
 
-    def _select_binpack(self, file_ranges, sort_column_name) -> Optional[dict]:
+    def _select_binpack(self, file_ranges, sort_column_name) -> dict | None:
         """Rule 1: reduce file count by packing CONSECUTIVE (in sort-key order),
         already-disjoint MEDIUM files toward TARGET. Only unsettled files (below
         MIN_SIZE_BYTES, the lower edge of the acceptable band) are packed; a file
@@ -1034,7 +1032,7 @@ class DatasetCompactor:
 
         return reconciled
 
-    def _execute_compaction(self, all_entries: List[dict], plan: dict) -> Optional[Snapshot]:
+    def _execute_compaction(self, all_entries: list[dict], plan: dict) -> Snapshot | None:
         """
         Execute the compaction plan.
 
@@ -1101,7 +1099,9 @@ class DatasetCompactor:
                 with read_parquet(bytes(data)) as reader:
                     row_group_morsels = list(reader)
                 file_morsel = (
-                    Morsel.combine(row_group_morsels) if len(row_group_morsels) > 1 else row_group_morsels[0]
+                    Morsel.combine(row_group_morsels)
+                    if len(row_group_morsels) > 1
+                    else row_group_morsels[0]
                 )
                 tables.append(file_morsel)
                 total_size += entry_size(entry)
@@ -1237,20 +1237,25 @@ class DatasetCompactor:
             del pdata
 
         return self._finalize_compaction_snapshot(
-            all_entries, files_to_compact, new_entries, snapshot_id,
-            input_records, input_data_size, sort_status,
+            all_entries,
+            files_to_compact,
+            new_entries,
+            snapshot_id,
+            input_records,
+            input_data_size,
+            sort_status,
         )
 
     def _finalize_compaction_snapshot(
         self,
-        all_entries: List[dict],
-        files_to_compact: List[dict],
-        new_entries: List[dict],
+        all_entries: list[dict],
+        files_to_compact: list[dict],
+        new_entries: list[dict],
         snapshot_id: int,
         input_records: int,
         input_data_size: int,
         sort_status: str,
-    ) -> Optional[Snapshot]:
+    ) -> Snapshot | None:
         """Shared tail for both execution paths (hold-everything and streaming):
         prune/validate the surviving old entries, write the new manifest, compute
         summary stats, and commit the snapshot. Neither execution path needs to
@@ -1307,8 +1312,7 @@ class DatasetCompactor:
                         # storage and read, to any caller, as "nothing to compact".
                         self._delete_written_files(new_entries)
                         reason = (
-                            "could not rebuild corrupted manifest entry for "
-                            f"{e.get('file_path')}"
+                            f"could not rebuild corrupted manifest entry for {e.get('file_path')}"
                         )
                         self._abort(reason)
                         _alert(
@@ -1466,7 +1470,7 @@ class DatasetCompactor:
             return False
         return current is not None and current != baseline
 
-    def _abort(self, reason: str, exc: Optional[BaseException] = None):
+    def _abort(self, reason: str, exc: BaseException | None = None):
         """Record and log why this pass is declining to commit, then return
         None so callers can ``return self._abort(...)``. Every abort path used
         to be a bare ``return None``, which made a compactor that had silently
@@ -1477,7 +1481,7 @@ class DatasetCompactor:
         else:
             logger.warning("compaction aborted: %s", reason)
 
-    def _row_counts_balance(self, files_to_compact: List[dict], new_entries: List[dict]) -> bool:
+    def _row_counts_balance(self, files_to_compact: list[dict], new_entries: list[dict]) -> bool:
         """Whether the outputs account for exactly the input rows.
 
         Skipped (returns True) when any input entry carries no ``record_count``:
@@ -1514,7 +1518,7 @@ class DatasetCompactor:
         )
         return False
 
-    def _delete_written_files(self, new_entries: List[dict]) -> None:
+    def _delete_written_files(self, new_entries: list[dict]) -> None:
         """Best-effort removal of output files written by an aborted pass.
 
         Nothing references them once the snapshot is not committed, so leaving
@@ -1533,7 +1537,7 @@ class DatasetCompactor:
     # --- Streaming execution (see the module comment above ROW_GROUP_TARGET_ROWS) ---
 
     def _read_sort_column_combined(
-        self, files_to_compact: List[dict], sort_column: str, source_cache
+        self, files_to_compact: list[dict], sort_column: str, source_cache
     ):
         """Pass 1: project ONLY the sort column from every candidate file,
         streaming row-group by row-group, and combine into one small morsel.
@@ -1763,8 +1767,8 @@ class DatasetCompactor:
                   eligibility already excludes ARRAY columns), accumulate and
                   flush at the same row-count cap.
         """
-        from draken.morsels.morsel import Morsel
         from draken.interop.vector_sequence import vector_from_sequence
+        from draken.morsels.morsel import Morsel
         from rugo.parquet import read_parquet
 
         def sort_and_yield(morsel):
@@ -1814,7 +1818,11 @@ class DatasetCompactor:
                             head = combined.slice(0, ROW_GROUP_TARGET_ROWS)
                             tail_len = combined.num_rows - ROW_GROUP_TARGET_ROWS
                             yield head
-                            acc = [combined.slice(ROW_GROUP_TARGET_ROWS, tail_len)] if tail_len else []
+                            acc = (
+                                [combined.slice(ROW_GROUP_TARGET_ROWS, tail_len)]
+                                if tail_len
+                                else []
+                            )
                             acc_rows = tail_len
             if acc_rows:
                 yield Morsel.combine(acc) if len(acc) > 1 else acc[0]
@@ -1845,13 +1853,17 @@ class DatasetCompactor:
                             head = combined.slice(0, ROW_GROUP_TARGET_ROWS)
                             tail_len = combined.num_rows - ROW_GROUP_TARGET_ROWS
                             yield head
-                            acc = [combined.slice(ROW_GROUP_TARGET_ROWS, tail_len)] if tail_len else []
+                            acc = (
+                                [combined.slice(ROW_GROUP_TARGET_ROWS, tail_len)]
+                                if tail_len
+                                else []
+                            )
                             acc_rows = tail_len
             if acc_rows:
                 yield Morsel.combine(acc) if len(acc) > 1 else acc[0]
             return
 
-    def _execute_compaction_streaming(self, all_entries: List[dict], plan: dict) -> Optional[Snapshot]:
+    def _execute_compaction_streaming(self, all_entries: list[dict], plan: dict) -> Snapshot | None:
         """Three-pass streaming execution: project+sort the key column, derive
         chunk groups, stream row-group-sized sorted chunks per group, and roll
         them into target-sized output files via rugo's streaming writer
@@ -1871,8 +1883,8 @@ class DatasetCompactor:
             return self._execute_compaction_streaming_inner(all_entries, plan, source_cache)
 
     def _execute_compaction_streaming_inner(
-        self, all_entries: List[dict], plan: dict, source_cache
-    ) -> Optional[Snapshot]:
+        self, all_entries: list[dict], plan: dict, source_cache
+    ) -> Snapshot | None:
         """Body of ``_execute_compaction_streaming``, split out so the source
         cache's temp directory is torn down on every exit path."""
         plan_type = plan["type"]
@@ -1886,9 +1898,7 @@ class DatasetCompactor:
             ascending = self.sort_order.get("ascending", True)
 
         # Pass 1: exact global sort of the key column alone.
-        key_morsel = self._read_sort_column_combined(
-            files_to_compact, sort_column, source_cache
-        )
+        key_morsel = self._read_sort_column_combined(files_to_compact, sort_column, source_cache)
         if key_morsel is None or key_morsel.num_rows == 0:
             return None
         try:
@@ -2029,8 +2039,13 @@ class DatasetCompactor:
         input_data_size = sum(entry_size(e) for e in files_to_compact)
 
         return self._finalize_compaction_snapshot(
-            all_entries, files_to_compact, new_entries, snapshot_id,
-            input_records, input_data_size, "native",
+            all_entries,
+            files_to_compact,
+            new_entries,
+            snapshot_id,
+            input_records,
+            input_data_size,
+            "native",
         )
 
     def _split_ranges(self, n: int, k: int) -> list:
@@ -2103,7 +2118,7 @@ class DatasetCompactor:
             # Any exception means the entry is corrupted or invalid
             return False
 
-    def _recover_entry(self, corrupted_entry: dict) -> Optional[dict]:
+    def _recover_entry(self, corrupted_entry: dict) -> dict | None:
         """
         Recover a corrupted manifest entry by reading the actual file.
 
@@ -2168,7 +2183,7 @@ class DatasetCompactor:
         except Exception:
             return entry  # If we can't rebuild, keep the original entry
 
-    def _refresh_manifest_from_data_files(self, all_entries: List[dict]) -> List[dict]:
+    def _refresh_manifest_from_data_files(self, all_entries: list[dict]) -> list[dict]:
         """
         Refresh entire manifest by reading all data files and rebuilding entries from scratch.
 

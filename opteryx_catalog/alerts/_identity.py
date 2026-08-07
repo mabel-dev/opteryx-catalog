@@ -173,9 +173,7 @@ def format_traceback(exc: BaseException) -> str:
     except Exception:
         text = f"{type(exc).__name__}: {exc}"
     if not exc.__traceback__:
-        outside = [
-            frame for frame in traceback.extract_stack() if not _is_ours(frame.filename)
-        ]
+        outside = [frame for frame in traceback.extract_stack() if not _is_ours(frame.filename)]
         text = text.rstrip() + "\n\n(constructed, not raised - stack at the report site:)\n"
         text += "".join(traceback.format_list(outside))
     if len(text) > MAX_TRACEBACK_CHARS:

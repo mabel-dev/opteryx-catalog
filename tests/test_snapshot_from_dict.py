@@ -74,8 +74,15 @@ def test_snapshot_document_round_trips_every_field_the_reader_asks_for():
 
     original = _full_snapshot()
     for field in (
-        "snapshot_id", "timestamp_ms", "author", "user_created", "sequence_number",
-        "manifest_list", "operation_type", "parent_snapshot_id", "schema_id",
+        "snapshot_id",
+        "timestamp_ms",
+        "author",
+        "user_created",
+        "sequence_number",
+        "manifest_list",
+        "operation_type",
+        "parent_snapshot_id",
+        "schema_id",
         "commit_message",
     ):
         assert getattr(restored, field) == getattr(original, field), field

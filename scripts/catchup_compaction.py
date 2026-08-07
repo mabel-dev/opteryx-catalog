@@ -46,9 +46,10 @@ sys.path.insert(1, os.path.join(os.path.dirname(__file__), ".."))
 # the catalog identifiers below typically come from. Import before reading
 # os.environ. Nothing else about opteryx (session, planner, connector
 # registry) is used below - the catalog is driven directly.
-import opteryx  # noqa: E402,F401
-from opteryx_catalog import OpteryxCatalog  # noqa: E402
-from opteryx_catalog.catalog.compaction import DatasetCompactor  # noqa: E402
+import opteryx  # noqa: F401
+
+from opteryx_catalog import OpteryxCatalog
+from opteryx_catalog.catalog.compaction import DatasetCompactor
 
 _REQUIRED_ENV = ("GCP_PROJECT_ID", "FIRESTORE_DATABASE", "GCS_BUCKET")
 
@@ -61,8 +62,7 @@ def _parse_identifier(name: str) -> tuple:
     parts = name.split(".", 1)
     if len(parts) != 2:
         raise ValueError(
-            f"'{name}' is not a fully qualified dataset name "
-            "(expected workspace.namespace.dataset)"
+            f"'{name}' is not a fully qualified dataset name (expected workspace.namespace.dataset)"
         )
     return parts[0], parts[1]
 
@@ -102,7 +102,9 @@ def catchup(
     compactor = DatasetCompactor(dataset, strategy=strategy, author=author, agent=agent)
     log.info(
         "[%s] starting catch-up: strategy=%s (decision=%s)",
-        dataset_name, compactor.strategy, compactor.decision,
+        dataset_name,
+        compactor.strategy,
+        compactor.decision,
     )
 
     passes = 0
@@ -119,7 +121,10 @@ def catchup(
         passes += 1
         log.info(
             "[%s] pass %d: %s (%s), %d input file(s)%s",
-            dataset_name, passes, plan.get("type"), plan.get("reason"),
+            dataset_name,
+            passes,
+            plan.get("type"),
+            plan.get("reason"),
             len(plan.get("files", [])),
             f", sort_column={plan['sort_column']}" if plan.get("sort_column") else "",
         )
@@ -134,7 +139,8 @@ def catchup(
             # Nothing was committed; stop rather than spin on the same plan.
             log.warning(
                 "[%s] pass %d: plan found but execution produced no snapshot - stopping",
-                dataset_name, passes,
+                dataset_name,
+                passes,
             )
             break
 
@@ -145,7 +151,11 @@ def catchup(
         total_added += added
         log.info(
             "[%s] pass %d committed in %.1fs: %d files -> %d files (total now %d files)",
-            dataset_name, passes, elapsed, deleted, added,
+            dataset_name,
+            passes,
+            elapsed,
+            deleted,
+            added,
             summary.get("total-data-files", -1),
         )
 
@@ -153,14 +163,19 @@ def catchup(
             time.sleep(sleep_seconds)
     else:
         log.warning(
-            "[%s] hit --max-passes=%d with more compaction likely remaining - "
-            "rerun to continue", dataset_name, max_passes,
+            "[%s] hit --max-passes=%d with more compaction likely remaining - rerun to continue",
+            dataset_name,
+            max_passes,
         )
 
     dataset_elapsed = time.monotonic() - dataset_started
     log.info(
         "[%s] done: %d pass(es) in %.1fs, %d files deleted, %d files added",
-        dataset_name, passes, dataset_elapsed, total_deleted, total_added,
+        dataset_name,
+        passes,
+        dataset_elapsed,
+        total_deleted,
+        total_added,
     )
     return passes, total_deleted, total_added
 
@@ -254,9 +269,12 @@ def main() -> None:
 
     elapsed = time.monotonic() - run_started
     log.info(
-        "ALL DONE in %.1fs: %d dataset(s), %d pass(es) total, "
-        "%d files deleted, %d files added",
-        elapsed, len(args.dataset), grand_passes, grand_deleted, grand_added,
+        "ALL DONE in %.1fs: %d dataset(s), %d pass(es) total, %d files deleted, %d files added",
+        elapsed,
+        len(args.dataset),
+        grand_passes,
+        grand_deleted,
+        grand_added,
     )
     if failed:
         log.error("failed dataset(s): %s", ", ".join(failed))

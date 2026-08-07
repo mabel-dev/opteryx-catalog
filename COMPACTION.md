@@ -165,21 +165,19 @@ Uses native rewrite operations:
 ```python
 from pyiceberg.table import Table
 
+
 def execute_compaction(table: Table, plan: CompactionPlan):
     """Execute compaction using a table library's rewrite_data_files or equivalent."""
     with table.update_spec() as update:
         for file_group in plan.file_groups:
             # Read data from small files
             data = read_files(file_group)
-            
+
             # Write consolidated file
             new_file = write_parquet(data, target_path)
-            
+
             # Update table with transaction
-            update.rewrite_files(
-                old_files=file_group,
-                new_files=[new_file]
-            )
+            update.rewrite_files(old_files=file_group, new_files=[new_file])
 ```
 
 ### Safety and Correctness
@@ -208,7 +206,7 @@ Track compaction metrics:
     "bytes_before": 4800000000,
     "bytes_after": 4800000000,
     "duration_seconds": 45.2,
-    "files_rewritten": 135
+    "files_rewritten": 135,
 }
 ```
 

@@ -1,17 +1,16 @@
-import time
-
-
 # Add local paths like other tests
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.join(sys.path[0], ".."))
 sys.path.insert(1, os.path.join(sys.path[0], "../opteryx-core"))
 sys.path.insert(1, os.path.join(sys.path[0], "../opteryx-catalog"))
 
-from opteryx_catalog.catalog.metadata import DatasetMetadata, Snapshot
 from opteryx_catalog.catalog.dataset import SimpleDataset
 from opteryx_catalog.catalog.expiration import SnapshotExpiration
+from opteryx_catalog.catalog.metadata import DatasetMetadata
+from opteryx_catalog.catalog.metadata import Snapshot
 from opteryx_catalog.catalog.orphan_quarantine import OrphanQuarantine
 
 

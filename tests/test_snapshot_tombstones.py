@@ -15,14 +15,10 @@ import time
 
 sys.path.insert(0, os.path.join(sys.path[0], ".."))
 
-from opteryx_catalog.catalog.expiration import (
-    EXPIRED_SNAPSHOT_RETENTION_MS,
-    SnapshotExpiration,
-)
-from opteryx_catalog.catalog.metadata import (
-    SNAPSHOT_EXPIRED_AT_KEY,
-    snapshot_is_tombstoned,
-)
+from opteryx_catalog.catalog.expiration import EXPIRED_SNAPSHOT_RETENTION_MS
+from opteryx_catalog.catalog.expiration import SnapshotExpiration
+from opteryx_catalog.catalog.metadata import SNAPSHOT_EXPIRED_AT_KEY
+from opteryx_catalog.catalog.metadata import snapshot_is_tombstoned
 
 DAY_MS = 24 * 60 * 60 * 1000
 

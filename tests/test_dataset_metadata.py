@@ -1,5 +1,5 @@
-from opteryx_catalog.catalog.metadata import DatasetMetadata
 from opteryx_catalog.catalog.dataset import SimpleDataset
+from opteryx_catalog.catalog.metadata import DatasetMetadata
 
 
 def test_dataset_metadata_and_simpledataset():

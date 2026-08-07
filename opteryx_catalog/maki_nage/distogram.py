@@ -1,12 +1,9 @@
 # type:ignore
 import math
-from bisect import bisect_left, bisect_right
+from bisect import bisect_left
 from collections import Counter
 from itertools import accumulate
 from operator import itemgetter
-from typing import List
-from typing import Optional
-from typing import Tuple
 
 __author__ = """Romain Picard"""
 __email__ = "romain.picard@oakbits.com"
@@ -22,12 +19,12 @@ The following changes have been made for Opteryx:
 
 EPSILON = 1e-5
 BIN_COUNT: int = 50
-Bin = Tuple[float, int]
+Bin = tuple[float, int]
 
 _caster = float
 
 
-def _histogram_impl(values: List[float], bin_count: int) -> Tuple[List[int], List[float]]:
+def _histogram_impl(values: list[float], bin_count: int) -> tuple[list[int], list[float]]:
     """Create a histogram of values using pure Python.
 
     Args:
@@ -69,7 +66,7 @@ def _histogram_impl(values: List[float], bin_count: int) -> Tuple[List[int], Lis
 class Distogram:  # pragma: no cover
     """Compressed representation of a distribution."""
 
-    __slots__ = "bins", "min", "max", "diffs", "min_diff", "_bin_count"
+    __slots__ = "_bin_count", "bins", "diffs", "max", "min", "min_diff"
 
     def __init__(self, bin_count: int = BIN_COUNT):
         """Creates a new Distogram object
@@ -81,11 +78,11 @@ class Distogram:  # pragma: no cover
         Returns:
             A Distogram object.
         """
-        self.bins: List[Bin] = list()
-        self.min: Optional[float] = None
-        self.max: Optional[float] = None
-        self.diffs: Optional[List[float]] = None
-        self.min_diff: Optional[float] = None
+        self.bins: list[Bin] = list()
+        self.min: float | None = None
+        self.max: float | None = None
+        self.diffs: list[float] | None = None
+        self.min_diff: float | None = None
 
         self._bin_count = bin_count
 
@@ -133,7 +130,10 @@ class Distogram:  # pragma: no cover
 
         if len(bin_values) > (self._bin_count * 5):
             counts, bin_edges = _histogram_impl(values, self._bin_count * 5)
-            bin_values = [bin_edges[i] + (bin_edges[i + 1] - bin_edges[i]) / 2 for i in range(len(bin_edges) - 1)]
+            bin_values = [
+                bin_edges[i] + (bin_edges[i + 1] - bin_edges[i]) / 2
+                for i in range(len(bin_edges) - 1)
+            ]
 
         for index, count in enumerate(counts):
             if count > 0:
@@ -184,7 +184,7 @@ def load(bins: list, minimum, maximum):  # pragma: no cover
     return dgram
 
 
-def _linspace(start: float, stop: float, num: int) -> List[float]:  # pragma: no cover
+def _linspace(start: float, stop: float, num: int) -> list[float]:  # pragma: no cover
     if num == 1:
         return [start, stop]
     step = (stop - start) / float(num)
@@ -193,7 +193,7 @@ def _linspace(start: float, stop: float, num: int) -> List[float]:  # pragma: no
     return values
 
 
-def _moment(x: List[float], counts: List[float], c: float, n: int) -> float:  # pragma: no cover
+def _moment(x: list[float], counts: list[float], c: float, n: int) -> float:  # pragma: no cover
     """
     Calculates the k-th moment of the distribution using the formula:
 
@@ -226,21 +226,17 @@ def _update_diffs(h: Distogram, i: int) -> None:  # pragma: no cover
                 update_min = True
 
             h.diffs[i - 1] = h.bins[i][0] - h.bins[i - 1][0]
-            if h.diffs[i - 1] < h.min_diff:
-                h.min_diff = h.diffs[i - 1]
+            h.min_diff = min(h.min_diff, h.diffs[i - 1])
 
         if i < len(h.bins) - 1:
             if h.diffs[i] == h.min_diff:
                 update_min = True
 
             h.diffs[i] = h.bins[i + 1][0] - h.bins[i][0]
-            if h.diffs[i] < h.min_diff:
-                h.min_diff = h.diffs[i]
+            h.min_diff = min(h.min_diff, h.diffs[i])
 
         if update_min is True:
             h.min_diff = min(h.diffs)
-
-    return
 
 
 def _trim(h: Distogram) -> Distogram:  # pragma: no cover
@@ -277,7 +273,7 @@ def _trim_in_place(
     return distogram
 
 
-def _compute_diffs(h: Distogram) -> List[float]:  # pragma: no cover
+def _compute_diffs(h: Distogram) -> list[float]:  # pragma: no cover
     diffs = [v2 - v1 for (v1, _), (v2, _) in zip(h.bins[:-1], h.bins[1:])]
     h.min_diff = min(diffs)
 
@@ -448,7 +444,7 @@ def bin_size(h: Distogram, value) -> int:  # pragma: no cover
     return None
 
 
-def bounds(h: Distogram) -> Tuple[float, float]:  # pragma: no cover
+def bounds(h: Distogram) -> tuple[float, float]:  # pragma: no cover
     """Returns the min and max values of the distribution.
 
     Args:
@@ -500,8 +496,8 @@ def stddev(h: Distogram) -> float:  # pragma: no cover
 
 
 def histogram(
-    h: Distogram, bin_count: Optional[int] = None
-) -> Tuple[List[float], List[float]]:  # pragma: no cover
+    h: Distogram, bin_count: int | None = None
+) -> tuple[list[float], list[float]]:  # pragma: no cover
     """Returns a histogram of the distribution in numpy format.
 
     Args:
@@ -533,7 +529,7 @@ def histogram(
 
 def frequency_density_distribution(
     h: Distogram,
-) -> Tuple[List[float], List[float]]:  # pragma: no cover
+) -> tuple[list[float], list[float]]:  # pragma: no cover
     """Returns a histogram of the distribution
 
     Args:
@@ -557,7 +553,7 @@ def frequency_density_distribution(
     return (densities, bin_bounds)
 
 
-def quantile(h: Distogram, value: float) -> Optional[float]:  # pragma: no cover
+def quantile(h: Distogram, value: float) -> float | None:  # pragma: no cover
     """Returns a quantile of the distribution
 
     Args:

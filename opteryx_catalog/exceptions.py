@@ -70,7 +70,7 @@ class Alertable:
     def with_alert_context(self, **fields):
         """Attach reproduction detail at the raise site, chainably.
 
-            raise ManifestReadError(msg).with_alert_context(dataset=identifier)
+        raise ManifestReadError(msg).with_alert_context(dataset=identifier)
         """
         merged = self.alert_context()
         merged.update(fields)

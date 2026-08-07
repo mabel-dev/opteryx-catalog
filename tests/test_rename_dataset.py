@@ -229,9 +229,7 @@ def test_all_snapshots_move_not_just_the_current_one(monkeypatch, capsys):
         1: {"snapshot-id": 1, "manifest": f"{_OLD_LOC}/metadata/manifest-1.parquet"},
         2: {"snapshot-id": 2, "manifest": f"{_OLD_LOC}/metadata/manifest-2.parquet"},
     }
-    catalog, _source, target, _tomb = _catalog(
-        snapshots=snapshots, manifest_rows=rows_1 + rows_2
-    )
+    catalog, _source, target, _tomb = _catalog(snapshots=snapshots, manifest_rows=rows_1 + rows_2)
     _patch_manifest_io(catalog, monkeypatch, {"manifest-1": rows_1, "manifest-2": rows_2})
 
     catalog.rename_dataset("coll.tbl", "newcoll.newtbl", author="alice")
@@ -273,9 +271,7 @@ def test_file_shared_by_two_snapshots_is_copied_once(monkeypatch, capsys):
 def test_externally_referenced_files_are_left_where_they_are(monkeypatch, capsys):
     """A file outside the dataset's own location was never ours to move."""
     external = {"file_path": "gs://bucket/elsewhere/shared.parquet"}
-    catalog, _source, _target, _tomb = _single_snapshot_catalog(
-        monkeypatch, extra_rows=[external]
-    )
+    catalog, _source, _target, _tomb = _single_snapshot_catalog(monkeypatch, extra_rows=[external])
 
     catalog.rename_dataset("coll.tbl", "newcoll.newtbl", author="alice")
 

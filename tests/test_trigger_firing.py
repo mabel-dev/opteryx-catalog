@@ -9,16 +9,15 @@ and the never-break-the-commit failure contract.
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
+from unittest.mock import patch
 
 from opteryx_catalog import trigger_firing
 from opteryx_catalog.catalog.dataset import SimpleDataset
 from opteryx_catalog.catalog.metadata import Snapshot
-from opteryx_catalog.trigger_firing import (
-    _make_job_id,
-    _task_id,
-    fire_triggers,
-)
+from opteryx_catalog.trigger_firing import _make_job_id
+from opteryx_catalog.trigger_firing import _task_id
+from opteryx_catalog.trigger_firing import fire_triggers
 
 
 def _snapshot(user_created=True):
@@ -85,11 +84,13 @@ def test_fire_writes_job_doc_and_enqueues():
     with (
         patch.object(trigger_firing, "_jobs_client", return_value=jobs_client),
         patch.object(trigger_firing, "_enqueue_refresh_task", return_value="enqueued") as enq,
-        patch.object(trigger_firing, "_policies_for", return_value=[{"role": "owner", "pattern": "*"}]),
+        patch.object(
+            trigger_firing, "_policies_for", return_value=[{"role": "owner", "pattern": "*"}]
+        ),
     ):
         fire_triggers(catalog, "src.a", author="alice", snapshot_id=123)
 
-    execution_id, = jobs_collection.document.call_args.args
+    (execution_id,) = jobs_collection.document.call_args.args
     job_doc = jobs_collection.document.return_value.set.call_args.args[0]
 
     assert job_doc["execution_id"] == execution_id
@@ -200,9 +201,7 @@ def test_after_commit_fires_for_user_snapshots():
     dataset = _dataset_with_catalog()
     with patch.object(trigger_firing, "fire_triggers") as fire:
         dataset._after_commit("alice", _snapshot(user_created=True))
-    fire.assert_called_once_with(
-        dataset.catalog, "src.a", author="alice", snapshot_id=123
-    )
+    fire.assert_called_once_with(dataset.catalog, "src.a", author="alice", snapshot_id=123)
 
 
 def test_after_commit_skips_housekeeping_snapshots():
