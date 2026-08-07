@@ -23,10 +23,13 @@ class Metastore:
     ) -> "Dataset":
         raise NotImplementedError()
 
-    def drop_dataset(self, identifier: str, author: str = None) -> None:
+    def drop_dataset(self, identifier: str, author: str) -> None:
+        """Drop a dataset. `author` is required - an unattributed drop is not
+        something an implementation should silently accept."""
         raise NotImplementedError()
 
-    def drop_view(self, identifier: str, author: str = None) -> None:
+    def drop_view(self, identifier: str, author: str) -> None:
+        """Drop a view. `author` is required - see `drop_dataset`."""
         raise NotImplementedError()
 
     def list_datasets(self, namespace: str) -> Iterable[str]:

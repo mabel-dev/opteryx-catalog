@@ -753,7 +753,17 @@ class OpteryxCatalog(Metastore):
         The workspace's `delete_protection` does NOT apply here: it protects the
         workspace from being deleted, not the assets inside it. Per-asset
         protection is `locked-by`.
+
+        An author is required, as it is to create one. The check is up front,
+        before the does-it-exist return: a caller that forgot must fail the same
+        way whether or not the dataset happened to be there, or the omission
+        only surfaces on the runs that actually drop something. Empty string is
+        rejected alongside None - callers resolve the author with
+        `session_user or DEFAULT`, and "" survives that to attribute the drop to
+        nobody just as effectively.
         """
+        if not author:
+            raise ValueError("author must be provided when dropping a dataset")
         collection, dataset_name = identifier.split(".")
         doc_ref = self._dataset_doc_ref(collection, dataset_name)
         doc = doc_ref.get()
@@ -1433,7 +1443,11 @@ class OpteryxCatalog(Metastore):
         set - the two-person deniability lock takes precedence over the drop.
         The workspace's `delete_protection` does not apply; it protects the
         workspace itself, not the assets inside it.
+
+        An author is required, as it is to create one.
         """
+        if not author:
+            raise ValueError("author must be provided when dropping a collection")
         doc_ref = self._collection_ref(collection)
         doc = doc_ref.get()
         if not doc.exists:
@@ -1652,7 +1666,12 @@ class OpteryxCatalog(Metastore):
 
         The workspace's `delete_protection` does not apply; it protects the
         workspace itself, not the assets inside it.
+
+        An author is required, as it is to create one - see `drop_dataset` for
+        why the check precedes the does-it-exist return.
         """
+        if not author:
+            raise ValueError("author must be provided when dropping a view")
         if isinstance(identifier, tuple) or isinstance(identifier, list):
             collection, view_name = identifier[0], identifier[1]
         else:
@@ -1806,7 +1825,11 @@ class OpteryxCatalog(Metastore):
         stays queryable but stops refreshing. That is the supported way to
         pause an MV, and `information_schema.triggers` is where the absence
         shows.
+
+        An author is required, as it is to create one.
         """
+        if not author:
+            raise ValueError("author must be provided when dropping a trigger")
         collection, dataset_name = self._relative_identifier(dataset_identifier).split(".", 1)
         doc_ref = self._triggers_collection(collection, dataset_name).document(name)
         if not doc_ref.get().exists:
@@ -2054,7 +2077,13 @@ class OpteryxCatalog(Metastore):
         Trigger removal happens first, while the MV document's source list is
         still readable; the dataset drop then handles tombstoning and
         subcollection cleanup exactly as any other dataset drop.
+
+        An author is required. Checked here rather than left to the
+        `drop_dataset` call at the end, which would otherwise raise only after
+        the triggers had already been removed.
         """
+        if not author:
+            raise ValueError("author must be provided when dropping a materialized view")
         collection, dataset_name = identifier.split(".", 1)
         doc = self._dataset_doc_ref(collection, dataset_name).get()
         if not doc.exists:
