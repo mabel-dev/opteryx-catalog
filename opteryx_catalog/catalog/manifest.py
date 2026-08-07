@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import logging
 import time
-from collections import Counter, OrderedDict
-from dataclasses import dataclass, field
-from typing import Any, Dict
+from collections import Counter
+from collections import OrderedDict
+from dataclasses import dataclass
+from dataclasses import field
+from typing import Any
 
 NULL_FLAG = -(1 << 63)
 MIN_K_HASHES = 32
@@ -15,12 +17,10 @@ ENABLE_BATCH_COLUMN_READS = True  # Read all columns at once before falling back
 PYLIST_CONVERSION_CACHE = True  # Cache to_pylist() results per column
 
 # Manifest retrieval optimization
-ENABLE_LAZY_MANIFEST = (
-    True  # Use Arrow format for planning instead of converting to Python
-)
+ENABLE_LAZY_MANIFEST = True  # Use Arrow format for planning instead of converting to Python
 
 # Parsed manifest cache (LRU) for Arrow tables (faster than Python dicts)
-_arrow_manifest_cache: "OrderedDict[str, Any]" = OrderedDict()
+_arrow_manifest_cache: OrderedDict[str, Any] = OrderedDict()
 
 
 @dataclass
@@ -29,9 +29,9 @@ class DataFile:
     file_format: str = "PARQUET"
     record_count: int = 0
     file_size_in_bytes: int = 0
-    partition: Dict[str, object] = field(default_factory=dict)
-    lower_bounds: Dict[int, bytes] | None = None
-    upper_bounds: Dict[int, bytes] | None = None
+    partition: dict[str, object] = field(default_factory=dict)
+    lower_bounds: dict[int, bytes] | None = None
+    upper_bounds: dict[int, bytes] | None = None
 
 
 @dataclass
@@ -102,7 +102,7 @@ _manifest_metrics = Counter()
 # to avoid repeated rugo parsing and expensive to_pylist() conversions.
 # Entries are "frozen" for memory efficiency (inner lists -> tuples).
 PARSED_MANIFEST_CACHE_SIZE: int = 32
-_parsed_manifest_cache: "OrderedDict[str, list]" = OrderedDict()
+_parsed_manifest_cache: OrderedDict[str, list] = OrderedDict()
 
 
 def _freeze_for_cache(value):
@@ -226,11 +226,7 @@ def read_manifest_columns(data: bytes, keep_native: tuple = ()) -> tuple:
             if keep_native:
                 kept_morsels.append(morsel)
             for name_b in morsel.column_names:
-                name = (
-                    name_b.decode("utf-8")
-                    if isinstance(name_b, (bytes, bytearray))
-                    else name_b
-                )
+                name = name_b.decode("utf-8") if isinstance(name_b, (bytes, bytearray)) else name_b
                 column_data.setdefault(name, []).extend(morsel.column(name_b).to_pylist())
 
     for name in _NESTED_INT_LIST_COLUMNS:
@@ -239,7 +235,9 @@ def read_manifest_columns(data: bytes, keep_native: tuple = ()) -> tuple:
 
     native: dict = {}
     if kept_morsels:
-        combined = kept_morsels[0] if len(kept_morsels) == 1 else kept_morsels[0].combine(kept_morsels)
+        combined = (
+            kept_morsels[0] if len(kept_morsels) == 1 else kept_morsels[0].combine(kept_morsels)
+        )
         for name in keep_native:
             name_b = name.encode("utf-8")
             if name_b in combined.column_names or name in combined.column_names:
@@ -580,7 +578,7 @@ def build_parquet_manifest_entry_from_morsel(
     data_bytes: bytes,
     file_path: str,
     file_size_in_bytes: int | None = None,
-    field_id_by_name: Dict[str, int] | None = None,
+    field_id_by_name: dict[str, int] | None = None,
 ) -> ParquetManifestEntry:
     """Build a manifest entry from the in-memory Morsel that was just written.
 
@@ -684,7 +682,7 @@ def build_parquet_manifest_entry_from_bytes(
     file_path: str,
     file_size_in_bytes: int | None = None,
     orig_morsel: Any | None = None,
-    field_id_by_name: Dict[str, int] | None = None,
+    field_id_by_name: dict[str, int] | None = None,
 ) -> ParquetManifestEntry:
     """Build a manifest entry by reading a parquet file's bytes.
 
@@ -712,9 +710,7 @@ def build_parquet_manifest_entry_from_bytes(
     # name -> category from Parquet's own logical-type annotations, since a
     # re-read Vector's own .type is the flattened physical storage type (e.g.
     # a DATE column reads back as plain INT64).
-    col_info = {
-        c.name: _category_from_logical_type(c.logical_type) for c in meta.schema_columns
-    }
+    col_info = {c.name: _category_from_logical_type(c.logical_type) for c in meta.schema_columns}
     col_names = list(col_info.keys())
 
     min_k_hashes: list = []
@@ -879,7 +875,9 @@ def build_parquet_manifest_entry_from_bytes(
         min_lengths_list.append(min_len)
         max_lengths_list.append(max_len)
         char_class_counts.append(acc["char_counts"] if category in _STRING_CATEGORIES else [])
-        char_total_bytes_list.append(acc["char_total_bytes"] if category in _STRING_CATEGORIES else 0)
+        char_total_bytes_list.append(
+            acc["char_total_bytes"] if category in _STRING_CATEGORIES else 0
+        )
 
         col_bytes = acc["nbytes"]
         column_uncompressed[col_names.index(name)] = col_bytes

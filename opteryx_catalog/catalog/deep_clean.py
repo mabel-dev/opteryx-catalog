@@ -13,10 +13,6 @@ Distinct from expiration module:
 from __future__ import annotations
 
 import logging
-from typing import Dict
-from typing import List
-from typing import Optional
-from typing import Set
 
 from ..alerts import report as _alert
 from ..exceptions import ManifestProtectionError
@@ -41,9 +37,9 @@ class DatasetDeepClean:
     def __init__(
         self,
         catalog,
-        author: Optional[str] = None,
-        agent: Optional[str] = None,
-        quarantine: Optional[OrphanQuarantine] = None,
+        author: str | None = None,
+        agent: str | None = None,
+        quarantine: OrphanQuarantine | None = None,
     ):
         """
         Initialize deep clean.
@@ -60,7 +56,7 @@ class DatasetDeepClean:
         self.agent = agent or "deep-clean"
         self.quarantine = quarantine or OrphanQuarantine(catalog)
 
-    def clean_dataset(self, identifier: str, *, dry_run: bool) -> Optional[Dict]:
+    def clean_dataset(self, identifier: str, *, dry_run: bool) -> dict | None:
         """
         Perform deep clean on a single dataset.
 
@@ -159,7 +155,7 @@ class DatasetDeepClean:
             logger.error(f"Error cleaning dataset {identifier}: {e}")
             return None
 
-    def clean_collection(self, collection: str, *, dry_run: bool) -> Dict[str, any]:
+    def clean_collection(self, collection: str, *, dry_run: bool) -> dict[str, any]:
         """
         Deep clean all datasets in a collection.
 
@@ -219,7 +215,7 @@ class DatasetDeepClean:
 
         return results
 
-    def clean_workspace(self, *, dry_run: bool) -> Dict[str, any]:
+    def clean_workspace(self, *, dry_run: bool) -> dict[str, any]:
         """
         Deep clean all datasets in workspace.
 
@@ -262,7 +258,7 @@ class DatasetDeepClean:
 
         return results
 
-    def _age_gate(self, dataset_location: str, candidates: Set[str]) -> Set[str]:
+    def _age_gate(self, dataset_location: str, candidates: set[str]) -> set[str]:
         """
         Drop candidates that are too new, or whose age can't be determined.
 
@@ -298,7 +294,7 @@ class DatasetDeepClean:
             )
         return eligible
 
-    def get_all_manifest_files(self, snapshots: List) -> Set[str]:
+    def get_all_manifest_files(self, snapshots: list) -> set[str]:
         """
         Get all files referenced in any snapshot manifest, plus the manifest
         files themselves.
@@ -351,7 +347,7 @@ class DatasetDeepClean:
 
         return manifest_files
 
-    def get_all_physical_files(self, dataset_location: str) -> Set[str]:
+    def get_all_physical_files(self, dataset_location: str) -> set[str]:
         """
         Get all physical files in dataset storage location.
 
@@ -400,7 +396,7 @@ class DatasetDeepClean:
             logger.error(f"Error listing physical files in {dataset_location}: {e}")
             return physical_files
 
-    def get_physical_file_ages_ms(self, dataset_location: str) -> Dict[str, int]:
+    def get_physical_file_ages_ms(self, dataset_location: str) -> dict[str, int]:
         """
         Get the age (in ms) of each physical file in dataset storage.
 
@@ -426,7 +422,7 @@ class DatasetDeepClean:
             logger.error(f"Error listing physical file ages in {dataset_location}: {e}")
             return {}
 
-    def _execute_cleanup(self, orphaned_files: Set[str], dataset, summary: Dict) -> Dict:
+    def _execute_cleanup(self, orphaned_files: set[str], dataset, summary: dict) -> dict:
         """
         Execute deletion of orphaned files.
 
@@ -476,7 +472,7 @@ class DatasetDeepClean:
             logger.error(f"Error deleting file {file_path}: {e}")
             return False
 
-    def get_orphaned_manifests(self, identifier: str) -> Optional[set]:
+    def get_orphaned_manifests(self, identifier: str) -> set | None:
         """
         Identify manifest files present in storage that are NOT referenced by any snapshot.
 
@@ -511,7 +507,7 @@ class DatasetDeepClean:
             return None
 
 
-def find_orphaned_files(catalog, identifier: str) -> Optional[Set[str]]:
+def find_orphaned_files(catalog, identifier: str) -> set[str] | None:
     """
     Find orphaned files in a dataset without deleting.
 

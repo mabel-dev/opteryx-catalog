@@ -14,12 +14,11 @@ sys.path.insert(1, os.path.join(sys.path[0], "../opteryx-catalog"))
 import pytest
 
 from opteryx_catalog.catalog.dataset import SimpleDataset
-from opteryx_catalog.catalog.manifest import (
-    build_parquet_manifest_entry_from_bytes,
-    get_manifest_metrics,
-    reset_manifest_metrics,
-)
-from opteryx_catalog.catalog.metadata import DatasetMetadata, Snapshot
+from opteryx_catalog.catalog.manifest import build_parquet_manifest_entry_from_bytes
+from opteryx_catalog.catalog.manifest import get_manifest_metrics
+from opteryx_catalog.catalog.manifest import reset_manifest_metrics
+from opteryx_catalog.catalog.metadata import DatasetMetadata
+from opteryx_catalog.catalog.metadata import Snapshot
 from opteryx_catalog.opteryx_catalog import OpteryxCatalog
 
 
@@ -202,7 +201,9 @@ def test_min_max_lengths_for_strings():
     data = write_parquet(table, compression="zstd")
 
     # Build manifest entry
-    entry = build_parquet_manifest_entry_from_bytes(data, "test.parquet", len(data), orig_morsel=table)
+    entry = build_parquet_manifest_entry_from_bytes(
+        data, "test.parquet", len(data), orig_morsel=table
+    )
 
     # Verify min/max lengths (None values should be excluded)
     # Non-null strings: "a" (1), "hello" (5), "the quick brown fox" (19), "hi" (2)
@@ -222,7 +223,9 @@ def test_min_max_lengths_for_binary():
     data = write_parquet(table, compression="zstd")
 
     # Build manifest entry
-    entry = build_parquet_manifest_entry_from_bytes(data, "test.parquet", len(data), orig_morsel=table)
+    entry = build_parquet_manifest_entry_from_bytes(
+        data, "test.parquet", len(data), orig_morsel=table
+    )
 
     # Non-null binary: b"ab" (2), b"x" (1), b"hello world" (11), b"123456789" (9)
     assert entry.min_lengths[0] == 1  # min length is b"x"
@@ -241,7 +244,9 @@ def test_min_max_lengths_for_lists():
     data = write_parquet(table, compression="zstd")
 
     # Build manifest entry
-    entry = build_parquet_manifest_entry_from_bytes(data, "test.parquet", len(data), orig_morsel=table)
+    entry = build_parquet_manifest_entry_from_bytes(
+        data, "test.parquet", len(data), orig_morsel=table
+    )
 
     # Non-null lists: [1,2,3] (3), [4] (1), [5,6] (2), [7,8,9,10,11] (5)
     assert entry.min_lengths[0] == 1  # min length is [4]
@@ -260,7 +265,9 @@ def test_min_max_lengths_for_numeric_columns():
     data = write_parquet(table, compression="zstd")
 
     # Build manifest entry
-    entry = build_parquet_manifest_entry_from_bytes(data, "test.parquet", len(data), orig_morsel=table)
+    entry = build_parquet_manifest_entry_from_bytes(
+        data, "test.parquet", len(data), orig_morsel=table
+    )
 
     # All non-variable-width types should have 0 length
     assert entry.min_lengths[0] == 0  # int_col
@@ -283,7 +290,9 @@ def test_min_max_lengths_equal_length_strings():
     data = write_parquet(table, compression="zstd")
 
     # Build manifest entry
-    entry = build_parquet_manifest_entry_from_bytes(data, "test.parquet", len(data), orig_morsel=table)
+    entry = build_parquet_manifest_entry_from_bytes(
+        data, "test.parquet", len(data), orig_morsel=table
+    )
 
     # All non-null strings are 3 characters
     assert entry.min_lengths[0] == 3
@@ -303,7 +312,9 @@ def test_lengths_in_manifest_roundtrip():
     data = write_parquet(table, compression="zstd")
 
     # Build initial entry
-    entry = build_parquet_manifest_entry_from_bytes(data, "test.parquet", len(data), orig_morsel=table)
+    entry = build_parquet_manifest_entry_from_bytes(
+        data, "test.parquet", len(data), orig_morsel=table
+    )
 
     # Verify lengths were computed
     assert entry.min_lengths[0] > 0  # name column has non-zero min length
@@ -454,9 +465,7 @@ def _entry_from_morsel(morsel):
     from rugo.parquet import write_parquet
 
     data = write_parquet(morsel, compression="zstd")
-    return build_parquet_manifest_entry_from_bytes(
-        data, "f.parquet", len(data), orig_morsel=morsel
-    )
+    return build_parquet_manifest_entry_from_bytes(data, "f.parquet", len(data), orig_morsel=morsel)
 
 
 # ── string columns get real min/max + histograms ────────────────────────────
@@ -491,9 +500,7 @@ def test_string_bounds_are_monotonic_in_value_order():
     # an ordinal key inside the ordinal range, or a file gets wrongly skipped.
     from draken.draken_native import DrakenType
 
-    morsel = _make_test_morsel(
-        [("name", "VARCHAR")], [("apple",), ("mango",), ("pear",)]
-    )
+    morsel = _make_test_morsel([("name", "VARCHAR")], [("apple",), ("mango",), ("pear",)])
     entry = _entry_from_morsel(morsel)
     lo, hi = entry.min_values[0], entry.max_values[0]
     assert lo <= DrakenType.VARCHAR.ordinalize("mango") <= hi

@@ -3,7 +3,9 @@ written Morsel by the dataset's configured sort order, since compaction only
 clusters files once they're large enough for sort-aware merges -- a small
 append/overwrite would otherwise never be internally sorted."""
 
-from opteryx_catalog.catalog.dataset import RelationSchema, SchemaColumn, SimpleDataset
+from opteryx_catalog.catalog.dataset import RelationSchema
+from opteryx_catalog.catalog.dataset import SchemaColumn
+from opteryx_catalog.catalog.dataset import SimpleDataset
 from opteryx_catalog.catalog.metadata import DatasetMetadata
 
 
@@ -45,7 +47,7 @@ def test_sort_for_write_sorts_by_configured_column():
 
     assert sort_column == "timestamp"
     assert sort_descending is False
-    assert sorted_table.column("timestamp".encode("utf-8")).to_pylist() == [10, 20, 30, 40, 50]
+    assert sorted_table.column(b"timestamp").to_pylist() == [10, 20, 30, 40, 50]
 
 
 def test_sort_for_write_descending():
@@ -56,7 +58,7 @@ def test_sort_for_write_descending():
 
     assert sort_column == "timestamp"
     assert sort_descending is True
-    assert sorted_table.column("timestamp".encode("utf-8")).to_pylist() == [50, 40, 30, 20, 10]
+    assert sorted_table.column(b"timestamp").to_pylist() == [50, 40, 30, 20, 10]
 
 
 def test_sort_for_write_positional_sort_order():
@@ -66,7 +68,7 @@ def test_sort_for_write_positional_sort_order():
     sorted_table, sort_column, _ = ds._sort_for_write(table)
 
     assert sort_column == "timestamp"
-    assert sorted_table.column("timestamp".encode("utf-8")).to_pylist() == [10, 20, 30, 40, 50]
+    assert sorted_table.column(b"timestamp").to_pylist() == [10, 20, 30, 40, 50]
 
 
 def test_sort_for_write_no_sort_order_configured_is_noop():
@@ -81,7 +83,9 @@ def test_sort_for_write_no_sort_order_configured_is_noop():
 
 
 def test_sort_for_write_unresolvable_column_is_noop():
-    ds = _make_dataset([{"order-id": 1, "fields": [{"name": "does_not_exist", "direction": "asc"}]}])
+    ds = _make_dataset(
+        [{"order-id": 1, "fields": [{"name": "does_not_exist", "direction": "asc"}]}]
+    )
     table = _make_unsorted_table()
 
     result_table, sort_column, _ = ds._sort_for_write(table)

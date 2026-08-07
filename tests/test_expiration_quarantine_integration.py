@@ -12,7 +12,8 @@ sys.path.insert(0, os.path.join(sys.path[0], ".."))
 
 from opteryx_catalog.catalog.dataset import SimpleDataset
 from opteryx_catalog.catalog.expiration import SnapshotExpiration
-from opteryx_catalog.catalog.metadata import DatasetMetadata, Snapshot
+from opteryx_catalog.catalog.metadata import DatasetMetadata
+from opteryx_catalog.catalog.metadata import Snapshot
 from opteryx_catalog.catalog.orphan_quarantine import OrphanQuarantine
 
 DAY_MS = 24 * 60 * 60 * 1000
@@ -148,9 +149,7 @@ class _FakeCatalog:
                 key = f"{collection}/{dataset_name}/snapshots/{self._snapshot_id}"
                 store[key] = {**store.get(key, {}), **payload}
                 dataset.metadata.snapshots = [
-                    s
-                    for s in dataset.metadata.snapshots
-                    if str(s.snapshot_id) != self._snapshot_id
+                    s for s in dataset.metadata.snapshots if str(s.snapshot_id) != self._snapshot_id
                 ]
 
             def delete(self):
@@ -207,9 +206,7 @@ def _make(referenced=LIVE, extra_files=(ORPHAN,)):
 
 
 def _expirer(catalog, clock):
-    return SnapshotExpiration(
-        catalog, author="test", quarantine=_ClockedQuarantine(catalog, clock)
-    )
+    return SnapshotExpiration(catalog, author="test", quarantine=_ClockedQuarantine(catalog, clock))
 
 
 def test_first_run_quarantines_instead_of_deleting():

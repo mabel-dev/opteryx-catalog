@@ -60,10 +60,23 @@ jobs:
         cache: pip
 
     - name: deps
-      run: python -m pip install -U ruff
+      # Pinned. pyproject sets no lint.select, so the active rule set is
+      # whatever ruff ships as its default -- an unpinned upgrade silently
+      # changes what this job reports.
+      run: python -m pip install ruff==0.16.2
 
     - name: ruff check
-      run: python -m ruff check --output-format=github
+      # Counts to the run summary, detail to the log. Deliberately NOT
+      # --output-format=github: that raises a GitHub error annotation per
+      # violation, which buries real failures under hundreds of advisories.
+      run: |
+        {
+          echo '### ruff check'
+          echo '```'
+          python -m ruff check --statistics || true
+          echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"
+        python -m ruff check --output-format=concise
 
     - name: ruff format
       run: python -m ruff format --check

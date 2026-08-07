@@ -14,7 +14,8 @@ sys.path.insert(0, os.path.join(sys.path[0], ".."))
 from opteryx_catalog.catalog.dataset import SimpleDataset
 from opteryx_catalog.catalog.deep_clean import DatasetDeepClean
 from opteryx_catalog.catalog.expiration import SnapshotExpiration
-from opteryx_catalog.catalog.metadata import DatasetMetadata, Snapshot
+from opteryx_catalog.catalog.metadata import DatasetMetadata
+from opteryx_catalog.catalog.metadata import Snapshot
 from opteryx_catalog.catalog.orphan_quarantine import OrphanQuarantine
 
 DAY_MS = 24 * 60 * 60 * 1000

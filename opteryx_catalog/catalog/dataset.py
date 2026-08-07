@@ -3,20 +3,20 @@ from __future__ import annotations
 import os
 import time
 import uuid
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any
 
 from ..alerts import report as _alert
 from ..audit import emit_audit
 from ..exceptions import ManifestReadError
-from ..resource_types import ResourceType
 from ..exceptions import SummaryInconsistencyError
-from .manifest import (
-    ParquetManifestEntry,
-    build_parquet_manifest_entry_from_bytes,
-    build_parquet_manifest_entry_from_morsel,
-)
-from .metadata import DatasetMetadata, Snapshot
+from ..resource_types import ResourceType
+from .manifest import ParquetManifestEntry
+from .manifest import build_parquet_manifest_entry_from_bytes
+from .manifest import build_parquet_manifest_entry_from_morsel
+from .metadata import DatasetMetadata
+from .metadata import Snapshot
 from .metastore import Dataset
 
 # Stable node identifier for this process (hex-mac-hex-pid)
@@ -24,8 +24,8 @@ _NODE = f"{uuid.getnode():x}-{os.getpid():x}"
 
 
 def select_last_user_snapshot(
-    snapshots: List[Snapshot], lookback: Optional[int] = None
-) -> Optional[Snapshot]:
+    snapshots: list[Snapshot], lookback: int | None = None
+) -> Snapshot | None:
     """The most recent USER-created snapshot in `snapshots`, or None.
 
     Shared by `SimpleDataset.last_user_snapshot` (UI: "when did a human last
@@ -51,9 +51,7 @@ def select_last_user_snapshot(
     predate it — never by Firestore's document iteration order, which is
     lexicographic on the id string and only coincidentally numeric.
     """
-    ordered = sorted(
-        snapshots, key=lambda s: (s.sequence_number or 0, s.snapshot_id or 0)
-    )
+    ordered = sorted(snapshots, key=lambda s: (s.sequence_number or 0, s.snapshot_id or 0))
     window = ordered if lookback is None else ordered[-lookback:]
     user_snapshots = [s for s in window if s.user_created is True]
     return user_snapshots[-1] if user_snapshots else None
@@ -72,13 +70,13 @@ class SchemaColumn:
 
     name: str
     type: str
-    element_type: Optional[str] = None
-    precision: Optional[int] = None
-    scale: Optional[int] = None
+    element_type: str | None = None
+    precision: int | None = None
+    scale: int | None = None
     nullable: bool = True
     # Stable, catalog-assigned field-id (see DatasetMetadata.next_field_id) —
     # None for schemas persisted before field-ids existed.
-    id: Optional[int] = None
+    id: int | None = None
 
 
 @dataclass
@@ -122,7 +120,7 @@ class Datafile:
     entry: dict
 
     @property
-    def file_path(self) -> Optional[str]:
+    def file_path(self) -> str | None:
         return self.entry.get("file_path")
 
     @property
@@ -164,7 +162,7 @@ class Datafile:
         return self.entry.get("field_ids") or []
 
     @property
-    def lower_bounds(self) -> Optional[Dict[int, Any]]:
+    def lower_bounds(self) -> dict[int, Any] | None:
         """min_values keyed by field-id instead of position. None when this
         entry has no field-ids (pre-migration manifest row) — callers must
         fall back to positional indexing of min_values in that case."""
@@ -174,7 +172,7 @@ class Datafile:
         return {fid: v for fid, v in zip(field_ids, min_values) if fid is not None}
 
     @property
-    def upper_bounds(self) -> Optional[Dict[int, Any]]:
+    def upper_bounds(self) -> dict[int, Any] | None:
         """max_values keyed by field-id — see lower_bounds."""
         field_ids, max_values = self.field_ids, self.max_values
         if not field_ids or len(field_ids) != len(max_values):
@@ -213,9 +211,7 @@ class SimpleDataset(Dataset):
             seq = getattr(current, "sequence_number", None)
             return int(seq) + 1 if seq is not None else 1
 
-    def snapshot(
-        self, snapshot_id: Optional[int] = None, user_only: bool = False
-    ) -> Optional[Snapshot]:
+    def snapshot(self, snapshot_id: int | None = None, user_only: bool = False) -> Snapshot | None:
         """Return a Snapshot.
 
         - If `snapshot_id` is None, return the in-memory current snapshot.
@@ -279,7 +275,7 @@ class SimpleDataset(Dataset):
 
         return None
 
-    def last_user_snapshot(self, lookback: Optional[int] = None) -> Optional[Snapshot]:
+    def last_user_snapshot(self, lookback: int | None = None) -> Snapshot | None:
         """The most recent snapshot a USER created, or None if there is none.
 
         `lookback` bounds the search to that many most-recent snapshots
@@ -343,7 +339,7 @@ class SimpleDataset(Dataset):
     def snapshots(self) -> Iterable[Snapshot]:
         return list(self.metadata.snapshots)
 
-    def schema(self, schema_id: Optional[str] = None) -> Optional[RelationSchema]:
+    def schema(self, schema_id: str | None = None) -> RelationSchema | None:
         """Return a stored schema description.
 
         If `schema_id` is None, return the current schema (by
@@ -421,7 +417,7 @@ class SimpleDataset(Dataset):
         ]
         return RelationSchema(name=self.identifier, columns=columns)
 
-    def _field_id_by_name(self) -> Dict[str, int]:
+    def _field_id_by_name(self) -> dict[str, int]:
         """Current schema's name->field_id mapping, for keying manifest stats.
 
         Returns an empty dict for schemas with no catalog-assigned ids (e.g.
@@ -431,11 +427,9 @@ class SimpleDataset(Dataset):
         schema = self.schema()
         if schema is None:
             return {}
-        return {
-            col.name: col.id for col in schema.columns if getattr(col, "id", None) is not None
-        }
+        return {col.name: col.id for col in schema.columns if getattr(col, "id", None) is not None}
 
-    def append(self, table: Any, author: str = None, commit_message: Optional[str] = None):
+    def append(self, table: Any, author: str = None, commit_message: str | None = None):
         """Append a draken Morsel:
 
         - write a Parquet data file via `self.io`
@@ -545,7 +539,7 @@ class SimpleDataset(Dataset):
 
         self._after_commit(author, snap)
 
-    def _parent_manifest_entries(self, snapshot) -> List[dict]:
+    def _parent_manifest_entries(self, snapshot) -> list[dict]:
         """Read the manifest entries a new commit must carry forward.
 
         Manifests are cumulative, so this list is the entire history of the
@@ -573,7 +567,7 @@ class SimpleDataset(Dataset):
                 "Refusing to commit a manifest that would drop its entries."
             ) from err
 
-    def _totals_from_entries(self, entries: List[dict]) -> Dict[str, int]:
+    def _totals_from_entries(self, entries: list[dict]) -> dict[str, int]:
         """Derive the snapshot summary totals from the manifest being written.
 
         These used to be carried forward as running counters (parent total +
@@ -599,7 +593,7 @@ class SimpleDataset(Dataset):
             "total-records": total_records,
         }
 
-    def _warn_if_summary_disagrees(self, snapshot, entries: List[dict]) -> None:
+    def _warn_if_summary_disagrees(self, snapshot, entries: list[dict]) -> None:
         """Log when a parent's recorded totals don't match its actual manifest.
 
         Evidence that an earlier commit wrote a manifest inconsistent with its
@@ -637,7 +631,7 @@ class SimpleDataset(Dataset):
             },
         )
 
-    def _emit_audit(self, action: str, *, author: Optional[str], **detail: Any) -> None:
+    def _emit_audit(self, action: str, *, author: str | None, **detail: Any) -> None:
         """Record a data-changing operation against this dataset."""
         collection, _, name = self.identifier.partition(".")
         emit_audit(
@@ -650,7 +644,7 @@ class SimpleDataset(Dataset):
             **detail,
         )
 
-    def _after_commit(self, author: Optional[str], snapshot: Snapshot) -> None:
+    def _after_commit(self, author: str | None, snapshot: Snapshot) -> None:
         """Fire this dataset's triggers for a just-landed commit.
 
         Only user-created snapshots fire - `refresh_manifest`, compaction and
@@ -698,7 +692,8 @@ class SimpleDataset(Dataset):
         None - a write must never fail because sorting couldn't happen.
         """
         try:
-            from .compaction import normalize_sort_order, resolve_sort_column
+            from .compaction import normalize_sort_order
+            from .compaction import resolve_sort_column
 
             sort_order = normalize_sort_order(getattr(self.metadata, "sort_orders", None))
             if sort_order is None:
@@ -759,7 +754,7 @@ class SimpleDataset(Dataset):
         )
         return manifest_entry
 
-    def overwrite(self, table: Any, author: str = None, commit_message: Optional[str] = None):
+    def overwrite(self, table: Any, author: str = None, commit_message: str | None = None):
         """Replace the dataset entirely with `table` in a single snapshot.
 
         Semantics:
@@ -866,7 +861,7 @@ class SimpleDataset(Dataset):
 
         self._after_commit(author, snap)
 
-    def add_files(self, files: list[str], author: str = None, commit_message: Optional[str] = None):
+    def add_files(self, files: list[str], author: str = None, commit_message: str | None = None):
         """Add filenames to the dataset manifest without writing the files.
 
         - `files` is a list of file paths (strings). Files are assumed to
@@ -1026,7 +1021,7 @@ class SimpleDataset(Dataset):
         self._after_commit(author, snap)
 
     def truncate_and_add_files(
-        self, files: list[str], author: str = None, commit_message: Optional[str] = None
+        self, files: list[str], author: str = None, commit_message: str | None = None
     ):
         """Truncate dataset (logical) and set manifest to provided files.
 
@@ -1208,7 +1203,7 @@ class SimpleDataset(Dataset):
 
         self._after_commit(author, snap)
 
-    def scan(self, row_filter=None, snapshot_id: Optional[int] = None) -> Iterable[Datafile]:
+    def scan(self, row_filter=None, snapshot_id: int | None = None) -> Iterable[Datafile]:
         """Return Datafile objects for the given snapshot.
 
         - If `snapshot_id` is None, use the current snapshot.
@@ -1231,7 +1226,7 @@ class SimpleDataset(Dataset):
         for r in get_arrow_manifest_rows(self.io, snap.manifest_list):
             yield Datafile(entry=r)
 
-    def manifest_sketch_vectors(self, snapshot_id: Optional[int] = None) -> dict:
+    def manifest_sketch_vectors(self, snapshot_id: int | None = None) -> dict:
         """Whole-column native draken Vectors for the sketch columns of a snapshot.
 
         Returns ``{column_name: Vector}`` for ``min_k_hashes`` / ``histogram_counts``
@@ -1247,7 +1242,7 @@ class SimpleDataset(Dataset):
 
         return get_arrow_manifest(self.io, snap.manifest_list).sketch_vectors
 
-    def describe(self, snapshot_id: Optional[int] = None, bins: int = 10) -> dict:
+    def describe(self, snapshot_id: int | None = None, bins: int = 10) -> dict:
         """Describe all schema columns for the given snapshot.
 
         Returns a dict mapping column name -> statistics (same shape as
@@ -1528,8 +1523,7 @@ class SimpleDataset(Dataset):
                                 continue
                             rep = fmin + (bi + 0.5) * (fmax - fmin) / fbins
                             gi = int((rep - global_min) / gspan * effective_bins)
-                            if gi < 0:
-                                gi = 0
+                            gi = max(gi, 0)
                             if gi >= effective_bins:
                                 gi = effective_bins - 1
                             distribution[gi] += int(cnt)
@@ -1607,7 +1601,7 @@ class SimpleDataset(Dataset):
 
         return results
 
-    def refresh_manifest(self, agent: str, author: Optional[str] = None) -> int:
+    def refresh_manifest(self, agent: str, author: str | None = None) -> int:
         """Refresh manifest statistics and create a new snapshot.
 
         - `agent`: identifier for the agent performing the refresh (string)
@@ -1768,7 +1762,7 @@ class SimpleDataset(Dataset):
     def truncate(
         self,
         author: str = None,
-        commit_message: Optional[str] = None,
+        commit_message: str | None = None,
         commit_truncation: bool = False,
     ) -> None:
         """Delete all data files and manifests for this dataset.

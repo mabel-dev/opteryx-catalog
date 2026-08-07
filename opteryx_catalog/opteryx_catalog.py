@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Iterable
 from typing import Any
-from typing import Iterable
-from typing import List
-from typing import Optional
 
 from google.cloud import firestore
 from google.cloud import storage
 
+from .alerts import report as _alert
+from .audit import emit_audit
 from .catalog.dataset import SimpleDataset
 from .catalog.metadata import DatasetMetadata
 from .catalog.metadata import Snapshot
@@ -16,7 +16,6 @@ from .catalog.metadata import snapshot_is_tombstoned
 from .catalog.metastore import Metastore
 from .catalog.orphan_quarantine import MAINTENANCE_SUBCOLLECTION
 from .catalog.view import View as CatalogView
-from .alerts import report as _alert
 from .exceptions import CollectionAlreadyExists
 from .exceptions import CollectionLocked
 from .exceptions import CollectionNotEmpty
@@ -29,11 +28,10 @@ from .exceptions import SnapshotMissingError
 from .exceptions import TriggerNotFound
 from .exceptions import ViewAlreadyExists
 from .exceptions import ViewNotFound
-from .exceptions import WorkspaceDeleteProtected
 from .exceptions import WorkspaceDeleted
+from .exceptions import WorkspaceDeleteProtected
 from .exceptions import WorkspaceNotFound
 from .iops.base import FileIO
-from .audit import emit_audit
 from .resource_types import ResourceType
 from .webhooks import send_webhook
 from .webhooks.events import dataset_created_payload
@@ -146,7 +144,11 @@ _DRAKEN_STORED_NAME = {
     "TIME32": "TIME",
     "TIME64": "TIME",
     "INTERVAL": "INTERVAL",
-    "BOOL": "BOOLEAN",
+    # BOOL, not BOOLEAN — BOOL is the canonical spelling opteryx-core's
+    # `_NAME_TO_PHYSICAL` resolves directly; BOOLEAN only still reads back
+    # because `_SQL_NAME_ALIASES` keeps the older spelling alive for schemas
+    # persisted before the rename.
+    "BOOL": "BOOL",
     "VARCHAR": "VARCHAR",
     "NVARCHAR": "NVARCHAR",
     "VARBINARY": "VARBINARY",
@@ -256,10 +258,10 @@ class OpteryxCatalog(Metastore):
     def __init__(
         self,
         workspace: str,
-        firestore_project: Optional[str] = None,
-        firestore_database: Optional[str] = None,
-        gcs_bucket: Optional[str] = None,
-        io: Optional[FileIO] = None,
+        firestore_project: str | None = None,
+        firestore_database: str | None = None,
+        gcs_bucket: str | None = None,
+        io: FileIO | None = None,
         include_deleted: bool = False,
         create_if_missing: bool = False,
     ):
@@ -659,7 +661,9 @@ class OpteryxCatalog(Metastore):
             metadata.snapshots = snaps
             metadata.schemas = [self._schema_entry_from_doc(s) for s in schemas_coll.stream()]
             metadata.current_schema_id = data.get("current-schema-id")
-            return SimpleDataset(identifier=identifier, _metadata=metadata, io=self.io, catalog=self)
+            return SimpleDataset(
+                identifier=identifier, _metadata=metadata, io=self.io, catalog=self
+            )
 
         current_snap_id = data.get("current-snapshot-id")
         current_schema_id = data.get("current-schema-id")
@@ -861,7 +865,7 @@ class OpteryxCatalog(Metastore):
         out.close()
 
     def rename_dataset(
-        self, identifier: str, new_identifier: str, author: Optional[str] = None
+        self, identifier: str, new_identifier: str, author: str | None = None
     ) -> None:
         """Rename a dataset, moving its files, manifests and catalog entry.
 
@@ -983,9 +987,7 @@ class OpteryxCatalog(Metastore):
                 row["file_path"] = target_path
 
             snapshot_id = snapshot_data.get("snapshot-id")
-            new_manifest_path = self.write_parquet_manifest(
-                snapshot_id, rows, new_location
-            )
+            new_manifest_path = self.write_parquet_manifest(snapshot_id, rows, new_location)
             rewritten_manifests[snapshot_doc.id] = (snapshot_data, new_manifest_path)
 
         # 3. Write the new catalog entry: dataset doc, schemas, snapshots. This
@@ -1065,7 +1067,7 @@ class OpteryxCatalog(Metastore):
         )
 
     def _write_tombstone(
-        self, collection: str, dataset_name: str, location: Optional[str], author: Optional[str]
+        self, collection: str, dataset_name: str, location: str | None, author: str | None
     ) -> None:
         """Record a dropped dataset's storage location for later reclamation."""
         self._tombstones_collection().document(f"{collection}.{dataset_name}").set(
@@ -1079,7 +1081,7 @@ class OpteryxCatalog(Metastore):
             }
         )
 
-    def list_dropped_datasets(self) -> List[dict]:
+    def list_dropped_datasets(self) -> list[dict]:
         """Tombstones for datasets dropped from this workspace.
 
         Each entry carries `location` (the storage prefix whose files are now
@@ -1219,9 +1221,7 @@ class OpteryxCatalog(Metastore):
         if author is None:
             raise ValueError("author must be provided when unlocking a workspace")
 
-        self._catalog_ref.document("$properties").update(
-            {"locked-by": None, "locked-at-ms": None}
-        )
+        self._catalog_ref.document("$properties").update({"locked-by": None, "locked-at-ms": None})
 
         send_webhook(
             action="unlock",
@@ -1299,9 +1299,7 @@ class OpteryxCatalog(Metastore):
         }
     )
 
-    def set_workspace_properties(
-        self, properties: dict, author: Optional[str] = None
-    ) -> None:
+    def set_workspace_properties(self, properties: dict, author: str | None = None) -> None:
         """Merge `properties` into the workspace's `$properties` document.
 
         A merge, not a replace: keys absent from `properties` are left as they
@@ -1344,7 +1342,7 @@ class OpteryxCatalog(Metastore):
             properties=sorted(properties),
         )
 
-    def list_dropped_workspaces(self) -> List[dict]:
+    def list_dropped_workspaces(self) -> list[dict]:
         """Tombstones for workspaces soft-deleted anywhere in this Firestore
         database - not scoped to `self.workspace`. Root-level, mirroring
         `list_dropped_datasets()` one level up. Consumed by the 24h sweep,
@@ -1417,7 +1415,7 @@ class OpteryxCatalog(Metastore):
         )
 
     def create_collection_if_not_exists(
-        self, collection: str, properties: dict | None = None, author: Optional[str] = None
+        self, collection: str, properties: dict | None = None, author: str | None = None
     ) -> None:
         """Convenience wrapper that creates the collection only if missing."""
         self.create_collection(collection, properties=properties, exists_ok=True, author=author)
@@ -1430,7 +1428,7 @@ class OpteryxCatalog(Metastore):
             # On any error, be conservative and return False
             return False
 
-    def drop_collection(self, collection: str, author: Optional[str] = None) -> None:
+    def drop_collection(self, collection: str, author: str | None = None) -> None:
         """Drop a collection.
 
         A collection owns no storage of its own - only its datasets and views
@@ -1473,7 +1471,7 @@ class OpteryxCatalog(Metastore):
         )
 
     def dataset_exists(
-        self, identifier_or_collection: str, dataset_name: Optional[str] = None
+        self, identifier_or_collection: str, dataset_name: str | None = None
     ) -> bool:
         """Return True if the dataset exists.
 
@@ -1508,7 +1506,7 @@ class OpteryxCatalog(Metastore):
         sql: str,
         schema: Any | None = None,
         author: str = None,
-        description: Optional[str] = None,
+        description: str | None = None,
         properties: dict | None = None,
         update_if_exists: bool = False,
     ) -> CatalogView:
@@ -1601,12 +1599,12 @@ class OpteryxCatalog(Metastore):
         # Return a simple CatalogView wrapper
         v = CatalogView(name=view_name, definition=sql, properties=properties or {})
         # provide convenient attributes used by docs/examples
-        setattr(v, "sql", sql)
-        setattr(v, "metadata", type("M", (), {})())
+        v.sql = sql
+        v.metadata = type("M", (), {})()
         v.metadata.schema = schema
         # Attach catalog and identifier for describe() method
-        setattr(v, "_catalog", self)
-        setattr(v, "_identifier", f"{collection}.{view_name}")
+        v._catalog = self
+        v._identifier = f"{collection}.{view_name}"
         return v
 
     def load_view(self, identifier: str | tuple) -> CatalogView:
@@ -1639,8 +1637,8 @@ class OpteryxCatalog(Metastore):
         sql = (sdoc.to_dict() or {}).get("sql")
 
         v = CatalogView(name=view_name, definition=sql or "", properties=data.get("properties", {}))
-        setattr(v, "sql", sql or "")
-        setattr(v, "metadata", type("M", (), {})())
+        v.sql = sql or ""
+        v.metadata = type("M", (), {})()
         v.metadata.schema = schema
         # Populate metadata fields from the stored view document so callers
         # expecting attributes like `timestamp_ms` won't fail.
@@ -1654,8 +1652,8 @@ class OpteryxCatalog(Metastore):
         # Optional describer (used to flag LLM-generated descriptions)
         v.metadata.describer = data.get("describer")
         # Attach catalog and identifier for describe() method
-        setattr(v, "_catalog", self)
-        setattr(v, "_identifier", f"{collection}.{view_name}")
+        v._catalog = self
+        v._identifier = f"{collection}.{view_name}"
         return v
 
     def drop_view(self, identifier: str | tuple, author: str = None) -> None:
@@ -1707,7 +1705,7 @@ class OpteryxCatalog(Metastore):
         return [doc.id for doc in coll.stream()]
 
     def view_exists(
-        self, identifier_or_collection: str | tuple, view_name: Optional[str] = None
+        self, identifier_or_collection: str | tuple, view_name: str | None = None
     ) -> bool:
         """Return True if the view exists.
 
@@ -1759,16 +1757,14 @@ class OpteryxCatalog(Metastore):
             return ".".join(parts[1:])
         if len(parts) >= 2:
             return table
-        raise MaterializedViewError(
-            f"source table must be at least 'collection.dataset': {table}"
-        )
+        raise MaterializedViewError(f"source table must be at least 'collection.dataset': {table}")
 
     def create_trigger(
         self,
         dataset_identifier: str,
         name: str,
         target_view: str,
-        statement_id: Optional[str] = None,
+        statement_id: str | None = None,
         author: str = None,
         kind: str = MV_REFRESH_TRIGGER_KIND,
     ) -> None:
@@ -1848,7 +1844,7 @@ class OpteryxCatalog(Metastore):
             trigger=name,
         )
 
-    def list_triggers(self, dataset_identifier: str) -> List[dict]:
+    def list_triggers(self, dataset_identifier: str) -> list[dict]:
         """All triggers attached to a dataset, as plain dicts."""
         collection, dataset_name = self._relative_identifier(dataset_identifier).split(".", 1)
         results = []
@@ -1858,9 +1854,7 @@ class OpteryxCatalog(Metastore):
             results.append(data)
         return results
 
-    def mark_trigger_fired(
-        self, dataset_identifier: str, name: str, status: str
-    ) -> None:
+    def mark_trigger_fired(self, dataset_identifier: str, name: str, status: str) -> None:
         """Stamp a trigger's last-fired fields. Called by the enqueue path."""
         collection, dataset_name = self._relative_identifier(dataset_identifier).split(".", 1)
         self._triggers_collection(collection, dataset_name).document(name).update(
@@ -1879,9 +1873,7 @@ class OpteryxCatalog(Metastore):
         """The auto-generated name of an MV's refresh trigger on a source."""
         return f"refresh__{collection}__{dataset_name}"
 
-    def _assert_no_materialized_view_cycle(
-        self, identifier: str, source_tables: List[str]
-    ) -> None:
+    def _assert_no_materialized_view_cycle(self, identifier: str, source_tables: list[str]) -> None:
         """Reject a source graph that reaches back to the MV being registered.
 
         Checked at creation rather than fire time: MV-over-MV chains are legal
@@ -1906,15 +1898,13 @@ class OpteryxCatalog(Metastore):
                 continue
             data = doc.to_dict() or {}
             if data.get("dataset-type") == MATERIALIZED_VIEW_TYPE:
-                stack.extend(
-                    self._relative_identifier(s) for s in data.get("source-tables") or []
-                )
+                stack.extend(self._relative_identifier(s) for s in data.get("source-tables") or [])
 
     def create_materialized_view(
         self,
         identifier: str,
         sql: str,
-        source_tables: List[str],
+        source_tables: list[str],
         author: str = None,
         update_if_exists: bool = False,
     ) -> None:
@@ -1953,13 +1943,11 @@ class OpteryxCatalog(Metastore):
             raise MaterializedViewError(f"Materialized view already exists: {identifier}")
 
         # Normalize, dedupe (order-preserving), and validate sources.
-        relative_sources: List[str] = []
+        relative_sources: list[str] = []
         for table in source_tables:
             relative = self._relative_identifier(table)
             if relative == identifier:
-                raise MaterializedViewError(
-                    f"materialized view cannot read itself: {identifier}"
-                )
+                raise MaterializedViewError(f"materialized view cannot read itself: {identifier}")
             if relative not in relative_sources:
                 relative_sources.append(relative)
         if not relative_sources:
@@ -2004,9 +1992,7 @@ class OpteryxCatalog(Metastore):
 
         # Reconcile triggers: one per current source, none on former sources.
         trigger_name = self._mv_trigger_name(collection, dataset_name)
-        previous_sources = [
-            self._relative_identifier(s) for s in data.get("source-tables") or []
-        ]
+        previous_sources = [self._relative_identifier(s) for s in data.get("source-tables") or []]
         for removed in (s for s in previous_sources if s not in relative_sources):
             self.drop_trigger(removed, trigger_name, author=author, missing_ok=True)
         for source in relative_sources:
@@ -2058,7 +2044,7 @@ class OpteryxCatalog(Metastore):
             "last-refresh-execution-id": data.get("last-refresh-execution-id"),
         }
 
-    def list_materialized_views(self, collection: str) -> List[str]:
+    def list_materialized_views(self, collection: str) -> list[str]:
         """Names of the materialized views in a collection.
 
         Client-side filter over the datasets subcollection rather than a
@@ -2090,9 +2076,7 @@ class OpteryxCatalog(Metastore):
             return
         data = doc.to_dict() or {}
         if data.get("dataset-type") != MATERIALIZED_VIEW_TYPE:
-            raise MaterializedViewError(
-                f"Not a materialized view: {identifier} (use drop_dataset)"
-            )
+            raise MaterializedViewError(f"Not a materialized view: {identifier} (use drop_dataset)")
 
         trigger_name = self._mv_trigger_name(collection, dataset_name)
         for source in data.get("source-tables") or []:
@@ -2113,7 +2097,7 @@ class OpteryxCatalog(Metastore):
         self,
         identifier: str,
         status: str,
-        execution_id: Optional[str] = None,
+        execution_id: str | None = None,
         author: str = None,
     ) -> None:
         """Stamp refresh state on an MV. Called by the worker when a refresh
@@ -2141,8 +2125,8 @@ class OpteryxCatalog(Metastore):
     def update_view_execution_metadata(
         self,
         identifier: str | tuple,
-        row_count: Optional[int] = None,
-        execution_time: Optional[float] = None,
+        row_count: int | None = None,
+        execution_time: float | None = None,
     ) -> None:
         if isinstance(identifier, tuple) or isinstance(identifier, list):
             collection, view_name = identifier[0], identifier[1]
@@ -2164,7 +2148,7 @@ class OpteryxCatalog(Metastore):
         self,
         identifier: str | tuple,
         description: str,
-        describer: Optional[str] = None,
+        describer: str | None = None,
     ) -> None:
         """Update the description for a view.
 
@@ -2190,7 +2174,7 @@ class OpteryxCatalog(Metastore):
         self,
         identifier: str | tuple,
         description: str,
-        describer: Optional[str] = None,
+        describer: str | None = None,
     ) -> None:
         """Update the description for a dataset.
 
@@ -2216,8 +2200,8 @@ class OpteryxCatalog(Metastore):
     def update_dataset_sort_order(
         self,
         identifier: str | tuple,
-        columns: List[str],
-        author: Optional[str] = None,
+        columns: list[str],
+        author: str | None = None,
     ) -> None:
         """Set the clustering columns for a dataset (``ALTER TABLE ... CLUSTER BY``).
 
@@ -2290,8 +2274,8 @@ class OpteryxCatalog(Metastore):
         )
 
     def write_parquet_manifest(
-        self, snapshot_id: int, entries: List[dict], dataset_location: str
-    ) -> Optional[str]:
+        self, snapshot_id: int, entries: list[dict], dataset_location: str
+    ) -> str | None:
         """Write a Parquet manifest for the given snapshot id and entries.
 
         Entries should be plain dicts. The manifest will be written to
@@ -2362,7 +2346,11 @@ class OpteryxCatalog(Metastore):
                 # how manifests grew NULL sizes that later raised
                 # `'<' not supported between instances of 'NoneType' and 'int'`
                 # inside compaction's size comparisons.
-                for _numeric in ("record_count", "file_size_in_bytes", "uncompressed_size_in_bytes"):
+                for _numeric in (
+                    "record_count",
+                    "file_size_in_bytes",
+                    "uncompressed_size_in_bytes",
+                ):
                     if e.get(_numeric) is None:
                         e[_numeric] = 0
                 # Ensure list fields exist
@@ -2417,9 +2405,7 @@ class OpteryxCatalog(Metastore):
                             return None
                         if isinstance(col, str):  # legacy comma-joined column
                             col = col.split(",") if col else []
-                        return [
-                            None if h is None else (int(h) & 0xFFFFFFFFFFFFFFFF) for h in col
-                        ]
+                        return [None if h is None else (int(h) & 0xFFFFFFFFFFFFFFFF) for h in col]
 
                     values = [
                         None if entry is None else [_norm_col(col) for col in entry]
@@ -2552,9 +2538,7 @@ class OpteryxCatalog(Metastore):
         callers that haven't been updated to pass allocated ids.
         """
         if hasattr(schema, "columns"):
-            entries = [
-                (col.name, _core_type_to_stored(col.column_type)) for col in schema.columns
-            ]
+            entries = [(col.name, _core_type_to_stored(col.column_type)) for col in schema.columns]
         elif hasattr(schema, "num_rows") and hasattr(schema, "column_names"):
             # Duck-typed as a draken Morsel. Don't check for `.schema`
             # directly — older draken releases (e.g. 0.4.2) don't expose it.
@@ -2572,8 +2556,7 @@ class OpteryxCatalog(Metastore):
 
         if field_ids is not None and len(field_ids) != len(entries):
             raise ValueError(
-                f"field_ids length ({len(field_ids)}) does not match column count "
-                f"({len(entries)})"
+                f"field_ids length ({len(field_ids)}) does not match column count ({len(entries)})"
             )
         ids = field_ids if field_ids is not None else range(1, len(entries) + 1)
 

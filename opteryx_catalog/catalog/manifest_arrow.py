@@ -17,7 +17,9 @@ from __future__ import annotations
 import logging
 import time
 from collections import OrderedDict
-from typing import Any, Iterable, Iterator
+from collections.abc import Iterable
+from collections.abc import Iterator
+from typing import Any
 
 from .manifest import read_manifest_columns
 
@@ -34,7 +36,7 @@ _SKETCH_VECTOR_COLUMNS = ("min_k_hashes", "histogram_counts", "char_class_counts
 # histogram_counts / char_class_counts) per manifest, so a cached entry holds
 # that manifest's sketch buffers alongside the boxed columns until evicted.
 ARROW_MANIFEST_CACHE_SIZE: int = 32
-_arrow_manifest_cache: "OrderedDict[str, tuple]" = OrderedDict()
+_arrow_manifest_cache: OrderedDict[str, tuple] = OrderedDict()
 
 # Metrics
 _manifest_retrieval_metrics = {

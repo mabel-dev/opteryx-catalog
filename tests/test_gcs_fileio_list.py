@@ -24,7 +24,7 @@ def test_fileio_base_has_list_files_and_ls_alias():
     # bound method each time, so `is` between two instance lookups is never true
     # even when both wrap the same function. The sibling GcsFileIO alias tests
     # already compare this way.
-    assert getattr(FileIO, "ls") is getattr(FileIO, "list_files")
+    assert FileIO.ls is FileIO.list_files
 
 
 def test_gcsfileio_ls_alias_exists():
@@ -37,7 +37,7 @@ def test_gcsfileio_ls_alias_exists():
     # class-level alias should point to same function object
     from opteryx_catalog.iops import fileio as _fio_mod
 
-    assert getattr(_fio_mod.GcsFileIO, "ls") is getattr(_fio_mod.GcsFileIO, "list_files")
+    assert _fio_mod.GcsFileIO.ls is _fio_mod.GcsFileIO.list_files
     # runtime call parity
     assert g.ls("x") == g.list_files("x")
 
@@ -87,12 +87,13 @@ def test_http_gcsfileio_ls_alias_exists():
 
     g = object.__new__(GcsFileIO)
     assert callable(getattr(g, "ls", None))
-    assert getattr(GcsFileIO, "ls") is getattr(GcsFileIO, "list_files")
+    assert GcsFileIO.ls is GcsFileIO.list_files
 
 
 def test_deep_clean_uses_io_list_files():
-    from opteryx_catalog.catalog.deep_clean import DatasetDeepClean
     from types import SimpleNamespace
+
+    from opteryx_catalog.catalog.deep_clean import DatasetDeepClean
     from opteryx_catalog.iops.gcs import GcsFileIO
 
     # fake catalog with GcsFileIO instance (avoid __init__ side effects).

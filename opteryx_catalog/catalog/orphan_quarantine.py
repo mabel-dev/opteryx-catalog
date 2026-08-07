@@ -37,10 +37,6 @@ import logging
 import time
 from dataclasses import dataclass
 from dataclasses import field
-from typing import Dict
-from typing import Optional
-from typing import Set
-from typing import Tuple
 
 from ..alerts import report as _alert
 from ..exceptions import QuarantineUnavailable
@@ -67,7 +63,12 @@ MAX_QUARANTINE_ENTRIES = 10_000
 # hierarchy has one home, and it gained `Alertable` and `CatalogError` bases
 # there. Importing it from here still works, which is how every existing caller
 # and test refers to it.
-__all__ = ["MAX_QUARANTINE_ENTRIES", "OrphanQuarantine", "QuarantineDecision", "QuarantineUnavailable"]
+__all__ = [
+    "MAX_QUARANTINE_ENTRIES",
+    "OrphanQuarantine",
+    "QuarantineDecision",
+    "QuarantineUnavailable",
+]
 
 
 @dataclass
@@ -75,18 +76,18 @@ class QuarantineDecision:
     """What a single review concluded about this run's orphan candidates."""
 
     # Candidates whose second sighting has landed and aged: safe to delete.
-    to_delete: Set[str] = field(default_factory=set)
+    to_delete: set[str] = field(default_factory=set)
     # Candidates still serving their quarantine, mapped to first-sighting time.
-    held: Dict[str, int] = field(default_factory=dict)
+    held: dict[str, int] = field(default_factory=dict)
     # Candidates recorded for the first time by this run.
-    newly_quarantined: Set[str] = field(default_factory=set)
+    newly_quarantined: set[str] = field(default_factory=set)
     # Previously quarantined files this run did NOT flag, so they are forgotten.
-    released: Set[str] = field(default_factory=set)
+    released: set[str] = field(default_factory=set)
 
 
 def review_candidates(
-    previous: Dict[str, int],
-    candidates: Set[str],
+    previous: dict[str, int],
+    candidates: set[str],
     now_ms: int,
     min_age_ms: int = ORPHAN_QUARANTINE_MIN_AGE_MS,
 ) -> QuarantineDecision:
@@ -152,7 +153,7 @@ class OrphanQuarantine:
             .document(QUARANTINE_DOC)
         )
 
-    def load(self, identifier: str) -> Dict[str, int]:
+    def load(self, identifier: str) -> dict[str, int]:
         """Read the record. Returns path -> first-sighting timestamp (ms).
 
         A document that has never been written is an empty record, which is a
@@ -163,7 +164,7 @@ class OrphanQuarantine:
             doc = self._doc_ref(identifier).get()
         except QuarantineUnavailable:
             raise
-        except Exception as exc:  # noqa: BLE001 - any backend failure is fatal here
+        except Exception as exc:  # any backend failure is fatal here
             raise QuarantineUnavailable(f"could not read quarantine record: {exc}") from exc
 
         if not getattr(doc, "exists", False):
@@ -179,10 +180,12 @@ class OrphanQuarantine:
             else:
                 # A malformed entry cannot prove a first sighting, so dropping it
                 # sends that file back to strike one - the safe direction.
-                logger.warning("Discarding malformed quarantine entry for %s: %r", identifier, entry)
+                logger.warning(
+                    "Discarding malformed quarantine entry for %s: %r", identifier, entry
+                )
         return entries
 
-    def save(self, identifier: str, entries: Dict[str, int]) -> None:
+    def save(self, identifier: str, entries: dict[str, int]) -> None:
         """Replace the record with `entries`.
 
         A full replace, not a merge: files absent from `entries` are meant to be
@@ -207,15 +210,15 @@ class OrphanQuarantine:
             self._doc_ref(identifier).set(payload)
         except QuarantineUnavailable:
             raise
-        except Exception as exc:  # noqa: BLE001 - any backend failure is fatal here
+        except Exception as exc:  # any backend failure is fatal here
             raise QuarantineUnavailable(f"could not write quarantine record: {exc}") from exc
 
     def review(
         self,
         identifier: str,
-        candidates: Set[str],
+        candidates: set[str],
         persist: bool = True,
-        now_ms: Optional[int] = None,
+        now_ms: int | None = None,
     ) -> QuarantineDecision:
         """Review this run's candidates against the stored record.
 
@@ -252,8 +255,8 @@ class OrphanQuarantine:
         return decision
 
     def review_for_deletion(
-        self, identifier: str, candidates: Set[str], dry_run: bool
-    ) -> Tuple[Set[str], Dict[str, object]]:
+        self, identifier: str, candidates: set[str], dry_run: bool
+    ) -> tuple[set[str], dict[str, object]]:
         """`review`, wrapped for callers that are about to delete.
 
         Turns an unavailable record into "delete nothing" rather than an
@@ -320,4 +323,3 @@ class OrphanQuarantine:
             "orphans_released": len(decision.released),
             "quarantined_files": sorted(decision.held),
         }
-

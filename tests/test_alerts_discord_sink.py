@@ -143,9 +143,7 @@ def test_oversized_values_are_clipped_not_rejected():
     sink = DiscordSink(webhook_url=WEBHOOK)
     with patch("opteryx_catalog.alerts.discord.requests.post") as post:
         post.return_value = _response(204)
-        sink.deliver(
-            _alert(title="T" * 5000, context={"k": "V" * 5000, "long" * 100: "x"})
-        )
+        sink.deliver(_alert(title="T" * 5000, context={"k": "V" * 5000, "long" * 100: "x"}))
 
         embed = post.call_args.kwargs["json"]["embeds"][0]
         assert len(embed["title"]) <= discord_module.MAX_EMBED_TITLE
@@ -159,7 +157,9 @@ def test_at_most_ten_fields():
     with patch("opteryx_catalog.alerts.discord.requests.post") as post:
         post.return_value = _response(204)
         sink.deliver(_alert(context={f"k{n}": n for n in range(50)}))
-        assert len(post.call_args.kwargs["json"]["embeds"][0]["fields"]) <= discord_module.MAX_FIELDS
+        assert (
+            len(post.call_args.kwargs["json"]["embeds"][0]["fields"]) <= discord_module.MAX_FIELDS
+        )
 
 
 # -- mentions -----------------------------------------------------------
@@ -216,9 +216,10 @@ def test_allowed_mentions_table(mention, expected):
 def test_429_reads_retry_after_from_the_body():
     """Discord puts retry_after in the BODY; reading only the header misses it."""
     sink = DiscordSink(webhook_url=WEBHOOK)
-    with patch("opteryx_catalog.alerts.discord.requests.post") as post, patch(
-        "opteryx_catalog.alerts.discord._sleep"
-    ) as sleep:
+    with (
+        patch("opteryx_catalog.alerts.discord.requests.post") as post,
+        patch("opteryx_catalog.alerts.discord._sleep") as sleep,
+    ):
         post.side_effect = [_response(429, {"retry_after": 2.5}), _response(204)]
         sink.deliver(_alert())
         sleep.assert_called_once_with(2.5)
@@ -227,9 +228,10 @@ def test_429_reads_retry_after_from_the_body():
 
 def test_429_falls_back_to_the_header():
     sink = DiscordSink(webhook_url=WEBHOOK)
-    with patch("opteryx_catalog.alerts.discord.requests.post") as post, patch(
-        "opteryx_catalog.alerts.discord._sleep"
-    ) as sleep:
+    with (
+        patch("opteryx_catalog.alerts.discord.requests.post") as post,
+        patch("opteryx_catalog.alerts.discord._sleep") as sleep,
+    ):
         post.side_effect = [_response(429, None, {"Retry-After": "4"}), _response(204)]
         sink.deliver(_alert())
         sleep.assert_called_once_with(4.0)
@@ -244,8 +246,9 @@ def test_retry_after_is_clamped():
 def test_a_persistent_failure_is_reported_as_not_delivered():
     """So the dispatcher forgets the fingerprint and the next occurrence retries."""
     sink = DiscordSink(webhook_url=WEBHOOK)
-    with patch("opteryx_catalog.alerts.discord.requests.post") as post, patch(
-        "opteryx_catalog.alerts.discord._sleep"
+    with (
+        patch("opteryx_catalog.alerts.discord.requests.post") as post,
+        patch("opteryx_catalog.alerts.discord._sleep"),
     ):
         post.return_value = _response(500)
         with pytest.raises(discord_module._NotDelivered):
@@ -282,8 +285,9 @@ def test_a_failing_discord_does_not_cost_the_stdout_line(capsys):
 def test_warnings_never_reach_discord():
     alerts.reset()
     alerts.configure(component="expiration", sink="discord")
-    with patch("opteryx_catalog.alerts.discord.requests.post") as post, patch.dict(
-        os.environ, {"OPTERYX_ALERTS_DISCORD_WEBHOOK": WEBHOOK}
+    with (
+        patch("opteryx_catalog.alerts.discord.requests.post") as post,
+        patch.dict(os.environ, {"OPTERYX_ALERTS_DISCORD_WEBHOOK": WEBHOOK}),
     ):
         alerts.report(SummaryInconsistencyError("totals disagree"), blocking=True)
         post.assert_not_called()

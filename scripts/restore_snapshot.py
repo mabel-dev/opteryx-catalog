@@ -54,8 +54,8 @@ import argparse
 import os
 import re
 import sys
-from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
+from datetime import UTC
+from datetime import datetime
 
 MANIFEST_RE = re.compile(r"/metadata/manifest-(\d+)\.parquet$")
 
@@ -113,11 +113,11 @@ class SoftDeleteIndex:
         self.bucket = client.bucket(bucket_name)
         self.prefix = prefix
 
-        self.live: Dict[str, object] = {}
+        self.live: dict[str, object] = {}
         for blob in client.list_blobs(bucket_name, prefix=prefix):
             self.live[blob.name] = blob
 
-        self.deleted: Dict[str, object] = {}
+        self.deleted: dict[str, object] = {}
         for blob in client.list_blobs(bucket_name, prefix=prefix, soft_deleted=True):
             existing = self.deleted.get(blob.name)
             if existing is None or (blob.soft_delete_time or _EPOCH) > (
@@ -133,12 +133,12 @@ class SoftDeleteIndex:
             return "recoverable"
         return "lost"
 
-    def deadline(self) -> Optional[datetime]:
+    def deadline(self) -> datetime | None:
         """Earliest hard-delete time across recoverable objects."""
         times = [b.hard_delete_time for b in self.deleted.values() if b.hard_delete_time]
         return min(times) if times else None
 
-    def manifests(self) -> List[Tuple[int, str, str]]:
+    def manifests(self) -> list[tuple[int, str, str]]:
         """(snapshot_id, object name, status) for every manifest seen."""
         found = {}
         for name in list(self.live) + list(self.deleted):
@@ -165,16 +165,17 @@ class SoftDeleteIndex:
         return True
 
 
-_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
 
 def _blob_name(path: str, bucket: str) -> str:
     prefix = f"gs://{bucket}/"
-    return path[len(prefix):] if path.startswith(prefix) else path.lstrip("/")
+    return path[len(prefix) :] if path.startswith(prefix) else path.lstrip("/")
 
 
 def _connect(workspace: str):
-    from google.cloud import firestore, storage
+    from google.cloud import firestore
+    from google.cloud import storage
 
     firestore_client = firestore.Client(
         project=os.environ["GCP_PROJECT_ID"], database=os.environ["FIRESTORE_DATABASE"]
@@ -198,7 +199,7 @@ def _connect(workspace: str):
     return catalog, storage_client
 
 
-def _source_prefix(catalog, identifier: str) -> Tuple[str, str]:
+def _source_prefix(catalog, identifier: str) -> tuple[str, str]:
     """(dataset location, blob prefix) for an existing dataset."""
     collection, dataset_name = identifier.split(".", 1)
     doc = catalog._dataset_doc_ref(collection, dataset_name).get()
@@ -226,7 +227,7 @@ def cmd_inventory(args) -> None:
 
     deadline = index.deadline()
     if deadline:
-        hours = (deadline - datetime.now(timezone.utc)).total_seconds() / 3600
+        hours = (deadline - datetime.now(UTC)).total_seconds() / 3600
         print(f"earliest hard delete: {deadline.isoformat()}  ({hours:.1f}h from now)")
     print()
 
@@ -234,7 +235,7 @@ def cmd_inventory(args) -> None:
     print(f"restore points ({len(manifests)} manifests):")
     print(f"  {'snapshot_id':>16}  {'when':<20}  status")
     for snapshot_id, name, status in manifests:
-        when = datetime.fromtimestamp(snapshot_id / 1000, tz=timezone.utc)
+        when = datetime.fromtimestamp(snapshot_id / 1000, tz=UTC)
         flag = "  <-- live" if status == "live" else ""
         print(f"  {snapshot_id:>16}  {when.strftime('%Y-%m-%d %H:%M:%S')}  {status}{flag}")
 
@@ -251,10 +252,8 @@ def cmd_inventory(args) -> None:
         print(f"\n(could not read Firestore snapshot entries: {exc})")
 
     if docs:
-        from opteryx_catalog.catalog.metadata import (
-            SNAPSHOT_EXPIRED_AT_KEY,
-            snapshot_is_tombstoned,
-        )
+        from opteryx_catalog.catalog.metadata import SNAPSHOT_EXPIRED_AT_KEY
+        from opteryx_catalog.catalog.metadata import snapshot_is_tombstoned
 
         tombstoned = [
             (doc.id, doc.to_dict() or {})
@@ -265,9 +264,7 @@ def cmd_inventory(args) -> None:
         for doc_id, data in sorted(tombstoned, key=lambda pair: pair[0]):
             expired_at = data.get(SNAPSHOT_EXPIRED_AT_KEY)
             when = (
-                datetime.fromtimestamp(expired_at / 1000, tz=timezone.utc).strftime(
-                    "%Y-%m-%d %H:%M"
-                )
+                datetime.fromtimestamp(expired_at / 1000, tz=UTC).strftime("%Y-%m-%d %H:%M")
                 if isinstance(expired_at, int)
                 else "?"
             )
@@ -301,7 +298,7 @@ def _load_manifest_rows(index, catalog, prefix: str, snapshot_id: int, announce:
 
     if status == "recoverable":
         if announce:
-            print(f"restoring manifest object (un-deletes it at its original path):")
+            print("restoring manifest object (un-deletes it at its original path):")
             print(f"  gs://{os.environ['GCS_BUCKET']}/{name}")
         index.restore(name)
         print("  restored")
@@ -333,7 +330,7 @@ def cmd_inspect(args) -> None:
         total_bytes += int(row.get("file_size_in_bytes") or 0)
         tally[index.status(_blob_name(path, bucket_name))].append(path)
 
-    print(f"total recorded size: {total_bytes / (1024 ** 3):.3f} GiB\n")
+    print(f"total recorded size: {total_bytes / (1024**3):.3f} GiB\n")
     for state in ("live", "recoverable", "lost"):
         print(f"  {state:<12} {len(tally[state])}")
     for path in tally["lost"][:20]:
@@ -361,9 +358,7 @@ def cmd_restore(args) -> None:
     if target_ref.get().exists:
         sys.exit(f"target dataset {args.target!r} already exists; refusing to overwrite")
 
-    target_location = (
-        f"gs://{bucket_name}/{args.workspace}/{target_collection}/{target_name}"
-    )
+    target_location = f"gs://{bucket_name}/{args.workspace}/{target_collection}/{target_name}"
     target_prefix = _blob_name(target_location, bucket_name) + "/"
     if any(storage_client.list_blobs(bucket_name, prefix=target_prefix, max_results=1)):
         sys.exit(f"target location is not empty: {target_location}")
@@ -385,7 +380,7 @@ def cmd_restore(args) -> None:
             continue
         # Preserve the layout below the dataset root so the restored dataset
         # mirrors the original rather than flattening it.
-        relative = source_name[len(prefix):] if source_name.startswith(prefix) else source_name
+        relative = source_name.removeprefix(prefix)
         plan.append((source_name, target_prefix + relative, status, row))
 
     print(f"\nsource:  {location}")
@@ -438,10 +433,9 @@ def cmd_restore(args) -> None:
             "workspace": args.workspace,
             "location": target_location,
             "current-snapshot-id": args.snapshot_id,
-            "timestamp-ms": int(datetime.now(timezone.utc).timestamp() * 1000),
+            "timestamp-ms": int(datetime.now(UTC).timestamp() * 1000),
             "description": (
-                f"Restored from {args.dataset} snapshot {args.snapshot_id} "
-                f"via restore_snapshot.py"
+                f"Restored from {args.dataset} snapshot {args.snapshot_id} via restore_snapshot.py"
             ),
             # Unversioned by default so the restored copy is not itself
             # expired by a maintenance pass before anyone has looked at it.
@@ -464,7 +458,7 @@ def cmd_restore(args) -> None:
             "user-created": True,
             "summary": {
                 "restored-from": args.dataset,
-                "restored-at-ms": int(datetime.now(timezone.utc).timestamp() * 1000),
+                "restored-at-ms": int(datetime.now(UTC).timestamp() * 1000),
             },
         }
     )
@@ -501,9 +495,7 @@ def main() -> None:
     args = parser.parse_args()
     _load_env(args.env)
 
-    {"inventory": cmd_inventory, "inspect": cmd_inspect, "restore": cmd_restore}[
-        args.command
-    ](args)
+    {"inventory": cmd_inventory, "inspect": cmd_inspect, "restore": cmd_restore}[args.command](args)
 
 
 if __name__ == "__main__":

@@ -195,9 +195,7 @@ def _catalog_with_properties(props_data=None, tombstone_data=None):
 
     dropped_workspaces = _Collection("$dropped-workspaces", log=log)
     if tombstone_data is not None:
-        dropped_workspaces._docs["ws"] = _DocRef(
-            "ws", data=tombstone_data, exists=True, log=log
-        )
+        dropped_workspaces._docs["ws"] = _DocRef("ws", data=tombstone_data, exists=True, log=log)
     catalog.firestore_client = _FirestoreClient(dropped_workspaces)
 
     return catalog, catalog_collection, dropped_workspaces, log
@@ -308,9 +306,7 @@ def test_list_dropped_workspaces():
 
 
 def test_delete_workspace_tombstone():
-    catalog, _cc, _dw, log = _catalog_with_properties(
-        tombstone_data={"workspace": "ws"}
-    )
+    catalog, _cc, _dw, log = _catalog_with_properties(tombstone_data={"workspace": "ws"})
 
     catalog.delete_workspace_tombstone("ws")
     assert ("delete", "ws") in log

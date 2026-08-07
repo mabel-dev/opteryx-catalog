@@ -3,9 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from dataclasses import field
 from typing import Any
-from typing import List
-from typing import Optional
-
 
 # Field stamped onto a snapshot document when expiration retires it. The
 # document is NOT deleted at that point: it becomes a tombstone that keeps the
@@ -33,18 +30,18 @@ def snapshot_is_tombstoned(doc: dict) -> bool:
 class Snapshot:
     snapshot_id: int
     timestamp_ms: int
-    author: Optional[str] = None
+    author: str | None = None
     # Indicates whether this snapshot was created by a user (True) or internally (False)
-    user_created: Optional[bool] = None
+    user_created: bool | None = None
     # Monotonic sequence number for writes
-    sequence_number: Optional[int] = None
-    manifest_list: Optional[str] = None
+    sequence_number: int | None = None
+    manifest_list: str | None = None
     # Operation metadata
-    operation_type: Optional[str] = None  # e.g., 'append', 'overwrite', 'compact'
-    parent_snapshot_id: Optional[int] = None
-    schema_id: Optional[str] = None
+    operation_type: str | None = None  # e.g., 'append', 'overwrite', 'compact'
+    parent_snapshot_id: int | None = None
+    schema_id: str | None = None
     # Commit message for the snapshot
-    commit_message: Optional[str] = None
+    commit_message: str | None = None
     # Summary metrics (store zeros when not applicable)
     summary: dict = field(
         default_factory=lambda: {
@@ -69,11 +66,11 @@ class DatasetMetadata:
     schema: Any = None
     properties: dict = field(default_factory=dict)
     # Dataset-level created/updated metadata
-    timestamp_ms: Optional[int] = None
-    author: Optional[str] = None
-    description: Optional[str] = None
-    describer: Optional[str] = None
-    sort_orders: List[int] = field(default_factory=list)
+    timestamp_ms: int | None = None
+    author: str | None = None
+    description: str | None = None
+    describer: str | None = None
+    sort_orders: list[int] = field(default_factory=list)
     # Maintenance policy: retention settings grouped under a single block
     maintenance_policy: dict = field(
         default_factory=lambda: {
@@ -82,13 +79,13 @@ class DatasetMetadata:
         }
     )
     # Compaction policy lives under maintenance_policy as 'compaction-policy'
-    snapshots: List[Snapshot] = field(default_factory=list)
-    current_snapshot_id: Optional[int] = None
+    snapshots: list[Snapshot] = field(default_factory=list)
+    current_snapshot_id: int | None = None
     # Schema management: schemas are stored in a subcollection in Firestore.
     # `schemas` contains dicts with keys: schema_id, columns (list of {id,name,type}).
     # Each schema dict may also include `timestamp-ms` and `author`.
-    schemas: List[dict] = field(default_factory=list)
-    current_schema_id: Optional[str] = None
+    schemas: list[dict] = field(default_factory=list)
+    current_schema_id: str | None = None
     # Monotonically-increasing, never-reused counter for allocating stable per-column
     # field-ids (Iceberg-style). Used to key manifest min/max statistics so they
     # survive schema evolution without positional drift. Persisted on the dataset's
@@ -96,26 +93,26 @@ class DatasetMetadata:
     next_field_id: int = 1
     # Annotations: list of annotation objects attached to this dataset
     # Each annotation is a dict with keys like 'key' and 'value'.
-    annotations: List[dict] = field(default_factory=list)
+    annotations: list[dict] = field(default_factory=list)
     # Refresh frequency in minutes; None means no automatic refresh
-    refresh_frequency_mins: Optional[int] = None
+    refresh_frequency_mins: int | None = None
     # What kind of dataset this is. None for a plain dataset (the field is
     # absent on their documents); "materialized_view" for the backing table of
     # a materialized view. Carried on the metadata so readers - the OData
     # service, describe, any UI - can tell them apart without a second lookup.
-    dataset_type: Optional[str] = None
+    dataset_type: str | None = None
     # Materialized-view registration, mirrored here for the same reason
     # sort_orders and maintenance_policy are: `save_dataset_metadata` writes
     # the whole dataset document with `set()`, so a field it does not carry is
     # DESTROYED by the next commit. For a materialized view that commit is its
     # own refresh - the registration would not survive the first one.
-    statement_id: Optional[str] = None
-    source_tables: List[str] = field(default_factory=list)
-    last_refreshed_at_ms: Optional[int] = None
-    last_refresh_status: Optional[str] = None
-    last_refresh_execution_id: Optional[str] = None
+    statement_id: str | None = None
+    source_tables: list[str] = field(default_factory=list)
+    last_refreshed_at_ms: int | None = None
+    last_refresh_status: str | None = None
+    last_refresh_execution_id: str | None = None
 
-    def current_snapshot(self) -> Optional[Snapshot]:
+    def current_snapshot(self) -> Snapshot | None:
         if self.current_snapshot_id is None:
             return self.snapshots[-1] if self.snapshots else None
         for s in self.snapshots:

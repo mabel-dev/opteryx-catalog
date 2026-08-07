@@ -7,13 +7,12 @@ for different types of catalog events.
 from __future__ import annotations
 
 from typing import Any
-from typing import Optional
 
 
 def dataset_created_payload(
     schema: Any,
-    location: Optional[str] = None,
-    properties: Optional[dict[str, Any]] = None,
+    location: str | None = None,
+    properties: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build payload for dataset creation event.
 
@@ -45,8 +44,8 @@ def dataset_created_payload(
 
 
 def dataset_deleted_payload(
-    location: Optional[str] = None,
-    dropped_by: Optional[str] = None,
+    location: str | None = None,
+    dropped_by: str | None = None,
 ) -> dict[str, Any]:
     """Build payload for dataset deletion event.
 
@@ -66,9 +65,9 @@ def dataset_deleted_payload(
 def dataset_renamed_payload(
     old_identifier: str,
     new_identifier: str,
-    old_location: Optional[str] = None,
-    new_location: Optional[str] = None,
-    renamed_by: Optional[str] = None,
+    old_location: str | None = None,
+    new_location: str | None = None,
+    renamed_by: str | None = None,
 ) -> dict[str, Any]:
     """Build payload for dataset rename event.
 
@@ -97,8 +96,8 @@ def dataset_renamed_payload(
 
 
 def dataset_updated_payload(
-    description: Optional[str] = None,
-    properties: Optional[dict[str, Any]] = None,
+    description: str | None = None,
+    properties: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build payload for dataset update event.
 
@@ -141,7 +140,7 @@ def dataset_commit_payload(
 
 
 def collection_created_payload(
-    properties: Optional[dict[str, Any]] = None,
+    properties: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build payload for collection creation event.
 
@@ -158,7 +157,7 @@ def collection_created_payload(
 
 def view_created_payload(
     definition: str,
-    properties: Optional[dict[str, Any]] = None,
+    properties: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build payload for view creation event.
 
@@ -175,7 +174,7 @@ def view_created_payload(
     }
 
 
-def view_deleted_payload(dropped_by: Optional[str] = None) -> dict[str, Any]:
+def view_deleted_payload(dropped_by: str | None = None) -> dict[str, Any]:
     """Build payload for view deletion event.
 
     Args:
@@ -188,8 +187,8 @@ def view_deleted_payload(dropped_by: Optional[str] = None) -> dict[str, Any]:
 
 
 def view_updated_payload(
-    description: Optional[str] = None,
-    properties: Optional[dict[str, Any]] = None,
+    description: str | None = None,
+    properties: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build payload for view update event.
 
@@ -206,7 +205,7 @@ def view_updated_payload(
     }
 
 
-def workspace_deleted_payload(dropped_by: Optional[str] = None) -> dict[str, Any]:
+def workspace_deleted_payload(dropped_by: str | None = None) -> dict[str, Any]:
     """Build payload for workspace soft-delete event.
 
     Args:
@@ -218,7 +217,7 @@ def workspace_deleted_payload(dropped_by: Optional[str] = None) -> dict[str, Any
     return {"dropped_by": dropped_by}
 
 
-def workspace_restored_payload(restored_by: Optional[str] = None) -> dict[str, Any]:
+def workspace_restored_payload(restored_by: str | None = None) -> dict[str, Any]:
     """Build payload for workspace restore event.
 
     Args:
@@ -230,7 +229,7 @@ def workspace_restored_payload(restored_by: Optional[str] = None) -> dict[str, A
     return {"restored_by": restored_by}
 
 
-def workspace_locked_payload(locked_by: Optional[str] = None) -> dict[str, Any]:
+def workspace_locked_payload(locked_by: str | None = None) -> dict[str, Any]:
     """Build payload for workspace lock event.
 
     Args:
@@ -242,7 +241,7 @@ def workspace_locked_payload(locked_by: Optional[str] = None) -> dict[str, Any]:
     return {"locked_by": locked_by}
 
 
-def workspace_unlocked_payload(unlocked_by: Optional[str] = None) -> dict[str, Any]:
+def workspace_unlocked_payload(unlocked_by: str | None = None) -> dict[str, Any]:
     """Build payload for workspace unlock event.
 
     Args:
@@ -255,9 +254,9 @@ def workspace_unlocked_payload(unlocked_by: Optional[str] = None) -> dict[str, A
 
 
 def view_executed_payload(
-    execution_time_ms: Optional[int] = None,
-    row_count: Optional[int] = None,
-    error: Optional[str] = None,
+    execution_time_ms: int | None = None,
+    row_count: int | None = None,
+    error: str | None = None,
 ) -> dict[str, Any]:
     """Build payload for view execution event.
 

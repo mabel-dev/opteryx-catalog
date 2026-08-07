@@ -29,11 +29,6 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Dict
-from typing import List
-from typing import Optional
-from typing import Set
-from typing import Tuple
 
 from ..alerts import report as _alert
 from ..exceptions import ManifestProtectionError
@@ -97,9 +92,9 @@ class SnapshotExpiration:
     def __init__(
         self,
         catalog,
-        author: Optional[str] = None,
-        agent: Optional[str] = None,
-        quarantine: Optional[OrphanQuarantine] = None,
+        author: str | None = None,
+        agent: str | None = None,
+        quarantine: OrphanQuarantine | None = None,
     ):
         """
         Initialize snapshot expiration manager.
@@ -119,7 +114,7 @@ class SnapshotExpiration:
         self.deleted_manifests = []
         self.deleted_files = []
 
-    def expire_dataset(self, identifier: str, *, dry_run: bool) -> Optional[Dict]:
+    def expire_dataset(self, identifier: str, *, dry_run: bool) -> dict | None:
         """
         Apply retention policy to a single dataset.
 
@@ -159,7 +154,7 @@ class SnapshotExpiration:
             )
         return summary
 
-    def purge_snapshot_tombstones(self, identifier: str) -> List[str]:
+    def purge_snapshot_tombstones(self, identifier: str) -> list[str]:
         """Hard-delete tombstones whose record window has ended.
 
         This is the ONLY place a snapshot document is ever deleted, and it is
@@ -180,7 +175,7 @@ class SnapshotExpiration:
             Document ids purged.
         """
         cutoff_ms = int(time.time() * 1000) - EXPIRED_SNAPSHOT_RETENTION_MS
-        purged: List[str] = []
+        purged: list[str] = []
         try:
             collection, dataset_name = identifier.split(".", 1)
             # pylint: disable=protected-access
@@ -208,7 +203,7 @@ class SnapshotExpiration:
             logger.debug("Tombstone purge unavailable for %s: %s", identifier, exc)
         return purged
 
-    def _expire_dataset(self, identifier: str, dry_run: bool = False) -> Optional[Dict]:
+    def _expire_dataset(self, identifier: str, dry_run: bool = False) -> dict | None:
         """Apply retention policy to a single dataset (see `expire_dataset`)."""
         try:
             # Load dataset with full history
@@ -453,9 +448,7 @@ class SnapshotExpiration:
                     # same measure the execute path does. Full-reconciliation
                     # orphans have no known size (physical listing carries no
                     # stats), so they contribute 0 here.
-                    summary["bytes_reclaimed"] = sum(
-                        deleted_file_sizes.get(p, 0) for p in orphaned
-                    )
+                    summary["bytes_reclaimed"] = sum(deleted_file_sizes.get(p, 0) for p in orphaned)
 
                 return summary
 
@@ -510,7 +503,7 @@ class SnapshotExpiration:
             logger.error("Error expiring dataset %s: %s", identifier, e)
             return None
 
-    def expire_collection(self, collection: str, *, dry_run: bool) -> Dict[str, any]:
+    def expire_collection(self, collection: str, *, dry_run: bool) -> dict[str, any]:
         """
         Apply retention policy to all datasets in a collection.
 
@@ -575,7 +568,7 @@ class SnapshotExpiration:
 
         return results
 
-    def expire_workspace(self, *, dry_run: bool) -> Dict[str, any]:
+    def expire_workspace(self, *, dry_run: bool) -> dict[str, any]:
         """
         Apply retention policy to all datasets in workspace.
 
@@ -634,11 +627,11 @@ class SnapshotExpiration:
         self,
         identifier: str,
         dataset,
-        snapshots_to_delete: List[Snapshot],
-        snapshots_to_keep: List[Snapshot],
+        snapshots_to_delete: list[Snapshot],
+        snapshots_to_keep: list[Snapshot],
         skip_orphan_detection: bool = False,
-        retention_days: Optional[int] = None,
-    ) -> Dict:
+        retention_days: int | None = None,
+    ) -> dict:
         """
         Execute snapshot expiration: delete snapshots, manifests, and orphaned files.
 
@@ -672,7 +665,7 @@ class SnapshotExpiration:
 
         # Step 1: Find which files are kept and which are orphaned (if not skipped)
         orphaned_files = set()
-        orphaned_file_sizes: Dict[str, int] = {}
+        orphaned_file_sizes: dict[str, int] = {}
         if not skip_orphan_detection:
             kept_files = self._get_files_in_snapshots(snapshots_to_keep, required=True)
             deleted_file_sizes = self._get_file_sizes_in_snapshots(
@@ -825,8 +818,8 @@ class SnapshotExpiration:
         return summary
 
     def _get_file_sizes_in_snapshots(
-        self, snapshots: List[Snapshot], *, required: bool
-    ) -> Dict[str, int]:
+        self, snapshots: list[Snapshot], *, required: bool
+    ) -> dict[str, int]:
         """
         Get all data files referenced by a set of snapshots, with their sizes.
 
@@ -856,7 +849,7 @@ class SnapshotExpiration:
         Returns:
             Mapping of file path -> on-disk size in bytes (0 when unrecorded)
         """
-        files: Dict[str, int] = {}
+        files: dict[str, int] = {}
 
         for snapshot in snapshots:
             if not snapshot.manifest_list:
@@ -888,7 +881,7 @@ class SnapshotExpiration:
 
         return files
 
-    def _get_files_in_snapshots(self, snapshots: List[Snapshot], *, required: bool) -> Set[str]:
+    def _get_files_in_snapshots(self, snapshots: list[Snapshot], *, required: bool) -> set[str]:
         """
         Get all data files referenced by a set of snapshots.
 
@@ -901,7 +894,7 @@ class SnapshotExpiration:
         """
         return set(self._get_file_sizes_in_snapshots(snapshots, required=required))
 
-    def _find_full_orphaned_data_files(self, dataset, kept_files: Set[str]) -> Set[str]:
+    def _find_full_orphaned_data_files(self, dataset, kept_files: set[str]) -> set[str]:
         """
         Full reconciliation: physical data files under the dataset location
         that aren't referenced by any currently-kept snapshot.
@@ -941,7 +934,7 @@ class SnapshotExpiration:
             logger.error("Error during full orphaned-data-file reconciliation: %s", e)
             return set()
 
-    def _age_gate(self, dataset, candidates: Set[str]) -> Set[str]:
+    def _age_gate(self, dataset, candidates: set[str]) -> set[str]:
         """
         Drop candidates that are too new, or whose age can't be determined.
 
@@ -971,8 +964,8 @@ class SnapshotExpiration:
         return {f for f in candidates if ages.get(f, 0) >= DATA_FILE_ORPHAN_MIN_AGE_MS}
 
     def _quarantine_orphans(
-        self, identifier: str, candidates: Set[str], dry_run: bool
-    ) -> Tuple[Set[str], Dict[str, any]]:
+        self, identifier: str, candidates: set[str], dry_run: bool
+    ) -> tuple[set[str], dict[str, any]]:
         """
         Require a second, independent sighting before any file is deleted.
 
@@ -1001,7 +994,7 @@ class SnapshotExpiration:
         """
         return self.quarantine.review_for_deletion(identifier, candidates, dry_run)
 
-    def _eligible_orphaned_manifests(self, identifier: str) -> Tuple[List[str], List[str]]:
+    def _eligible_orphaned_manifests(self, identifier: str) -> tuple[list[str], list[str]]:
         """
         Manifest files in storage that no snapshot references, split by age.
 
@@ -1025,8 +1018,8 @@ class SnapshotExpiration:
         orphaned_manifests = cleaner.get_orphaned_manifests(identifier) or set()
 
         now_ms = int(time.time() * 1000)
-        eligible: List[str] = []
-        skipped_recent: List[str] = []
+        eligible: list[str] = []
+        skipped_recent: list[str] = []
         for manifest in orphaned_manifests:
             name = manifest.rsplit("/", 1)[-1]
             match = re.search(r"manifest-(\d+)\.parquet$", name)
@@ -1040,10 +1033,10 @@ class SnapshotExpiration:
     def _review_run_candidates(
         self,
         identifier: str,
-        data_candidates: Set[str],
-        manifest_candidates: Set[str],
+        data_candidates: set[str],
+        manifest_candidates: set[str],
         dry_run: bool,
-    ) -> Tuple[Set[str], Set[str], Dict[str, any]]:
+    ) -> tuple[set[str], set[str], dict[str, any]]:
         """
         Put everything this run proposes to delete through one review.
 
@@ -1096,7 +1089,7 @@ class SnapshotExpiration:
             return False
 
 
-def identify_expiring_datasets(catalog) -> Dict[str, List[str]]:
+def identify_expiring_datasets(catalog) -> dict[str, list[str]]:
     """
     Scan workspace and find datasets with snapshots outside retention window.
 
@@ -1150,8 +1143,7 @@ def identify_expiring_datasets(catalog) -> Dict[str, List[str]]:
                     if outside_window:
                         retained_snapshots = len(snapshots) - len(outside_window)
                         # Always keep at least the current snapshot
-                        if retained_snapshots < 1:
-                            retained_snapshots = 1
+                        retained_snapshots = max(retained_snapshots, 1)
                         excess_snapshots = len(outside_window)
 
                         expiring_datasets.append(

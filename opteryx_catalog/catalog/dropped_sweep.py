@@ -18,8 +18,6 @@ from __future__ import annotations
 import logging
 import time
 from typing import Any
-from typing import Dict
-from typing import Optional
 
 from .deep_clean import DatasetDeepClean
 from .expiration import DATA_FILE_ORPHAN_MIN_AGE_MS
@@ -39,8 +37,8 @@ class DroppedDatasetSweep:
     def __init__(
         self,
         catalog,
-        author: Optional[str] = None,
-        agent: Optional[str] = None,
+        author: str | None = None,
+        agent: str | None = None,
         min_age_ms: int = DATA_FILE_ORPHAN_MIN_AGE_MS,
     ):
         """
@@ -57,7 +55,7 @@ class DroppedDatasetSweep:
         self.min_age_ms = min_age_ms
         self._deep_clean = DatasetDeepClean(catalog, author=author, agent=agent)
 
-    def sweep(self, dry_run: bool = True) -> Dict[str, Any]:
+    def sweep(self, dry_run: bool = True) -> dict[str, Any]:
         """Process every tombstone in the workspace.
 
         Returns a summary with a per-tombstone breakdown in `details`.
@@ -88,7 +86,7 @@ class DroppedDatasetSweep:
             "details": details,
         }
 
-    def _sweep_one(self, tombstone: Dict[str, Any], dry_run: bool = True) -> Dict[str, Any]:
+    def _sweep_one(self, tombstone: dict[str, Any], dry_run: bool = True) -> dict[str, Any]:
         """Reclaim one tombstoned location, then clear the tombstone."""
         start = time.perf_counter()
         row = {
@@ -104,7 +102,7 @@ class DroppedDatasetSweep:
             "tombstone_cleared": False,
         }
 
-        def _done(action: str, reason: str) -> Dict[str, Any]:
+        def _done(action: str, reason: str) -> dict[str, Any]:
             row["action"] = action
             row["reason"] = reason
             row["duration_ms"] = int((time.perf_counter() - start) * 1000)

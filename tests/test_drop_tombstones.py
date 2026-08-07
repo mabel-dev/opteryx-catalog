@@ -162,9 +162,7 @@ def test_list_and_delete_tombstones():
         catalog.drop_dataset("coll.tbl", author="alice")
 
     # The stub records writes rather than materialising them, so seed the read side.
-    tombstones._docs["coll.tbl"]._doc = _Doc(
-        "coll.tbl", tombstones.document("coll.tbl").written
-    )
+    tombstones._docs["coll.tbl"]._doc = _Doc("coll.tbl", tombstones.document("coll.tbl").written)
 
     listed = catalog.list_dropped_datasets()
     assert len(listed) == 1

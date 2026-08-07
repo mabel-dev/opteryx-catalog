@@ -1,8 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import Any
-from typing import Iterable
-from typing import Optional
 
 
 class Metastore:
@@ -15,12 +14,12 @@ class Metastore:
     implementations to ease future compatibility.
     """
 
-    def load_dataset(self, identifier: str) -> "Dataset":
+    def load_dataset(self, identifier: str) -> Dataset:
         raise NotImplementedError()
 
     def create_dataset(
         self, identifier: str, schema: Any, properties: dict | None = None
-    ) -> "Dataset":
+    ) -> Dataset:
         raise NotImplementedError()
 
     def drop_dataset(self, identifier: str, author: str) -> None:
@@ -50,7 +49,7 @@ class Dataset:
     def snapshots(self) -> Iterable[Any]:
         raise NotImplementedError()
 
-    def snapshot(self, snapshot_id: Optional[int] = None) -> Optional[Any]:
+    def snapshot(self, snapshot_id: int | None = None) -> Any | None:
         """Return a specific snapshot by id or the current snapshot when
         called with `snapshot_id=None`.
         """
@@ -61,7 +60,7 @@ class Dataset:
         raise NotImplementedError()
 
     def scan(
-        self, row_filter=None, snapshot_id: Optional[int] = None, row_limit: Optional[int] = None
+        self, row_filter=None, snapshot_id: int | None = None, row_limit: int | None = None
     ) -> Any:
         raise NotImplementedError()
 

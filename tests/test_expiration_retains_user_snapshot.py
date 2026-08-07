@@ -21,8 +21,10 @@ sys.path.insert(0, os.path.join(sys.path[0], ".."))
 
 import pytest
 
-from opteryx_catalog.catalog.expiration import USER_SNAPSHOT_LOOKBACK, SnapshotExpiration
-from opteryx_catalog.catalog.metadata import DatasetMetadata, Snapshot
+from opteryx_catalog.catalog.expiration import USER_SNAPSHOT_LOOKBACK
+from opteryx_catalog.catalog.expiration import SnapshotExpiration
+from opteryx_catalog.catalog.metadata import DatasetMetadata
+from opteryx_catalog.catalog.metadata import Snapshot
 
 _DAY_MS = 24 * 60 * 60 * 1000
 

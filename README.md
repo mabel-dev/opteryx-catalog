@@ -43,9 +43,9 @@ from draken.morsels.morsel import Morsel
 from opteryx_catalog import OpteryxCatalog
 
 catalog = OpteryxCatalog(
-	workspace="my_workspace",
-	firestore_project="my-gcp-project",
-	gcs_bucket="my-default-bucket",
+    workspace="my_workspace",
+    firestore_project="my-gcp-project",
+    gcs_bucket="my-default-bucket",
 )
 
 # Create a collection
@@ -60,7 +60,9 @@ schema.append_vector("name", vector_from_sequence([], dtype="VARCHAR"))
 dataset = catalog.create_dataset("example_collection.users", schema, author="me")
 
 # Or register a table if you already have a metadata JSON in GCS
-catalog.register_table(("example_namespace", "events"), "gs://my-bucket/path/to/events/metadata/00000001.json")
+catalog.register_table(
+    ("example_namespace", "events"), "gs://my-bucket/path/to/events/metadata/00000001.json"
+)
 
 # Load a table
 tbl = catalog.load_dataset(("example_namespace", "users"))
@@ -245,7 +247,7 @@ view = catalog.create_view(
     sql="SELECT user_id, username FROM users WHERE active = true",
     schema=schema,
     author="data_team",
-    description="View of all active users in the system"
+    description="View of all active users in the system",
 )
 
 # Load a view
@@ -255,9 +257,7 @@ print(f"Schema: {view.metadata.schema}")
 
 # Update execution metadata after running the view
 catalog.update_view_execution_metadata(
-    ("my_namespace", "active_users"),
-    row_count=1250,
-    execution_time=0.45
+    ("my_namespace", "active_users"), row_count=1250, execution_time=0.45
 )
 ```
 
@@ -284,7 +284,7 @@ a CTAS), then registers it:
 catalog.create_materialized_view(
     "mart.daily_orders",
     "SELECT customer_id, COUNT(*) FROM sales.orders GROUP BY customer_id",
-    source_tables=["sales.orders"],   # one refresh trigger per source
+    source_tables=["sales.orders"],  # one refresh trigger per source
     author="data_team",
 )
 

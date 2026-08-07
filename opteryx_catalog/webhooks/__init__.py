@@ -39,8 +39,8 @@ class WebhookManager:
 
     def __init__(
         self,
-        domain: Optional[str] = None,
-        queue_path: Optional[str] = None,
+        domain: str | None = None,
+        queue_path: str | None = None,
         timeout: int = 10,
     ):
         """Initialize the webhook manager.
@@ -75,7 +75,7 @@ class WebhookManager:
         collection: str,
         resource_type: str,
         resource_name: str,
-        payload: Optional[dict[str, Any]] = None,
+        payload: dict[str, Any] | None = None,
     ) -> bool:
         """Send a webhook notification.
 
@@ -206,7 +206,7 @@ class WebhookManager:
 
 
 # Global webhook manager instance
-_webhook_manager: Optional[WebhookManager] = None
+_webhook_manager: WebhookManager | None = None
 
 
 def get_webhook_manager() -> WebhookManager:
@@ -223,7 +223,7 @@ def send_webhook(
     collection: str,
     resource_type: str,
     resource_name: str,
-    payload: Optional[dict[str, Any]] = None,
+    payload: dict[str, Any] | None = None,
 ) -> bool:
     """Convenience function to send a webhook via the global manager."""
     manager = get_webhook_manager()

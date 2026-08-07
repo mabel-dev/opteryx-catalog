@@ -1,7 +1,8 @@
 import copy
 
 from opteryx_catalog.catalog.dataset import SimpleDataset
-from opteryx_catalog.catalog.metadata import DatasetMetadata, Snapshot
+from opteryx_catalog.catalog.metadata import DatasetMetadata
+from opteryx_catalog.catalog.metadata import Snapshot
 
 
 class _FakeCatalog:
