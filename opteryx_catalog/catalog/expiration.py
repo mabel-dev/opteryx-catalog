@@ -189,14 +189,14 @@ class SnapshotExpiration:
                     try:
                         snaps_coll.document(doc.id).delete()
                         purged.append(doc.id)
-                    except Exception as exc:
+                    except Exception as exc:  # noqa: BLE001 - GCS/Firestore client boundary
                         logger.error(
                             "Failed to purge snapshot tombstone %s of %s: %s",
                             doc.id,
                             identifier,
                             exc,
                         )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - GCS/Firestore client boundary
             # Includes catalogs/fakes whose snapshot collections cannot
             # stream. Purging is housekeeping; nothing downstream depends on
             # it having run.
@@ -334,16 +334,19 @@ class SnapshotExpiration:
                             res = self._delete_file(io, m)
                             if res:
                                 deleted.append(m)
-                        except Exception:
+                        except Exception as exc:  # noqa: BLE001 - GCS client boundary
+                            # Continue deleting what we can, but don't fail the whole op. An
+                            # undeleted manifest is an orphan the next run re-proposes, so this
+                            # is recoverable - but it is not nothing, and it now says so.
+                            logger.error("Failed to delete orphaned manifest %s: %s", m, exc)
                             # Continue deleting what we can, but don't fail the whole op
-                            pass
 
                     deleted_data_files = []
                     for f in full_orphans:
                         try:
                             if self._delete_file(io, f):
                                 deleted_data_files.append(f)
-                        except Exception as e:
+                        except Exception as e:  # noqa: BLE001 - GCS/Firestore client boundary
                             logger.error("Failed to delete orphaned data file %s: %s", f, e)
 
                     return {
@@ -367,9 +370,13 @@ class SnapshotExpiration:
                     # what this dataset's files are, so the caller has to know
                     # the dataset was skipped rather than found clean.
                     raise
-                except Exception as e:
-                    # If manifest tidy-up fails, log and continue (do not silently swallow)
-                    logger.exception("Manifest-only tidy-up failed for %s: %s", identifier, e)
+                except Exception:
+                    # Not annotated: `logger.exception` below records the error
+                    # in full, which is what BLE001 asks for.
+                    # If manifest tidy-up fails, log and continue (do not
+                    # silently swallow). `logger.exception` already attaches
+                    # the traceback, so the message must not repeat it.
+                    logger.exception("Manifest-only tidy-up failed for %s", identifier)
                     return None
 
             # Identify snapshots to delete
@@ -424,7 +431,13 @@ class SnapshotExpiration:
                     try:
                         eligible, skipped_recent = self._eligible_orphaned_manifests(identifier)
                         summary["manifests_skipped_due_to_age"] = sorted(skipped_recent)
-                    except Exception:
+                    except Exception as exc:  # noqa: BLE001 - GCS listing boundary
+                        # If manifest listing fails, be conservative and skip. Reporting zero
+                        # orphans is safe (nothing gets deleted on the strength of it); the
+                        # danger would be reporting a short list as if it were complete.
+                        logger.error(
+                            "Could not list orphaned manifests for %s: %s", identifier, exc
+                        )
                         # If manifest listing fails, be conservative and skip
                         eligible = []
                         summary["orphaned_manifests_count"] = 0
@@ -470,9 +483,10 @@ class SnapshotExpiration:
                             try:
                                 if self._delete_file(io, m):
                                     deleted.append(m)
-                            except Exception:
+                            except Exception as exc:  # noqa: BLE001 - GCS client boundary, see above
                                 # Continue deleting what we can
-                                pass
+                                logger.error("Failed to delete orphaned manifest %s: %s", m, exc)
+                                # Continue deleting what we can
 
                         summary["deleted_manifests"] = deleted
                         summary["orphaned_manifests_count"] = len(deleted)
@@ -690,7 +704,7 @@ class SnapshotExpiration:
             try:
                 eligible_manifests, skipped_recent = self._eligible_orphaned_manifests(identifier)
                 summary["manifests_skipped_due_to_age"] = sorted(skipped_recent)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 - GCS/Firestore client boundary
                 logger.error("Error listing orphaned manifests for %s: %s", identifier, e)
                 eligible_manifests = []
 
@@ -753,7 +767,7 @@ class SnapshotExpiration:
                     identifier,
                     EXPIRED_SNAPSHOT_RETENTION_MS // (24 * 60 * 60 * 1000),
                 )
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 - deliberate, see below
                 # Broad on purpose: unlike the old delete() (idempotent on a
                 # missing document), update() raises NotFound - a
                 # google.api_core exception, neither ValueError nor OSError -
@@ -791,7 +805,7 @@ class SnapshotExpiration:
                 if self._delete_file(self.catalog.io or dataset.io, m):
                     summary["deleted_manifests"].append(m)
                     logger.info("Deleted orphaned manifest %s", m)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 - GCS/Firestore client boundary
                 logger.error("Failed to delete orphaned manifest %s: %s", m, e)
 
         # Step 4: Delete orphaned data files (if detection was performed)
@@ -930,7 +944,7 @@ class SnapshotExpiration:
                 f for f in physical if f not in kept_files and "/metadata/manifest-" not in f
             }
             return self._age_gate(dataset, candidates)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - GCS/Firestore client boundary
             logger.error("Error during full orphaned-data-file reconciliation: %s", e)
             return set()
 

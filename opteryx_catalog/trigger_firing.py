@@ -33,6 +33,7 @@ pattern) is exactly what this does NOT do.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import secrets
@@ -181,7 +182,7 @@ def _enqueue_refresh_task(catalog, execution_id: str, task_id: str) -> str:
         "http_method": tasks_v2.HttpMethod.POST,
         "url": target_url,
         "headers": {"Content-Type": "application/json"},
-        "body": ('{"execution_id": "%s"}' % execution_id).encode("utf-8"),
+        "body": json.dumps({"execution_id": execution_id}).encode("utf-8"),
     }
     # worker.opteryx pins one OIDC subject; the SA here must be the same one
     # jobs.opteryx enqueues as (decision 4 - no worker-side auth changes).

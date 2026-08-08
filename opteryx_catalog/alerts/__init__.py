@@ -372,7 +372,7 @@ def report(
         )
 
         _dispatch.submit(alert, cfg.sinks, cfg.cooloff_seconds, blocking)
-    except Exception as inner:  # reporting must never become the failure
+    except Exception as inner:  # noqa: BLE001 - reporting must never become the failure
         logger.warning("alerts: report() failed: %s", inner)
 
 

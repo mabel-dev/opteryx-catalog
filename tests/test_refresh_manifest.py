@@ -395,7 +395,7 @@ def _two_file_fixture():
 def test_refresh_manifest_raises_when_a_file_cannot_be_read():
     from opteryx_catalog.exceptions import ManifestRefreshError
 
-    mapping, manifest_path, f1, f2, snapshot_id = _two_file_fixture()
+    mapping, manifest_path, _f1, f2, snapshot_id = _two_file_fixture()
     ds, meta = _dataset_with_manifest(mapping, manifest_path, snapshot_id)
 
     # f2's bytes disappear (deleted/unreadable object) AFTER the manifest was written.

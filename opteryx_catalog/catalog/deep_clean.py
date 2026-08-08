@@ -87,7 +87,7 @@ class DatasetDeepClean:
             # Step 2: Get all physical files in storage
             try:
                 physical_files = self.get_all_physical_files(dataset_location)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 - storage listing boundary
                 logger.error(f"Error listing files in {dataset_location}: {e}")
                 return None
 
@@ -145,7 +145,7 @@ class DatasetDeepClean:
             }
 
             if dry_run:
-                summary["orphaned_files"] = sorted(list(orphaned_files))
+                summary["orphaned_files"] = sorted(orphaned_files)
                 return summary
 
             # Execute deletion

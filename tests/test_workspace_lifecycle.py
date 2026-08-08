@@ -121,9 +121,11 @@ def test_init_raises_for_deleted_workspace():
     client, _cc, _log = _properties_client(
         props_data={"deleted-at-ms": 12345, "deleted-by": "alice"}
     )
-    with patch("opteryx_catalog.opteryx_catalog.firestore.Client", return_value=client):
-        with pytest.raises(WorkspaceDeleted):
-            OpteryxCatalog(workspace="ws")
+    with (
+        patch("opteryx_catalog.opteryx_catalog.firestore.Client", return_value=client),
+        pytest.raises(WorkspaceDeleted),
+    ):
+        OpteryxCatalog(workspace="ws")
 
 
 def test_init_succeeds_for_deleted_workspace_with_include_deleted():
@@ -144,9 +146,11 @@ def test_init_succeeds_for_non_deleted_existing_workspace():
 
 def test_init_raises_for_unknown_workspace():
     client, _cc, _log = _properties_client(props_exists=False)
-    with patch("opteryx_catalog.opteryx_catalog.firestore.Client", return_value=client):
-        with pytest.raises(WorkspaceNotFound):
-            OpteryxCatalog(workspace="ws")
+    with (
+        patch("opteryx_catalog.opteryx_catalog.firestore.Client", return_value=client),
+        pytest.raises(WorkspaceNotFound),
+    ):
+        OpteryxCatalog(workspace="ws")
 
 
 def test_init_does_not_write_for_unknown_workspace():
@@ -157,9 +161,11 @@ def test_init_does_not_write_for_unknown_workspace():
     failed `banana.banana.banana` query.
     """
     client, catalog_collection, log = _properties_client(props_exists=False)
-    with patch("opteryx_catalog.opteryx_catalog.firestore.Client", return_value=client):
-        with pytest.raises(WorkspaceNotFound):
-            OpteryxCatalog(workspace="ws")
+    with (
+        patch("opteryx_catalog.opteryx_catalog.firestore.Client", return_value=client),
+        pytest.raises(WorkspaceNotFound),
+    ):
+        OpteryxCatalog(workspace="ws")
 
     assert catalog_collection.document("$properties").written is None
     assert log == []

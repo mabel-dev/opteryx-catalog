@@ -84,7 +84,7 @@ def add_small_data_files(dataset, catalog, identifier, num_files=5, rows_per_fil
     """
     print(f"\n📝 Step 2: Adding {num_files} small data files...")
 
-    collection, dataset_name = identifier.split(".")
+    _collection, _dataset_name = identifier.split(".")
 
     for file_idx in range(num_files):
         print(f"  Creating file {file_idx + 1}/{num_files}...")

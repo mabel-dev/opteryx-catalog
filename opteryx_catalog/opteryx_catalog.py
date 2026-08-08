@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import time
 from collections.abc import Iterable
 from typing import Any
@@ -43,6 +44,8 @@ from .webhooks.events import workspace_deleted_payload
 from .webhooks.events import workspace_locked_payload
 from .webhooks.events import workspace_restored_payload
 from .webhooks.events import workspace_unlocked_payload
+
+logger = logging.getLogger(__name__)
 
 # Workspace-level document holding drop tombstones. The `$` prefix keeps it out of
 # `list_collections()`, which filters `$`-prefixed documents, so tombstones are
@@ -324,7 +327,11 @@ class OpteryxCatalog(Metastore):
         try:
             props_ref = self._catalog_ref.document("$properties")
             props_doc = props_ref.get()
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 - Firestore client boundary
+            # Deliberate, and explained above: a transient read failure must not
+            # be reported as "workspace does not exist". `props_doc` staying None
+            # routes past both of those decisions rather than guessing either.
+            logger.debug("Workspace properties for %s unreadable (%s)", workspace, exc)
             props_doc = None
 
         if props_doc is not None:
@@ -344,9 +351,9 @@ class OpteryxCatalog(Metastore):
                             "locked-at-ms": None,
                         }
                     )
-                except Exception:
+                except Exception as exc:  # noqa: BLE001 - Firestore client boundary
                     # Be conservative: don't fail catalog initialization on Firestore errors
-                    pass
+                    logger.debug("Could not seed $properties for %s (%s)", workspace, exc)
             elif not include_deleted:
                 data = props_doc.to_dict() or {}
                 if data.get("deleted-at-ms") is not None:
@@ -420,7 +427,11 @@ class OpteryxCatalog(Metastore):
             coll_ref.document(doc.id).delete()
 
     def create_dataset(
-        self, identifier: str, schema: Any, properties: dict | None = None, author: str = None
+        self,
+        identifier: str,
+        schema: Any,
+        properties: dict | None = None,
+        author: str | None = None,
     ) -> SimpleDataset:
         if author is None:
             raise ValueError("author must be provided when creating a dataset")
@@ -492,7 +503,14 @@ class OpteryxCatalog(Metastore):
                         "sequence-number": sdata.get("sequence-number"),
                     }
                 ]
-            except Exception:
+            except Exception as exc:  # noqa: BLE001 - read-back is an optimisation
+                # The schema document is already written; this only reads it back to
+                # mirror its server-side fields into the in-memory metadata. Rebuilding
+                # the column list locally loses the timestamp and sequence number, not
+                # the schema.
+                logger.debug(
+                    "Schema read-back for %s.%s failed (%s)", collection, dataset_name, exc
+                )
                 metadata.schemas = [
                     {
                         "schema_id": schema_id,
@@ -581,7 +599,11 @@ class OpteryxCatalog(Metastore):
                 ref = getattr(d, "reference", None)
                 if ref is not None:
                     docs_by_path[ref.path] = d
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 - Firestore client boundary
+            # `get_all` is a batched read of a dataset doc and a view doc, used to
+            # answer "which kind of thing is this?" in one round trip. An empty
+            # map falls through to the per-document lookups below.
+            logger.debug("Batched existence lookup failed (%s)", exc)
             docs_by_path = {}
 
         ds_doc = docs_by_path.get(ds_ref.path)
@@ -728,7 +750,8 @@ class OpteryxCatalog(Metastore):
                     ref = getattr(d, "reference", None)
                     if ref is not None:
                         docs_by_path[ref.path] = d
-            except Exception:
+            except Exception as exc:  # noqa: BLE001 - Firestore client boundary, see above
+                logger.debug("Batched snapshot/schema lookup failed (%s)", exc)
                 docs_by_path = {}
 
         snaps = []
@@ -772,7 +795,7 @@ class OpteryxCatalog(Metastore):
 
         return SimpleDataset(identifier=identifier, _metadata=metadata, io=self.io, catalog=self)
 
-    def drop_dataset(self, identifier: str, author: str = None) -> None:
+    def drop_dataset(self, identifier: str, author: str | None = None) -> None:
         """Drop a dataset, leaving a tombstone so its files can be reclaimed.
 
         Dropping removes the dataset from the catalog immediately, which also
@@ -1409,7 +1432,7 @@ class OpteryxCatalog(Metastore):
         collection: str,
         properties: dict | None = None,
         exists_ok: bool = False,
-        author: str = None,
+        author: str | None = None,
     ) -> None:
         """Create a collection document under the catalog.
 
@@ -1454,7 +1477,11 @@ class OpteryxCatalog(Metastore):
         """Return True if the collection exists."""
         try:
             return self._collection_ref(collection).get().exists
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 - Firestore client boundary
+            # On any error, be conservative and return False. Callers use this to
+            # decide whether to CREATE, and create_collection re-checks under its
+            # own guard, so a false negative costs a retry rather than a clobber.
+            logger.debug("collection_exists(%s) failed (%s)", collection, exc)
             # On any error, be conservative and return False
             return False
 
@@ -1523,7 +1550,9 @@ class OpteryxCatalog(Metastore):
         try:
             doc_ref = self._dataset_doc_ref(collection, dataset_name)
             return doc_ref.get().exists
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 - Firestore client boundary, see above
+            # On any error, be conservative and return False
+            logger.debug("dataset_exists(%s) failed (%s)", collection, exc)
             # On any error, be conservative and return False
             return False
 
@@ -1535,7 +1564,7 @@ class OpteryxCatalog(Metastore):
         identifier: str | tuple,
         sql: str,
         schema: Any | None = None,
-        author: str = None,
+        author: str | None = None,
         description: str | None = None,
         properties: dict | None = None,
         update_if_exists: bool = False,
@@ -1545,7 +1574,7 @@ class OpteryxCatalog(Metastore):
         `identifier` may be a string like 'namespace.view' or a tuple ('namespace','view').
         """
         # Normalize identifier
-        if isinstance(identifier, tuple) or isinstance(identifier, list):
+        if isinstance(identifier, (tuple, list)):
             collection, view_name = identifier[0], identifier[1]
         else:
             collection, view_name = identifier.split(".")
@@ -1642,7 +1671,7 @@ class OpteryxCatalog(Metastore):
 
         Raises `ViewNotFound` if the view doc is missing.
         """
-        if isinstance(identifier, tuple) or isinstance(identifier, list):
+        if isinstance(identifier, (tuple, list)):
             collection, view_name = identifier[0], identifier[1]
         else:
             collection, view_name = identifier.split(".")
@@ -1686,7 +1715,7 @@ class OpteryxCatalog(Metastore):
         v._identifier = f"{collection}.{view_name}"
         return v
 
-    def drop_view(self, identifier: str | tuple, author: str = None) -> None:
+    def drop_view(self, identifier: str | tuple, author: str | None = None) -> None:
         """Drop a view.
 
         No tombstone: a view owns no storage, so dropping it leaves nothing to
@@ -1700,7 +1729,7 @@ class OpteryxCatalog(Metastore):
         """
         if not author:
             raise ValueError("author must be provided when dropping a view")
-        if isinstance(identifier, tuple) or isinstance(identifier, list):
+        if isinstance(identifier, (tuple, list)):
             collection, view_name = identifier[0], identifier[1]
         else:
             collection, view_name = identifier.split(".")
@@ -1746,9 +1775,7 @@ class OpteryxCatalog(Metastore):
         """
         # Normalize inputs
         if view_name is None:
-            if isinstance(identifier_or_collection, tuple) or isinstance(
-                identifier_or_collection, list
-            ):
+            if isinstance(identifier_or_collection, (tuple, list)):
                 collection, view_name = identifier_or_collection[0], identifier_or_collection[1]
             else:
                 if "." not in identifier_or_collection:
@@ -1762,7 +1789,8 @@ class OpteryxCatalog(Metastore):
         try:
             doc_ref = self._view_doc_ref(collection, view_name)
             return doc_ref.get().exists
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 - Firestore client boundary, see above
+            logger.debug("view_exists(%s) failed (%s)", collection, exc)
             return False
 
     # ------------------------------------------------------------------
@@ -1795,7 +1823,7 @@ class OpteryxCatalog(Metastore):
         name: str,
         target_view: str,
         statement_id: str | None = None,
-        author: str = None,
+        author: str | None = None,
         kind: str = MV_REFRESH_TRIGGER_KIND,
     ) -> None:
         """Attach a trigger to a dataset.
@@ -1842,7 +1870,7 @@ class OpteryxCatalog(Metastore):
         self,
         dataset_identifier: str,
         name: str,
-        author: str = None,
+        author: str | None = None,
         missing_ok: bool = False,
     ) -> None:
         """Remove a trigger from a dataset.
@@ -1935,7 +1963,7 @@ class OpteryxCatalog(Metastore):
         identifier: str,
         sql: str,
         source_tables: list[str],
-        author: str = None,
+        author: str | None = None,
         update_if_exists: bool = False,
     ) -> None:
         """Register an existing dataset as a materialized view.
@@ -2087,7 +2115,7 @@ class OpteryxCatalog(Metastore):
                 results.append(doc.id)
         return results
 
-    def drop_materialized_view(self, identifier: str, author: str = None) -> None:
+    def drop_materialized_view(self, identifier: str, author: str | None = None) -> None:
         """Drop a materialized view: its triggers, then its backing dataset.
 
         Trigger removal happens first, while the MV document's source list is
@@ -2128,7 +2156,7 @@ class OpteryxCatalog(Metastore):
         identifier: str,
         status: str,
         execution_id: str | None = None,
-        author: str = None,
+        author: str | None = None,
     ) -> None:
         """Stamp refresh state on an MV. Called by the worker when a refresh
         job completes (or is denied - a denial is a status, not silence)."""
@@ -2158,7 +2186,7 @@ class OpteryxCatalog(Metastore):
         row_count: int | None = None,
         execution_time: float | None = None,
     ) -> None:
-        if isinstance(identifier, tuple) or isinstance(identifier, list):
+        if isinstance(identifier, (tuple, list)):
             collection, view_name = identifier[0], identifier[1]
         else:
             collection, view_name = identifier.split(".")
@@ -2187,7 +2215,7 @@ class OpteryxCatalog(Metastore):
             description: The new description text
             describer: Optional identifier for who/what created the description
         """
-        if isinstance(identifier, tuple) or isinstance(identifier, list):
+        if isinstance(identifier, (tuple, list)):
             collection, view_name = identifier[0], identifier[1]
         else:
             collection, view_name = identifier.split(".")
@@ -2214,7 +2242,7 @@ class OpteryxCatalog(Metastore):
             describer: Optional identifier for who/what created the description
         """
 
-        if isinstance(identifier, tuple) or isinstance(identifier, list):
+        if isinstance(identifier, (tuple, list)):
             collection, dataset_name = identifier[0], identifier[1]
         else:
             collection, dataset_name = identifier.split(".")
@@ -2257,7 +2285,7 @@ class OpteryxCatalog(Metastore):
         if not columns:
             raise ValueError("columns must be a non-empty list of column names")
 
-        if isinstance(identifier, tuple) or isinstance(identifier, list):
+        if isinstance(identifier, (tuple, list)):
             collection, dataset_name = identifier[0], identifier[1]
         else:
             collection, dataset_name = identifier.split(".")
@@ -2326,148 +2354,145 @@ class OpteryxCatalog(Metastore):
 
         parquet_path = f"{dataset_location}/metadata/manifest-{snapshot_id}.parquet"
 
-        # Use provided FileIO if it supports writing; otherwise write to GCS
-        try:
-            # Explicit dtype per column (especially the nested-list stats
-            # columns) so rugo's writer gets a consistent shape regardless of
-            # what individual entries happen to carry.
-            columns = {
-                "file_path": "VARCHAR",
-                "file_format": "VARCHAR",
-                "record_count": "INTEGER",
-                "file_size_in_bytes": "INTEGER",
-                "uncompressed_size_in_bytes": "INTEGER",
-                "column_uncompressed_sizes_in_bytes": "ARRAY",
-                "null_counts": "ARRAY",
-                "min_k_hashes": "ARRAY",
-                "histogram_counts": "ARRAY",
-                "histogram_bins": "INTEGER",
-                "min_values": "ARRAY",
-                "max_values": "ARRAY",
-                "min_lengths": "ARRAY",
-                "max_lengths": "ARRAY",
-                # Stable per-column field-id, same order/index as every other
-                # per-column stats array above (min_values[i] is field_ids[i]'s
-                # min, etc.) — lets readers key stats by a schema-stable id
-                # instead of assuming today's array position equals a column's
-                # position in some other schema snapshot. Empty for manifest
-                # rows written before this existed; readers must fall back to
-                # positional indexing in that case.
-                "field_ids": "ARRAY",
-                # Per-column byte-class histogram (8 fixed classes) and total
-                # byte count, VARCHAR/NVARCHAR/VARBINARY columns only (empty
-                # list / 0 elsewhere) — backs the LIKE '%needle%' selectivity
-                # char-class estimator. See catalog/manifest.py's
-                # _compute_column_stats / Vector.char_class_stats().
-                "char_class_counts": "ARRAY",
-                "char_total_bytes": "ARRAY",
-            }
+        # Use provided FileIO if it supports writing; otherwise write to GCS.
+        # Nothing below is recoverable - see the note on out.close() - so this
+        # runs unguarded and lets failures reach the caller.
+        #
+        # Explicit dtype per column (especially the nested-list stats
+        # columns) so rugo's writer gets a consistent shape regardless of
+        # what individual entries happen to carry.
+        columns = {
+            "file_path": "VARCHAR",
+            "file_format": "VARCHAR",
+            "record_count": "INTEGER",
+            "file_size_in_bytes": "INTEGER",
+            "uncompressed_size_in_bytes": "INTEGER",
+            "column_uncompressed_sizes_in_bytes": "ARRAY",
+            "null_counts": "ARRAY",
+            "min_k_hashes": "ARRAY",
+            "histogram_counts": "ARRAY",
+            "histogram_bins": "INTEGER",
+            "min_values": "ARRAY",
+            "max_values": "ARRAY",
+            "min_lengths": "ARRAY",
+            "max_lengths": "ARRAY",
+            # Stable per-column field-id, same order/index as every other
+            # per-column stats array above (min_values[i] is field_ids[i]'s
+            # min, etc.) — lets readers key stats by a schema-stable id
+            # instead of assuming today's array position equals a column's
+            # position in some other schema snapshot. Empty for manifest
+            # rows written before this existed; readers must fall back to
+            # positional indexing in that case.
+            "field_ids": "ARRAY",
+            # Per-column byte-class histogram (8 fixed classes) and total
+            # byte count, VARCHAR/NVARCHAR/VARBINARY columns only (empty
+            # list / 0 elsewhere) — backs the LIKE '%needle%' selectivity
+            # char-class estimator. See catalog/manifest.py's
+            # _compute_column_stats / Vector.char_class_stats().
+            "char_class_counts": "ARRAY",
+            "char_total_bytes": "ARRAY",
+        }
 
-            # Normalize entries to match the column set above:
-            normalized = []
-            for ent in entries:
-                if not isinstance(ent, dict):
-                    continue
-                e = dict(ent)
-                # Ensure the numeric scalars exist AND are non-None: every
-                # column below is written for every row, so a key an entry
-                # didn't carry lands as SQL NULL and reads back as None, not
-                # as the 0 that `entry.get(col, 0)` readers assume. That is
-                # how manifests grew NULL sizes that later raised
-                # `'<' not supported between instances of 'NoneType' and 'int'`
-                # inside compaction's size comparisons.
-                for _numeric in (
-                    "record_count",
-                    "file_size_in_bytes",
-                    "uncompressed_size_in_bytes",
-                ):
-                    if e.get(_numeric) is None:
-                        e[_numeric] = 0
-                # Ensure list fields exist
-                e.setdefault("min_k_hashes", [])
-                e.setdefault("histogram_counts", [])
-                e.setdefault("histogram_bins", 0)
-                e.setdefault("column_uncompressed_sizes_in_bytes", [])
-                e.setdefault("null_counts", [])
-                e.setdefault("min_lengths", [])
-                e.setdefault("max_lengths", [])
-                e.setdefault("field_ids", [])
-                e.setdefault("char_class_counts", [])
-                e.setdefault("char_total_bytes", [])
+        # Normalize entries to match the column set above:
+        normalized = []
+        for ent in entries:
+            if not isinstance(ent, dict):
+                continue
+            e = dict(ent)
+            # Ensure the numeric scalars exist AND are non-None: every
+            # column below is written for every row, so a key an entry
+            # didn't carry lands as SQL NULL and reads back as None, not
+            # as the 0 that `entry.get(col, 0)` readers assume. That is
+            # how manifests grew NULL sizes that later raised
+            # `'<' not supported between instances of 'NoneType' and 'int'`
+            # inside compaction's size comparisons.
+            for _numeric in (
+                "record_count",
+                "file_size_in_bytes",
+                "uncompressed_size_in_bytes",
+            ):
+                if e.get(_numeric) is None:
+                    e[_numeric] = 0
+            # Ensure list fields exist
+            e.setdefault("min_k_hashes", [])
+            e.setdefault("histogram_counts", [])
+            e.setdefault("histogram_bins", 0)
+            e.setdefault("column_uncompressed_sizes_in_bytes", [])
+            e.setdefault("null_counts", [])
+            e.setdefault("min_lengths", [])
+            e.setdefault("max_lengths", [])
+            e.setdefault("field_ids", [])
+            e.setdefault("char_class_counts", [])
+            e.setdefault("char_total_bytes", [])
 
-                # min/max values are stored as compressed int64 values
-                mv = e.get("min_values") or []
-                xv = e.get("max_values") or []
+            # min/max values are stored as compressed int64 values
+            mv = e.get("min_values") or []
+            xv = e.get("max_values") or []
 
-                # Ensure int64 values are properly typed for min/max
-                e["min_values"] = [int(v) if v is not None else None for v in mv]
-                e["max_values"] = [int(v) if v is not None else None for v in xv]
+            # Ensure int64 values are properly typed for min/max
+            e["min_values"] = [int(v) if v is not None else None for v in mv]
+            e["max_values"] = [int(v) if v is not None else None for v in xv]
 
-                # min_k_hashes / histogram_counts are per-column lists of ints,
-                # so each entry is list[list[int]] and the column is a native
-                # nested ARRAY<ARRAY<...>> (rugo's writer emits the 2-level LIST
-                # encoding; read_manifest_columns reads it straight back). No
-                # string encoding — min_k_hashes are full-range xxhash uint64,
-                # stored with an unsigned leaf so values above INT64_MAX survive.
-                normalized.append(e)
+            # min_k_hashes / histogram_counts are per-column lists of ints,
+            # so each entry is list[list[int]] and the column is a native
+            # nested ARRAY<ARRAY<...>> (rugo's writer emits the 2-level LIST
+            # encoding; read_manifest_columns reads it straight back). No
+            # string encoding — min_k_hashes are full-range xxhash uint64,
+            # stored with an unsigned leaf so values above INT64_MAX survive.
+            normalized.append(e)
 
-            from draken import draken_native as _dn
+        from draken import draken_native as _dn
 
-            morsel = Morsel()
-            for name, dtype in columns.items():
-                values = [e.get(name) for e in normalized]
-                if name == "min_k_hashes":
-                    # UINT64 leaf: xxhash values span the full unsigned range; a
-                    # signed leaf would read back negative above INT64_MAX and
-                    # corrupt min-k ordering.
-                    #
-                    # Entries reach here in mixed forms during migration: freshly
-                    # computed (int hashes), decoded from a legacy comma-joined
-                    # manifest (int hashes, possibly NEGATIVE where a uint64 was
-                    # stored signed), a per-hash decimal-string list, or a single
-                    # comma-joined string per column. Normalize every hash to its
-                    # unsigned 64-bit value: a hash is a 64-bit identifier, not an
-                    # arithmetic quantity, so `int(h) & mask` recovers the true
-                    # uint64 (no-op for correct values, fixes legacy negatives)
-                    # and draken's UINT64 factory then accepts it.
-                    def _norm_col(col):
-                        if col is None:
-                            return None
-                        if isinstance(col, str):  # legacy comma-joined column
-                            col = col.split(",") if col else []
-                        return [None if h is None else (int(h) & 0xFFFFFFFFFFFFFFFF) for h in col]
+        morsel = Morsel()
+        for name, dtype in columns.items():
+            values = [e.get(name) for e in normalized]
+            if name == "min_k_hashes":
+                # UINT64 leaf: xxhash values span the full unsigned range; a
+                # signed leaf would read back negative above INT64_MAX and
+                # corrupt min-k ordering.
+                #
+                # Entries reach here in mixed forms during migration: freshly
+                # computed (int hashes), decoded from a legacy comma-joined
+                # manifest (int hashes, possibly NEGATIVE where a uint64 was
+                # stored signed), a per-hash decimal-string list, or a single
+                # comma-joined string per column. Normalize every hash to its
+                # unsigned 64-bit value: a hash is a 64-bit identifier, not an
+                # arithmetic quantity, so `int(h) & mask` recovers the true
+                # uint64 (no-op for correct values, fixes legacy negatives)
+                # and draken's UINT64 factory then accepts it.
+                def _norm_col(col):
+                    if col is None:
+                        return None
+                    if isinstance(col, str):  # legacy comma-joined column
+                        col = col.split(",") if col else []
+                    return [None if h is None else (int(h) & 0xFFFFFFFFFFFFFFFF) for h in col]
 
-                    values = [
-                        None if entry is None else [_norm_col(col) for col in entry]
-                        for entry in values
-                    ]
-                    morsel.append_vector(
-                        name,
-                        _dn.vector_array_from_sequence(
-                            values, element_type=_dn.DrakenType.UINT64.value, nesting_depth=2
-                        ),
-                    )
-                else:
-                    morsel.append_vector(name, vector_from_sequence(values, dtype=dtype))
+                values = [
+                    None if entry is None else [_norm_col(col) for col in entry] for entry in values
+                ]
+                morsel.append_vector(
+                    name,
+                    _dn.vector_array_from_sequence(
+                        values, element_type=_dn.DrakenType.UINT64.value, nesting_depth=2
+                    ),
+                )
+            else:
+                morsel.append_vector(name, vector_from_sequence(values, dtype=dtype))
 
-            data = write_parquet(morsel, **WRITE_PARQUET_OPTIONS)
+        data = write_parquet(morsel, **WRITE_PARQUET_OPTIONS)
 
-            if self.io:
-                out = self.io.new_output(parquet_path).create()
-                out.write(data)
-                # close() is where the upload actually happens - the GCS output
-                # stream buffers into memory and flushes on close - so a failure
-                # here means the manifest object does not exist. Swallowing it
-                # returned this path to the caller, which committed a snapshot
-                # pointing at a manifest that was never written; the next commit
-                # then couldn't read its parent. Let it raise.
-                out.close()
+        if self.io:
+            out = self.io.new_output(parquet_path).create()
+            out.write(data)
+            # close() is where the upload actually happens - the GCS output
+            # stream buffers into memory and flushes on close - so a failure
+            # here means the manifest object does not exist. Swallowing it
+            # returned this path to the caller, which committed a snapshot
+            # pointing at a manifest that was never written; the next commit
+            # then couldn't read its parent. Let it raise.
+            out.close()
 
-            return parquet_path
-        except Exception as e:
-            # Log and return None on failure
-            # print(f"Failed to write Parquet manifest: {e}")
-            raise e
+        return parquet_path
 
     def save_snapshot(self, identifier: str, snapshot: Snapshot) -> None:
         """Persist a single snapshot document for a dataset."""
@@ -2623,43 +2648,37 @@ class OpteryxCatalog(Metastore):
         doc_ref = self._dataset_doc_ref(namespace, dataset_name)
         schemas_coll = doc_ref.collection("schemas")
         sid = str(uuid.uuid4())
-        # print(f"[DEBUG] _write_schema called for {namespace}/{dataset_name} sid={sid}")
-        try:
-            cols = self._schema_to_columns(schema, field_ids=field_ids)
-        except Exception:
-            # print(
-            #     f"[DEBUG] _write_schema: _schema_to_columns raised: {e}; falling back to empty columns list"
-            # )
-            cols = []
+
+        # Nothing below is guarded, and each step used to be. Between them they
+        # could return `sid` for a schema that has no columns, that is numbered
+        # behind every schema already written, or that was never written at all
+        # - and the sole caller stamps that id onto the dataset as
+        # `current-schema-id` either way. A dataset pointing at a schema
+        # document that does not exist is not a state worth reaching quietly;
+        # failing here leaves the caller able to retry.
+        cols = self._schema_to_columns(schema, field_ids=field_ids)
         now_ms = int(time.time() * 1000)
         if author is None:
             raise ValueError("author must be provided when writing a schema")
-        # Determine next sequence number by scanning existing schema docs
-        try:
-            max_seq = 0
-            for d in schemas_coll.stream():
-                sd = d.to_dict() or {}
-                seq = sd.get("sequence-number") or 0
-                if isinstance(seq, int) and seq > max_seq:
-                    max_seq = seq
-            new_seq = max_seq + 1
-        except Exception:
-            new_seq = 1
 
-        try:
-            # print(
-            #     f"[DEBUG] Writing schema doc {sid} for {namespace}/{dataset_name} (cols={len(cols)})"
-            # )
-            schemas_coll.document(sid).set(
-                {
-                    "columns": cols,
-                    "timestamp-ms": now_ms,
-                    "author": author,
-                    "sequence-number": new_seq,
-                }
-            )
-            # print(f"[DEBUG] Wrote schema doc {sid}")
-        except Exception:
-            # print(f"[DEBUG] Failed to write schema doc {sid}: {e}")
-            pass
+        # Determine next sequence number by scanning existing schema docs. An
+        # absent subcollection streams empty rather than raising, so a failure
+        # here means Firestore itself is unhealthy - and guessing 1 would put
+        # this schema behind its own predecessors.
+        max_seq = 0
+        for d in schemas_coll.stream():
+            sd = d.to_dict() or {}
+            seq = sd.get("sequence-number") or 0
+            if isinstance(seq, int) and seq > max_seq:
+                max_seq = seq
+        new_seq = max_seq + 1
+
+        schemas_coll.document(sid).set(
+            {
+                "columns": cols,
+                "timestamp-ms": now_ms,
+                "author": author,
+                "sequence-number": new_seq,
+            }
+        )
         return sid

@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import logging
 import os
 import time
 import uuid
 from collections.abc import Iterable
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any
 
 from ..alerts import report as _alert
 from ..audit import emit_audit
+from ..exceptions import AddFilesReadError
 from ..exceptions import ManifestReadError
 from ..exceptions import SummaryInconsistencyError
 from ..resource_types import ResourceType
@@ -21,6 +24,84 @@ from .metastore import Dataset
 
 # Stable node identifier for this process (hex-mac-hex-pid)
 _NODE = f"{uuid.getnode():x}-{os.getpid():x}"
+
+logger = logging.getLogger(__name__)
+
+
+def _as_number_or_text(text: str):
+    """A numeric string as a number, otherwise the string itself."""
+    try:
+        return int(text)
+    except ValueError:
+        pass
+    try:
+        return float(text)
+    except ValueError:
+        # Not a number, return the string itself for display
+        return text
+
+
+def _decode_minmax(v):
+    """A manifest min/max value as something comparable, or None.
+
+    Min/max statistics reach us as numbers, as text, or as the UTF-8 bytes a
+    writer stored for a string column - optionally with a trailing 0xFF, which
+    marks a bound that was truncated to fit. Numeric-looking text decodes to a
+    number so that bounds written by an older writer still compare against
+    ones written today; anything genuinely undecodable is None, meaning "this
+    file offers no bound for this column", not "the bound is zero".
+    """
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return v
+    # For strings stored as string values (not bytes), return as-is
+    if isinstance(v, str):
+        # Try to parse as number for backward compatibility
+        return _as_number_or_text(v)
+    if isinstance(v, (bytes, bytearray, memoryview)):
+        b = bytes(v)
+        if b and b[-1] == 0xFF:
+            b = b[:-1]
+        try:
+            return _as_number_or_text(b.decode("utf-8"))
+        except UnicodeDecodeError:
+            # Binary or mid-codepoint-truncated bound: nothing to display.
+            return None
+    return None
+
+
+def _at(values: Any, index: int) -> Any:
+    """`values[index]`, or None when that is not something this can index.
+
+    The per-column statistics on a manifest entry are parallel arrays that are
+    supposed to line up with the schema, but an entry written by an older
+    version - or by a writer that saw a different column set - can be short,
+    scalar, or absent. A statistic that isn't there is not an error: it costs
+    that column a pruning hint for that one file and nothing else.
+    """
+    try:
+        return values[index]
+    except (IndexError, KeyError, TypeError):
+        return None
+
+
+def _as_int(value: Any) -> int | None:
+    """`value` as an int, or None if it will not convert.
+
+    Snapshot rows and their summary counters come straight out of Firestore,
+    so these fields arrive as ints, as numeric strings from an older writer,
+    or missing entirely. Unconvertible is "unknown" - deliberately None rather
+    than 0, so each caller chooses its own fallback: 0 is right for a
+    reporting counter and wrong for `_next_sequence_number`, where it would
+    restart the counter behind every snapshot already written.
+    """
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def select_last_user_snapshot(
@@ -198,8 +279,15 @@ class SimpleDataset(Dataset):
         with load_history=False since we only need the most recent snapshot,
         not the full history.
 
+        Every path returns a number greater than one already on record, or 1
+        only when nothing on record has one. Restarting the counter behind
+        existing snapshots would silently reorder history: `sequence_number`
+        is the primary sort key in `select_last_user_snapshot` and in
+        expiration, so a snapshot numbered 1 sitting behind a hundred others
+        is not a cosmetic wart - it moves which commit those read as current.
+
         Returns:
-            The next sequence number (current snapshot's sequence + 1, or 1 if no snapshots).
+            The next sequence number (highest known sequence + 1, or 1 if none is known).
         """
         if not self.metadata.snapshots:
             # No snapshots yet - this is the first one
@@ -207,9 +295,23 @@ class SimpleDataset(Dataset):
 
         # Get the current (most recent) snapshot - should have the highest sequence number
         current = self.snapshot()
-        if current:
-            seq = getattr(current, "sequence_number", None)
-            return int(seq) + 1 if seq is not None else 1
+        seq = _as_int(getattr(current, "sequence_number", None))
+        if seq is not None:
+            return seq + 1
+
+        # The current snapshot has no usable number: either it predates the
+        # field, or `snapshot()` fell back to the in-memory list and found
+        # nothing. Take the highest number actually on record rather than
+        # restarting. Only a dataset whose snapshots ALL predate the field
+        # reaches 1 here, which is the one case where 1 is honest.
+        known = [
+            number
+            for number in (
+                _as_int(getattr(snap, "sequence_number", None)) for snap in self.metadata.snapshots
+            )
+            if number is not None
+        ]
+        return max(known) + 1 if known else 1
 
     def snapshot(self, snapshot_id: int | None = None, user_only: bool = False) -> Snapshot | None:
         """Return a Snapshot.
@@ -264,9 +366,19 @@ class SimpleDataset(Dataset):
                         commit_message=sd.get("commit-message"),
                     )
                     return snap
-            except Exception:
-                # Be conservative: fall through to in-memory fallback
-                pass
+            except Exception as exc:  # noqa: BLE001 - Firestore client boundary
+                # The google-cloud-firestore surface raises a wide, mostly
+                # undocumented family here (transport, deadline, auth refresh)
+                # on top of the KeyError/TypeError a drifted document shape
+                # produces, so this catches broadly on purpose. It is a
+                # read-only lookup with an in-memory answer available, so it
+                # degrades rather than failing - but it says so.
+                logger.debug(
+                    "Snapshot %s of %s unreadable from Firestore (%s); using in-memory snapshots",
+                    snapshot_id,
+                    self.identifier,
+                    exc,
+                )
 
         # Fallback: search in-memory snapshots (only used when no catalog)
         for s in self.metadata.snapshots:
@@ -319,9 +431,14 @@ class SimpleDataset(Dataset):
                     self.catalog._snapshot_from_dict(doc.to_dict() or {})
                     for doc in snaps_coll.stream()
                 ]
-            except Exception:
+            except Exception as exc:  # noqa: BLE001 - Firestore client boundary, see snapshot()
                 # Fall through to whatever is already in memory rather than
                 # failing a read-only lookup outright.
+                logger.debug(
+                    "Snapshot stream for %s failed (%s); ranking in-memory snapshots instead",
+                    self.identifier,
+                    exc,
+                )
                 candidates = []
 
         if not candidates:
@@ -385,7 +502,13 @@ class SimpleDataset(Dataset):
                     .get()
                 )
                 sdict = doc.to_dict() or None
-            except Exception:
+            except Exception as exc:  # noqa: BLE001 - Firestore client boundary, see snapshot()
+                logger.debug(
+                    "Schema %s of %s unreadable from Firestore (%s); trying in-memory schemas",
+                    sid,
+                    self.identifier,
+                    exc,
+                )
                 sdict = None
 
         # As a last-resort when no catalog is attached, fall back to an
@@ -429,7 +552,7 @@ class SimpleDataset(Dataset):
             return {}
         return {col.name: col.id for col in schema.columns if getattr(col, "id", None) is not None}
 
-    def append(self, table: Any, author: str = None, commit_message: str | None = None):
+    def append(self, table: Any, author: str | None = None, commit_message: str | None = None):
         """Append a draken Morsel:
 
         - write a Parquet data file via `self.io`
@@ -498,10 +621,7 @@ class SimpleDataset(Dataset):
         }
 
         # sequence number
-        try:
-            next_seq = self._next_sequence_number()
-        except Exception:
-            next_seq = 1
+        next_seq = self._next_sequence_number()
 
         parent_id = self.metadata.current_snapshot_id
 
@@ -715,8 +835,16 @@ class SimpleDataset(Dataset):
             perm = morsel_sort(table, [sort_column], [ascending])
             table = table.take(list(perm))
             return table, sort_column, not ascending
-        except Exception:
-            # Never let a sort failure block the write itself.
+        except Exception as exc:  # noqa: BLE001 - draken native sort, C-ABI boundary
+            # Sorting is an optimisation: it buys key locality and honest
+            # `sorted_by` row-group metadata, and the write is correct without
+            # it. draken's sort is a native extension whose failures arrive as
+            # anything from TypeError to SystemError, so this catches broadly -
+            # but it must not be silent, or a dataset quietly stops being
+            # clustered and only shows up as a query-performance regression.
+            logger.warning(
+                "Sort for write of %s failed (%s); writing unsorted", self.identifier, exc
+            )
             return table, None, False
 
     def _write_table_and_build_entry(self, table: Any):
@@ -754,7 +882,7 @@ class SimpleDataset(Dataset):
         )
         return manifest_entry
 
-    def overwrite(self, table: Any, author: str = None, commit_message: str | None = None):
+    def overwrite(self, table: Any, author: str | None = None, commit_message: str | None = None):
         """Replace the dataset entirely with `table` in a single snapshot.
 
         Semantics:
@@ -826,10 +954,7 @@ class SimpleDataset(Dataset):
         }
 
         # sequence number
-        try:
-            next_seq = self._next_sequence_number()
-        except Exception:
-            next_seq = 1
+        next_seq = self._next_sequence_number()
 
         parent_id = self.metadata.current_snapshot_id
 
@@ -861,7 +986,9 @@ class SimpleDataset(Dataset):
 
         self._after_commit(author, snap)
 
-    def add_files(self, files: list[str], author: str = None, commit_message: str | None = None):
+    def add_files(
+        self, files: list[str], author: str | None = None, commit_message: str | None = None
+    ):
         """Add filenames to the dataset manifest without writing the files.
 
         - `files` is a list of file paths (strings). Files are assumed to
@@ -914,7 +1041,9 @@ class SimpleDataset(Dataset):
                         data, fp, file_size, field_id_by_name=self._field_id_by_name()
                     )
                 else:
-                    # Empty file, create placeholder entry
+                    # A genuinely empty object is a real state, not a failure:
+                    # it holds no rows, and a zero-row entry describes it
+                    # honestly. Only an unreadable file goes to the handler.
                     manifest_entry = ParquetManifestEntry(
                         file_path=fp,
                         file_format="parquet",
@@ -928,23 +1057,14 @@ class SimpleDataset(Dataset):
                         histogram_bins=0,
                         min_values=[],
                         max_values=[],
+                        min_lengths=[],
+                        max_lengths=[],
                     )
-            except Exception:
-                # If read fails, fall back to placeholders
-                manifest_entry = ParquetManifestEntry(
-                    file_path=fp,
-                    file_format="parquet",
-                    record_count=0,
-                    null_counts=[],
-                    file_size_in_bytes=0,
-                    uncompressed_size_in_bytes=0,
-                    column_uncompressed_sizes_in_bytes=[],
-                    min_k_hashes=[],
-                    histogram_counts=[],
-                    histogram_bins=0,
-                    min_values=[],
-                    max_values=[],
-                )
+            except Exception as err:
+                raise AddFilesReadError(
+                    f"Cannot read {fp} to add it to {self.identifier}: {err}. "
+                    "Refusing to register a file whose statistics are unknown."
+                ) from err
             new_entries.append(manifest_entry.to_dict())
 
         merged_entries = prev_entries + new_entries
@@ -986,10 +1106,7 @@ class SimpleDataset(Dataset):
         }
 
         # Sequence number
-        try:
-            next_seq = self._next_sequence_number()
-        except Exception:
-            next_seq = 1
+        next_seq = self._next_sequence_number()
 
         parent_id = self.metadata.current_snapshot_id
 
@@ -1021,7 +1138,7 @@ class SimpleDataset(Dataset):
         self._after_commit(author, snap)
 
     def truncate_and_add_files(
-        self, files: list[str], author: str = None, commit_message: str | None = None
+        self, files: list[str], author: str | None = None, commit_message: str | None = None
     ):
         """Truncate dataset (logical) and set manifest to provided files.
 
@@ -1040,18 +1157,13 @@ class SimpleDataset(Dataset):
         prev_total_size = 0
         prev_total_records = 0
         if prev and prev.summary:
-            try:
-                prev_total_files = int(prev.summary.get("total-data-files", 0))
-            except Exception:
-                prev_total_files = 0
-            try:
-                prev_total_size = int(prev.summary.get("total-files-size", 0))
-            except Exception:
-                prev_total_size = 0
-            try:
-                prev_total_records = int(prev.summary.get("total-records", 0))
-            except Exception:
-                prev_total_records = 0
+            # Reporting-only: these feed the "deleted-*" counters in the new
+            # snapshot's summary. An unparseable value is worth 0 rather than a
+            # failed truncate, because the totals that matter are derived from
+            # the manifest actually written (see `_totals_from_entries`).
+            prev_total_files = _as_int(prev.summary.get("total-data-files")) or 0
+            prev_total_size = _as_int(prev.summary.get("total-files-size")) or 0
+            prev_total_records = _as_int(prev.summary.get("total-records")) or 0
 
         # Build unique new entries (ignore duplicates in input). Only accept
         # parquet files and compute full statistics for each file.
@@ -1090,7 +1202,9 @@ class SimpleDataset(Dataset):
                         data, fp, file_size, field_id_by_name=self._field_id_by_name()
                     )
                 else:
-                    # Empty file, create placeholder entry
+                    # A genuinely empty object is a real state, not a failure:
+                    # it holds no rows, and a zero-row entry describes it
+                    # honestly. Only an unreadable file goes to the handler.
                     manifest_entry = ParquetManifestEntry(
                         file_path=fp,
                         file_format="parquet",
@@ -1104,23 +1218,14 @@ class SimpleDataset(Dataset):
                         histogram_bins=0,
                         min_values=[],
                         max_values=[],
+                        min_lengths=[],
+                        max_lengths=[],
                     )
-            except Exception:
-                # If read fails, create placeholder entry
-                manifest_entry = ParquetManifestEntry(
-                    file_path=fp,
-                    file_format="parquet",
-                    record_count=0,
-                    null_counts=[],
-                    file_size_in_bytes=0,
-                    uncompressed_size_in_bytes=0,
-                    column_uncompressed_sizes_in_bytes=[],
-                    min_k_hashes=[],
-                    histogram_counts=[],
-                    histogram_bins=0,
-                    min_values=[],
-                    max_values=[],
-                )
+            except Exception as err:
+                raise AddFilesReadError(
+                    f"Cannot read {fp} to add it to {self.identifier}: {err}. "
+                    "Refusing to register a file whose statistics are unknown."
+                ) from err
             new_entries.append(manifest_entry.to_dict())
 
         manifest_path = None
@@ -1168,10 +1273,7 @@ class SimpleDataset(Dataset):
         }
 
         # Sequence number
-        try:
-            next_seq = self._next_sequence_number()
-        except Exception:
-            next_seq = 1
+        next_seq = self._next_sequence_number()
 
         parent_id = self.metadata.current_snapshot_id
 
@@ -1257,22 +1359,24 @@ class SimpleDataset(Dataset):
         manifest_path = snap.manifest_list
 
         # Read manifest once using Arrow-native retrieval (30-50% faster)
-        try:
-            from .manifest_arrow import get_arrow_manifest
+        from .manifest_arrow import get_arrow_manifest
 
-            manifest = get_arrow_manifest(self.io, manifest_path)
-            entries = manifest.to_pylist()  # Convert to list only when needed
-            if not entries:
-                raise ValueError("Empty manifest data")
-        except Exception:
-            raise
+        manifest = get_arrow_manifest(self.io, manifest_path)
+        entries = manifest.to_pylist()  # Convert to list only when needed
+        if not entries:
+            raise ValueError("Empty manifest data")
 
-        # Resolve schema and describe all columns
-        relation_schema = None
+        # Resolve schema and describe all columns. A schema that cannot be
+        # fetched used to be flattened into the same bare "Schema unavailable"
+        # as a dataset that genuinely has none, which sent people looking for a
+        # missing schema when the real answer was a Firestore permission or
+        # transport error. Chain the cause instead.
         try:
             relation_schema = self.schema()
-        except Exception:
-            relation_schema = None
+        except Exception as err:
+            raise ValueError(
+                f"Schema for {self.identifier} could not be read; cannot describe all columns"
+            ) from err
 
         if relation_schema is None:
             raise ValueError("Schema unavailable; cannot describe all columns")
@@ -1296,40 +1400,6 @@ class SimpleDataset(Dataset):
 
         total_rows = 0
 
-        def _decode_minmax(v):
-            if v is None:
-                return None
-            if isinstance(v, (int, float)):
-                return v
-            # For strings stored as string values (not bytes), return as-is
-            if isinstance(v, str):
-                # Try to parse as number for backward compatibility
-                try:
-                    return int(v)
-                except Exception:
-                    try:
-                        return float(v)
-                    except Exception:
-                        # Not a number, return the string itself for display
-                        return v
-            try:
-                if isinstance(v, (bytes, bytearray, memoryview)):
-                    b = bytes(v)
-                    if b and b[-1] == 0xFF:
-                        b = b[:-1]
-                    s = b.decode("utf-8")
-                    try:
-                        return int(s)
-                    except Exception:
-                        try:
-                            return float(s)
-                        except Exception:
-                            # Decoded bytes that aren't numbers, return as string
-                            return s
-            except Exception:
-                pass
-            return None
-
         # Single pass through entries updating per-column accumulators
         for ent in entries:
             if not isinstance(ent, dict):
@@ -1346,65 +1416,48 @@ class SimpleDataset(Dataset):
 
             for cname, cidx in col_to_idx.items():
                 # nulls
-                try:
-                    stats[cname]["null_count"] += int((ncounts or [0])[cidx])
-                except Exception:
-                    pass
+                null_count = _as_int(_at(ncounts, cidx))
+                if null_count is not None:
+                    stats[cname]["null_count"] += null_count
 
                 # mins/maxs
-                try:
-                    raw_min = mv[cidx]
-                except Exception:
-                    raw_min = None
-                try:
-                    raw_max = xv[cidx]
-                except Exception:
-                    raw_max = None
-                dmin = _decode_minmax(raw_min)
-                dmax = _decode_minmax(raw_max)
+                dmin = _decode_minmax(_at(mv, cidx))
+                dmax = _decode_minmax(_at(xv, cidx))
                 if dmin is not None:
                     stats[cname]["mins"].append(dmin)
                 if dmax is not None:
                     stats[cname]["maxs"].append(dmax)
 
                 # min-k hashes (tolerant to scalar/list/tuple shapes)
-                try:
-                    col_mk = mks[cidx]
-                    if isinstance(col_mk, (int, float, bytes, bytearray, memoryview, str)):
-                        col_mk = (col_mk,)
-                    elif col_mk is None:
-                        col_mk = ()
-                except Exception:
+                col_mk = _at(mks, cidx)
+                if isinstance(col_mk, (int, float, bytes, bytearray, memoryview, str)):
+                    col_mk = (col_mk,)
+                elif col_mk is None:
                     col_mk = ()
                 for h in col_mk:
-                    try:
-                        stats[cname]["hashes"].add(int(h))
-                    except Exception:
-                        pass
+                    hashed = _as_int(h)
+                    if hashed is not None:
+                        stats[cname]["hashes"].add(hashed)
 
                 # histograms (tolerant to scalar/list/tuple)
-                try:
-                    col_hist = hists[cidx]
-                    if isinstance(col_hist, (int, float, str)):
-                        col_hist = (col_hist,)
-                    elif col_hist is None:
-                        col_hist = ()
-                except Exception:
+                col_hist = _at(hists, cidx)
+                if isinstance(col_hist, (int, float, str)):
+                    col_hist = (col_hist,)
+                elif col_hist is None:
                     col_hist = ()
-                if col_hist:
-                    try:
-                        if dmin is not None and dmax is not None and dmin != dmax:
-                            stats[cname]["file_hist_infos"].append(
-                                (float(dmin), float(dmax), list(col_hist))
-                            )
-                    except Exception:
-                        pass
+                if col_hist and dmin is not None and dmax is not None and dmin != dmax:
+                    # A string column reaches here with text min/max and has no
+                    # numeric range to bucket; it keeps its mins/maxs and simply
+                    # contributes no histogram.
+                    with suppress(TypeError, ValueError):
+                        stats[cname]["file_hist_infos"].append(
+                            (float(dmin), float(dmax), list(col_hist))
+                        )
 
                 # uncompressed bytes for this column (sum across files)
-                try:
-                    stats[cname]["uncompressed_bytes"] += int((col_sizes or [0])[cidx])
-                except Exception:
-                    pass
+                column_bytes = _as_int(_at(col_sizes, cidx))
+                if column_bytes is not None:
+                    stats[cname]["uncompressed_bytes"] += column_bytes
 
         # Build results per column
         results: dict[str, dict] = {}
@@ -1451,7 +1504,11 @@ class SimpleDataset(Dataset):
                             cardinality = len(set(smallest))
                         else:
                             cardinality = int((k - 1) * (MAX_HASH + 1) / (R + 1))
-            except Exception:
+            except (TypeError, ValueError):
+                # `hashes` is built through `_as_int`, so every member is an
+                # int and this should be unreachable; it stays as a floor under
+                # the estimator rather than letting one odd column fail a whole
+                # describe(). 0 reads as "unknown" downstream, not "no values".
                 cardinality = 0
 
             # distribution via distogram
@@ -1506,12 +1563,24 @@ class SimpleDataset(Dataset):
                         for i in range(1, effective_bins + 1):
                             edge = gmin + (i / effective_bins) * (gmax - gmin)
                             cum = _count_up_to(global_d, edge) or 0.0
-                            distribution[i - 1] = int(round(cum - prev))
+                            distribution[i - 1] = round(cum - prev)
                             prev = cum
                         diff = total - sum(distribution)
                         if diff != 0:
                             distribution[-1] += diff
-                except Exception:
+                except Exception as exc:  # noqa: BLE001 - vendored numeric code, fallback below
+                    # `maki_nage.distogram` is vendored third-party numeric
+                    # code; a merge or quantile step can fail on degenerate
+                    # inputs in ways not worth enumerating here. The block
+                    # below recomputes the same distribution by linear
+                    # interpolation, so this is a real fallback path, not a
+                    # swallowed error.
+                    logger.debug(
+                        "Distogram merge failed for %s.%s (%s); interpolating instead",
+                        self.identifier,
+                        cname,
+                        exc,
+                    )
                     distribution = [0] * effective_bins
                     gspan = float(global_max - global_min)
                     for fmin, fmax, counts in s["file_hist_infos"]:
@@ -1542,56 +1611,36 @@ class SimpleDataset(Dataset):
                 "distribution": distribution,
             }
 
-            # If textual, attempt display prefixes like describe()
-            try:
-                is_text = False
-                if relation_schema is not None:
-                    col = relation_schema.columns[cidx]
-                    ctype = getattr(col, "type", None)
-                    if ctype is not None:
-                        sctype = str(ctype).lower()
-                        if "char" in sctype or "string" in sctype or "varchar" in sctype:
-                            is_text = True
-            except Exception:
-                is_text = False
+            # If textual, attempt display prefixes like describe(). `_at`
+            # absorbs a schema that is None or shorter than the stats arrays,
+            # which is the only way any of this failed.
+            column = _at(getattr(relation_schema, "columns", None), cidx)
+            column_type = getattr(column, "type", None)
+            spelling = "" if column_type is None else str(column_type).lower()
+            is_text = "char" in spelling or "string" in spelling or "varchar" in spelling
 
             if is_text:
                 # Use only textual display values collected from manifests.
                 # Decode bytes and strip truncation marker (0xFF) if present.
                 def _decode_display_raw(v):
-                    if v is None:
-                        return None
-                    try:
-                        if isinstance(v, (bytes, bytearray, memoryview)):
-                            b = bytes(v)
-                            if b and b[-1] == 0xFF:
-                                b = b[:-1]
-                            s_val = b.decode("utf-8", errors="replace")
-                            return s_val[:16]
-                        if isinstance(v, str):
-                            return v[:16]
-                    except Exception:
-                        return None
+                    if isinstance(v, (bytes, bytearray, memoryview)):
+                        b = bytes(v)
+                        if b and b[-1] == 0xFF:
+                            b = b[:-1]
+                        # errors="replace" means this cannot raise: a display
+                        # prefix is cosmetic, so undecodable bytes become U+FFFD
+                        # rather than costing the column its whole row.
+                        return b.decode("utf-8", errors="replace")[:16]
+                    if isinstance(v, str):
+                        return v[:16]
                     return None
 
-                min_disp = None
-                max_disp = None
-                try:
-                    if s.get("min_displays"):
-                        for v in s.get("min_displays"):
-                            dv = _decode_display_raw(v)
-                            if dv:
-                                min_disp = dv
-                                break
-                    if s.get("max_displays"):
-                        for v in s.get("max_displays"):
-                            dv = _decode_display_raw(v)
-                            if dv:
-                                max_disp = dv
-                                break
-                except Exception:
-                    min_disp = None
-                    max_disp = None
+                min_disp = next(
+                    (d for d in map(_decode_display_raw, s.get("min_displays") or []) if d), None
+                )
+                max_disp = next(
+                    (d for d in map(_decode_display_raw, s.get("max_displays") or []) if d), None
+                )
 
                 if min_disp is not None or max_disp is not None:
                     res["min_display"] = min_disp
@@ -1671,10 +1720,12 @@ class SimpleDataset(Dataset):
                     data, fp, file_size, field_id_by_name=self._field_id_by_name()
                 )
                 dent = manifest_entry.to_dict()
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - collected, then raised below
                 # Collect and keep going: a bad batch write or bucket issue
                 # usually affects many files at once, and surfacing them one
-                # per re-run would take N runs to discover N bad files.
+                # per re-run would take N runs to discover N bad files. Nothing
+                # is swallowed - `failures` is what decides whether this pass
+                # commits at all.
                 failures.append((fp, exc))
                 continue
 
@@ -1714,10 +1765,7 @@ class SimpleDataset(Dataset):
         }
 
         # sequence number
-        try:
-            next_seq = self._next_sequence_number()
-        except Exception:
-            next_seq = 1
+        next_seq = self._next_sequence_number()
 
         parent_id = self.metadata.current_snapshot_id
 
@@ -1761,7 +1809,7 @@ class SimpleDataset(Dataset):
 
     def truncate(
         self,
-        author: str = None,
+        author: str | None = None,
         commit_message: str | None = None,
         commit_truncation: bool = False,
     ) -> None:
@@ -1807,7 +1855,20 @@ class SimpleDataset(Dataset):
                 with inp.open() as f:
                     data = f.read()
                 rows = read_manifest_rows(data)
-            except Exception:
+            except Exception as exc:  # noqa: BLE001 - historical manifest, reporting only
+                # This walks EVERY snapshot to tally what the truncate is
+                # removing, and old snapshots legitimately outlive their
+                # manifests once expiration has purged them - so one that will
+                # not read cannot fail the truncate. It does undercount the
+                # "deleted-*" figures in the resulting summary, which is worth
+                # a line in the log rather than silence.
+                logger.warning(
+                    "Manifest %s of %s unreadable (%s); its files are missing from the "
+                    "truncate summary",
+                    manifest_path,
+                    self.identifier,
+                    exc,
+                )
                 rows = []
 
             for r in rows:
@@ -1857,10 +1918,7 @@ class SimpleDataset(Dataset):
         }
 
         # Sequence number
-        try:
-            next_seq = self._next_sequence_number()
-        except Exception:
-            next_seq = 1
+        next_seq = self._next_sequence_number()
 
         if author is None:
             raise ValueError(

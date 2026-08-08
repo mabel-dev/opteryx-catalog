@@ -348,7 +348,7 @@ def test_emits_audit_record(monkeypatch, capsys):
 
     catalog.rename_dataset("coll.tbl", "newcoll.newtbl", author="alice")
 
-    record = [r for r in _emitted(capsys) if r["action"] == "rename_dataset"][0]
+    record = next(r for r in _emitted(capsys) if r["action"] == "rename_dataset")
     assert record["resource_type"] == "dataset"
     assert record["workspace"] == "ws"
     assert record["collection"] == "newcoll"
@@ -365,5 +365,5 @@ def test_unauthenticated_records_no_author(monkeypatch, capsys):
 
     catalog.rename_dataset("coll.tbl", "newcoll.newtbl")
 
-    record = [r for r in _emitted(capsys) if r["action"] == "rename_dataset"][0]
+    record = next(r for r in _emitted(capsys) if r["action"] == "rename_dataset")
     assert record["author"] is None

@@ -314,11 +314,11 @@ def _load_manifest_rows(index, catalog, prefix: str, snapshot_id: int, announce:
 def cmd_inspect(args) -> None:
     """Restores one manifest object, then reports what it referenced."""
     catalog, storage_client = _connect(args.workspace)
-    location, prefix = _source_prefix(catalog, args.dataset)
+    _location, prefix = _source_prefix(catalog, args.dataset)
     index = SoftDeleteIndex(storage_client, os.environ["GCS_BUCKET"], prefix)
     bucket_name = os.environ["GCS_BUCKET"]
 
-    name, rows = _load_manifest_rows(index, catalog, prefix, args.snapshot_id, announce=True)
+    _name, rows = _load_manifest_rows(index, catalog, prefix, args.snapshot_id, announce=True)
     print(f"\nmanifest entries: {len(rows)}")
 
     tally = {"live": [], "recoverable": [], "lost": []}
@@ -364,7 +364,7 @@ def cmd_restore(args) -> None:
         sys.exit(f"target location is not empty: {target_location}")
 
     index = SoftDeleteIndex(storage_client, bucket_name, prefix)
-    manifest_name, rows = _load_manifest_rows(
+    _manifest_name, rows = _load_manifest_rows(
         index, catalog, prefix, args.snapshot_id, announce=True
     )
 

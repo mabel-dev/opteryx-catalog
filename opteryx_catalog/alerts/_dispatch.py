@@ -16,6 +16,7 @@ import logging
 import queue
 import threading
 import time
+from contextlib import suppress
 
 logger = logging.getLogger(__name__)
 
@@ -113,7 +114,7 @@ def _deliver_to(alert, sinks) -> bool:
         try:
             sink.deliver(alert)
             delivered_any = True
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - one sink must not break the others
             # One sink failing must not stop the others - the stdout line is the
             # guarantee and it is cheap, so it should survive GitHub being down.
             if type(exc).__name__ == "_NotFiled":
@@ -197,7 +198,7 @@ def _drain() -> None:
                 # occurrence is delivered rather than deduped against a ticket
                 # that was never created.
                 forget(alert.fingerprint)
-        except Exception as exc:  # a reporter must never take the process down
+        except Exception as exc:  # noqa: BLE001 - a reporter must never take the process down
             logger.warning("alerts: reporting failed: %s", exc)
         finally:
             _pending.task_done()
@@ -218,7 +219,10 @@ def flush(timeout: float = 10.0) -> None:
 
 
 def _flush_at_exit() -> None:
-    try:
+    # Silence is deliberate and cannot be improved on: this runs from atexit,
+    # where the logging handlers this would report through may already be torn
+    # down, and where raising would print an "Exception ignored in atexit"
+    # traceback over whatever the process was actually doing. Undelivered
+    # alerts are already visible - the stdout sink emitted them synchronously.
+    with suppress(Exception):
         flush(timeout=5.0)
-    except Exception:
-        pass

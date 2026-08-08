@@ -149,13 +149,12 @@ def get_parsed_manifest(io, manifest_path: str) -> list:
         return _parsed_manifest_cache[manifest_path]
 
     # Miss: read bytes -> parse -> freeze -> cache
+    # A missing manifest propagates as FileNotFoundError: callers distinguish
+    # "no manifest" from "empty manifest", and caching a [] for a path that
+    # merely failed to read would serve that emptiness to every later caller.
     inp = io.new_input(manifest_path)
-    try:
-        with inp.open() as f:
-            data = f.read()
-    except FileNotFoundError:
-        # keep behavior consistent with callers
-        raise
+    with inp.open() as f:
+        data = f.read()
 
     if not data:
         _manifest_metrics["parsed_cache_misses"] += 1

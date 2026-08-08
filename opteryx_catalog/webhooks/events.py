@@ -37,7 +37,10 @@ def dataset_created_payload(
                     {"name": name, "type": str(schema.field(name).type)} for name in schema.names
                 ]
             }
-    except Exception:
+    except (AttributeError, KeyError, TypeError):
+        # Introspecting a schema object of unknown provenance. The schema block
+        # is extra detail on the payload; the event itself is still correct
+        # without it.
         pass
 
     return payload

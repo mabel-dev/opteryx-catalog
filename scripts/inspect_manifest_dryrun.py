@@ -37,8 +37,14 @@ def safe_read_manifest(ds) -> list:
 
 
 def inspect_dataset(dataset_identifier: str, output_path: str, catalog_kwargs: dict):
-    out_file = open(output_path, "w", encoding="utf-8")
+    # Opened here rather than inside the body so a failure part-way through
+    # still flushes and closes the artifact. It used to be left open on the
+    # exception path, which produced a silently truncated file.
+    with open(output_path, "w", encoding="utf-8") as out_file:
+        _write_inspection(dataset_identifier, out_file, catalog_kwargs)
 
+
+def _write_inspection(dataset_identifier: str, out_file, catalog_kwargs: dict):
     meta = {"dataset": dataset_identifier, "timestamp": int(time.time() * 1000)}
     out_file.write(json.dumps({"_meta": meta}) + "\n")
 
@@ -262,8 +268,6 @@ def inspect_dataset(dataset_identifier: str, output_path: str, catalog_kwargs: d
         recompute_describe = {"__error": str(e)}
 
     out_file.write(json.dumps({"describe_recomputed": recompute_describe}) + "\n")
-
-    out_file.close()
 
 
 if __name__ == "__main__":

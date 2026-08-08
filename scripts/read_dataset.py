@@ -110,9 +110,9 @@ def _read_data_file(io, path: str) -> list:
 # s.append(df)
 
 ts = s.snapshots()[-1].timestamp_ms
-print(f"Table last updated: {datetime.datetime.fromtimestamp(ts / 1000)}")
+print(f"Table last updated: {datetime.datetime.fromtimestamp(ts / 1000, tz=datetime.UTC)}")
 ts = s.snapshots()[0].timestamp_ms
-print(f"Table last created: {datetime.datetime.fromtimestamp(ts / 1000)}")
+print(f"Table last created: {datetime.datetime.fromtimestamp(ts / 1000, tz=datetime.UTC)}")
 
 
 print(f"Table format version: {s.metadata.format_version}")

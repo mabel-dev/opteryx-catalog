@@ -21,12 +21,14 @@ Webhook Endpoint:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 from typing import Any
-from typing import Optional
 
 import requests
+
+logger = logging.getLogger(__name__)
 
 
 class WebhookManager:
@@ -158,8 +160,14 @@ class WebhookManager:
                 },
             )
             return response.status_code >= 200 and response.status_code < 300
-        except Exception:
-            # Log errors in production; for now, silently fail
+        except Exception as exc:  # noqa: BLE001 - a notification must not break the commit
+            # Broader than requests' own exception hierarchy on purpose: the
+            # payload is serialised inside `requests.post`, so an unserialisable
+            # value raises TypeError rather than a RequestException. The caller
+            # has already done the thing being announced - letting either kind
+            # escape would fail a completed catalog operation over a
+            # notification nobody was waiting on.
+            logger.warning("Webhook POST to %s failed: %s", url, exc)
             return False
 
     def _send_via_cloud_tasks(self, url: str, payload: dict[str, Any]) -> bool:
@@ -200,8 +208,9 @@ class WebhookManager:
                 )
             )
             return True
-        except Exception:
-            # Log errors in production; for now, silently fail
+        except Exception as exc:  # noqa: BLE001 - Cloud Tasks client boundary
+            # Same contract as the direct POST above: announced, not committed.
+            logger.warning("Could not queue webhook task for %s: %s", url, exc)
             return False
 
 

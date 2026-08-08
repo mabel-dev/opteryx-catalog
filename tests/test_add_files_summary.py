@@ -4,12 +4,14 @@ import sys
 
 sys.path.insert(0, os.path.join(sys.path[0], ".."))
 
+import pytest
 from draken.interop.vector_sequence import vector_from_sequence
 from draken.morsels.morsel import Morsel
 from rugo.parquet import write_parquet
 
 from opteryx_catalog.catalog.dataset import SimpleDataset
 from opteryx_catalog.catalog.metadata import DatasetMetadata
+from opteryx_catalog.exceptions import AddFilesReadError
 from opteryx_catalog.opteryx_catalog import OpteryxCatalog
 
 
@@ -118,3 +120,55 @@ def test_truncate_and_add_files_accumulates_files_size():
     assert snap.summary["added-files-size"] == expected_size
     assert snap.summary["added-files-size"] > 0
     assert snap.summary["total-files-size"] == expected_size
+
+
+def test_add_files_refuses_a_file_it_cannot_read():
+    """An unreadable file fails the commit instead of registering zero rows.
+
+    `add_files` used to substitute a placeholder entry recording record_count=0
+    and file_size_in_bytes=0, so the commit landed with a summary that
+    undercounted by the whole file and nothing reported it.
+    """
+    mapping = {}
+    mem_io = _MemIO(mapping)
+    present = "mem://data/present.parquet"
+    _make_parquet_file(mapping, present, [(1, 10), (2, 20)])
+    missing = "mem://data/not-there.parquet"
+
+    ds = _make_dataset("tests_temp.add_files_unreadable", mem_io)
+
+    with pytest.raises(AddFilesReadError) as caught:
+        ds.add_files([present, missing], author="tester")
+
+    assert missing in str(caught.value)
+    # Nothing was committed: the dataset is exactly as it was.
+    assert ds.snapshot() is None
+
+
+def test_truncate_and_add_files_refuses_a_file_it_cannot_read():
+    mapping = {}
+    mem_io = _MemIO(mapping)
+    missing = "mem://data/also-not-there.parquet"
+
+    ds = _make_dataset("tests_temp.truncate_add_files_unreadable", mem_io)
+
+    with pytest.raises(AddFilesReadError):
+        ds.truncate_and_add_files([missing], author="tester")
+
+    assert ds.snapshot() is None
+
+
+def test_add_files_accepts_a_genuinely_empty_object():
+    """An empty object is a real state and still registers, with zero rows."""
+    mapping = {}
+    mem_io = _MemIO(mapping)
+    empty = "mem://data/empty.parquet"
+    mapping[empty] = b""
+
+    ds = _make_dataset("tests_temp.add_files_empty", mem_io)
+    ds.add_files([empty], author="tester")
+
+    snap = ds.snapshot()
+    assert snap is not None
+    assert snap.summary["total-data-files"] == 1
+    assert snap.summary["total-records"] == 0

@@ -93,5 +93,25 @@ docstring-code-line-length = 100
 # without this ruff and `make lint` re-sort the same imports against each other.
 [tool.ruff.lint.isort]
 force-single-line = true
+
+[tool.ruff.lint.per-file-ignores]
+# `scripts/` holds operational one-offs run by a human at a terminal: inspect a
+# manifest, restore a snapshot, audit a log. "Catch anything, print it, move on"
+# is the correct shape there - the operator reads the message and decides - and
+# the same catch inside the package would not be.
+#
+# This is an exemption, not a verdict that the code is clean. It exists so the
+# advisory lint job reports on the library only: with ~35 script findings mixed
+# in, a new blind except in opteryx_catalog/ is invisible, which is the failure
+# mode this whole rule is meant to prevent. Every catch inside the package is
+# now either narrowed to real types or carries `# noqa: BLE001 - <why>`, so
+# anything BLE001 reports from here on is genuinely new.
+"scripts/*" = ["BLE001", "S110", "S112"]
+
+# Vendored upstream (Romain Picard's distogram, 3.0.0 - see its own LICENSE.txt
+# and the "changes made for Opteryx" note at the top of distogram.py). Style
+# findings here are upstream's to make; fixing them locally only makes the next
+# sync harder to read. Substantive changes go in that note, not silently.
+"opteryx_catalog/maki_nage/*" = ["C408", "RUF059"]
 [tool.pylint.logging]
 logging-format-style = "new"
