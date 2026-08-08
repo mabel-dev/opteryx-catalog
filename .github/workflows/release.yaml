@@ -3,7 +3,7 @@ name: release
 on:
   push:
     tags:
-      - 'v*'
+      - 'version-*'
 
 jobs:
 
@@ -27,7 +27,7 @@ jobs:
 
     - name: compare
       run: |
-        TAG="${GITHUB_REF_NAME#v}"
+        TAG="${GITHUB_REF_NAME#version-}"
         PROJECT=$(python -c "import tomllib;print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
         echo "tag=${TAG} pyproject=${PROJECT}"
         if [ "${TAG}" != "${PROJECT}" ]; then
