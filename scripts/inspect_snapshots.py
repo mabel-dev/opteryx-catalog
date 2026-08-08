@@ -140,7 +140,7 @@ def inspect_collection(catalog, collection: str):
 
 def inspect_dataset(catalog, identifier: str):
     """Inspect one dataset in detail."""
-    collection, dataset_name = identifier.split(".")
+    _collection, _dataset_name = identifier.split(".")
 
     print("\n" + "=" * 80)
     print(f"SNAPSHOT EXPIRATION PLAN - '{identifier}'")

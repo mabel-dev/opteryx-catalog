@@ -181,6 +181,22 @@ class ManifestReadError(Alertable, CatalogError):
     alert_summary = "A parent manifest was unreadable; the commit was refused."
 
 
+class AddFilesReadError(CatalogError):
+    """A file named in `add_files` could not be read to compute its statistics.
+
+    Those methods register files that are already in storage, so a file that
+    cannot be read means the caller named something that is not there, or not
+    readable with these credentials. That is a caller error, which is why this
+    is deliberately NOT `Alertable` - see the note on that class.
+
+    Both call sites used to substitute a placeholder manifest entry recording
+    zero rows and zero bytes. The commit then succeeded, the snapshot summary
+    undercounted by however many rows the file actually held, and no signal
+    was emitted anywhere. Refusing leaves the dataset exactly as it was, which
+    is a state the caller can retry from.
+    """
+
+
 class ManifestProtectionError(Alertable, CatalogError):
     """Garbage collection could not establish which files are still in use.
 

@@ -52,7 +52,9 @@ def _project() -> str | None:
         )
         if response.status_code == 200:
             return response.text.strip()
-    except Exception:
+    except requests.RequestException:
+        # Not on GCE, or the metadata server did not answer inside the second
+        # we allow it. Either way there is no project id to report against.
         return None
     return None
 
@@ -77,7 +79,7 @@ def access_secret(secret_name: str):
         client = secretmanager.SecretManagerServiceClient()
         name = f"projects/{project}/secrets/{secret_name}/versions/latest"
         return client.access_secret_version(request={"name": name}).payload.data.decode().strip()
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - Secret Manager client boundary
         logger.warning("alerts: could not read secret '%s': %s", secret_name, exc)
         return None
 

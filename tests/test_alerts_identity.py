@@ -24,7 +24,7 @@ def _raise_b(message):
 def _caught(fn, message):
     try:
         fn(message)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - capturing whatever the fixture raised
         return exc
     raise AssertionError("expected an exception")
 

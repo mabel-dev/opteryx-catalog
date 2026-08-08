@@ -2,6 +2,8 @@
 Optimized GCS FileIO for opteryx_catalog.iops
 """
 
+from __future__ import annotations
+
 import io
 import logging
 import os
@@ -118,7 +120,7 @@ class _GcsInputFile(InputFile):
         location: str,
         session: requests.Session,
         access_token_getter: Callable[[], str],
-        cache: OrderedDict = None,
+        cache: OrderedDict | None = None,
     ):
         # Check cache first
         if cache is not None and location in cache:
@@ -183,7 +185,7 @@ class GcsFileIO(FileIO):
                     req = Request()
                     self._credentials.refresh(req)
                 self._access_token = self._credentials.token
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 - google-auth boundary
                 logger.warning("Failed to refresh GCS credentials: %s", e)
                 self._access_token = None
 
@@ -271,7 +273,10 @@ class GcsFileIO(FileIO):
                 return [f"gs://{bucket_name}/{b.name}" for b in blobs]
         except Exception:
             # Be conservative: on any failure return empty list so callers
-            # (deep-clean / expiration) can continue without crashing.
+            # (deep-clean / expiration) can continue without crashing. Both
+            # treat an empty listing as ambiguous, never as "nothing is
+            # orphaned", so this cannot cause a deletion.
+            logger.warning("Listing %s failed; reporting no files", prefix, exc_info=True)
             return []
 
         return []
@@ -314,6 +319,9 @@ class GcsFileIO(FileIO):
                     ages[uri] = now_ms - int(b.time_created.timestamp() * 1000)
                 return ages
         except Exception:
+            # No ages means every candidate fails its age gate and is KEPT,
+            # so an empty map is the safe direction.
+            logger.warning("Could not read object ages under %s", prefix, exc_info=True)
             return {}
 
         return {}

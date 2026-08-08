@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import logging
 from io import BytesIO
 from typing import BinaryIO
+
+logger = logging.getLogger(__name__)
 
 
 class InputFile:
@@ -133,10 +136,11 @@ class GcsFileIO(FileIO):
             # Some implementations provide `exists()`
             if hasattr(impl_in, "exists"):
                 return impl_in.exists()
-            # Fallback: try to open
-            _ = impl_in.open()
-            return True
-        except Exception:
+            # Fallback: try to open. Closed immediately - this answers a
+            # question about existence and must not leak the handle.
+            with impl_in.open():
+                return True
+        except Exception:  # noqa: BLE001 - storage boundary; the question is boolean
             return False
 
     def list_files(self, prefix: str) -> list:
@@ -152,6 +156,7 @@ class GcsFileIO(FileIO):
             try:
                 return list(self._impl.list_files(prefix))
             except Exception:
+                logger.warning("Listing %s failed; reporting no files", prefix, exc_info=True)
                 return []
 
         # Fallback: handle gs://<bucket>/<prefix> by using google-cloud-storage client
@@ -168,7 +173,13 @@ class GcsFileIO(FileIO):
                 blobs = client.list_blobs(bucket_name, prefix=object_prefix)
                 return [f"gs://{bucket_name}/{b.name}" for b in blobs]
         except Exception:
-            # Silently return empty list on failure to avoid crashing callers
+            # Empty on failure so callers (deep-clean / expiration) continue.
+            # Both already treat an empty listing as AMBIGUOUS rather than as
+            # "nothing is orphaned" - see the comment in
+            # `DatasetDeepClean.find_orphaned_files` - so this cannot cause a
+            # deletion. It is logged because a silent empty listing otherwise
+            # looks like a clean dataset.
+            logger.warning("Listing %s failed; reporting no files", prefix, exc_info=True)
             return []
 
         # No supported listing available

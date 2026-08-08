@@ -6,6 +6,7 @@ This tests the DatasetCompactor class with both brute and performance strategies
 
 import os
 import sys
+from typing import ClassVar
 
 sys.path.insert(0, os.path.join(sys.path[0], ".."))
 sys.path.insert(1, os.path.join(sys.path[0], "../opteryx-core"))
@@ -1020,8 +1021,8 @@ def test_reconcile_failure_aborts_instead_of_dropping_rows():
         but its columns can't be read back out."""
 
         num_rows = 4
-        column_names = ["timestamp"]  # missing "value" -> needs a rebuild
-        column_types = ["INTEGER"]
+        column_names: ClassVar[list[str]] = ["timestamp"]  # missing "value" -> needs a rebuild
+        column_types: ClassVar[list[str]] = ["INTEGER"]
 
         def column(self, name):
             raise RuntimeError("unreadable")

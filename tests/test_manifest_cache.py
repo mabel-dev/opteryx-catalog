@@ -96,12 +96,12 @@ def test_parsed_manifest_cache_hits_and_invalidation():
     assert isinstance(ent.get("min_k_hashes"), tuple)
 
     # Second read -> hit
-    rows2 = get_parsed_manifest(ds.io, manifest_path)
+    get_parsed_manifest(ds.io, manifest_path)
     m2 = get_manifest_metrics()
     assert m2.get("parsed_cache_hits", 0) >= 1
 
     # Invalidate and force re-read -> miss increments
     invalidate_parsed_manifest(manifest_path)
-    rows3 = get_parsed_manifest(ds.io, manifest_path)
+    get_parsed_manifest(ds.io, manifest_path)
     m3 = get_manifest_metrics()
     assert m3.get("parsed_cache_misses", 0) >= 2

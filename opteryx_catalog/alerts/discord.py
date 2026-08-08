@@ -199,7 +199,10 @@ def _retry_after_seconds(response) -> float:
 def _body_retry_after(response):
     try:
         payload = response.json()
-    except Exception:
+    except ValueError:
+        # requests raises JSONDecodeError (a ValueError) for a non-JSON body,
+        # which is what a proxy or an HTML error page gives us. Fall through
+        # to the Retry-After header.
         return None
     if not isinstance(payload, dict):
         return None

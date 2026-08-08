@@ -62,7 +62,7 @@ class DroppedDatasetSweep:
         """
         try:
             tombstones = list(self.catalog.list_dropped_datasets())
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - Firestore client boundary
             logger.error("Could not list tombstones: %s", exc)
             return {
                 "tombstones": 0,
@@ -129,7 +129,7 @@ class DroppedDatasetSweep:
 
         try:
             files = self._deep_clean.get_all_physical_files(location)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - storage listing boundary
             logger.error("Could not list files under %s: %s", location, exc)
             row["error"] = str(exc)
             return _done("error", "list-failed")
@@ -158,7 +158,7 @@ class DroppedDatasetSweep:
         try:
             self.catalog.delete_tombstone(tombstone["id"])
             row["tombstone_cleared"] = True
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - Firestore client boundary
             logger.error("Reclaimed %s but could not clear tombstone: %s", location, exc)
             row["error"] = str(exc)
             return _done("error", "tombstone-clear-failed")

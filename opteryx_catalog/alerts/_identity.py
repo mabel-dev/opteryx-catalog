@@ -38,7 +38,10 @@ _PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
 def _is_ours(filename: str) -> bool:
     try:
         return os.path.dirname(os.path.abspath(filename)) == _PACKAGE_DIR
-    except Exception:
+    except (AttributeError, OSError, TypeError, ValueError):
+        # A frame filename can be a synthetic one ("<string>", "<frozen ...>")
+        # or absent. Not ours, which is the safe answer: it keeps the frame in
+        # the fingerprint material rather than silently dropping it.
         return False
 
 
@@ -163,14 +166,19 @@ def jsonable(value: Any) -> Any:
 def context_block(context: Mapping) -> str:
     try:
         return json.dumps(jsonable(context), indent=2, sort_keys=True)
-    except Exception:
+    except (RecursionError, TypeError, ValueError):
+        # `jsonable` walks arbitrary caller-supplied context: it can be
+        # self-referential, or hold keys that will not sort against each other.
+        # repr() of the whole thing still tells a human what was passed.
         return repr(context)
 
 
 def format_traceback(exc: BaseException) -> str:
     try:
         text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-    except Exception:
+    except Exception:  # noqa: BLE001 - formats a caller's exception, see below
+        # Rendering someone else's exception runs their __str__/__repr__, which
+        # can raise anything at all. The one-line form below is the floor.
         text = f"{type(exc).__name__}: {exc}"
     if not exc.__traceback__:
         outside = [frame for frame in traceback.extract_stack() if not _is_ours(frame.filename)]

@@ -116,10 +116,7 @@ def _verify_mapping() -> int:
         ok = before is not None and str(before) == str(after)
         if not ok:
             failures += 1
-        print(
-            f"  {'ok ' if ok else 'FAIL'}  {legacy:9} -> {canonical:9} "
-            f"({before} vs {after})"
-        )
+        print(f"  {'ok ' if ok else 'FAIL'}  {legacy:9} -> {canonical:9} ({before} vs {after})")
     print("mapping verified" if not failures else f"{failures} mapping FAILURES")
     return 1 if failures else 0
 
@@ -145,9 +142,7 @@ def _rewrite_columns(columns: list, renames: dict) -> tuple[list, list]:
 
 def _iter_schema_docs(client, workspace: str | None):
     """Yield ``(doc_ref, data)`` for every schema document in scope."""
-    workspaces = (
-        [client.collection(workspace)] if workspace else list(client.collections())
-    )
+    workspaces = [client.collection(workspace)] if workspace else list(client.collections())
     for ws in workspaces:
         for coll_doc in ws.list_documents():
             for ds_ref in coll_doc.collection("datasets").list_documents():
@@ -242,9 +237,7 @@ def main() -> int:
     if args.restore:
         return restore(client, args.restore)
 
-    backup_path = os.path.join(
-        args.backup_dir, f"schema-type-backup-{int(time.time())}.json"
-    )
+    backup_path = os.path.join(args.backup_dir, f"schema-type-backup-{int(time.time())}.json")
     return migrate(
         client,
         workspace=args.workspace,

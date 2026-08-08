@@ -353,7 +353,7 @@ def test_deep_clean_dry_run_writes_nothing_when_files_are_due_for_deletion():
 def test_the_strict_fakes_actually_catch_a_write():
     """Guards the guard: these tests are only worth anything if a real
     mutation would be caught."""
-    storage, catalog = _make()
+    _storage, catalog = _make()
 
     with pytest.raises(DryRunViolation):
         catalog.io.delete(ORPHAN)
@@ -392,7 +392,7 @@ def test_execute_run_would_trip_the_strict_fakes():
     """The counterpart: an execute run on the same fixture DOES reach for the
     delete, so the dry-run results above are a real difference in behaviour and
     not an artefact of a fixture where nothing was ever deletable."""
-    storage, catalog = _make()
+    _storage, catalog = _make()
     clock = [1_000_000]
     quarantine = _MemoryQuarantine(clock, {ORPHAN: clock[0] - DAY_MS})
 

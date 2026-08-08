@@ -294,7 +294,6 @@ def test_either_pass_finding_the_file_referenced_clears_it():
     quarantine = _ClockedQuarantine(catalog, clock)
 
     expirer = SnapshotExpiration(catalog, author="test", quarantine=quarantine)
-    cleaner = DatasetDeepClean(catalog, quarantine=quarantine)
 
     expirer.expire_dataset("github.events", dry_run=False)
     assert quarantine.load("github.events") == {ORPHAN: 1_000_000}

@@ -150,7 +150,11 @@ def normalize_sort_order(sort_orders) -> dict | None:
                 "index": None,
                 "ascending": ascending,
             }
-    except Exception:
+    except (AttributeError, KeyError, TypeError, ValueError):
+        # Reading an arbitrarily-shaped sort-order document: a missing key, a
+        # non-dict where a dict was expected, a direction that will not stringify.
+        # Any of those means "no usable sort order", which callers handle by
+        # falling back to a brute-force merge.
         return None
     return None
 
@@ -281,7 +285,7 @@ MAX_MEMORY_FILES = 1
 # We fold the container RAM back into a ceiling on a merge's *combined budget-unit
 # size*, so all selection arithmetic stays in the one budget unit. Override the
 # container size for non-16 GB deployments via OPTERYX_COMPACTION_RAM_MB.
-CONTAINER_RAM_MB = int(os.environ.get("OPTERYX_COMPACTION_RAM_MB", 16 * 1024))
+CONTAINER_RAM_MB = int(os.environ.get("OPTERYX_COMPACTION_RAM_MB") or 16 * 1024)
 CONTAINER_RAM_BYTES = CONTAINER_RAM_MB * 1024 * 1024
 RUNTIME_WARMUP_BYTES = 768 * 1024 * 1024  # native lib/arena/threadpool floor (~measured)
 PEAK_RAM_PER_BUDGET_BYTE = 2.0  # combine transient dominates (~2x combined budget-unit)
@@ -377,7 +381,7 @@ KEY_SCAN_CHUNK_ROWS = 1_000_000
 # How much of the candidate files' COMPRESSED bytes the source cache may hold in
 # RAM before spilling the rest to local disk. See ``_SourceFileCache``.
 SOURCE_CACHE_RAM_BYTES = (
-    int(os.environ.get("OPTERYX_COMPACTION_SOURCE_CACHE_MB", 2048)) * 1024 * 1024
+    int(os.environ.get("OPTERYX_COMPACTION_SOURCE_CACHE_MB") or 2048) * 1024 * 1024
 )
 
 
@@ -572,7 +576,7 @@ class DatasetCompactor:
 
         try:
             return get_parsed_manifest(self.dataset.io, manifest_path)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - aborts the pass, see _abort
             self._abort(f"could not read manifest {manifest_path}", exc)
             return []
 
@@ -638,7 +642,11 @@ class DatasetCompactor:
             resolved = self.dataset.schema()
             if resolved is not None and getattr(resolved, "columns", None):
                 columns = resolved.columns
-        except Exception:
+        except Exception:  # noqa: BLE001 - Firestore client boundary
+            # `dataset.schema()` reaches Firestore. Falling back to the in-memory
+            # schema below is the whole point of the guard; an unresolvable sort
+            # column downgrades this pass to a brute-force merge, never to a
+            # silently wrong one.
             columns = None
         if columns is None:
             schema = getattr(self.dataset.metadata, "schema", None)
@@ -1024,7 +1032,7 @@ class DatasetCompactor:
                             vector_from_sequence([None] * morsel.num_rows, dtype=target_type),
                         )
                 reconciled.append(rebuilt)
-            except Exception:
+            except Exception:  # noqa: BLE001 - aborts the pass rather than dropping rows
                 # Cannot reconcile this morsel. Dropping it would silently lose
                 # its rows while the commit still deletes its source file, so
                 # abort the compaction instead.
@@ -1105,7 +1113,7 @@ class DatasetCompactor:
                 )
                 tables.append(file_morsel)
                 total_size += entry_size(entry)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - aborts the pass, see _abort
                 # Failed to read file, abort this compaction
                 return self._abort(f"could not read input file {file_path}", exc)
 
@@ -1158,10 +1166,12 @@ class DatasetCompactor:
                         key=lambda i: (sort_values[i] is None, sort_values[i]),
                     )
                     sort_status = "python-fallback"
-                except Exception:
+                except Exception:  # noqa: BLE001 - pure-Python fallback sort
+                    # Comparing values of mixed or exotic types. Recorded as failed
+                    # rather than swallowed: `sort_status` reaches the commit.
                     perm = None
                     sort_status = "failed"
-            except Exception:
+            except Exception:  # noqa: BLE001 - draken native sort, C-ABI boundary
                 # Native sort raised on this data; leave output unsorted but
                 # record it rather than silently degrading.
                 perm = None
@@ -1212,7 +1222,7 @@ class DatasetCompactor:
                 out = io.new_output(file_path).create()
                 out.write(pdata)
                 out.close()
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - cleans up, then aborts the pass
                 # Failed to write or upload. Anything already written this pass
                 # is unreferenced now, so clean it up before aborting.
                 self._delete_written_files(new_entries)
@@ -1365,7 +1375,10 @@ class DatasetCompactor:
             total_size = sum(entry_int(e, "file_size_in_bytes") for e in final_entries)
             total_data_size = sum(entry_size(e) for e in final_entries)
             total_records = sum(entry_int(e, "record_count") for e in final_entries)
-        except Exception:
+        except Exception:  # noqa: BLE001 - falls back to a full manifest refresh
+            # Summing statistics off entries whose shape may predate this code.
+            # The fallback below rebuilds every entry from its data file, so this
+            # trades time for certainty rather than accepting wrong totals.
             # If stats calculation fails, refresh the entire manifest from data files
             final_entries = self._refresh_manifest_from_data_files(final_entries)
 
@@ -1465,7 +1478,7 @@ class DatasetCompactor:
         try:
             fresh = loader(self.dataset.identifier)
             current = fresh.metadata.current_snapshot_id
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - advisory check, logged below
             logger.debug("compaction: staleness check unavailable (%s)", exc)
             return False
         return current is not None and current != baseline
@@ -1531,7 +1544,7 @@ class DatasetCompactor:
                 continue
             try:
                 self.dataset.io.delete(path)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - best-effort cleanup, logged below
                 logger.debug("compaction: could not remove orphan %s (%s)", path, exc)
 
     # --- Streaming execution (see the module comment above ROW_GROUP_TARGET_ROWS) ---
@@ -1559,7 +1572,10 @@ class DatasetCompactor:
                 data = source_cache.read(file_path)
                 with read_parquet(data, columns=[sort_column]) as reader:
                     parts.extend(reader)
-            except Exception:
+            except Exception:  # noqa: BLE001 - caller falls back to a brute merge
+                # One unreadable input means no reliable global key order, so the
+                # sort-aware plan is abandoned wholesale. The pass still runs, it
+                # just stops claiming the output is sorted.
                 return None
         if not parts:
             return None
@@ -1906,7 +1922,7 @@ class DatasetCompactor:
 
             perm = morsel_sort(key_morsel, [sort_column], [ascending])
             sorted_key_morsel = key_morsel.take(list(perm))
-        except Exception:
+        except Exception:  # noqa: BLE001 - draken native sort, C-ABI boundary
             return None
         n = sorted_key_morsel.num_rows
         del key_morsel, perm
@@ -1937,7 +1953,9 @@ class DatasetCompactor:
         try:
             columns = self.dataset.schema().columns
             _, sort_field_id, sort_index = self._resolve_sort_column(self.sort_order, columns)
-        except Exception:
+        except Exception:  # noqa: BLE001 - Firestore client boundary, see above
+            # Without the resolved field-id the null-bearing scan below simply
+            # finds nothing, which costs a planning refinement, not correctness.
             sort_field_id, sort_index = None, None
         null_bearing_paths = set()
         for entry in files_to_compact:
@@ -2026,7 +2044,7 @@ class DatasetCompactor:
                 )
                 new_entries.append(self._to_dict(entry_obj))
                 del written
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - cleans up, then aborts the pass
             # Outputs written before the failure are unreferenced; remove them
             # rather than leaving orphans in the data directory.
             self._delete_written_files(new_entries)
@@ -2149,7 +2167,7 @@ class DatasetCompactor:
             if isinstance(entry_dict, dict):
                 return entry_dict
             return None
-        except Exception:
+        except Exception:  # noqa: BLE001 - per-entry recovery, contract documented above
             # If we can't recover the file, return None
             return None
 
@@ -2180,7 +2198,7 @@ class DatasetCompactor:
             if isinstance(entry_dict, dict):
                 return entry_dict
             return entry  # Fall back to original if rebuild failed
-        except Exception:
+        except Exception:  # noqa: BLE001 - per-entry recovery, contract documented above
             return entry  # If we can't rebuild, keep the original entry
 
     def _refresh_manifest_from_data_files(self, all_entries: list[dict]) -> list[dict]:
