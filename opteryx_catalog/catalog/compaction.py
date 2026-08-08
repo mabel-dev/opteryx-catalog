@@ -1197,7 +1197,7 @@ class DatasetCompactor:
         # output rather than combined + a full sorted copy + all outputs.
         from rugo.parquet import write_parquet
 
-        from ..iops.fileio import WRITE_PARQUET_OPTIONS
+        from ..iops.fileio import COMPACTION_WRITE_PARQUET_OPTIONS
 
         new_entries = []
         snapshot_id = int(time.time() * 1000)
@@ -1217,7 +1217,7 @@ class DatasetCompactor:
 
             # Write parquet file and upload (so we can reuse bytes)
             try:
-                pdata = write_parquet(part, **WRITE_PARQUET_OPTIONS)
+                pdata = write_parquet(part, **COMPACTION_WRITE_PARQUET_OPTIONS)
                 io = self.dataset.io
                 out = io.new_output(file_path).create()
                 out.write(pdata)
@@ -2006,7 +2006,7 @@ class DatasetCompactor:
 
         from rugo.parquet import write_parquet_stream
 
-        from ..iops.fileio import WRITE_PARQUET_OPTIONS
+        from ..iops.fileio import COMPACTION_WRITE_PARQUET_OPTIONS
 
         gen = master_chunks()
         new_entries = []
@@ -2021,7 +2021,9 @@ class DatasetCompactor:
                 file_path = os.path.join(self.dataset.metadata.location, "data", file_name)
                 out = self.dataset.io.new_output(file_path).create()
                 try:
-                    write_parquet_stream(rechain(first, sub), out.write, **WRITE_PARQUET_OPTIONS)
+                    write_parquet_stream(
+                        rechain(first, sub), out.write, **COMPACTION_WRITE_PARQUET_OPTIONS
+                    )
                 finally:
                     out.close()
 

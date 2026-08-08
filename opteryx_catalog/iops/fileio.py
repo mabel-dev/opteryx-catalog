@@ -196,4 +196,21 @@ WRITE_PARQUET_OPTIONS = {
     "compression": "zstd",
     "bloom_filters": True,
     # No override: use rugo's own default (262,144 rows/row group).
+    # profile: rugo's default is "fast", which is what ingest and CTAS want —
+    # the caller is waiting on the write. See COMPACTION_WRITE_PARQUET_OPTIONS
+    # for the other side of that trade.
+}
+
+# Compaction rewrites bytes that are then read many times, so it can pay more
+# at write time to make every subsequent read cheaper. rugo's "storage" profile
+# raises the zstd level on BYTE_ARRAY columns ONLY — numeric columns come out
+# byte-identical, because measurement showed they do not respond to level
+# (high-cardinality integers are incompressible at any level). On ClickBench
+# that is ~6% fewer bytes for ~40% more compress time, concentrated entirely in
+# the string columns.
+#
+# The level itself is never passed in: it is rugo's policy, chosen per column.
+COMPACTION_WRITE_PARQUET_OPTIONS = {
+    **WRITE_PARQUET_OPTIONS,
+    "profile": "storage",
 }
