@@ -60,6 +60,7 @@ alerts = [
 # see the note on the parquet extra for what installing it does to rugo.
 test = [
     "pytest>=8",
+    "hypothesis>=6",
     "opteryx-catalog[parquet]"
 ]
 
