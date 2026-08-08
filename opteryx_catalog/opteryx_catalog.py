@@ -239,6 +239,32 @@ def _snapshot_to_document(snapshot: Snapshot) -> dict:
     }
 
 
+_PARQUET_ENGINE_HELP = (
+    "opteryx-catalog needs `rugo` to read and write Parquet, and it could not be "
+    "imported. Install it directly:\n"
+    "    pip install 'opteryx-catalog[parquet]'   (or: pip install rugo)\n"
+    "or install opteryx-core, whose wheel bundles a matching rugo:\n"
+    "    pip install opteryx-core\n"
+    "If rugo IS installed, check that the separately published `draken` "
+    "distribution is not installed alongside it: rugo vendors its own draken and "
+    "pip overwrites those files, which breaks the import at the C ABI level."
+)
+
+
+def _require_parquet_engine() -> None:
+    """Fail fast, with install guidance, when the Parquet engine is unusable.
+
+    rugo is an optional dependency and every import of it in this package is
+    function-local, so without this check a missing (or ABI-broken) rugo only
+    surfaces deep inside a write or a manifest read, as a bare ImportError from
+    a module the caller has never heard of.
+    """
+    try:
+        import rugo.parquet  # noqa: F401
+    except Exception as err:  # ImportError, or a draken ABI ValueError
+        raise ImportError(f"{_PARQUET_ENGINE_HELP}\n\nImport failed with: {err!r}") from err
+
+
 class OpteryxCatalog(Metastore):
     """Firestore-backed Metastore implementation.
 
@@ -265,6 +291,10 @@ class OpteryxCatalog(Metastore):
         include_deleted: bool = False,
         create_if_missing: bool = False,
     ):
+        # Before any Firestore work: a catalog handle whose Parquet engine is
+        # missing can read metadata but fails on the first manifest touch, so
+        # say so here rather than several calls later.
+        _require_parquet_engine()
         # `workspace` is the configured catalog/workspace name
         self.workspace = workspace
         # Backwards-compatible alias: keep `catalog_name` for older code paths

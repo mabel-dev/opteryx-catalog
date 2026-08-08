@@ -149,17 +149,20 @@ def test_refresh_manifest_with_single_file():
     # Ensure the manifest bytes are present in the mapping
     mapping[manifest_path] = mapping[manifest_path]
 
-    # Persist the single-file manifest as JSON for quick inspection during
-    # iterative debugging (writes to repo `artifacts/` so you can open it).
-    import json
-    import os
+    # Opt-in debugging aid: `OPTERYX_TEST_ARTIFACTS=1 pytest ...` drops the
+    # single-file manifest into repo `artifacts/` (same output dir the
+    # scripts/inspect_* tools use) so you can open it during iterative work.
+    # Off by default — the entry's byte sizes vary with the installed rugo
+    # build, so writing it unconditionally dirtied the working tree.
+    if os.environ.get("OPTERYX_TEST_ARTIFACTS", "").strip().lower() in ("1", "true", "yes", "on"):
+        import json
 
-    artifacts_dir = os.path.join(os.getcwd(), "artifacts")
-    os.makedirs(artifacts_dir, exist_ok=True)
-    with open(
-        os.path.join(artifacts_dir, "single_file_manifest.json"), "w", encoding="utf-8"
-    ) as fh:
-        json.dump(e1, fh, indent=2, default=str)
+        artifacts_dir = os.path.join(os.getcwd(), "artifacts")
+        os.makedirs(artifacts_dir, exist_ok=True)
+        with open(
+            os.path.join(artifacts_dir, "single_file_manifest.json"), "w", encoding="utf-8"
+        ) as fh:
+            json.dump(e1, fh, indent=2, default=str)
 
     # Create metadata and snapshot
     meta = DatasetMetadata(

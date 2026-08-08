@@ -206,3 +206,6 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 .DS_Store
+
+# Debug/inspection output from scripts/inspect_* and OPTERYX_TEST_ARTIFACTS runs
+artifacts/

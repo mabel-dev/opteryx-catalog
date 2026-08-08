@@ -31,8 +31,13 @@ metastore and **GCS** for data and manifest storage.
 2. Install locally (or publish to your package repo):
 
 ```bash
-python -m pip install -e .
+python -m pip install -e ".[parquet]"
 ```
+
+   `rugo` (the Parquet engine) is an optional dependency so it can be supplied by
+   whatever already provides it — the `parquet` extra installs it directly, and
+   `opteryx-core` bundles a matching build. Do not install the separately
+   published `draken` distribution: rugo vendors its own, and pip overwrites it.
 
 3. Create an `OpteryxCatalog` and use it in your application:
 

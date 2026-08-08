@@ -29,19 +29,24 @@ dependencies = [
     "google-cloud-firestore==2.*",
     "google-cloud-storage==3.*",
     "requests==2.*",
-    # Hard pin. rugo's compiled extension links draken's C ABI but declares no
-    # dependency on it, and its per-cpXX wheels are not all built against the
-    # same draken -- so the working pairing varies by Python version. Observed
-    # against the published draken 0.4.2:
-    #   0.4.26  ImportError "undefined symbol: draken_vector_own_string" (CI, 3.14)
-    #   0.4.22  ValueError "Vector size changed (40 vs 32)" (3.11-3.13)
-    # 0.4.21 is what the known-good development environment runs. This pin is a
-    # workaround: the durable fix is for rugo to declare its draken version and
-    # build every wheel against it. Re-test the full matrix before moving it.
-    "rugo==0.4.21"
 ]
 
 [project.optional-dependencies]
+# Parquet read/write. Every rugo import under opteryx_catalog/ is function-local,
+# so the catalog imports and its metadata operations work without this installed
+# -- only the paths that touch data files need it.
+#
+# NOTE: rugo vendors the matching draken inside its own wheel (draken/__init__.py,
+# draken_native, morsels, vectors, interop) and links it by C ABI. Nothing may
+# install the separately published `draken` distribution alongside it: that
+# package is an older, differently-shaped build of the same import name, so pip
+# overwrites rugo's vendored files with mismatched ones and importing rugo dies
+# with "undefined symbol: draken_vector_own_string" or "Vector size changed
+# (40 vs 32)". Keeping draken out of the environment is the whole fix -- no
+# upper bound needed here, 0.4.21 and 0.4.26 both import clean on their own.
+parquet = [
+    "rugo>=0.4.21"
+]
 webhooks = [
     "google-cloud-tasks>=2.16.0"
 ]
@@ -50,12 +55,12 @@ webhooks = [
 alerts = [
     "google-cloud-secret-manager>=2.20.0"
 ]
-# The test suite writes and reads real Parquet through rugo/draken morsels, so
-# draken is a hard requirement for collection even though nothing under
-# opteryx_catalog/ imports it at runtime.
+# The suite writes and reads real Parquet, so it pulls in the parquet extra
+# rather than restating the rugo requirement. `draken` must NOT be added here --
+# see the note on the parquet extra for what installing it does to rugo.
 test = [
     "pytest>=8",
-    "draken"
+    "opteryx-catalog[parquet]"
 ]
 
 [tool.setuptools.package-dir]
