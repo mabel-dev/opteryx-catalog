@@ -576,6 +576,92 @@ def test_uint32_bounds_span_the_full_unsigned_range():
     assert (entry.min_values[0], entry.max_values[0]) == (0, 4294967295)
 
 
+# ── ARRAY columns get statistics over their ELEMENTS ────────────────────────
+#
+# An ARRAY has no ordinal encoding of its own, so min_values/histogram_counts
+# are the sentinel/empty for it and it could be pruned on nothing at all. Its
+# elements, though, are an ordinary flat vector (Vector.array_child) and take
+# the ordinary kernels: bounds that let ARRAY_CONTAINS prune, and a min-k
+# sketch that counts distinct ELEMENTS rather than distinct lists.
+
+
+def test_array_columns_get_element_bounds_and_sketch():
+    from opteryx_catalog.catalog.manifest import NULL_FLAG
+
+    morsel = _make_test_morsel(
+        [("tags", "ARRAY")],
+        [(["a", "b"],), (["c"],), (["d", "e", "f", "g"],), (None,), ([],)],
+    )
+    entry = _entry_from_morsel(morsel)
+
+    # The column itself is still unbounded -- that has not changed.
+    assert entry.min_values[0] == NULL_FLAG
+    assert entry.histogram_counts[0] == []
+
+    # Its elements are not.
+    assert entry.element_min_values[0] != NULL_FLAG
+    assert entry.element_min_values[0] < entry.element_max_values[0]
+    # 7 distinct elements across the lists, well under MIN_K_HASHES, so the
+    # sketch holds them exactly.
+    assert len(entry.element_min_k_hashes[0]) == 7
+
+
+def test_element_bounds_are_monotonic_in_element_order():
+    # The pruning property: an element inside the real range must have an
+    # ordinal inside the reported range, or ARRAY_CONTAINS wrongly skips a file.
+    from draken.draken_native import DrakenType
+
+    morsel = _make_test_morsel([("tags", "ARRAY")], [(["apple", "pear"],), (["mango"],)])
+    entry = _entry_from_morsel(morsel)
+    lo, hi = entry.element_min_values[0], entry.element_max_values[0]
+    assert lo <= DrakenType.VARCHAR.ordinalize("mango") <= hi
+    assert DrakenType.VARCHAR.ordinalize("aaaa") < lo
+    assert DrakenType.VARCHAR.ordinalize("zebra") > hi
+
+
+def test_element_count_counts_elements_not_lists():
+    from opteryx_catalog.catalog.dataset import _kmv_cardinality
+
+    # Three lists, but only two distinct elements between them.
+    morsel = _make_test_morsel(
+        [("tags", "ARRAY")], [(["x", "y"],), (["x"],), (["y", "x"],)]
+    )
+    entry = _entry_from_morsel(morsel)
+    assert _kmv_cardinality(entry.element_min_k_hashes[0]) == (2, True)
+
+
+def test_non_array_columns_carry_no_element_stats():
+    from opteryx_catalog.catalog.manifest import NULL_FLAG
+
+    morsel = _make_test_morsel([("n", "INTEGER"), ("s", "VARCHAR")], [(1, "a"), (2, "b")])
+    entry = _entry_from_morsel(morsel)
+    assert entry.element_min_values == [NULL_FLAG, NULL_FLAG]
+    assert entry.element_max_values == [NULL_FLAG, NULL_FLAG]
+    assert entry.element_min_k_hashes == [[], []]
+
+
+def test_both_builders_agree_on_element_stats():
+    # The morsel path and the re-read-from-bytes path accumulate element stats
+    # separately (per row group in one, in one pass in the other) and must not
+    # disagree about the same file.
+    from rugo.parquet import write_parquet
+
+    from opteryx_catalog.catalog.manifest import build_parquet_manifest_entry_from_morsel
+
+    morsel = _make_test_morsel(
+        [("tags", "ARRAY")], [(["a", "b"],), (["c"],), (["d", "e", "f", "g"],)]
+    )
+    data = write_parquet(morsel, compression="zstd")
+    from_bytes = _entry_from_morsel(morsel)
+    from_morsel = build_parquet_manifest_entry_from_morsel(
+        morsel, data, "f.parquet", len(data)
+    )
+
+    assert from_bytes.element_min_values == from_morsel.element_min_values
+    assert from_bytes.element_max_values == from_morsel.element_max_values
+    assert from_bytes.element_min_k_hashes == from_morsel.element_min_k_hashes
+
+
 def test_uint64_columns_still_have_no_bounds():
     # Deliberate. UINT64's ordinal is the value offset by 2**63, which puts
     # zero exactly on ordinalize()'s null sentinel: ordinal_min_max() then

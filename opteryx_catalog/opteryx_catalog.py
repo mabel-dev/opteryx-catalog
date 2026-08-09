@@ -2391,6 +2391,17 @@ class OpteryxCatalog(Metastore):
             # _compute_column_stats / Vector.char_class_stats().
             "char_class_counts": "ARRAY",
             "char_total_bytes": "ARRAY",
+            # ARRAY columns only: statistics over the flat CHILD vector, i.e.
+            # the elements pooled across every row's list. An ARRAY has no
+            # ordinal encoding of its own, so min_values/histogram_counts are
+            # the sentinel/empty for it and it can be pruned on nothing; its
+            # elements are an ordinary vector and take the ordinary kernels.
+            # See catalog/manifest.py's _compute_column_stats. Empty for
+            # manifest rows written before this existed, which readers must
+            # treat as "not computed", not "no elements".
+            "element_min_values": "ARRAY",
+            "element_max_values": "ARRAY",
+            "element_min_k_hashes": "ARRAY",
         }
 
         # Normalize entries to match the column set above:
@@ -2424,6 +2435,9 @@ class OpteryxCatalog(Metastore):
             e.setdefault("field_ids", [])
             e.setdefault("char_class_counts", [])
             e.setdefault("char_total_bytes", [])
+            e.setdefault("element_min_values", [])
+            e.setdefault("element_max_values", [])
+            e.setdefault("element_min_k_hashes", [])
 
             # min/max values are stored as compressed int64 values
             mv = e.get("min_values") or []
@@ -2432,6 +2446,13 @@ class OpteryxCatalog(Metastore):
             # Ensure int64 values are properly typed for min/max
             e["min_values"] = [int(v) if v is not None else None for v in mv]
             e["max_values"] = [int(v) if v is not None else None for v in xv]
+            # Element bounds are the same int64 ordinals, over the child vector.
+            e["element_min_values"] = [
+                int(v) if v is not None else None for v in (e.get("element_min_values") or [])
+            ]
+            e["element_max_values"] = [
+                int(v) if v is not None else None for v in (e.get("element_max_values") or [])
+            ]
 
             # min_k_hashes / histogram_counts are per-column lists of ints,
             # so each entry is list[list[int]] and the column is a native
