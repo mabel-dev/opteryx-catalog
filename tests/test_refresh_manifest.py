@@ -528,3 +528,62 @@ def test_array_columns_still_have_no_bounds():
     entry = _entry_from_morsel(morsel)
     assert entry.min_values[0] == NULL_FLAG
     assert entry.histogram_counts[0] == []
+
+
+# ── narrow unsigned columns get real min/max + histograms ───────────────────
+#
+# UINT8/UINT16/UINT32 were excluded from _COMPRESSIBLE_CATEGORIES, so every
+# unsigned column's bounds were the NULL_FLAG sentinel -- and IPv4 is
+# physically a UINT32, so an address column could never be pruned on and any
+# consumer reading its bounds for display got int64's floor. Unlike the string
+# family these ordinalize BY VALUE, so the bounds are the addresses/numbers
+# themselves, not keys.
+#
+# `vector_from_sequence` has no unsigned dtype names, so these build the
+# vector natively rather than through `_make_test_morsel`.
+
+
+def _unsigned_morsel(name, maker, values):
+    import draken.draken_native as dn
+    from draken.morsels.morsel import Morsel as _Morsel
+
+    morsel = _Morsel()
+    morsel.append_vector(name, getattr(dn, maker)(values))
+    return morsel
+
+
+def test_narrow_unsigned_columns_get_value_min_max_and_histogram():
+    from opteryx_catalog.catalog.manifest import NULL_FLAG
+
+    for maker, values, expected in (
+        ("vector_uint8_from_sequence", [0, 255, 7], (0, 255)),
+        ("vector_uint16_from_sequence", [9, 65535, 0], (0, 65535)),
+        # 10.0.0.7 .. 10.0.3.200 as an IPv4 column is stored.
+        ("vector_uint32_from_sequence", [167772167, 167773128, 167772167], (167772167, 167773128)),
+    ):
+        entry = _entry_from_morsel(_unsigned_morsel("v", maker, values))
+        assert entry.min_values[0] != NULL_FLAG, f"{maker} left without bounds"
+        assert (entry.min_values[0], entry.max_values[0]) == expected
+        assert len(entry.histogram_counts[0]) == 32
+
+
+def test_uint32_bounds_span_the_full_unsigned_range():
+    # The whole point of not going via the signed path: 4294967295 must come
+    # back as itself, not as -1 or a truncated value.
+    entry = _entry_from_morsel(
+        _unsigned_morsel("v", "vector_uint32_from_sequence", [0, 4294967295])
+    )
+    assert (entry.min_values[0], entry.max_values[0]) == (0, 4294967295)
+
+
+def test_uint64_columns_still_have_no_bounds():
+    # Deliberate. UINT64's ordinal is the value offset by 2**63, which puts
+    # zero exactly on ordinalize()'s null sentinel: ordinal_min_max() then
+    # excludes it, so a column holding 0 and 5 would claim a minimum of 5 and
+    # a `= 0` predicate would prune away the file that holds the match. No
+    # bounds beats wrong bounds.
+    from opteryx_catalog.catalog.manifest import NULL_FLAG
+
+    entry = _entry_from_morsel(_unsigned_morsel("v", "vector_uint64_from_sequence", [0, 5]))
+    assert entry.min_values[0] == NULL_FLAG
+    assert entry.max_values[0] == NULL_FLAG
