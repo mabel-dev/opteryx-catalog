@@ -41,6 +41,42 @@ def _as_number_or_text(text: str):
         return text
 
 
+def _kmv_cardinality(hashes) -> tuple:
+    """Distinct-value count from a min-k sketch: ``(count, is_exact)``.
+
+    The sketch holds the 32 smallest distinct hashes seen. Fewer than 31 of
+    them means the column had no more distinct values than that, so the count
+    is EXACT; at 31 or more the sketch saturated and the KMV estimator takes
+    over, whose relative standard error is roughly 1/sqrt(k-2) -- around 18% at
+    k=32. Callers must keep the two apart: an estimate presented as a count
+    gets quoted back as one.
+
+    ``0`` with ``is_exact=False`` means "unknown", not "no values".
+
+    Shared by the whole-column count and the ARRAY element count, which are the
+    same sketch over different vectors -- rows in one case, the flat child in
+    the other.
+    """
+    import heapq
+
+    if not hashes:
+        return 0, False
+    try:
+        smallest = heapq.nsmallest(32, hashes)
+        k = len(smallest)
+        if k < 31:
+            return len(set(smallest)), True
+        largest_of_smallest = max(smallest)
+        if largest_of_smallest == 0:
+            return len(set(smallest)), False
+        return int((k - 1) * (1 << 64) / (largest_of_smallest + 1)), False
+    except (TypeError, ValueError):
+        # Members arrive through `_as_int`, so every one is an int and this
+        # should be unreachable; it stays as a floor under the estimator rather
+        # than letting one odd column fail a whole describe().
+        return 0, False
+
+
 def _decode_minmax(v):
     """A manifest min/max value as something comparable, or None.
 
@@ -1396,6 +1432,11 @@ class SimpleDataset(Dataset):
                 "min_displays": [],
                 "max_displays": [],
                 "uncompressed_bytes": 0,
+                # ARRAY only: the same sketch and bounds every column gets,
+                # computed over the flat child vector rather than the rows.
+                "element_hashes": set(),
+                "element_mins": [],
+                "element_maxs": [],
             }
 
         total_rows = 0
@@ -1413,6 +1454,9 @@ class SimpleDataset(Dataset):
             mv = ent.get("min_values") or []
             xv = ent.get("max_values") or []
             col_sizes = ent.get("column_uncompressed_sizes_in_bytes") or []
+            emv = ent.get("element_min_values") or []
+            exv = ent.get("element_max_values") or []
+            emks = ent.get("element_min_k_hashes") or []
 
             for cname, cidx in col_to_idx.items():
                 # nulls
@@ -1427,6 +1471,23 @@ class SimpleDataset(Dataset):
                     stats[cname]["mins"].append(dmin)
                 if dmax is not None:
                     stats[cname]["maxs"].append(dmax)
+
+                # ARRAY element bounds and sketch
+                element_min = _decode_minmax(_at(emv, cidx))
+                element_max = _decode_minmax(_at(exv, cidx))
+                if element_min is not None:
+                    stats[cname]["element_mins"].append(element_min)
+                if element_max is not None:
+                    stats[cname]["element_maxs"].append(element_max)
+                col_emk = _at(emks, cidx)
+                if isinstance(col_emk, (int, float, bytes, bytearray, memoryview, str)):
+                    col_emk = (col_emk,)
+                elif col_emk is None:
+                    col_emk = ()
+                for h in col_emk:
+                    hashed = _as_int(h)
+                    if hashed is not None:
+                        stats[cname]["element_hashes"].add(hashed)
 
                 # min-k hashes (tolerant to scalar/list/tuple shapes)
                 col_mk = _at(mks, cidx)
@@ -1487,29 +1548,7 @@ class SimpleDataset(Dataset):
                 global_max = max(num_maxs)
 
             # kmv approx
-            cardinality = 0
-            cardinality_is_exact = False
-            try:
-                collected = s["hashes"]
-                if collected:
-                    smallest = heapq.nsmallest(32, collected)
-                    k = len(smallest)
-                    if k < 31:
-                        cardinality = len(set(smallest))
-                        cardinality_is_exact = True
-                    else:
-                        MAX_HASH = (1 << 64) - 1
-                        R = max(smallest)
-                        if R == 0:
-                            cardinality = len(set(smallest))
-                        else:
-                            cardinality = int((k - 1) * (MAX_HASH + 1) / (R + 1))
-            except (TypeError, ValueError):
-                # `hashes` is built through `_as_int`, so every member is an
-                # int and this should be unreachable; it stays as a floor under
-                # the estimator rather than letting one odd column fail a whole
-                # describe(). 0 reads as "unknown" downstream, not "no values".
-                cardinality = 0
+            cardinality, cardinality_is_exact = _kmv_cardinality(s["hashes"])
 
             # distribution via distogram
             distribution = None
@@ -1597,6 +1636,12 @@ class SimpleDataset(Dataset):
                                 gi = effective_bins - 1
                             distribution[gi] += int(cnt)
 
+            element_cardinality, element_cardinality_is_exact = _kmv_cardinality(
+                s["element_hashes"]
+            )
+            element_mins = [v for v in s["element_mins"] if v is not None]
+            element_maxs = [v for v in s["element_maxs"] if v is not None]
+
             res = {
                 "dataset": self.identifier,
                 "description": getattr(self.metadata, "description", None),
@@ -1609,6 +1654,16 @@ class SimpleDataset(Dataset):
                 "cardinality": cardinality,
                 "cardinality_is_exact": cardinality_is_exact,
                 "distribution": distribution,
+                # ARRAY only, 0/None elsewhere: statistics over the elements
+                # pooled across every row's list, which is the only thing an
+                # array column can be summarised or pruned by. The bounds are
+                # the child's ORDINAL encoding, so they are a pruning key, not
+                # a displayable value -- the same caveat every non-integer
+                # column's min/max carries.
+                "element_cardinality": element_cardinality,
+                "element_cardinality_is_exact": element_cardinality_is_exact,
+                "element_min": min(element_mins) if element_mins else None,
+                "element_max": max(element_maxs) if element_maxs else None,
             }
 
             # If textual, attempt display prefixes like describe(). `_at`

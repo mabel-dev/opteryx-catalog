@@ -72,6 +72,21 @@ class ParquetManifestEntry:
     # estimator. See _compute_column_stats / Vector.char_class_stats().
     char_class_counts: list[list[int]] = field(default_factory=list)
     char_total_bytes: list[int] = field(default_factory=list)
+    # ARRAY columns only: statistics over the flat CHILD vector -- the elements
+    # themselves, pooled across every row's list. An ARRAY has no ordinal
+    # encoding of its own, so the three lists above are the sentinel/empty for
+    # it and an array column could be pruned on nothing at all; its elements,
+    # however, are an ordinary vector and take the ordinary kernels.
+    #
+    # `element_min_values`/`element_max_values` are the child's ordinal bounds,
+    # which is what lets `ARRAY_CONTAINS(tags, 'x')` skip a file whose elements
+    # cannot include 'x'. `element_min_k_hashes` is the same KMV sketch every
+    # other column gets, over elements rather than rows, which answers "how
+    # many distinct tags are in this column" -- a different question from how
+    # many distinct lists there are. NULL_FLAG / empty for non-ARRAY columns.
+    element_min_values: list = field(default_factory=list)
+    element_max_values: list = field(default_factory=list)
+    element_min_k_hashes: list[list[int]] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -92,6 +107,9 @@ class ParquetManifestEntry:
             "field_ids": self.field_ids,
             "char_class_counts": self.char_class_counts,
             "char_total_bytes": self.char_total_bytes,
+            "element_min_values": self.element_min_values,
+            "element_max_values": self.element_max_values,
+            "element_min_k_hashes": self.element_min_k_hashes,
         }
 
 
@@ -439,7 +457,8 @@ def _compute_column_stats(vec, category: str) -> tuple:
     not a Tb-scale reduction.
 
     Returns: (min_k, histogram, min_value, max_value, null_count, min_length,
-    max_length, char_class_counts, char_total_bytes)
+    max_length, char_class_counts, char_total_bytes, element_min, element_max,
+    element_min_k)
     """
     try:
         # ARRAY (and possibly other nested/complex types) don't support
@@ -519,6 +538,33 @@ def _compute_column_stats(vec, category: str) -> tuple:
         if lengths:
             min_len, max_len = min(lengths), max(lengths)
 
+    # ARRAY elements. `array_child` is the flat vector of every element in the
+    # column, lists concatenated -- an ordinary vector, so the ordinary kernels
+    # apply to it even though they refuse the ARRAY that owns it. This is the
+    # only statistic an array column can be pruned on, and the only distinct
+    # count that answers the question a reader actually has ("how many distinct
+    # tags?", not "how many distinct lists?").
+    element_min = NULL_FLAG
+    element_max = NULL_FLAG
+    element_min_k: list = []
+    if category == "ARRAY":
+        child = getattr(vec, "array_child", None)
+        if child is not None:
+            # Each step is independently optional: a child type with no hash
+            # kernel still gets bounds, one with no ordinalize kernel (an ARRAY
+            # of ARRAY) still gets a sketch, and neither failing costs the
+            # column anything it has today.
+            try:
+                element_min_k = _native_min_k_smallest(child.hash_shaped(), MIN_K_HASHES)
+            except (ValueError, AttributeError):
+                element_min_k = []
+            try:
+                child_min_max = child.ordinalize().ordinal_min_max()
+                if child_min_max is not None:
+                    element_min, element_max = (int(v) for v in child_min_max)
+            except (ValueError, AttributeError):
+                pass
+
     return (
         col_min_k,
         col_hist,
@@ -529,6 +575,9 @@ def _compute_column_stats(vec, category: str) -> tuple:
         max_len,
         char_class_counts,
         char_total_bytes,
+        element_min,
+        element_max,
+        element_min_k,
     )
 
 
@@ -634,6 +683,9 @@ def build_parquet_manifest_entry_from_morsel(
     field_ids: list = []
     char_class_counts: list = []
     char_total_bytes_list: list = []
+    element_min_values: list = []
+    element_max_values: list = []
+    element_min_k_hashes: list = []
     uncompressed_size = 0
 
     for name in col_names:
@@ -652,6 +704,9 @@ def build_parquet_manifest_entry_from_morsel(
             col_max_len,
             col_char_class_counts,
             col_char_total_bytes,
+            col_element_min,
+            col_element_max,
+            col_element_min_k,
         ) = _compute_column_stats(vec, category)
 
         min_k_hashes.append(col_min_k)
@@ -663,6 +718,9 @@ def build_parquet_manifest_entry_from_morsel(
         max_lengths_list.append(col_max_len)
         char_class_counts.append(col_char_class_counts)
         char_total_bytes_list.append(col_char_total_bytes)
+        element_min_values.append(col_element_min)
+        element_max_values.append(col_element_max)
+        element_min_k_hashes.append(col_element_min_k)
 
         col_bytes = _column_nbytes_estimate(morsel, name, vec)
         column_uncompressed.append(col_bytes)
@@ -686,6 +744,9 @@ def build_parquet_manifest_entry_from_morsel(
         field_ids=field_ids,
         char_class_counts=char_class_counts,
         char_total_bytes=char_total_bytes_list,
+        element_min_values=element_min_values,
+        element_max_values=element_max_values,
+        element_min_k_hashes=element_min_k_hashes,
     )
 
     logger.debug(
@@ -743,6 +804,9 @@ def build_parquet_manifest_entry_from_bytes(
     column_uncompressed = [0] * len(col_names)
     char_class_counts: list = []
     char_total_bytes_list: list = []
+    element_min_values: list = []
+    element_max_values: list = []
+    element_min_k_hashes: list = []
     uncompressed_size = 0
     record_count = 0
 
@@ -771,6 +835,10 @@ def build_parquet_manifest_entry_from_bytes(
             "char_total_bytes": 0,
             "length_range": None,
             "nbytes": 0,
+            # ARRAY only: the same two accumulators as above, but over the flat
+            # child vector -- see the element block in _compute_column_stats.
+            "element_min_k_candidates": [],
+            "element_ordinal_vecs": [],
         }
         for name in col_names
     }
@@ -833,6 +901,20 @@ def build_parquet_manifest_entry_from_bytes(
                             (lo, hi) if cur is None else (min(cur[0], lo), max(cur[1], hi))
                         )
 
+                if category == "ARRAY":
+                    child = getattr(vec, "array_child", None)
+                    if child is not None:
+                        try:
+                            acc["element_min_k_candidates"].extend(
+                                _native_min_k_smallest(child.hash_shaped(), MIN_K_HASHES)
+                            )
+                        except (ValueError, AttributeError):
+                            pass
+                        try:
+                            acc["element_ordinal_vecs"].append(child.ordinalize())
+                        except (ValueError, AttributeError):
+                            pass
+
     field_ids: list = []
     for name in col_names:
         field_ids.append(field_id_by_name.get(name) if field_id_by_name else None)
@@ -855,6 +937,25 @@ def build_parquet_manifest_entry_from_bytes(
         col_max = NULL_FLAG
         min_len = 0
         max_len = 0
+
+        # ARRAY element stats, merged across row groups exactly as their
+        # whole-column counterparts are.
+        element_candidates = set(acc["element_min_k_candidates"])
+        col_element_min_k = (
+            sorted(element_candidates)
+            if len(element_candidates) <= MIN_K_HASHES
+            else heapq.nsmallest(MIN_K_HASHES, element_candidates)
+        )
+        col_element_min = NULL_FLAG
+        col_element_max = NULL_FLAG
+        element_pairs = [
+            p
+            for p in (v.ordinal_min_max() for v in acc["element_ordinal_vecs"])
+            if p is not None
+        ]
+        if element_pairs:
+            col_element_min = int(min(p[0] for p in element_pairs))
+            col_element_max = int(max(p[1] for p in element_pairs))
 
         if category in _COMPRESSIBLE_CATEGORIES:
             vecs = acc["ordinal_vecs"]
@@ -898,6 +999,9 @@ def build_parquet_manifest_entry_from_bytes(
         char_total_bytes_list.append(
             acc["char_total_bytes"] if category in _STRING_CATEGORIES else 0
         )
+        element_min_values.append(col_element_min)
+        element_max_values.append(col_element_max)
+        element_min_k_hashes.append(col_element_min_k)
 
         col_bytes = acc["nbytes"]
         column_uncompressed[col_names.index(name)] = col_bytes
@@ -921,6 +1025,9 @@ def build_parquet_manifest_entry_from_bytes(
         field_ids=field_ids,
         char_class_counts=char_class_counts,
         char_total_bytes=char_total_bytes_list,
+        element_min_values=element_min_values,
+        element_max_values=element_max_values,
+        element_min_k_hashes=element_min_k_hashes,
     )
 
     logger.debug(
