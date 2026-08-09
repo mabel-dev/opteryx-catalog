@@ -14,6 +14,11 @@ jobs:
 
   # Guards against tagging v1.2.3 while pyproject.toml still says 1.2.2, which
   # would publish a version nobody asked for under a tag that misdescribes it.
+  #
+  # Prefix, not equality: a tag may carry extra trailing components for a
+  # release that doesn't change the package version (whitespace, CI, docs), so
+  # 0.4.86.1 is a valid tag for pyproject 0.4.86. The extra part must start at
+  # a `.` boundary, so 0.4.861 is still rejected against 0.4.86.
   version-check:
     name: tag matches pyproject version
     runs-on: ubuntu-latest
@@ -30,10 +35,13 @@ jobs:
         TAG="${GITHUB_REF_NAME#version-}"
         PROJECT=$(python -c "import tomllib;print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
         echo "tag=${TAG} pyproject=${PROJECT}"
-        if [ "${TAG}" != "${PROJECT}" ]; then
-          echo "::error::tag ${GITHUB_REF_NAME} does not match pyproject version ${PROJECT}"
-          exit 1
-        fi
+        case "${TAG}" in
+          "${PROJECT}"|"${PROJECT}".*) ;;
+          *)
+            echo "::error::tag ${GITHUB_REF_NAME} is not ${PROJECT} or a ${PROJECT}.* suffix of it"
+            exit 1
+            ;;
+        esac
 
   build:
     needs: [test, version-check]
