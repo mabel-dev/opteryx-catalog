@@ -38,11 +38,14 @@ import os
 import re
 import secrets
 import string
+import threading
 import time
 from datetime import UTC
 from datetime import datetime
 from datetime import timedelta
 from typing import Any
+
+import requests
 
 from .alerts import report as _alert
 from .audit import write_audit_record
@@ -60,6 +63,66 @@ JOB_TTL_DAYS = int(os.environ.get("JOB_TTL_DAYS", "14"))
 _TASK_ID_UNSAFE = re.compile(r"[^A-Za-z0-9_-]+")
 
 _KILL_SWITCH_ENV = "OPTERYX_TRIGGER_FIRING"
+
+# The service's own identity, from the metadata server. Same endpoint and
+# timeout as `alerts/_secrets.py` uses for the project id.
+_METADATA_SA_URL = (
+    "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email"
+)
+_METADATA_TIMEOUT_SECONDS = 1.0
+
+_sa_lock = threading.Lock()
+_sa_cache: str | None = None
+
+
+def _runtime_service_account() -> str | None:
+    """This process's own service account, or None when not on GCP.
+
+    Only successful lookups are cached: a failure here is fatal to the fire
+    (see `_enqueue_refresh_task`), so caching a None would turn one slow
+    metadata response into permanently stale views for the process lifetime.
+    """
+    global _sa_cache
+
+    with _sa_lock:
+        if _sa_cache is not None:
+            return _sa_cache
+
+    try:
+        response = requests.get(
+            _METADATA_SA_URL,
+            headers={"Metadata-Flavor": "Google"},
+            timeout=_METADATA_TIMEOUT_SECONDS,
+        )
+    except requests.RequestException:
+        # Not on GCP, or the metadata server did not answer in time.
+        return None
+    if response.status_code != 200:
+        return None
+    email = response.text.strip()
+    if not email:
+        return None
+
+    with _sa_lock:
+        _sa_cache = email
+    return email
+
+
+def _oidc_service_account() -> str | None:
+    """The service account the refresh task is minted for.
+
+    worker.opteryx pins one OIDC subject (`WORKER_OIDC_SUBJECT`, defaulting to
+    the numeric id of the project's Cloud Run runtime identity), so the answer
+    is always "whoever this process already is" - every Opteryx service runs as
+    that same account, which is why jobs.opteryx's enqueue is accepted today.
+    Asking the metadata server is therefore both correct and self-configuring;
+    there is nothing for an operator to set, and nothing to keep in step with
+    the worker when the platform identity changes.
+
+    TASKS_OIDC_SA remains as an escape hatch for the case the runtime identity
+    and the enqueuing identity are deliberately split.
+    """
+    return os.environ.get("TASKS_OIDC_SA") or _runtime_service_account()
 
 
 def firing_enabled() -> bool:
@@ -186,12 +249,20 @@ def _enqueue_refresh_task(catalog, execution_id: str, task_id: str) -> str:
     }
     # worker.opteryx pins one OIDC subject; the SA here must be the same one
     # jobs.opteryx enqueues as (decision 4 - no worker-side auth changes).
-    oidc_sa = os.environ.get("TASKS_OIDC_SA")
-    if oidc_sa:
-        http_request["oidc_token"] = tasks_v2.OidcToken(
-            service_account_email=oidc_sa,
-            audience=os.environ.get("TASKS_OIDC_AUDIENCE", target_url),
+    # No token means a task the worker answers with 401, which Cloud Tasks
+    # then retries until it expires - a stale view whose only evidence is in
+    # the queue's logs. Failing here instead puts it in the audit log.
+    oidc_sa = _oidc_service_account()
+    if not oidc_sa:
+        raise MaterializedViewError(
+            "cannot mint an OIDC token for the refresh task: no TASKS_OIDC_SA "
+            "and no runtime service account from the metadata server. Set "
+            "OPTERYX_TRIGGER_FIRING=0 where commits happen off-platform."
         )
+    http_request["oidc_token"] = tasks_v2.OidcToken(
+        service_account_email=oidc_sa,
+        audience=os.environ.get("TASKS_OIDC_AUDIENCE", target_url),
+    )
 
     task = {"name": f"{parent}/tasks/{task_id}", "http_request": http_request}
     try:

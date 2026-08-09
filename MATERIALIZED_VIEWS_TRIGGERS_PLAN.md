@@ -5,10 +5,18 @@ Delivered: Phase 1-2 (catalog storage/API + commit-time firing), Phase 3
 (engine CREATE/DROP MATERIALIZED VIEW, incl. LocalStoreConnector sidecar for
 GCP-free tests), Phase 4 (DROP TRIGGER / SHOW TRIGGERS FOR &lt;table&gt; /
 information_schema.triggers), Phase 5 (jobs recent-queries filter + worker
-refresh stamping). Pending: Phase 6 (docs + end-to-end emulator test), and
+refresh stamping), Phase 6 docs. Pending: the end-to-end emulator test, and
 deployment: worker-dispatch queue IAM (`cloudtasks.enqueuer`) for committing
-identities, `TASKS_OIDC_SA`, deploy updated worker/jobs, release + pin a new
-opteryx-catalog (installed wheel 0.4.78 predates triggers).
+identities, deploy updated worker/jobs, release + pin a new opteryx-catalog
+(services pin `>=0.4.78`; triggers first shipped in 0.4.81).
+
+`TASKS_OIDC_SA` is **not** a setting to deploy (2026-08-09). Every Opteryx
+Cloud Run service runs as `762690895289-compute@developer.gserviceaccount.com`,
+whose numeric id is the `GPC_SUBJECT` the worker pins - so the account to mint
+for is always "whoever this process already is", read from the metadata server
+(`trigger_firing._oidc_service_account`). The env var survives only as an
+escape hatch. No token now means a hard failure into the audit log rather than
+a task the worker 401s and Cloud Tasks silently retries into expiry.
 
 Live E2E (2026-08-06, dev/mabeldev): registration → trigger → commit →
 job-doc write all verified against the real catalog; enqueue 403'd on queue

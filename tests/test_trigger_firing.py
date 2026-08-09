@@ -12,10 +12,16 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 from unittest.mock import patch
 
+import pytest
+
 from opteryx_catalog import trigger_firing
 from opteryx_catalog.catalog.dataset import SimpleDataset
 from opteryx_catalog.catalog.metadata import Snapshot
+from opteryx_catalog.exceptions import MaterializedViewError
+from opteryx_catalog.trigger_firing import _enqueue_refresh_task
 from opteryx_catalog.trigger_firing import _make_job_id
+from opteryx_catalog.trigger_firing import _oidc_service_account
+from opteryx_catalog.trigger_firing import _runtime_service_account
 from opteryx_catalog.trigger_firing import _task_id
 from opteryx_catalog.trigger_firing import fire_triggers
 
@@ -184,6 +190,97 @@ def test_kill_switch(monkeypatch):
     catalog = _catalog_stub(triggers=[_refresh_trigger()])
     fire_triggers(catalog, "src.a", author="alice")
     catalog.list_triggers.assert_not_called()
+
+
+# --- OIDC identity -------------------------------------------------------
+
+
+def _metadata_response(status=200, text="svc@project.iam.gserviceaccount.com"):
+    response = MagicMock()
+    response.status_code = status
+    response.text = text
+    return response
+
+
+def test_runtime_service_account_from_metadata_server(monkeypatch):
+    monkeypatch.setattr(trigger_firing, "_sa_cache", None)
+    with patch.object(trigger_firing.requests, "get", return_value=_metadata_response()) as get:
+        assert _runtime_service_account() == "svc@project.iam.gserviceaccount.com"
+    assert get.call_args.kwargs["headers"] == {"Metadata-Flavor": "Google"}
+
+
+def test_runtime_service_account_caches_only_success(monkeypatch):
+    """A slow metadata server must not stick as 'no identity' for the process."""
+    monkeypatch.setattr(trigger_firing, "_sa_cache", None)
+    with patch.object(
+        trigger_firing.requests, "get", side_effect=trigger_firing.requests.RequestException
+    ):
+        assert _runtime_service_account() is None
+    with patch.object(trigger_firing.requests, "get", return_value=_metadata_response()) as get:
+        assert _runtime_service_account() == "svc@project.iam.gserviceaccount.com"
+        assert _runtime_service_account() == "svc@project.iam.gserviceaccount.com"
+    assert get.call_count == 1
+
+
+def test_env_overrides_runtime_identity(monkeypatch):
+    monkeypatch.setenv("TASKS_OIDC_SA", "explicit@project.iam.gserviceaccount.com")
+    with patch.object(trigger_firing, "_runtime_service_account") as runtime:
+        assert _oidc_service_account() == "explicit@project.iam.gserviceaccount.com"
+    runtime.assert_not_called()
+
+
+def test_enqueue_mints_oidc_for_the_runtime_identity(monkeypatch):
+    monkeypatch.delenv("TASKS_OIDC_SA", raising=False)
+    monkeypatch.delenv("TASKS_OIDC_AUDIENCE", raising=False)
+    client = MagicMock()
+    client.queue_path.return_value = "projects/p/locations/l/queues/worker-dispatch"
+    with (
+        patch.object(trigger_firing, "_project_id", return_value="p"),
+        patch.object(
+            trigger_firing,
+            "_runtime_service_account",
+            return_value="runtime@project.iam.gserviceaccount.com",
+        ),
+        patch("google.cloud.tasks_v2.CloudTasksClient", return_value=client),
+    ):
+        assert _enqueue_refresh_task(MagicMock(), "exec-1", "task-1") == "enqueued"
+
+    token = client.create_task.call_args.kwargs["task"]["http_request"]["oidc_token"]
+    assert token.service_account_email == "runtime@project.iam.gserviceaccount.com"
+    assert token.audience == "https://worker.opteryx.app/api/v1/submit"
+
+
+def test_enqueue_refuses_to_send_an_unauthenticated_task(monkeypatch):
+    """No identity is a loud failure, not a task the worker will 401."""
+    monkeypatch.delenv("TASKS_OIDC_SA", raising=False)
+    client = MagicMock()
+    with (
+        patch.object(trigger_firing, "_project_id", return_value="p"),
+        patch.object(trigger_firing, "_runtime_service_account", return_value=None),
+        patch("google.cloud.tasks_v2.CloudTasksClient", return_value=client),
+        pytest.raises(MaterializedViewError, match="OIDC"),
+    ):
+        _enqueue_refresh_task(MagicMock(), "exec-1", "task-1")
+
+    client.create_task.assert_not_called()
+
+
+def test_missing_identity_audits_instead_of_breaking_the_commit(monkeypatch):
+    monkeypatch.delenv("TASKS_OIDC_SA", raising=False)
+    catalog = _catalog_stub(triggers=[_refresh_trigger()])
+    with (
+        patch.object(trigger_firing, "_jobs_client", return_value=MagicMock()),
+        patch.object(trigger_firing, "_policies_for", return_value=None),
+        patch.object(trigger_firing, "_runtime_service_account", return_value=None),
+        patch("google.cloud.tasks_v2.CloudTasksClient", return_value=MagicMock()),
+        patch.object(trigger_firing, "_project_id", return_value="p"),
+        patch.object(trigger_firing, "_alert") as alert,
+        patch.object(trigger_firing, "write_audit_record") as audit,
+    ):
+        fire_triggers(catalog, "src.a", author="alice")  # must not raise
+
+    assert alert.call_count == 1
+    assert audit.call_args.args[0]["event"] == "trigger.fire_failed"
 
 
 # --- _after_commit guard -------------------------------------------------
