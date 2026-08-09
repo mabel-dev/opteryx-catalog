@@ -1386,8 +1386,6 @@ class SimpleDataset(Dataset):
         Returns a dict mapping column name -> statistics (same shape as
         the previous `describe` per-column output).
         """
-        import heapq
-
         snap = self.snapshot(snapshot_id)
         if snap is None or not getattr(snap, "manifest_list", None):
             raise ValueError("No manifest available for this dataset/snapshot")
