@@ -281,11 +281,32 @@ import heapq
 # column's bounds were the NULL_FLAG sentinel, so a string predicate could
 # never prune and opteryx-core's local ANALYZE path (which does compute
 # them) disagreed with this one about the same data.
+#
+# UINT8/UINT16/UINT32 are here for the same reason: ordinalize() maps each of
+# them onto int64 by value (0 and 4294967295 come back as 0 and 4294967295 —
+# every unsigned value below 2**63 IS its own ordinal), so they bound and
+# prune exactly like the signed widths, and leaving them out cost every
+# unsigned column — including IPv4, which is physically a UINT32 — its bounds,
+# its histogram, and any chance of being pruned on.
+#
+# UINT64 is deliberately still absent, and not only because its ordinal is
+# the value offset by 2**63 (so 5 ordinalizes to -9223372036854775803, which
+# is not what a consumer reading min_values for display expects). The offset
+# puts UINT64's ZERO exactly on ordinalize()'s ORDINAL_NULL sentinel, and
+# ordinal_min_max() excludes that row as null: a column holding 0 and 5
+# reports BOTH bounds as ordinal(5), and a column holding only 0 reports no
+# bounds at all. Those bounds are wrong, not merely offset -- a `= 0`
+# predicate would prune away the very file that holds the match. Including
+# UINT64 needs a sentinel-free encoding first; until then it keeps NULL_FLAG,
+# which readers already handle.
 _COMPRESSIBLE_CATEGORIES = {
     "INT8",
     "INT16",
     "INT32",
     "INT64",
+    "UINT8",
+    "UINT16",
+    "UINT32",
     "DECIMAL",
     "DECIMAL128",
     "FLOAT32",
