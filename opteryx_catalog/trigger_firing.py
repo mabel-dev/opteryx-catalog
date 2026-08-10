@@ -20,6 +20,13 @@ holds - so a revoked role stops refreshes at the next fire, enforced by the
 engine's binder in the worker. A non-owner invoker's refresh is *denied
 visibly* (the job fails; `last-refresh-status` records it), by design.
 
+Egress lock: before the job document is written, the view's sources are put
+through `enforce_materialized_view_egress`. Re-checking at fire time is
+the point of checking here at all - registration already checked, but a source
+workspace can take the lock afterwards, and the refresh is what turns one grant
+into a standing copy. A blocked refresh is a fire failure like any other: alert,
+audit, `last-fired-status: egress-blocked`, commit untouched.
+
 The job document carries `origin: "trigger"`, which is what keeps these off
 `/jobs/recent` (filtered in jobs.opteryx) and tells the worker to stamp the
 MV's refresh state on completion.
@@ -49,6 +56,7 @@ import requests
 
 from .alerts import report as _alert
 from .audit import write_audit_record
+from .exceptions import EgressRestricted
 from .exceptions import MaterializedViewError
 
 # Refreshes fired inside one window share a task name, and Cloud Tasks
@@ -333,12 +341,40 @@ def _fire_refresh(
 ) -> None:
     target_view = trigger["target-view"]
     mv = catalog.get_materialized_view(target_view)
-    sql = mv.get("sql")
-    if not sql:
+    # The definition is not sent to the worker (REFRESH re-reads it), but a view
+    # with none can never refresh, and finding that out here means it lands in
+    # the audit log next to the commit that tried, rather than as a job failure
+    # nobody is watching.
+    if not mv.get("sql"):
         raise MaterializedViewError(f"materialized view has no defining SQL: {target_view}")
 
+    # Re-checked here and not only at creation: a source workspace can take the
+    # egress lock long after the view was registered, and every refresh writes
+    # a fresh copy. Before the job document, so a blocked refresh leaves no
+    # job for the worker to pick up.
+    #
+    # Surfaced like any other fire failure - `fire_triggers` alerts and audits
+    # it, and never lets it reach the commit - plus a status on the trigger
+    # document, so the block is visible where an operator looks for the view's
+    # staleness rather than only in the alert stream.
+    try:
+        catalog.enforce_materialized_view_egress(target_view, mv.get("source-tables") or [])
+    except EgressRestricted:
+        catalog.mark_trigger_fired(dataset_identifier, trigger["name"], status="egress-blocked")
+        raise
+
+    # REFRESH MATERIALIZED VIEW, not the CoRTAS it desugars to. The statement
+    # says what is happening, which is what the job list, the audit record and
+    # anyone reading the query history all see - and it is now the only way in:
+    # a plain CREATE OR REPLACE TABLE aimed at a view is refused by the engine,
+    # because a view is not a table.
+    #
+    # It also means the definition is no longer copied into the job. The engine
+    # reads it from the catalog when the refresh runs, so a view redefined
+    # between firing and execution refreshes as its current self rather than as
+    # a snapshot of what it was when someone committed to a source.
     qualified_target = f"{catalog.workspace}.{mv['collection']}.{mv['name']}"
-    sql_text = f"CREATE OR REPLACE TABLE {qualified_target} AS\n{sql}"
+    sql_text = f"REFRESH MATERIALIZED VIEW {qualified_target}"
 
     execution_id = _make_job_id()
     _write_refresh_job(

@@ -100,8 +100,12 @@ def test_fire_writes_job_doc_and_enqueues():
     job_doc = jobs_collection.document.return_value.set.call_args.args[0]
 
     assert job_doc["execution_id"] == execution_id
-    assert job_doc["sql_text"].startswith("CREATE OR REPLACE TABLE ws.mart.daily AS")
-    assert "SELECT * FROM src.a" in job_doc["sql_text"]
+    # The statement names the intent. It is not the CoRTAS it desugars to, and
+    # it does not carry the definition - the engine re-reads that from the
+    # catalog when the refresh runs, so a view redefined between firing and
+    # execution refreshes as its current self.
+    assert job_doc["sql_text"] == "REFRESH MATERIALIZED VIEW ws.mart.daily"
+    assert "SELECT" not in job_doc["sql_text"]
     assert job_doc["status"] == "SUBMITTED"
     assert job_doc["submitted_by"] == "alice"  # invoker semantics
     assert job_doc["billing_account"] == "alice"

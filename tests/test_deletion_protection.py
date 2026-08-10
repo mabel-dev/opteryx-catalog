@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from opteryx_catalog.exceptions import WorkspaceDeleteProtected
+from opteryx_catalog.exceptions import WorkspaceDeletionProtected
 from opteryx_catalog.opteryx_catalog import OpteryxCatalog
 
 
@@ -55,9 +55,9 @@ class _Collection:
 
 
 def _catalog(protected: bool):
-    """A catalog whose workspace is (or isn't) delete-protected, with one
+    """A catalog whose workspace is (or isn't) deletion-protected, with one
     dataset, one collection and one view, all otherwise droppable."""
-    props = {"delete_protection": True} if protected else {"delete_protection": False}
+    props = {"deletion_protection": True} if protected else {"deletion_protection": False}
     catalog_ref = _Collection({"$properties": _DocRef(data=props)})
 
     dataset_ref = _DocRef(data={"location": "gs://bucket/ws/coll/tbl", "locked-by": None})
@@ -78,13 +78,13 @@ def _catalog(protected: bool):
     return catalog, dataset_ref, collection_ref, view_ref
 
 
-# --- What delete_protection guards: the workspace, and only the workspace ---
+# --- What deletion_protection guards: the workspace, and only the workspace ---
 
 
 def test_soft_delete_workspace_blocked():
     catalog, _d, _c, _v = _catalog(protected=True)
 
-    with pytest.raises(WorkspaceDeleteProtected, match="delete-protected"):
+    with pytest.raises(WorkspaceDeletionProtected, match="deletion-protected"):
         catalog.soft_delete_workspace(author="alice")
 
     assert catalog.get_workspace_properties().get("deleted-at-ms") is None
@@ -93,13 +93,38 @@ def test_soft_delete_workspace_blocked():
 def test_error_names_the_statement_that_clears_it():
     catalog, _d, _c, _v = _catalog(protected=True)
 
-    with pytest.raises(WorkspaceDeleteProtected, match="SET delete_protection TO OFF"):
+    with pytest.raises(WorkspaceDeletionProtected, match="SET deletion_protection TO OFF"):
         catalog.soft_delete_workspace(author="alice")
 
 
-@pytest.mark.parametrize("props", [{}, {"delete_protection": False}, {"delete_protection": None}])
-def test_unprotected_workspace_deletes_normally(props, monkeypatch):
-    """Absent, false and null all mean 'not protected' - only a truthy flag blocks."""
+@pytest.mark.parametrize(
+    "props",
+    [{}, {"deletion_protection": None}, {"deletion_protection": "OFF"}],
+    ids=["absent", "null", "unrecognised-value"],
+)
+def test_workspace_is_protected_from_birth(props):
+    """The flag is ON unless explicitly turned off.
+
+    Absent and null both mean nobody has decided yet, which resolves to
+    protected - a workspace is born guarded. An unrecognised value keeps the
+    guard on too: the engine writes a real bool for ON/OFF, so the string "OFF"
+    is something hand-written, and failing closed is the right way for a
+    default-on flag to be wrong.
+    """
+    catalog, _d, _c, _v = _catalog(protected=False)
+    catalog._catalog_ref.document("$properties")._doc._data = dict(props)
+
+    with pytest.raises(WorkspaceDeletionProtected, match="deletion-protected"):
+        catalog.soft_delete_workspace(author="alice")
+
+    assert catalog.get_workspace_properties().get("deleted-at-ms") is None
+
+
+@pytest.mark.parametrize(
+    "props", [{"deletion_protection": False}, {"deletion_protection": 0}], ids=["false", "falsey"]
+)
+def test_explicitly_unprotected_workspace_deletes_normally(props, monkeypatch):
+    """Only a deliberate falsey value clears the guard."""
     monkeypatch.setattr("opteryx_catalog.opteryx_catalog.send_webhook", lambda **k: None)
     catalog, _d, _c, _v = _catalog(protected=False)
     catalog._catalog_ref.document("$properties")._doc._data = dict(props)
@@ -116,9 +141,9 @@ def test_protection_is_re_read_not_cached(monkeypatch):
     catalog, _d, _c, _v = _catalog(protected=False)
 
     catalog.get_workspace_properties()  # warm any accidental cache
-    catalog._catalog_ref.document("$properties")._doc._data = {"delete_protection": True}
+    catalog._catalog_ref.document("$properties")._doc._data = {"deletion_protection": True}
 
-    with pytest.raises(WorkspaceDeleteProtected):
+    with pytest.raises(WorkspaceDeletionProtected):
         catalog.soft_delete_workspace(author="alice")
 
 
@@ -127,9 +152,9 @@ def test_setting_the_flag_then_deleting_is_blocked(capsys):
     deleting the workspace is refused."""
     catalog, _d, _c, _v = _catalog(protected=False)
 
-    catalog.set_workspace_properties({"delete_protection": True}, author="alice")
+    catalog.set_workspace_properties({"deletion_protection": True}, author="alice")
 
-    with pytest.raises(WorkspaceDeleteProtected):
+    with pytest.raises(WorkspaceDeletionProtected):
         catalog.soft_delete_workspace(author="alice")
 
 
@@ -137,7 +162,7 @@ def test_clearing_the_flag_re_enables_deletion(monkeypatch, capsys):
     monkeypatch.setattr("opteryx_catalog.opteryx_catalog.send_webhook", lambda **k: None)
     catalog, _d, _c, _v = _catalog(protected=True)
 
-    catalog.set_workspace_properties({"delete_protection": False}, author="alice")
+    catalog.set_workspace_properties({"deletion_protection": False}, author="alice")
     catalog.soft_delete_workspace(author="alice")
 
     assert catalog.get_workspace_properties()["deleted-at-ms"] is not None
@@ -147,7 +172,7 @@ def test_clearing_the_flag_re_enables_deletion(monkeypatch, capsys):
 
 
 def test_drop_dataset_is_not_blocked(monkeypatch):
-    """delete_protection protects the workspace, not the assets in it.
+    """deletion_protection protects the workspace, not the assets in it.
     Per-asset protection is the `locked-by` two-person lock."""
     monkeypatch.setattr("opteryx_catalog.opteryx_catalog.send_webhook", lambda **k: None)
     catalog, dataset_ref, _c, _v = _catalog(protected=True)

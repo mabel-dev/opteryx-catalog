@@ -44,11 +44,11 @@ catalog: mv stored as a dataset document (readable as a table by the FE, no engi
    |  (later: any user-created data commit on src.a or src.b)
    v
 catalog commit path reads the dataset's triggers subcollection
-   → writes a jobs/{execution_id} document (CoRTAS statement, principal, origin: "trigger")
+   → writes a jobs/{execution_id} document (REFRESH statement, principal, origin: "trigger")
    → enqueues a Cloud Task (OIDC) targeting https://worker.opteryx.app/api/v1/submit
    |
    v
-worker.opteryx executes the CoRTAS exactly like any other job — the engine's binder
+worker.opteryx executes the REFRESH exactly like any other job — the engine's binder
 enforces permissions from the job's policies; if the principal lacks rights the plan
 fails and the MV goes stale (visibly, via last-refreshed-at)
    |
@@ -59,10 +59,15 @@ Key properties:
 - **No new services.** worker.opteryx is the executor; jobs.opteryx needs a one-filter change.
 - **The MV is just a dataset.** The FE and engine read it like any table; only creation,
   refresh, and drop know it's special.
-- **Refresh is CoRTAS** — `CREATE OR REPLACE TABLE ... AS SELECT`, which is already atomic:
-  files written durably first, then a single `truncate_and_add_files` snapshot commit
+- **Refresh is `REFRESH MATERIALIZED VIEW`**, which desugars at plan time to the CoRTAS it
+  always was — `CREATE OR REPLACE TABLE ... AS SELECT`, already atomic: files written
+  durably first, then a single `truncate_and_add_files` snapshot commit
   (`opteryx-core/opteryx/operators/insert/insert.pyx:70-105`,
-  `opteryx-core/opteryx/connectors/opteryx_connector.py:852-861`).
+  `opteryx-core/opteryx/connectors/opteryx_connector.py:852-861`). The statement is the
+  honest name for what happens; the desugar keeps the proven write path. **A materialized
+  view is not a table**: a user-written CTAS, INSERT, TRUNCATE or ALTER TABLE aimed at one
+  is refused at bind time, so REFRESH (and the CREATE that made it) are the only writes that
+  can land on a view.
 
 ## 1. Statement surface (opteryx-core)
 
@@ -221,9 +226,13 @@ per-dataset beats the old plan's workspace-wide `$hooks` query) and enqueues one
 trigger. Debounce within the call: a multi-trigger commit fires each distinct MV once.
 
 **MV-over-MV / loops**: a refresh commit on an MV's backing table is itself a user-created
-commit, so MVs stacking on MVs works by construction. Guard against cycles at **creation**
-time (walk `source-tables` of any source that is itself an MV; reject cycles) — cheaper and
-more debuggable than runtime loop detection.
+commit, so MVs stacking on MVs would work mechanically — but it is **rejected at creation**.
+The outer view can only ever be a refresh behind the inner one, and a failed inner refresh
+pins the whole tower without saying so. Registration rejects both an MV source and the
+registration of a dataset another MV already reads. Cycles are rejected at **creation** time
+as well (walk `source-tables` of any source that is itself an MV) — cheaper and more
+debuggable than runtime loop detection, and it still covers graphs written before the
+no-stacking rule.
 
 ### Enqueue mechanics — copy jobs.opteryx, not the webhook sender
 
@@ -296,6 +305,125 @@ Enforced where all DDL is enforced — the opteryx-core **binder**, from the ses
 - **`DROP TRIGGER ... ON table`: `WRITE` on that table** (symmetric with creation — it's an
   update to that table). `DROP MATERIALIZED VIEW`: `DROP` tier on the MV itself, consistent
   with `DROP TABLE`.
+
+### The egress lock — `egress_protection` (not a permission)
+
+Granting `reader` on `ichnos.landing.*` transitively means "may copy all of landing
+anywhere I can write, permanently, on a refresh schedule". Nobody means that when they
+grant read. `egress_protection` is an optional workspace property that refuses the automated
+copy — MV creation, MV refresh, and CTAS — of that workspace's data **into a different
+workspace**.
+
+- **The source workspace's flag decides**, never the destination's. The property protects
+  data leaving; a copy that stays inside the source workspace is not egress.
+- **Enforced at creation and at every refresh.** A workspace can be locked long after a
+  view that reads it was registered, and each refresh is a fresh copy.
+- **On by default.** Tri-state: absent, null, and a workspace with no `$properties` document
+  at all read as restricted; only an explicit `OFF` clears it (`ALTER WORKSPACE ichnos SET
+  egress_protection TO OFF`). Sharing data out is opted into, never defaulted into, and a
+  workspace nobody has thought about is not wide open. `deletion_protection` was moved to the
+  same default-on tri-state in the same change, via the shared `_guard_is_on` helper.
+  Still an **ordinary settable property**, deliberately NOT in
+  `_RESERVED_WORKSPACE_PROPERTIES` — that set is for lifecycle fields with dedicated methods.
+- **Named `*_protection`, uniformly.** `delete_protection` was renamed to
+  `deletion_protection` in the same change so both workspace guards are noun-phrase
+  protections with the same polarity. The point is scannability: every `..._protection`
+  property is safe when ON, so a list of workspace settings can be read for `OFF` without
+  reasoning about which direction each rule points.
+- **Not containment, and must never be described as such.** Anyone with read can SELECT and
+  paste. It is leaky by construction, the same way a VPC Service Controls perimeter is an
+  egress boundary rather than a permission. What it stops is the systematic, automated,
+  recurring copy, which is where the leakage volume actually is.
+
+### Deployment: no migration
+
+`delete_protection` → `deletion_protection` is read with no fallback, and needs none: no
+workspace has ever had either protection set, so there is nothing stored under the old key
+anywhere. The rename is code-only. Same for `egress_protection`, which is new.
+
+This is why both defaults could be flipped to ON at all, and why it had to happen now: with
+no stored values, "absent" is every workspace's state, so the default *is* the behaviour and
+changing it costs nothing. Once anyone has set either flag deliberately, a change like this
+stops being free — a later flip would silently override real decisions, and a later rename
+would silently discard them.
+
+Catalog surface (`opteryx_catalog.py`): `EGRESS_PROTECTION_PROPERTY`,
+`is_egress_restricted(workspace=None)`, `enforce_egress_policy(source_workspaces,
+destination_workspace, operation)` — the shared gate — and `enforce_materialized_view_egress`,
+which resolves an MV's source workspaces and calls it. `EgressRestricted` is its own
+exception type (not a `MaterializedViewError`) because CTAS raises it too, and it is
+deliberately not `Alertable`: a blocked copy is the setting working. `enforce_` rather than
+`_assert_` because both are called across a duck-typed catalog boundary, where
+`unittest.mock` rejects any attribute named `assert*`.
+
+A blocked refresh in `trigger_firing._fire_refresh` is checked before the job document is
+written and surfaces exactly like any other fire failure — `_alert`, a `trigger.fire_failed`
+audit record, `last-fired-status: egress-blocked` — and never raises into the commit.
+
+**Guard first, feature second.** Cross-workspace MV sources are not representable yet — an
+MV's sources are workspace-relative (`_relative_identifier`) and opteryx-core's
+`register_materialized_view` rejects a cross-workspace source outright — but they are
+planned, and cross-workspace MVs are a driver for this work. Landing the boundary ahead of
+the capability is deliberate: because the flag defaults to ON, the day a view can read
+another workspace it needs that workspace's owner to have opted out first, and there is no
+release in which the capability ships ahead of the guard. When cross-workspace sources land,
+`_relative_identifier` and `_source_workspace` should be revisited together — once a source
+carries its workspace explicitly, resolution stops being a guess and the local-dataset probe
+becomes a compatibility path for names stored under the old rule.
+
+### Engine wiring (delivered, opteryx-core)
+
+The load-bearing path is the write path, which lives in opteryx-core, and it is now wired:
+
+- **`WORKSPACE_PROPERTIES`** (`planner/logical_planner/logical_planner.py`) — carries
+  `egress_protection` with `_parse_boolean_workspace_property`. Without it the flag could not
+  be cleared through SQL at all, which under default-on means no opt-out route exists.
+- **`Writable.enforce_egress_policy(target_relation, source_relations)`**
+  (`connectors/capabilities/writable.py`) — a **no-op by default**, not a
+  `NotImplementedError` like its neighbours: a connector with no workspace concept has no
+  boundary to cross, so "nothing to check" is the complete answer, and filesystem CTAS is
+  untouched.
+- **`OpteryxConnector.enforce_egress_policy`** — resolves relation names to workspaces, drops
+  same-workspace sources before asking (so the common case costs no Firestore read), and
+  translates the catalog's `EgressRestricted` into the engine's
+  `EgressRestrictedError(SecurityError)`. Deliberately **not** a `PermissionsError`: the
+  caller may hold every grant the statement needs; what is refused is the destination.
+  **Fails closed** if the installed opteryx-catalog is too old to carry the gate — opteryx
+  resolves opteryx-catalog from site-packages, not a sibling checkout, so version skew is
+  real and a silently-unenforced control is worse than a refused copy.
+- **`planner/binder/relation.py::visit_insert`** — calls it at bind time, after the target's
+  permission check (so a caller who may not write the target cannot use this to probe another
+  workspace's protection state) and before any schema work or write.
+
+**Scope: every write, not just CTAS.** The check runs for CTAS, CREATE OR REPLACE, CREATE
+MATERIALIZED VIEW *and* plain `INSERT ... SELECT`. Covering only CTAS would not be a
+boundary — the same copy is two statements away (`CREATE TABLE mine.x AS SELECT ... LIMIT 0`,
+then `INSERT INTO mine.x SELECT ...`), and a control with a two-statement bypass teaches
+people to route around it. `INSERT ... VALUES` scans nothing and drops straight through.
+
+**MV refresh needs no separate statement.** There is no `REFRESH MATERIALIZED VIEW`;
+`_fire_refresh` submits `CREATE OR REPLACE TABLE <view> AS <sql>`, which reaches the binder
+as an ordinary CTAS. So a refresh is checked twice on the same setting, in two processes: by
+the catalog at fire time before the job document is written, and by the engine at bind time
+in the worker. That redundancy is wanted for a flag that can be switched on long after the
+view was created.
+
+Remaining, not in scope here:
+
+- **opteryx-core** — `opteryx_connector.register_materialized_view` still rejects a
+  cross-workspace source with a flat `ValueError`. When cross-workspace MVs land, that
+  rejection is replaced by the egress gate, not simply deleted.
+- **odata.opteryx / flight.opteryx / upload.opteryx** — these are read/serve surfaces, not
+  copy-into-a-workspace surfaces, so the lock does not apply to them as written. If any of
+  them grows a "materialize this result into a workspace" path, it takes the same gate.
+- **Release ordering** — the engine wiring requires an opteryx-catalog carrying
+  `enforce_egress_policy` and `EgressRestricted`. Until that is released and installed, every
+  cross-workspace write fails closed with the "catalog too old" message.
+
+Compatible with, and deliberately not foreclosing, the open questions: definer's rights for
+refresh (an identity question — orthogonal to whether the copy may cross the boundary at
+all), and a `SECURE` flag marking a sanctioned declassification, which would be a documented
+exemption checked inside `enforce_egress_policy`.
 
 ## 5. Delivery phases
 

@@ -208,7 +208,11 @@ def _catalog_with_properties(props_data=None, tombstone_data=None):
 
 
 def test_soft_delete_workspace_sets_properties_and_writes_tombstone():
-    catalog, catalog_collection, dropped_workspaces, _log = _catalog_with_properties()
+    # deletion_protection is ON unless explicitly cleared, so a workspace that is
+    # about to be deleted has had it turned off first.
+    catalog, catalog_collection, dropped_workspaces, _log = _catalog_with_properties(
+        props_data={"deletion_protection": False}
+    )
 
     with patch("opteryx_catalog.opteryx_catalog.send_webhook") as hook:
         catalog.soft_delete_workspace(author="alice")
