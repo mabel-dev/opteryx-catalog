@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import time
 from collections.abc import Iterable
@@ -866,6 +867,19 @@ class OpteryxCatalog(Metastore):
         if data.get("locked-by") is not None:
             raise DatasetLocked(f"Dataset is locked: {identifier}")
 
+        # Refuse to drop a dataset that materialized views read. Their triggers
+        # live in THIS dataset's subcollection, so the drop would take them with
+        # it and leave each dependent view refreshing on whatever sources
+        # remain - silently producing partial data, or silently never
+        # refreshing again if this was the last one. Consistent with
+        # `rename_dataset`, which refuses for the same reason.
+        dependents = self._materialized_views_reading(identifier)
+        if dependents:
+            raise MaterializedViewError(
+                f"Cannot drop {identifier}: it is a source of materialized view(s) "
+                f"{', '.join(sorted(dependents))}. Drop those first."
+            )
+
         location = data.get("location")
 
         # Tombstone FIRST: a failure between here and the final delete leaves a
@@ -882,7 +896,7 @@ class OpteryxCatalog(Metastore):
         # must be chased down too - Firestore cannot cascade across documents
         # any more than it can into subcollections.
         if data.get("dataset-type") == MATERIALIZED_VIEW_TYPE:
-            trigger_name = self._mv_trigger_name(collection, dataset_name)
+            trigger_name = self._mv_trigger_name(f"{self.workspace}.{identifier}")
             for source in data.get("source-tables") or []:
                 self.drop_trigger(source, trigger_name, author=author, missing_ok=True)
 
@@ -1583,7 +1597,19 @@ class OpteryxCatalog(Metastore):
         """Create a collection document under the catalog.
 
         If `exists_ok` is False and the collection already exists, a KeyError is raised.
+
+        A collection name may not contain a dot. Qualified names are split
+        left-anchored with maxsplit - `ws.coll.a.b` is dataset `a.b` in
+        collection `coll` - so a dotted collection name would make every
+        qualified name ambiguous and silently misroute materialized-view
+        sources and triggers. See `_split_qualified`.
         """
+        if "." in collection:
+            raise ValueError(
+                f"collection name may not contain a dot: {collection!r} - qualified "
+                "names are parsed as 'workspace.collection.dataset' and a dotted "
+                "collection would make that split ambiguous"
+            )
         doc_ref = self._collection_ref(collection)
         if doc_ref.get().exists:
             if exists_ok:
@@ -1946,58 +1972,96 @@ class OpteryxCatalog(Metastore):
     def _triggers_collection(self, collection: str, dataset_name: str):
         return self._dataset_doc_ref(collection, dataset_name).collection(TRIGGERS_SUBCOLLECTION)
 
-    def _relative_identifier(self, table: str) -> str:
-        """Reduce a possibly workspace-qualified table name to 'collection.dataset'.
+    def _materialized_views_reading(self, dataset_identifier: str) -> set[str]:
+        """Qualified names of the materialized views that read this dataset.
 
-        The engine hands over fully-qualified names (workspace.collection.dataset,
-        where the dataset part may itself contain dots). A leading segment equal
-        to this catalog's workspace is stripped; any other 2+-part name is taken
-        as already relative - if the first segment was actually a *different*
-        workspace, the source-existence check fails with a clear DatasetNotFound
-        rather than silently attaching a trigger in the wrong place.
+        Read from the dataset's own triggers subcollection, not by scanning for
+        views whose source list mentions it: an MV's refresh trigger lives on
+        each of its sources, so the answer is already here as one keyed read -
+        the same read the commit path makes on every write.
+        """
+        try:
+            collection, dataset_name = self._local_parts(dataset_identifier)
+        except MaterializedViewError:
+            return set()
+        readers = set()
+        for doc in self._triggers_collection(collection, dataset_name).stream():
+            trigger = doc.to_dict() or {}
+            if trigger.get("kind") != MV_REFRESH_TRIGGER_KIND:
+                continue
+            target = trigger.get("target-view")
+            if target and "." in target:
+                readers.add(self._qualify(target))
+        return readers
+
+    def _qualify(self, table: str) -> str:
+        """The fully-qualified 'workspace.collection.dataset' form of a name.
+
+        The single place a workspace is ever inferred, and the only shape the
+        materialized-view and trigger records store. A 3+-part name already
+        carries its workspace and is returned untouched; a 2-part name is read
+        as relative to this catalog.
+
+        This replaced a rule that reduced names the other way, toward
+        'collection.dataset'. That rule was lossy and could not be made
+        otherwise: `a.b.c` was returned unchanged whether `a` was a collection
+        here holding a dataset called `b.c`, or the name of another workspace
+        entirely - so a foreign source silently became a local lookup. Storing
+        the qualified form removes the guess rather than improving it.
+
+        Idempotent, so callers may hand over either form and methods can
+        normalize on entry without caring which they were given.
         """
         parts = table.split(".")
-        if len(parts) >= 3 and parts[0] == self.workspace:
-            return ".".join(parts[1:])
-        if len(parts) >= 2:
+        if len(parts) >= 3:
             return table
-        raise MaterializedViewError(f"source table must be at least 'collection.dataset': {table}")
+        if len(parts) == 2:
+            return f"{self.workspace}.{table}"
+        raise MaterializedViewError(f"table name must be at least 'collection.dataset': {table}")
+
+    @staticmethod
+    def _split_qualified(table: str) -> tuple[str, str, str]:
+        """Split a qualified name into (workspace, collection, dataset).
+
+        Left-anchored with maxsplit, so a dataset name containing dots stays
+        whole: 'ws.coll.a.b' is dataset 'a.b' in collection 'coll'. That is
+        unambiguous only because workspace and collection names may not contain
+        dots - enforced in `create_collection`, and the precondition the whole
+        qualified-name scheme rests on.
+        """
+        parts = table.split(".", 2)
+        if len(parts) != 3:
+            raise MaterializedViewError(
+                f"expected a qualified 'workspace.collection.dataset' name: {table}"
+            )
+        return parts[0], parts[1], parts[2]
+
+    def _local_parts(self, table: str) -> tuple[str, str]:
+        """(collection, dataset) for a name that must live in THIS workspace.
+
+        The replacement for every `_relative_identifier(x).split(".", 1)` in the
+        trigger and materialized-view paths. A name belonging to another
+        workspace raises here rather than being written into this one - the
+        failure the old reduction produced silently.
+        """
+        workspace, collection, dataset_name = self._split_qualified(self._qualify(table))
+        if workspace != self.workspace:
+            raise MaterializedViewError(
+                f"{table} belongs to workspace {workspace}, not {self.workspace}; "
+                "this catalog handle cannot read or write it"
+            )
+        return collection, dataset_name
 
     def _source_workspace(self, table: str) -> str:
-        """Which workspace a source-table name actually refers to.
+        """Which workspace a source-table name refers to.
 
-        The counterpart to `_relative_identifier`, and it exists because that
-        method's rule is lossy: `a.b.c` from workspace `ws` is returned
-        unchanged, whether `a` is a collection here holding a dataset called
-        `b.c` or the name of another workspace entirely. `_relative_identifier`
-        can afford the ambiguity - guessing wrong just means the source lookup
-        misses and `DatasetNotFound` says so - but an egress decision cannot,
-        because guessing wrong the other way blocks a legitimate copy.
-
-        So the local reading wins: a name that resolves to a dataset in THIS
-        workspace is this workspace's, full stop. Only a 3+-part name whose
-        leading segment is not this workspace AND which resolves to nothing
-        locally is read as cross-workspace.
-
-        The local-dataset probe is the only Firestore read, and only for names
-        that could be cross-workspace at all; the ordinary relative source
-        (`collection.dataset`) returns without touching Firestore.
-
-        When cross-workspace MV sources land, `_relative_identifier` has to
-        stop collapsing a foreign prefix into a relative name, and the pair
-        should be revisited together: once a source can carry its workspace
-        explicitly, resolution stops being a guess and this probe becomes a
-        compatibility path for names stored under the old rule. Until then the
-        probe is what keeps the guard from misfiring on a collection that
-        happens to share a workspace's name.
+        Now a split rather than a guess. This used to probe Firestore to
+        resolve the ambiguity in the old relative form - a name that resolved
+        to a local dataset was read as local - which was the best available
+        answer while sources did not carry their workspace. They do now, so the
+        probe is gone along with its Firestore read.
         """
-        parts = table.split(".")
-        if len(parts) < 3 or parts[0] == self.workspace:
-            return self.workspace
-        collection, dataset_name = table.split(".", 1)
-        if self._dataset_doc_ref(collection, dataset_name).get().exists:
-            return self.workspace
-        return parts[0]
+        return self._split_qualified(self._qualify(table))[0]
 
     def enforce_materialized_view_egress(
         self, identifier: str, source_tables: Iterable[str], operation: str = "refresh"
@@ -2048,14 +2112,33 @@ class OpteryxCatalog(Metastore):
         trigger is an update to the dataset that carries it, which is why the
         caller-side permission model demands writer on that dataset, not on the
         target view.
+
+        Refuses to overwrite a trigger of the same name aimed at a DIFFERENT
+        view. Trigger names are derived from the target's collection and
+        dataset (`_mv_trigger_name`), so two views can in principle want the
+        same document; a blind write would leave the first view with no trigger
+        and nothing to report it - it would simply never refresh again. The
+        digest in the generated name makes this collision implausible, and this
+        guard makes it impossible.
         """
         if author is None:
             raise ValueError("author must be provided when creating a trigger")
-        collection, dataset_name = self._relative_identifier(dataset_identifier).split(".", 1)
+        collection, dataset_name = self._local_parts(dataset_identifier)
         if not self._dataset_doc_ref(collection, dataset_name).get().exists:
             raise DatasetNotFound(f"Dataset not found: {collection}.{dataset_name}")
 
-        self._triggers_collection(collection, dataset_name).document(name).set(
+        target_view = self._qualify(target_view)
+        trigger_ref = self._triggers_collection(collection, dataset_name).document(name)
+        existing = trigger_ref.get()
+        if existing.exists:
+            claimed = (existing.to_dict() or {}).get("target-view")
+            if claimed and claimed != target_view:
+                raise MaterializedViewError(
+                    f"trigger {name} on {collection}.{dataset_name} already refreshes "
+                    f"{claimed}; refusing to repoint it at {target_view}"
+                )
+
+        trigger_ref.set(
             {
                 "name": name,
                 "kind": kind,
@@ -2098,7 +2181,7 @@ class OpteryxCatalog(Metastore):
         """
         if not author:
             raise ValueError("author must be provided when dropping a trigger")
-        collection, dataset_name = self._relative_identifier(dataset_identifier).split(".", 1)
+        collection, dataset_name = self._local_parts(dataset_identifier)
         doc_ref = self._triggers_collection(collection, dataset_name).document(name)
         if not doc_ref.get().exists:
             if missing_ok:
@@ -2118,7 +2201,7 @@ class OpteryxCatalog(Metastore):
 
     def list_triggers(self, dataset_identifier: str) -> list[dict]:
         """All triggers attached to a dataset, as plain dicts."""
-        collection, dataset_name = self._relative_identifier(dataset_identifier).split(".", 1)
+        collection, dataset_name = self._local_parts(dataset_identifier)
         results = []
         for doc in self._triggers_collection(collection, dataset_name).stream():
             data = doc.to_dict() or {}
@@ -2128,7 +2211,7 @@ class OpteryxCatalog(Metastore):
 
     def mark_trigger_fired(self, dataset_identifier: str, name: str, status: str) -> None:
         """Stamp a trigger's last-fired fields. Called by the enqueue path."""
-        collection, dataset_name = self._relative_identifier(dataset_identifier).split(".", 1)
+        collection, dataset_name = self._local_parts(dataset_identifier)
         self._triggers_collection(collection, dataset_name).document(name).update(
             {
                 "last-fired-at-ms": int(time.time() * 1000),
@@ -2141,9 +2224,19 @@ class OpteryxCatalog(Metastore):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _mv_trigger_name(collection: str, dataset_name: str) -> str:
-        """The auto-generated name of an MV's refresh trigger on a source."""
-        return f"refresh__{collection}__{dataset_name}"
+    def _mv_trigger_name(qualified_target: str) -> str:
+        """The auto-generated name of an MV's refresh trigger on a source.
+
+        The readable part is the target's collection and dataset - the name
+        appears in `information_schema.triggers` and in `DROP TRIGGER <name> ON
+        <table>`, which people type. The digest is what makes it unique: the
+        readable part alone collides ('mart' + 'a__b' against 'mart__a' + 'b',
+        and dataset names may contain dots), and a collision would silently
+        hand one view's trigger document to another.
+        """
+        _, collection, dataset_name = OpteryxCatalog._split_qualified(qualified_target)
+        digest = hashlib.sha256(qualified_target.encode("utf-8")).hexdigest()[:8]
+        return f"refresh__{collection}__{dataset_name}__{digest}"
 
     def _assert_no_stacked_materialized_view(
         self, identifier: str, source_tables: list[str]
@@ -2165,7 +2258,7 @@ class OpteryxCatalog(Metastore):
         targets some other view is exactly the evidence that a view reads it.
         """
         for source in source_tables:
-            coll, name = source.split(".", 1)
+            coll, name = self._local_parts(source)
             data = self._dataset_doc_ref(coll, name).get().to_dict() or {}
             if data.get("dataset-type") == MATERIALIZED_VIEW_TYPE:
                 raise MaterializedViewError(
@@ -2173,7 +2266,7 @@ class OpteryxCatalog(Metastore):
                     f"{identifier} reads {source}"
                 )
 
-        collection, dataset_name = identifier.split(".", 1)
+        collection, dataset_name = self._local_parts(identifier)
         for doc in self._triggers_collection(collection, dataset_name).stream():
             trigger = doc.to_dict() or {}
             if trigger.get("kind") != MV_REFRESH_TRIGGER_KIND:
@@ -2183,7 +2276,7 @@ class OpteryxCatalog(Metastore):
             # stack; leave it to whoever fires it to complain.
             if not target or "." not in target:
                 continue
-            target = self._relative_identifier(target)
+            target = self._qualify(target)
             if target != identifier:
                 raise MaterializedViewError(
                     f"cannot register {identifier} as a materialized view: it is a source "
@@ -2215,13 +2308,19 @@ class OpteryxCatalog(Metastore):
             if current in seen:
                 continue
             seen.add(current)
-            coll, name = current.split(".", 1)
+            if self._source_workspace(current) != self.workspace:
+                # Another workspace's dataset - unreadable from this handle, so
+                # the walk cannot continue through it. It also cannot close a
+                # cycle back to this view without a foreign MV reading us, which
+                # the same check on that side would refuse.
+                continue
+            coll, name = self._local_parts(current)
             doc = self._dataset_doc_ref(coll, name).get()
             if not doc.exists:
                 continue
             data = doc.to_dict() or {}
             if data.get("dataset-type") == MATERIALIZED_VIEW_TYPE:
-                stack.extend(self._relative_identifier(s) for s in data.get("source-tables") or [])
+                stack.extend(self._qualify(s) for s in data.get("source-tables") or [])
 
     def create_materialized_view(
         self,
@@ -2247,18 +2346,29 @@ class OpteryxCatalog(Metastore):
         restricts egress is refused with `EgressRestricted`, at refresh time as
         well as here.
 
+        The identity a refresh runs as (`runs-as`) is pinned at creation and is
+        NOT changed by re-registration - editing a view does not transfer it,
+        only `set_materialized_view_owner` does. The confused-deputy risk that
+        would otherwise create is closed on the caller side: the engine re-runs
+        the full creation authorization against whoever is editing, so an editor
+        can never repoint a view at sources they could not read themselves.
+
         Args:
-            identifier: 'collection.dataset' of the (existing) backing table.
+            identifier: the (existing) backing table, 'collection.dataset' or
+                fully qualified. Stored and returned fully qualified.
             sql: the defining SELECT, as executable text.
             source_tables: every catalog table the SELECT reads - triggers land
-                on each. Workspace-qualified names are accepted and reduced.
-            author: the identity registering the MV.
+                on each. Accepted in either form, stored fully qualified.
+            author: the identity registering the MV. Becomes `runs-as` on a
+                first registration; on a re-registration it is recorded as the
+                statement's author and the existing `runs-as` is left alone.
             update_if_exists: allow re-registration of an existing MV.
         """
         if author is None:
             raise ValueError("author must be provided when creating a materialized view")
 
-        collection, dataset_name = identifier.split(".", 1)
+        identifier = self._qualify(identifier)
+        collection, dataset_name = self._local_parts(identifier)
         doc_ref = self._dataset_doc_ref(collection, dataset_name)
         doc = doc_ref.get()
         if not doc.exists:
@@ -2274,7 +2384,7 @@ class OpteryxCatalog(Metastore):
         # Normalize, dedupe (order-preserving), and validate sources.
         relative_sources: list[str] = []
         for table in source_tables:
-            relative = self._relative_identifier(table)
+            relative = self._qualify(table)
             if relative == identifier:
                 raise MaterializedViewError(f"materialized view cannot read itself: {identifier}")
             if relative not in relative_sources:
@@ -2291,7 +2401,7 @@ class OpteryxCatalog(Metastore):
         # `enforce_materialized_view_egress`.)
         self.enforce_materialized_view_egress(identifier, relative_sources, "create")
         for relative in relative_sources:
-            src_coll, src_name = relative.split(".", 1)
+            src_coll, src_name = self._local_parts(relative)
             if not self._dataset_doc_ref(src_coll, src_name).get().exists:
                 raise DatasetNotFound(f"Source dataset not found: {relative}")
         self._assert_no_stacked_materialized_view(identifier, relative_sources)
@@ -2320,6 +2430,10 @@ class OpteryxCatalog(Metastore):
                 "dataset-type": MATERIALIZED_VIEW_TYPE,
                 "statement-id": statement_id,
                 "source-tables": relative_sources,
+                # Pinned: an existing value survives re-registration, so editing
+                # a view never silently transfers whose authority it refreshes
+                # with. `set_materialized_view_owner` is the only way to move it.
+                "runs-as": data.get("runs-as") or author,
                 "last-refreshed-at-ms": data.get("last-refreshed-at-ms"),
                 "last-refresh-status": data.get("last-refresh-status"),
                 "last-refresh-execution-id": data.get("last-refresh-execution-id"),
@@ -2327,8 +2441,8 @@ class OpteryxCatalog(Metastore):
         )
 
         # Reconcile triggers: one per current source, none on former sources.
-        trigger_name = self._mv_trigger_name(collection, dataset_name)
-        previous_sources = [self._relative_identifier(s) for s in data.get("source-tables") or []]
+        trigger_name = self._mv_trigger_name(identifier)
+        previous_sources = [self._qualify(s) for s in data.get("source-tables") or []]
         for removed in (s for s in previous_sources if s not in relative_sources):
             self.drop_trigger(removed, trigger_name, author=author, missing_ok=True)
         for source in relative_sources:
@@ -2352,8 +2466,16 @@ class OpteryxCatalog(Metastore):
         )
 
     def get_materialized_view(self, identifier: str) -> dict:
-        """The MV's registration record: defining SQL, sources, refresh state."""
-        collection, dataset_name = identifier.split(".", 1)
+        """The MV's registration record: defining SQL, sources, refresh state.
+
+        `identifier` is the qualified name, so callers stop rebuilding it from
+        the decomposed parts. `runs-as` is the pinned identity a refresh
+        executes as; `last-updated-by`/`last-updated-at-ms` are the author and
+        time of the current statement version - who last changed the definition,
+        which is a different question and a different person.
+        """
+        identifier = self._qualify(identifier)
+        collection, dataset_name = self._local_parts(identifier)
         doc_ref = self._dataset_doc_ref(collection, dataset_name)
         doc = doc_ref.get()
         if not doc.exists:
@@ -2364,21 +2486,79 @@ class OpteryxCatalog(Metastore):
 
         statement_id = data.get("statement-id")
         sql = None
+        last_updated_by = None
+        last_updated_at_ms = None
         if statement_id:
-            stmt_doc = doc_ref.collection("statement").document(str(statement_id)).get()
-            sql = (stmt_doc.to_dict() or {}).get("sql")
+            # One read, three fields - the author and timestamp were already
+            # being fetched alongside the SQL and thrown away.
+            statement = (
+                doc_ref.collection("statement").document(str(statement_id)).get().to_dict() or {}
+            )
+            sql = statement.get("sql")
+            last_updated_by = statement.get("author")
+            last_updated_at_ms = statement.get("timestamp-ms")
 
         return {
+            "identifier": identifier,
             "name": dataset_name,
             "collection": collection,
             "workspace": self.workspace,
             "sql": sql,
             "statement-id": statement_id,
             "source-tables": data.get("source-tables") or [],
+            "runs-as": data.get("runs-as"),
+            "last-updated-by": last_updated_by,
+            "last-updated-at-ms": last_updated_at_ms,
             "last-refreshed-at-ms": data.get("last-refreshed-at-ms"),
             "last-refresh-status": data.get("last-refresh-status"),
             "last-refresh-execution-id": data.get("last-refresh-execution-id"),
         }
+
+    def set_materialized_view_owner(
+        self, identifier: str, new_owner: str, author: str | None = None
+    ) -> None:
+        """Repoint a materialized view's `runs-as` identity.
+
+        The only thing that moves a pinned owner. Deliberately narrow: it writes
+        no statement version and reconciles no triggers, because the definition
+        has not changed - only whose authority refreshes it.
+
+        The caller-side permission model gates this on WORKSPACE owner rather
+        than on the view. At creation `runs-as` is necessarily an identity that
+        held every grant the statement needed, because it was the identity that
+        ran it; this method breaks that invariant by letting a view be pointed
+        at someone else's authority, and nothing here can check another
+        principal's grants. A workspace owner can already grant themselves
+        anything, so requiring that tier escalates nothing.
+        """
+        if not author:
+            raise ValueError("author must be provided when changing a materialized view owner")
+        if not new_owner:
+            raise ValueError("new_owner must be provided")
+
+        identifier = self._qualify(identifier)
+        collection, dataset_name = self._local_parts(identifier)
+        doc_ref = self._dataset_doc_ref(collection, dataset_name)
+        doc = doc_ref.get()
+        if not doc.exists:
+            raise DatasetNotFound(f"Dataset not found: {identifier}")
+        data = doc.to_dict() or {}
+        if data.get("dataset-type") != MATERIALIZED_VIEW_TYPE:
+            raise MaterializedViewError(f"Not a materialized view: {identifier}")
+
+        previous_owner = data.get("runs-as")
+        doc_ref.update({"runs-as": new_owner})
+
+        emit_audit(
+            "alter_materialized_view_owner",
+            resource_type=ResourceType.MATERIALIZED_VIEW,
+            workspace=self.workspace,
+            collection=collection,
+            resource=dataset_name,
+            author=author,
+            previous_owner=previous_owner,
+            new_owner=new_owner,
+        )
 
     def list_materialized_views(self, collection: str) -> list[str]:
         """Names of the materialized views in a collection.
@@ -2406,7 +2586,8 @@ class OpteryxCatalog(Metastore):
         """
         if not author:
             raise ValueError("author must be provided when dropping a materialized view")
-        collection, dataset_name = identifier.split(".", 1)
+        identifier = self._qualify(identifier)
+        collection, dataset_name = self._local_parts(identifier)
         doc = self._dataset_doc_ref(collection, dataset_name).get()
         if not doc.exists:
             return
@@ -2414,7 +2595,7 @@ class OpteryxCatalog(Metastore):
         if data.get("dataset-type") != MATERIALIZED_VIEW_TYPE:
             raise MaterializedViewError(f"Not a materialized view: {identifier} (use drop_dataset)")
 
-        trigger_name = self._mv_trigger_name(collection, dataset_name)
+        trigger_name = self._mv_trigger_name(identifier)
         for source in data.get("source-tables") or []:
             self.drop_trigger(source, trigger_name, author=author, missing_ok=True)
 
@@ -2427,7 +2608,10 @@ class OpteryxCatalog(Metastore):
             author=author,
         )
 
-        self.drop_dataset(identifier, author=author)
+        # `drop_dataset` is part of the general dataset API and takes the
+        # relative form; only the materialized-view and trigger records are
+        # stored qualified.
+        self.drop_dataset(f"{collection}.{dataset_name}", author=author)
 
     def mark_materialized_view_refreshed(
         self,
@@ -2436,9 +2620,14 @@ class OpteryxCatalog(Metastore):
         execution_id: str | None = None,
         author: str | None = None,
     ) -> None:
-        """Stamp refresh state on an MV. Called by the worker when a refresh
-        job completes (or is denied - a denial is a status, not silence)."""
-        collection, dataset_name = identifier.split(".", 1)
+        """Stamp refresh state on an MV.
+
+        Called by the engine when a refresh commits, and by the worker when a
+        trigger-fired refresh fails or is denied - a denial is a status, not
+        silence. The engine cannot record its own failures (a refresh that
+        raised never reaches the stamp), which is why both callers exist.
+        """
+        collection, dataset_name = self._local_parts(identifier)
         self._dataset_doc_ref(collection, dataset_name).update(
             {
                 "last-refreshed-at-ms": int(time.time() * 1000),

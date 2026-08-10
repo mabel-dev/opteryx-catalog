@@ -1,4 +1,5 @@
 # type:ignore
+import json
 import math
 from bisect import bisect_left
 from collections import Counter
@@ -88,16 +89,17 @@ class Distogram:  # pragma: no cover
 
     ## all class methods below here have been added for Opteryx
     def dumps(self):  # pragma: no cover
-        import orjson
-
         def handler(obj):
+            # numpy scalars reach here: np.int64 is not an int subclass, so the
+            # encoder rejects it. np.float64 subclasses float and never gets here.
             if isinstance(obj, int):
                 return int(obj)
             if isinstance(obj, float):
                 return float(obj)
             raise TypeError
 
-        return orjson.dumps(self.dump(), default=handler)
+        # bytes, not str - preserving the return type this had under orjson.
+        return json.dumps(self.dump(), default=handler).encode()
 
     def dump(self):
         return {

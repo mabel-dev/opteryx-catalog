@@ -290,6 +290,7 @@ def _write_refresh_job(
     trigger_name: str,
     target_view: str,
     snapshot_id: Any | None,
+    fired_by: str | None = None,
 ) -> None:
     """Write the jobs/{execution_id} document the worker will execute from."""
     from google.cloud import firestore
@@ -301,10 +302,11 @@ def _write_refresh_job(
         "status": "SUBMITTED",
         "created_at": firestore.SERVER_TIMESTAMP,
         "updated_at": firestore.SERVER_TIMESTAMP,
-        # The invoker: the author of the commit that fired the trigger. This
-        # is the identity the worker hands the engine, the one the binder
-        # authorizes, and the one billed - matching jobs.opteryx's fallback
-        # of billing_account to the submitting identity.
+        # The view's pinned owner (`runs-as`), not the commit's author. This is
+        # the identity the worker hands the engine, the one the binder
+        # authorizes, and the one billed - the party that chose to create a
+        # standing refresh cost, rather than whoever happened to write to a
+        # source. `trigger.fired_by` below keeps the link to that commit.
         "submitted_by": author,
         "billing_account": author,
         "entitlements": [],
@@ -313,13 +315,17 @@ def _write_refresh_job(
         # the MV's refresh state when the job finishes.
         "origin": "trigger",
         "trigger": {
-            # workspace travels too: target_view is workspace-relative, and
-            # the worker needs both to stamp refresh state on the right MV.
+            # workspace travels too: the worker builds a catalog handle from it
+            # to stamp refresh state on the right MV.
             "workspace": catalog.workspace,
             "source_dataset": source_dataset,
             "trigger_name": trigger_name,
             "target_view": target_view,
             "snapshot_id": snapshot_id,
+            # Which commit caused this refresh. `submitted_by` used to carry it
+            # and now carries the owner instead, so without this the audit trail
+            # from a refresh back to the write that triggered it is lost.
+            "fired_by": fired_by,
         },
         "description": (
             f"materialized view refresh of {target_view} "
@@ -373,20 +379,33 @@ def _fire_refresh(
     # reads it from the catalog when the refresh runs, so a view redefined
     # between firing and execution refreshes as its current self rather than as
     # a snapshot of what it was when someone committed to a source.
-    qualified_target = f"{catalog.workspace}.{mv['collection']}.{mv['name']}"
-    sql_text = f"REFRESH MATERIALIZED VIEW {qualified_target}"
+    sql_text = f"REFRESH MATERIALIZED VIEW {mv['identifier']}"
+
+    # The refresh runs as the view's pinned owner, NOT as whoever's commit fired
+    # it. A committer is incidental - an ingest account with writer on a source
+    # collection and nothing on the view's would make the view permanently
+    # unrefreshable, and which principal happened to write last would decide
+    # whether a refresh worked. The owner is the identity that chose to create
+    # the standing cost, and the only one it makes sense to charge and check.
+    #
+    # An owner whose grants have been revoked yields no policies, the binder
+    # denies, and `last-refresh-status` records it. That is the intended
+    # failure: falling back to the committer here would rebuild the confused
+    # deputy this design exists to remove.
+    runs_as = mv.get("runs-as") or author
 
     execution_id = _make_job_id()
     _write_refresh_job(
         catalog,
         execution_id=execution_id,
         sql_text=sql_text,
-        author=author,
-        policies=_policies_for(catalog, author),
+        author=runs_as,
+        policies=_policies_for(catalog, runs_as),
         source_dataset=dataset_identifier,
         trigger_name=trigger["name"],
         target_view=target_view,
         snapshot_id=snapshot_id,
+        fired_by=author,
     )
     outcome = _enqueue_refresh_task(
         catalog, execution_id, _task_id(catalog.workspace, trigger["name"])

@@ -42,16 +42,18 @@ def _catalog_stub(triggers=None, mv=None):
     catalog.workspace = "ws"
     catalog.list_triggers.return_value = triggers or []
     catalog.get_materialized_view.return_value = mv or {
+        "identifier": "ws.mart.daily",
         "name": "daily",
         "collection": "mart",
-        "sql": "SELECT * FROM src.a",
+        "sql": "SELECT * FROM ws.src.a",
         "statement-id": "1",
-        "source-tables": ["src.a"],
+        "source-tables": ["ws.src.a"],
+        "runs-as": "olive",
     }
     return catalog
 
 
-def _refresh_trigger(name="refresh__mart__daily", target="mart.daily"):
+def _refresh_trigger(name="refresh__mart__daily", target="ws.mart.daily"):
     return {"name": name, "kind": "materialized_view_refresh", "target-view": target}
 
 
@@ -107,8 +109,12 @@ def test_fire_writes_job_doc_and_enqueues():
     assert job_doc["sql_text"] == "REFRESH MATERIALIZED VIEW ws.mart.daily"
     assert "SELECT" not in job_doc["sql_text"]
     assert job_doc["status"] == "SUBMITTED"
-    assert job_doc["submitted_by"] == "alice"  # invoker semantics
-    assert job_doc["billing_account"] == "alice"
+    # The view's pinned owner runs and is billed, not the committer - `alice`
+    # fired this by writing to a source and may have no rights on the view.
+    assert job_doc["submitted_by"] == "olive"
+    assert job_doc["billing_account"] == "olive"
+    # ...but the commit that caused it is still recorded.
+    assert job_doc["trigger"]["fired_by"] == "alice"
     assert job_doc["origin"] == "trigger"
     assert job_doc["policies"] == [{"role": "owner", "pattern": "*"}]
     assert job_doc["trigger"]["source_dataset"] == "src.a"
@@ -175,7 +181,13 @@ def test_one_bad_trigger_does_not_stop_the_rest():
     def mv_lookup(target):
         if target == "mart.broken":
             raise RuntimeError("boom")
-        return {"name": "ok", "collection": "mart", "sql": "SELECT 1"}
+        return {
+            "identifier": "ws.mart.ok",
+            "name": "ok",
+            "collection": "mart",
+            "sql": "SELECT 1",
+            "runs-as": "olive",
+        }
 
     catalog.get_materialized_view.side_effect = mv_lookup
     with (

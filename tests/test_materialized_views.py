@@ -188,7 +188,7 @@ def test_create_trigger_writes_document():
 
     written = ref.collection(TRIGGERS_SUBCOLLECTION).document("t1").get().to_dict()
     assert written["kind"] == "materialized_view_refresh"
-    assert written["target-view"] == "mart.daily"
+    assert written["target-view"] == "ws.mart.daily"
     assert written["statement-id"] == "123"
     assert written["created-by"] == "alice"
     assert written["last-fired-at-ms"] is None
@@ -243,16 +243,16 @@ def test_create_mv_registers_and_creates_triggers():
 
     doc = mv_ref.get().to_dict()
     assert doc["dataset-type"] == MATERIALIZED_VIEW_TYPE
-    assert doc["source-tables"] == ["src.a", "src.b"]
+    assert doc["source-tables"] == ["ws.src.a", "ws.src.b"]
     statement = mv_ref.collection("statement").document(doc["statement-id"]).get().to_dict()
     assert statement["sql"].startswith("SELECT")
     assert statement["sequence-number"] == 1
 
     for src in (src_a, src_b):
         trigger = (
-            src.collection(TRIGGERS_SUBCOLLECTION).document("refresh__mart__daily").get().to_dict()
+            src.collection(TRIGGERS_SUBCOLLECTION).document(OpteryxCatalog._mv_trigger_name("ws.mart.daily")).get().to_dict()
         )
-        assert trigger["target-view"] == "mart.daily"
+        assert trigger["target-view"] == "ws.mart.daily"
         assert trigger["statement-id"] == doc["statement-id"]
 
 
@@ -302,7 +302,7 @@ def test_update_mv_reconciles_triggers_and_bumps_sequence():
         update_if_exists=True,
     )
 
-    trigger_name = "refresh__mart__daily"
+    trigger_name = OpteryxCatalog._mv_trigger_name("ws.mart.daily")
     assert not src_a.collection(TRIGGERS_SUBCOLLECTION).document(trigger_name).get().exists
     assert src_b.collection(TRIGGERS_SUBCOLLECTION).document(trigger_name).get().exists
 
@@ -348,7 +348,7 @@ def test_cannot_register_an_mv_over_a_dataset_a_view_reads():
     _add_dataset(catalog, "src.b")
     _register_mv(catalog, "mart.mv1", sources=("src.a",))
 
-    with pytest.raises(MaterializedViewError, match="it is a source of materialized view mart.mv1"):
+    with pytest.raises(MaterializedViewError, match="it is a source of materialized view ws.mart.mv1"):
         catalog.create_materialized_view("src.a", "SELECT * FROM src.b", ["src.b"], author="alice")
     # src.b picked up no trigger from the rejected registration.
     assert catalog.list_triggers("src.b") == []
@@ -369,7 +369,7 @@ def test_re_registering_an_mv_is_unaffected_by_its_own_triggers():
         author="alice",
         update_if_exists=True,
     )
-    assert catalog.get_materialized_view("mart.mv1")["source-tables"] == ["src.b"]
+    assert catalog.get_materialized_view("mart.mv1")["source-tables"] == ["ws.src.b"]
 
 
 def test_mv_cycle_rejected():
@@ -385,20 +385,114 @@ def test_mv_cycle_rejected():
     _add_dataset(
         catalog,
         "mart.mv2",
-        **{"dataset-type": MATERIALIZED_VIEW_TYPE, "source-tables": ["mart.mv3"]},
+        **{"dataset-type": MATERIALIZED_VIEW_TYPE, "source-tables": ["ws.mart.mv3"]},
     )
     _add_dataset(
         catalog,
         "mart.mv3",
-        **{"dataset-type": MATERIALIZED_VIEW_TYPE, "source-tables": ["mart.mv1"]},
+        **{"dataset-type": MATERIALIZED_VIEW_TYPE, "source-tables": ["ws.mart.mv1"]},
     )
 
     with pytest.raises(MaterializedViewError, match="cycle"):
-        catalog._assert_no_materialized_view_cycle("mart.mv1", ["mart.mv2"])
+        catalog._assert_no_materialized_view_cycle("ws.mart.mv1", ["ws.mart.mv2"])
 
     # A chain that never reaches back is fine.
-    catalog._dataset_doc_ref("mart", "mv3").update({"source-tables": ["src.a"]})
-    catalog._assert_no_materialized_view_cycle("mart.mv1", ["mart.mv2"])
+    catalog._dataset_doc_ref("mart", "mv3").update({"source-tables": ["ws.src.a"]})
+    catalog._assert_no_materialized_view_cycle("ws.mart.mv1", ["ws.mart.mv2"])
+
+
+# --- runs-as (the pinned refresh identity) ------------------------------
+
+
+def test_runs_as_is_pinned_to_the_creator():
+    catalog = _catalog()
+    _add_dataset(catalog, "src.a")
+    _register_mv(catalog, "mart.daily", sources=("src.a",))
+
+    assert catalog.get_materialized_view("mart.daily")["runs-as"] == "alice"
+
+
+def test_editing_a_view_does_not_transfer_who_it_runs_as():
+    """The whole point of pinning. Someone else redefining the view records
+    them as the statement's author, but the view keeps refreshing under the
+    identity it was created with - transferring that takes an explicit act."""
+    catalog = _catalog()
+    _add_dataset(catalog, "src.a")
+    _add_dataset(catalog, "src.b")
+    _register_mv(catalog, "mart.daily", sources=("src.a",))
+
+    catalog.create_materialized_view(
+        "mart.daily",
+        "SELECT * FROM src.b",
+        ["src.b"],
+        author="bob",
+        update_if_exists=True,
+    )
+
+    record = catalog.get_materialized_view("mart.daily")
+    assert record["runs-as"] == "alice"  # unchanged by bob's edit
+    assert record["last-updated-by"] == "bob"  # but bob is on the record
+    assert isinstance(record["last-updated-at-ms"], int)
+
+
+def test_set_materialized_view_owner_moves_it():
+    catalog = _catalog()
+    _add_dataset(catalog, "src.a")
+    _register_mv(catalog, "mart.daily", sources=("src.a",))
+
+    catalog.set_materialized_view_owner("mart.daily", "svc-etl", author="admin")
+
+    record = catalog.get_materialized_view("mart.daily")
+    assert record["runs-as"] == "svc-etl"
+    # A transfer is not an edit: no new statement version, sources untouched.
+    assert record["last-updated-by"] == "alice"
+    assert record["source-tables"] == ["ws.src.a"]
+
+
+def test_set_materialized_view_owner_requires_author_and_a_view():
+    catalog = _catalog()
+    _add_dataset(catalog, "src.a")
+    _add_dataset(catalog, "mart.plain")
+    _register_mv(catalog, "mart.daily", sources=("src.a",))
+
+    with pytest.raises(ValueError):
+        catalog.set_materialized_view_owner("mart.daily", "svc-etl", author=None)
+    with pytest.raises(ValueError):
+        catalog.set_materialized_view_owner("mart.daily", "", author="admin")
+    with pytest.raises(MaterializedViewError):
+        catalog.set_materialized_view_owner("mart.plain", "svc-etl", author="admin")
+
+
+# --- trigger naming -----------------------------------------------------
+
+
+def test_trigger_names_do_not_collide_across_views():
+    """`refresh__{collection}__{dataset}` alone collides: 'mart' + 'a__b' and
+    'mart__a' + 'b' produce the same string. The digest separates them."""
+    assert OpteryxCatalog._mv_trigger_name("ws.mart.a__b") != OpteryxCatalog._mv_trigger_name(
+        "ws.mart__a.b"
+    )
+    # Still readable, and stable for the same target.
+    name = OpteryxCatalog._mv_trigger_name("ws.mart.daily")
+    assert name.startswith("refresh__mart__daily__")
+    assert name == OpteryxCatalog._mv_trigger_name("ws.mart.daily")
+
+
+def test_create_trigger_refuses_to_steal_another_views_trigger():
+    """The safety net behind the digest. A blind overwrite would leave the
+    first view with no trigger and nothing to report it - it would simply stop
+    refreshing, forever."""
+    catalog = _catalog()
+    _add_dataset(catalog, "src.a")
+    catalog.create_trigger("src.a", "shared", target_view="mart.one", author="alice")
+
+    with pytest.raises(MaterializedViewError, match="already refreshes"):
+        catalog.create_trigger("src.a", "shared", target_view="mart.two", author="bob")
+
+    # Re-registering the SAME view through the same trigger is fine.
+    catalog.create_trigger("src.a", "shared", target_view="mart.one", author="alice")
+    [trigger] = catalog.list_triggers("src.a")
+    assert trigger["target-view"] == "ws.mart.one"
 
 
 def test_get_and_list_materialized_views():
@@ -409,7 +503,7 @@ def test_get_and_list_materialized_views():
 
     record = catalog.get_materialized_view("mart.daily")
     assert record["sql"] == "SELECT * FROM src.a"
-    assert record["source-tables"] == ["src.a"]
+    assert record["source-tables"] == ["ws.src.a"]
     assert record["last-refreshed-at-ms"] is None
 
     assert catalog.list_materialized_views("mart") == ["daily"]
@@ -434,7 +528,7 @@ def test_registration_survives_a_commit():
     catalog.save_dataset_metadata("mart.daily", dataset.metadata)
 
     record = catalog.get_materialized_view("mart.daily")
-    assert record["source-tables"] == ["src.a"]
+    assert record["source-tables"] == ["ws.src.a"]
     assert record["sql"] == "SELECT * FROM src.a"
     assert record["last-refresh-status"] == "success"
     assert record["last-refresh-execution-id"] == "job-1"
@@ -465,7 +559,7 @@ def test_drop_mv_removes_source_triggers_and_dataset():
     with patch("opteryx_catalog.opteryx_catalog.send_webhook"):
         catalog.drop_materialized_view("mart.daily", author="alice")
 
-    trigger_ref = src_a.collection(TRIGGERS_SUBCOLLECTION).document("refresh__mart__daily")
+    trigger_ref = src_a.collection(TRIGGERS_SUBCOLLECTION).document(OpteryxCatalog._mv_trigger_name("ws.mart.daily"))
     assert not trigger_ref.get().exists
     assert not catalog._dataset_doc_ref("mart", "daily").get().exists
 
@@ -487,15 +581,21 @@ def test_drop_dataset_directly_on_mv_still_cleans_source_triggers():
     with patch("opteryx_catalog.opteryx_catalog.send_webhook"):
         catalog.drop_dataset("mart.daily", author="alice")
 
-    trigger_ref = src_a.collection(TRIGGERS_SUBCOLLECTION).document("refresh__mart__daily")
+    trigger_ref = src_a.collection(TRIGGERS_SUBCOLLECTION).document(OpteryxCatalog._mv_trigger_name("ws.mart.daily"))
     assert not trigger_ref.get().exists
 
 
 def test_drop_dataset_deletes_trigger_and_statement_subcollections():
+    """Subcollections go with the document.
+
+    Uses a non-refresh trigger: a dataset carrying a *refresh* trigger is a
+    materialized view's source and is refused outright (below), so it could
+    never reach the deletion this asserts.
+    """
     catalog = _catalog()
     _add_dataset(catalog, "src.a")
     src_ref = catalog._dataset_doc_ref("src", "a")
-    catalog.create_trigger("src.a", "t1", target_view="mart.daily", author="alice")
+    catalog.create_trigger("src.a", "t1", target_view="mart.daily", author="alice", kind="other")
     src_ref.collection("statement").document("s1").set({"sql": "SELECT 1"})
 
     with patch("opteryx_catalog.opteryx_catalog.send_webhook"):
@@ -503,6 +603,25 @@ def test_drop_dataset_deletes_trigger_and_statement_subcollections():
 
     assert not src_ref.collection(TRIGGERS_SUBCOLLECTION).document("t1").get().exists
     assert not src_ref.collection("statement").document("s1").get().exists
+
+
+def test_drop_dataset_refuses_a_source_a_view_reads():
+    """Dropping a source would take its refresh triggers with it, leaving every
+    dependent view refreshing on whatever sources remain - silently partial, or
+    silently never again. Refuse instead, as rename already does."""
+    catalog = _catalog()
+    _add_dataset(catalog, "src.a")
+    _register_mv(catalog, "mart.daily", sources=("src.a",))
+
+    with pytest.raises(MaterializedViewError, match="source of materialized view"):
+        catalog.drop_dataset("src.a", author="alice")
+    assert catalog._dataset_doc_ref("src", "a").get().exists
+
+    # Dropping the view first releases the source.
+    catalog.drop_materialized_view("mart.daily", author="alice")
+    with patch("opteryx_catalog.opteryx_catalog.send_webhook"):
+        catalog.drop_dataset("src.a", author="alice")
+    assert not catalog._dataset_doc_ref("src", "a").get().exists
 
 
 def test_rename_rejects_mv_and_triggered_datasets():
@@ -562,7 +681,7 @@ def test_egress_lock_does_not_restrict_copies_within_the_workspace():
 
     _register_mv(catalog, "mart.daily", sources=("src.a",))
 
-    assert catalog.get_materialized_view("mart.daily")["source-tables"] == ["src.a"]
+    assert catalog.get_materialized_view("mart.daily")["source-tables"] == ["ws.src.a"]
 
 
 def test_egress_lock_blocks_creation_reading_another_workspace():
@@ -584,16 +703,16 @@ def test_egress_lock_blocks_creation_reading_another_workspace():
     assert catalog._dataset_doc_ref("mart", "copy").get().to_dict().get("dataset-type") is None
 
 
-def test_with_the_lock_cleared_a_cross_workspace_source_passes_the_egress_gate():
-    """`ichnos` has opted out, so the gate allows and ordinary source validation
-    decides. It says not-found, because a cross-workspace source is not
-    representable yet - which is the state the guard is waiting on, not a
-    reason it is inert."""
+def test_with_the_lock_cleared_a_cross_workspace_source_is_still_unreachable():
+    """`ichnos` has opted out, so the egress gate allows and ordinary source
+    validation decides. It refuses: a handle bound to `ws` cannot read or write
+    another workspace's datasets, which is why cross-workspace sources are not
+    representable yet. The guard is waiting on that, not inert."""
     catalog = _catalog()
     _add_dataset(catalog, "mart.copy")
     _set_egress_restriction(catalog, "ichnos", False)
 
-    with pytest.raises(DatasetNotFound):
+    with pytest.raises(MaterializedViewError, match="belongs to workspace ichnos"):
         catalog.create_materialized_view(
             "mart.copy",
             "SELECT * FROM ichnos.landing.orders",
@@ -602,26 +721,31 @@ def test_with_the_lock_cleared_a_cross_workspace_source_passes_the_egress_gate()
         )
 
 
-def test_local_collection_sharing_a_workspace_name_is_not_egress():
-    """`ichnos.landing.orders` is ambiguous - collection `ichnos` here, or
-    workspace `ichnos` over there. A dataset that resolves locally wins, so a
-    restriction on a same-named workspace cannot block a purely local view.
+def test_a_local_collection_may_share_a_workspace_name():
+    """A collection here called `ichnos` is no longer confusable with the
+    workspace `ichnos`.
 
-    This is the false-positive the default-on flag would otherwise create
-    everywhere: with every workspace restricted from birth, resolving the
-    ambiguity the other way would refuse ordinary local views."""
+    This used to be genuinely ambiguous - `ichnos.landing.orders` could be
+    either - and was resolved by probing Firestore and letting the local
+    reading win. Qualified names remove the question: the local dataset is
+    `ws.ichnos.landing.orders`, and nothing about a same-named workspace's
+    egress lock touches it."""
     catalog = _catalog()
     _add_dataset(catalog, "ichnos.landing.orders")
     _add_dataset(catalog, "mart.copy")
+    # The other workspace stays locked; it is simply not involved.
+    _set_egress_restriction(catalog, "ichnos", True)
 
     catalog.create_materialized_view(
         "mart.copy",
-        "SELECT * FROM ichnos.landing.orders",
-        ["ichnos.landing.orders"],
+        "SELECT * FROM ws.ichnos.landing.orders",
+        ["ws.ichnos.landing.orders"],
         author="alice",
     )
 
-    assert catalog.get_materialized_view("mart.copy")["source-tables"] == ["ichnos.landing.orders"]
+    assert catalog.get_materialized_view("mart.copy")["source-tables"] == [
+        "ws.ichnos.landing.orders"
+    ]
 
 
 def test_egress_lock_turned_on_after_registration_blocks_refresh():
