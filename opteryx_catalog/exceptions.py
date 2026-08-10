@@ -115,7 +115,8 @@ class TriggerNotFound(KeyError, CatalogError):
 class MaterializedViewError(CatalogError):
     """A materialized-view registration or drop that cannot proceed:
     the named dataset is not a materialized view, a source is invalid,
-    or the source graph would contain a cycle."""
+    a view would be stacked on another view, or the source graph would
+    contain a cycle."""
 
 
 class CollectionAlreadyExists(KeyError, CatalogError):
@@ -152,14 +153,37 @@ class WorkspaceNotFound(KeyError, CatalogError):
     genuinely provision pass `create_if_missing=True`."""
 
 
-class WorkspaceDeleteProtected(CatalogError):
-    """Raised by `soft_delete_workspace` when the workspace's `$properties`
-    document has `delete_protection` set true.
+class WorkspaceDeletionProtected(CatalogError):
+    """Raised by `soft_delete_workspace` when the workspace is deletion-protected.
+
+    Protection is ON unless `deletion_protection` is explicitly turned off, so
+    this is the *default* answer for a workspace nobody has configured - see
+    `opteryx_catalog._guard_is_on`. Deleting a workspace is a deliberate
+    two-step: clear the flag, then delete.
 
     Scope is the workspace itself: dropping datasets, collections and views
     inside a protected workspace is unaffected. Per-asset protection is the
     `locked-by` two-person lock (`DatasetLocked`/`CollectionLocked`), a separate
     mechanism cleared by an unlock rather than by a property change."""
+
+
+class EgressRestricted(CatalogError):
+    """A copy would move data out of a workspace whose `egress_protection`
+    property is set.
+
+    Raised by the materialized-view creation and refresh paths, and intended
+    for the CTAS path too (`OpteryxCatalog.enforce_egress_policy` is the shared
+    gate) - anything that writes a *durable copy* of a source workspace's data
+    into a different workspace.
+
+    Deliberately its own type rather than a `MaterializedViewError`: the
+    condition has nothing to do with the view being well-formed, and CTAS -
+    which has no materialized view anywhere in it - needs to raise the same
+    thing.
+
+    Not `Alertable`. A blocked copy is the setting working, not the platform
+    breaking. The trigger-firing path alerts on it separately, because there a
+    blocked refresh also means a view is going stale."""
 
 
 class ManifestReadError(Alertable, CatalogError):

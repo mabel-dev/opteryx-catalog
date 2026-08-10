@@ -63,13 +63,13 @@ def _emitted(capsys):
 
 def test_get_returns_whole_document():
     catalog, _ = _catalog(
-        {"owner": "alice", "billing-account-id": "acct-1", "delete_protection": True}
+        {"owner": "alice", "billing-account-id": "acct-1", "deletion_protection": True}
     )
 
     assert catalog.get_workspace_properties() == {
         "owner": "alice",
         "billing-account-id": "acct-1",
-        "delete_protection": True,
+        "deletion_protection": True,
     }
 
 
@@ -93,10 +93,10 @@ def test_set_merges_rather_than_replaces(capsys):
     """Setting one property must not blank the others by omission."""
     catalog, props_ref = _catalog({"owner": "alice", "billing-account-id": "acct-1"})
 
-    catalog.set_workspace_properties({"delete_protection": False}, author="alice")
+    catalog.set_workspace_properties({"deletion_protection": False}, author="alice")
 
     assert props_ref.written_merge is True
-    assert props_ref.written["delete_protection"] is False
+    assert props_ref.written["deletion_protection"] is False
     assert "owner" not in props_ref.written  # untouched, not rewritten
     assert catalog.get_workspace_properties()["owner"] == "alice"
 
@@ -104,17 +104,17 @@ def test_set_merges_rather_than_replaces(capsys):
 def test_set_stamps_timestamp(capsys):
     catalog, props_ref = _catalog({})
 
-    catalog.set_workspace_properties({"delete_protection": True}, author="alice")
+    catalog.set_workspace_properties({"deletion_protection": True}, author="alice")
 
     assert isinstance(props_ref.written["timestamp-ms"], int)
 
 
 def test_set_explicit_none_removes_a_property(capsys):
-    catalog, props_ref = _catalog({"delete_protection": True})
+    catalog, props_ref = _catalog({"deletion_protection": True})
 
-    catalog.set_workspace_properties({"delete_protection": None}, author="alice")
+    catalog.set_workspace_properties({"deletion_protection": None}, author="alice")
 
-    assert props_ref.written["delete_protection"] is None
+    assert props_ref.written["deletion_protection"] is None
 
 
 def test_set_rejects_empty_mapping():
@@ -145,7 +145,7 @@ def test_set_rejects_reserved_field_alongside_a_valid_one():
 
     with pytest.raises(ValueError, match="reserved workspace lifecycle field"):
         catalog.set_workspace_properties(
-            {"delete_protection": True, "locked-by": None}, author="alice"
+            {"deletion_protection": True, "locked-by": None}, author="alice"
         )
 
     assert props_ref.written is None
@@ -154,20 +154,20 @@ def test_set_rejects_reserved_field_alongside_a_valid_one():
 def test_set_emits_audit_record(capsys):
     catalog, _ = _catalog({})
 
-    catalog.set_workspace_properties({"delete_protection": False}, author="alice")
+    catalog.set_workspace_properties({"deletion_protection": False}, author="alice")
 
     record = _emitted(capsys)[0]
     assert record["action"] == "set_workspace_properties"
     assert record["resource_type"] == "workspace"
     assert record["workspace"] == "ws"
     assert record["author"] == "alice"
-    assert record["detail"]["properties"] == ["delete_protection"]
+    assert record["detail"]["properties"] == ["deletion_protection"]
 
 
 def test_set_unauthenticated_records_no_author(capsys):
     """No author means no author - not an invented one."""
     catalog, _ = _catalog({})
 
-    catalog.set_workspace_properties({"delete_protection": False})
+    catalog.set_workspace_properties({"deletion_protection": False})
 
     assert _emitted(capsys)[0]["author"] is None

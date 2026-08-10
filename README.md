@@ -309,14 +309,85 @@ Behavior worth knowing:
   fired it, with policies re-read at fire time. A committer without rights on
   the view gets a denied refresh — recorded in `last-refresh-status`, never
   silent.
-- **Cycles are rejected at registration**; a materialized view reading another
-  materialized view is fine and refreshes by construction.
+- **Materialized views do not stack.** A view's sources must all be plain
+  datasets: registration is rejected if a source is itself a materialized view,
+  and equally if the dataset being registered is one some other view already
+  reads. Stacking would leave the outer view permanently a refresh behind the
+  inner one, and a failed inner refresh would silently pin everything above it.
+- **Cycles are rejected at registration** too — the transitive walk over
+  `source-tables` is the backstop behind the no-stacking rule, for registrations
+  that predate it or documents edited out of band.
 - `drop_materialized_view` removes the triggers from every source before
   dropping the dataset; `drop_dataset` on a materialized view does the same
   cleanup, so a raw drop cannot strand triggers.
 - Datasets carrying triggers, and materialized views themselves, **cannot be
   renamed** — trigger documents and source lists reference names. Drop and
   recreate instead.
+
+#### The egress lock (`egress_protection`)
+
+A workspace property that refuses **automated copies of that workspace's
+datasets into a different workspace** — materialized-view refreshes, CTAS, and
+`INSERT ... SELECT`. Enforced in the catalog and, since the engine wiring
+landed, at bind time in opteryx-core before anything is written.
+
+**On by default.** A workspace is restricted from birth: absent, null, and a
+workspace with no `$properties` document at all all read as restricted, and only
+an explicit `OFF` clears it. Sharing a workspace's data out is a decision
+someone makes, not a state a workspace drifts into. It is an ordinary settable
+property, not a reserved lifecycle field:
+
+```sql
+ALTER WORKSPACE ichnos SET egress_protection TO OFF;  -- opt out
+ALTER WORKSPACE ichnos SET egress_protection TO ON;   -- opt back in
+```
+
+`deletion_protection` shares the same tri-state, default-on semantics
+(`_guard_is_on`): a workspace is protected from birth, and deleting one is a
+deliberate two-step — turn the flag off, then delete. For both guards only an
+explicit falsey value clears them, so a hand-written `"OFF"` string keeps the
+guard on rather than silently clearing it. Fail-closed is the right way for a
+default-on flag to be wrong.
+
+```python
+catalog.is_egress_restricted()  # this workspace
+catalog.is_egress_restricted("ichnos")  # any workspace in the database
+catalog.enforce_egress_policy(  # the shared gate; raises EgressRestricted
+    source_workspaces=["ichnos"],
+    destination_workspace="sales",
+    operation="create table sales.mart.copy",
+)
+```
+
+The **source** workspace's flag decides, never the destination's — the property
+protects data *leaving*. A copy that stays inside the source workspace is not
+egress and is unaffected whatever the flag says, which is what makes a default-on
+setting liveable: the ordinary same-workspace view or CTAS never touches it.
+
+It is checked at both materialized-view creation and every refresh, because a
+workspace can be restricted long after a view that reads it was registered, and
+each refresh writes a fresh copy. A refresh blocked this way surfaces like any
+other fire failure: alert, audit record, `last-fired-status: egress-blocked`, and
+the commit that fired it is untouched.
+
+**What it is not: containment.** Anyone with `reader` can still `SELECT` the
+data and paste it wherever they like, and nothing here prevents that — it is
+leaky by construction, in the way a VPC Service Controls perimeter is an egress
+boundary rather than a permission. What it stops is the *systematic, automated,
+recurring* copy: the standing view or CTAS that keeps a full mirror of someone
+else's data fresh forever off the back of one read grant. Do not describe it,
+or rely on it, as anything stronger.
+
+**Where this stands relative to the feature it guards.** Cross-workspace MV
+sources are not representable yet — `_relative_identifier` collapses a foreign
+prefix into a relative name, and opteryx-core's `register_materialized_view`
+rejects one outright — but they are planned, and this is the guard waiting for
+them. That ordering is the point: because the flag defaults to ON, the day a view
+can read another workspace it needs that workspace's owner to have said yes
+first, and there is no release in which the capability ships ahead of the
+boundary. Today the MV gate fires for a caller driving this library directly with
+a foreign-qualified source; the load-bearing caller is CTAS, in the engine, which
+is not wired up yet.
 
 Notes about behavior:
 - `create_dataset` will try to infer a default GCS location using the provided `gcs_bucket` property if `location` is omitted.

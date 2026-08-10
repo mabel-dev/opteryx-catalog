@@ -3,8 +3,8 @@
 An MV is a normal dataset document wearing `dataset-type: materialized_view`,
 its defining SQL versioned in a `statement` subcollection, and one refresh
 trigger document under EACH source dataset's `triggers` subcollection. These
-tests cover registration, trigger reconciliation, cycle rejection, and the
-cascade rules in drop/rename.
+tests cover registration, trigger reconciliation, cycle rejection, the cascade
+rules in drop/rename, and the workspace egress lock.
 """
 
 from __future__ import annotations
@@ -13,12 +13,15 @@ from unittest.mock import patch
 
 import pytest
 
+from opteryx_catalog import trigger_firing
 from opteryx_catalog.exceptions import DatasetNotFound
+from opteryx_catalog.exceptions import EgressRestricted
 from opteryx_catalog.exceptions import MaterializedViewError
 from opteryx_catalog.exceptions import TriggerNotFound
 from opteryx_catalog.opteryx_catalog import MATERIALIZED_VIEW_TYPE
 from opteryx_catalog.opteryx_catalog import TRIGGERS_SUBCOLLECTION
 from opteryx_catalog.opteryx_catalog import OpteryxCatalog
+from opteryx_catalog.trigger_firing import fire_triggers
 
 
 class _Doc:
@@ -45,8 +48,8 @@ class _DocRef:
     def get(self):
         return _Doc(self.id, self._data, self._exists)
 
-    def set(self, data):
-        self._data = dict(data)
+    def set(self, data, merge=False):
+        self._data = {**self._data, **data} if merge else dict(data)
         self._exists = True
 
     def update(self, data):
@@ -79,6 +82,20 @@ class _Collection:
         return [ref.get() for ref in self._docs.values() if ref._exists]
 
 
+class _FirestoreClient:
+    """A stand-in for the Firestore client, whose root collections are the
+    workspaces - which is what lets a handle bound to one workspace read
+    another's `$properties` (the egress lock lives there)."""
+
+    def __init__(self):
+        self._collections = {}
+
+    def collection(self, name):
+        if name not in self._collections:
+            self._collections[name] = _Collection()
+        return self._collections[name]
+
+
 def _catalog():
     catalog = object.__new__(OpteryxCatalog)
     catalog.workspace = "ws"
@@ -97,7 +114,25 @@ def _catalog():
     )
     tombstones = _Collection()
     catalog._tombstones_collection = lambda: tombstones
+    catalog.firestore_client = _FirestoreClient()
+    catalog._catalog_ref = catalog.firestore_client.collection("ws")
     return catalog
+
+
+def _set_egress_restriction(catalog, workspace, restricted):
+    """Set `workspace`'s egress lock explicitly, in either direction.
+
+    Written straight to `$properties`: `set_workspace_properties` only ever
+    writes the workspace its handle is bound to, so this is what a handle bound
+    to `workspace` - an operator's `ALTER WORKSPACE <workspace> SET
+    egress_protection TO ON/OFF` - would have left behind.
+
+    Needed mostly for the OFF direction. The lock is on by default, so a test
+    that wants it on generally has to do nothing at all.
+    """
+    catalog.firestore_client.collection(workspace).document("$properties").set(
+        {"egress_protection": restricted}, merge=True
+    )
 
 
 def _add_dataset(catalog, identifier, **fields):
@@ -276,21 +311,94 @@ def test_update_mv_reconciles_triggers_and_bumps_sequence():
     assert statement["sequence-number"] == 2
 
 
-def test_mv_cycle_rejected():
-    """mv2 reads mv1; re-pointing mv1 at mv2 would refresh forever."""
+def test_mv_cannot_read_another_mv():
+    """Policy: a view's sources are plain datasets. No stacking, upward."""
     catalog = _catalog()
     _add_dataset(catalog, "src.a")
     _register_mv(catalog, "mart.mv1", sources=("src.a",))
-    _register_mv(catalog, "mart.mv2", sources=("mart.mv1",))
+    _add_dataset(catalog, "mart.mv2")
 
-    with pytest.raises(MaterializedViewError):
+    with pytest.raises(MaterializedViewError, match="cannot read another materialized view"):
         catalog.create_materialized_view(
-            "mart.mv1",
-            "SELECT * FROM mart.mv2",
-            ["mart.mv2"],
-            author="alice",
-            update_if_exists=True,
+            "mart.mv2", "SELECT * FROM mart.mv1", ["mart.mv1"], author="alice"
         )
+    # Rejected before anything was written: no trigger landed on mv1.
+    assert catalog.list_triggers("mart.mv1") == []
+    assert catalog._dataset_doc_ref("mart", "mv2").get().to_dict().get("dataset-type") is None
+
+
+def test_mv_cannot_read_another_mv_via_workspace_qualified_name():
+    """The same rejection, with the engine's fully-qualified source name."""
+    catalog = _catalog()
+    _add_dataset(catalog, "src.a")
+    _register_mv(catalog, "mart.mv1", sources=("src.a",))
+    _add_dataset(catalog, "mart.mv2")
+
+    with pytest.raises(MaterializedViewError, match="cannot read another materialized view"):
+        catalog.create_materialized_view(
+            "mart.mv2", "SELECT * FROM mart.mv1", ["ws.mart.mv1"], author="alice"
+        )
+
+
+def test_cannot_register_an_mv_over_a_dataset_a_view_reads():
+    """The same policy from the other end: src.a already feeds mv1, so turning
+    src.a into a view would stack mv1 on top of it after the fact."""
+    catalog = _catalog()
+    _add_dataset(catalog, "src.a")
+    _add_dataset(catalog, "src.b")
+    _register_mv(catalog, "mart.mv1", sources=("src.a",))
+
+    with pytest.raises(MaterializedViewError, match="it is a source of materialized view mart.mv1"):
+        catalog.create_materialized_view("src.a", "SELECT * FROM src.b", ["src.b"], author="alice")
+    # src.b picked up no trigger from the rejected registration.
+    assert catalog.list_triggers("src.b") == []
+
+
+def test_re_registering_an_mv_is_unaffected_by_its_own_triggers():
+    """An MV's refresh triggers live on its sources, never on itself, so the
+    no-stacking check must not trip on a plain CoRTAS re-registration."""
+    catalog = _catalog()
+    _add_dataset(catalog, "src.a")
+    _add_dataset(catalog, "src.b")
+    _register_mv(catalog, "mart.mv1", sources=("src.a",))
+
+    catalog.create_materialized_view(
+        "mart.mv1",
+        "SELECT * FROM src.b",
+        ["src.b"],
+        author="alice",
+        update_if_exists=True,
+    )
+    assert catalog.get_materialized_view("mart.mv1")["source-tables"] == ["src.b"]
+
+
+def test_mv_cycle_rejected():
+    """The backstop behind the no-stacking policy.
+
+    A stacked graph cannot be built through `create_materialized_view` any more,
+    so the transitive walk is driven directly against documents seeded the way a
+    pre-policy catalog (or an out-of-band edit) would leave them: mv2 reads mv3,
+    mv3 reads mv1, so pointing mv1 at mv2 closes the loop.
+    """
+    catalog = _catalog()
+    _add_dataset(catalog, "src.a")
+    _add_dataset(
+        catalog,
+        "mart.mv2",
+        **{"dataset-type": MATERIALIZED_VIEW_TYPE, "source-tables": ["mart.mv3"]},
+    )
+    _add_dataset(
+        catalog,
+        "mart.mv3",
+        **{"dataset-type": MATERIALIZED_VIEW_TYPE, "source-tables": ["mart.mv1"]},
+    )
+
+    with pytest.raises(MaterializedViewError, match="cycle"):
+        catalog._assert_no_materialized_view_cycle("mart.mv1", ["mart.mv2"])
+
+    # A chain that never reaches back is fine.
+    catalog._dataset_doc_ref("mart", "mv3").update({"source-tables": ["src.a"]})
+    catalog._assert_no_materialized_view_cycle("mart.mv1", ["mart.mv2"])
 
 
 def test_get_and_list_materialized_views():
@@ -406,3 +514,158 @@ def test_rename_rejects_mv_and_triggered_datasets():
         catalog.rename_dataset("mart.daily", "mart.renamed", author="alice")
     with pytest.raises(MaterializedViewError):
         catalog.rename_dataset("src.a", "src.renamed", author="alice")
+
+
+# --- egress lock --------------------------------------------------------
+#
+# `egress_protection` on a workspace refuses automated copies of its datasets
+# INTO ANOTHER workspace, and is ON unless explicitly turned off. Cross-workspace
+# MV sources are not representable yet, so these tests pin the gate itself, the
+# name disambiguation it rests on, and the creation- and fire-time behaviour a
+# cross-workspace source will meet when they are.
+
+
+def test_egress_protection_is_an_ordinary_settable_property():
+    """Not a reserved lifecycle field - it goes through the same
+    ALTER WORKSPACE ... SET path as deletion_protection, in both directions."""
+    catalog = _catalog()
+    assert catalog.is_egress_restricted() is True  # on from birth
+
+    catalog.set_workspace_properties({"egress_protection": False}, author="alice")
+    assert catalog.is_egress_restricted() is False
+
+    catalog.set_workspace_properties({"egress_protection": True}, author="alice")
+    assert catalog.is_egress_restricted() is True
+
+
+@pytest.mark.parametrize(
+    "props", [None, {}, {"egress_protection": None}], ids=["no-document", "absent", "null"]
+)
+def test_egress_is_restricted_from_birth(props):
+    """No properties document, no property, or an explicit null: every state
+    that means "nobody has decided" resolves to restricted. Sharing a
+    workspace's data out is opted into, never defaulted into."""
+    catalog = _catalog()
+    if props is not None:
+        catalog.firestore_client.collection("ichnos").document("$properties").set(dict(props))
+
+    assert catalog.is_egress_restricted("ichnos") is True
+
+
+def test_egress_lock_does_not_restrict_copies_within_the_workspace():
+    """The flag protects data *leaving*. A view materializing its own
+    workspace's data back into that workspace is not egress, so the lock -
+    on by default, and never explicitly cleared here - says nothing about it.
+    This is what keeps a default-on flag liveable."""
+    catalog = _catalog()
+    _add_dataset(catalog, "src.a")
+
+    _register_mv(catalog, "mart.daily", sources=("src.a",))
+
+    assert catalog.get_materialized_view("mart.daily")["source-tables"] == ["src.a"]
+
+
+def test_egress_lock_blocks_creation_reading_another_workspace():
+    """Nothing is set on `ichnos` at all - the default is what refuses."""
+    catalog = _catalog()
+    _add_dataset(catalog, "mart.copy")
+
+    with pytest.raises(
+        EgressRestricted, match="ALTER WORKSPACE ichnos SET egress_protection TO OFF"
+    ):
+        catalog.create_materialized_view(
+            "mart.copy",
+            "SELECT * FROM ichnos.landing.orders",
+            ["ichnos.landing.orders"],
+            author="alice",
+        )
+
+    # Refused before anything was written: still a plain dataset.
+    assert catalog._dataset_doc_ref("mart", "copy").get().to_dict().get("dataset-type") is None
+
+
+def test_with_the_lock_cleared_a_cross_workspace_source_passes_the_egress_gate():
+    """`ichnos` has opted out, so the gate allows and ordinary source validation
+    decides. It says not-found, because a cross-workspace source is not
+    representable yet - which is the state the guard is waiting on, not a
+    reason it is inert."""
+    catalog = _catalog()
+    _add_dataset(catalog, "mart.copy")
+    _set_egress_restriction(catalog, "ichnos", False)
+
+    with pytest.raises(DatasetNotFound):
+        catalog.create_materialized_view(
+            "mart.copy",
+            "SELECT * FROM ichnos.landing.orders",
+            ["ichnos.landing.orders"],
+            author="alice",
+        )
+
+
+def test_local_collection_sharing_a_workspace_name_is_not_egress():
+    """`ichnos.landing.orders` is ambiguous - collection `ichnos` here, or
+    workspace `ichnos` over there. A dataset that resolves locally wins, so a
+    restriction on a same-named workspace cannot block a purely local view.
+
+    This is the false-positive the default-on flag would otherwise create
+    everywhere: with every workspace restricted from birth, resolving the
+    ambiguity the other way would refuse ordinary local views."""
+    catalog = _catalog()
+    _add_dataset(catalog, "ichnos.landing.orders")
+    _add_dataset(catalog, "mart.copy")
+
+    catalog.create_materialized_view(
+        "mart.copy",
+        "SELECT * FROM ichnos.landing.orders",
+        ["ichnos.landing.orders"],
+        author="alice",
+    )
+
+    assert catalog.get_materialized_view("mart.copy")["source-tables"] == ["ichnos.landing.orders"]
+
+
+def test_egress_lock_turned_on_after_registration_blocks_refresh():
+    """The lock arrives after the view does - the case creation-time checking
+    cannot cover, and the whole reason the gate runs at fire time too.
+
+    `ichnos` starts opted out, so the view refreshes; then it opts back in and
+    the next refresh is refused. The source list is edited onto the document
+    rather than registered because a cross-workspace source is not
+    representable yet (see the section note) - the fire-time contract is what
+    is being pinned: blocked before the job document exists, surfaced as an
+    alert and a trigger status, never raised into the commit.
+    """
+    catalog = _catalog()
+    _add_dataset(catalog, "src.a")
+    _register_mv(catalog, "mart.daily", sources=("src.a",))
+    catalog._dataset_doc_ref("mart", "daily").update({"source-tables": ["ichnos.landing.orders"]})
+    _set_egress_restriction(catalog, "ichnos", False)
+
+    with (
+        patch.object(trigger_firing, "_jobs_client"),
+        patch.object(trigger_firing, "_enqueue_refresh_task", return_value="enqueued") as enqueue,
+        patch.object(trigger_firing, "_policies_for", return_value=None),
+    ):
+        fire_triggers(catalog, "src.a", author="alice")
+
+    assert enqueue.call_count == 1
+    assert catalog.list_triggers("src.a")[0]["last-fired-status"] == "enqueued"
+
+    # ichnos changes its mind.
+    _set_egress_restriction(catalog, "ichnos", True)
+
+    with (
+        patch.object(trigger_firing, "_alert") as alert,
+        patch.object(trigger_firing, "write_audit_record") as audit,
+        patch.object(trigger_firing, "_jobs_client") as jobs_client,
+        patch.object(trigger_firing, "_enqueue_refresh_task") as enqueue,
+    ):
+        fire_triggers(catalog, "src.a", author="alice")  # must not raise
+
+    jobs_client.assert_not_called()
+    enqueue.assert_not_called()
+    assert isinstance(alert.call_args.args[0], EgressRestricted)
+    assert audit.call_args.args[0]["event"] == "trigger.fire_failed"
+
+    (trigger,) = catalog.list_triggers("src.a")
+    assert trigger["last-fired-status"] == "egress-blocked"

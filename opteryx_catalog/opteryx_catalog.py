@@ -24,13 +24,14 @@ from .exceptions import CollectionNotFound
 from .exceptions import DatasetAlreadyExists
 from .exceptions import DatasetLocked
 from .exceptions import DatasetNotFound
+from .exceptions import EgressRestricted
 from .exceptions import MaterializedViewError
 from .exceptions import SnapshotMissingError
 from .exceptions import TriggerNotFound
 from .exceptions import ViewAlreadyExists
 from .exceptions import ViewNotFound
 from .exceptions import WorkspaceDeleted
-from .exceptions import WorkspaceDeleteProtected
+from .exceptions import WorkspaceDeletionProtected
 from .exceptions import WorkspaceNotFound
 from .iops.base import FileIO
 from .resource_types import ResourceType
@@ -76,6 +77,39 @@ MV_REFRESH_TRIGGER_KIND = "materialized_view_refresh"
 # Value of a dataset document's `dataset-type` field marking it as the backing
 # table of a materialized view. Plain datasets have no `dataset-type` field.
 MATERIALIZED_VIEW_TYPE = "materialized_view"
+
+# Workspace `$properties` flag: when on, this workspace's datasets may not be
+# copied into a *different* workspace by an automated, repeating copy
+# (materialized view refresh, CTAS). See `OpteryxCatalog.enforce_egress_policy`
+# for what that does and does not stop.
+EGRESS_PROTECTION_PROPERTY = "egress_protection"
+
+# Workspace `$properties` flag: when on, the workspace itself cannot be deleted.
+DELETION_PROTECTION_PROPERTY = "deletion_protection"
+
+
+def _guard_is_on(properties: dict, name: str) -> bool:
+    """Read a workspace guard flag, which is ON unless explicitly turned off.
+
+    Both guards (`deletion_protection`, `egress_protection`) are tri-state and
+    default to protecting: unset means ON, and so does a workspace with no
+    `$properties` document at all. A workspace is born protected and stays that
+    way until someone deliberately writes the flag off - the states that mean
+    "nobody has decided yet" resolve to the safe answer, not the permissive one.
+
+    Only an explicit falsey value turns a guard off. That is what the engine
+    writes for `... TO OFF` / `TO FALSE` (`_parse_boolean_workspace_property`
+    stores a real bool), and it means an unrecognised value left by hand -
+    the string "OFF", say - keeps the guard on rather than silently clearing
+    it. Fail-closed is the right way for a default-on flag to be wrong.
+
+    `None` reads as unset, matching `set_workspace_properties`, where writing
+    None is how a property is removed.
+    """
+    value = properties.get(name)
+    if value is None:
+        return True
+    return bool(value)
 
 
 def _core_type_to_stored(column_type: Any) -> tuple:
@@ -807,7 +841,7 @@ class OpteryxCatalog(Metastore):
         Raises `DatasetLocked` if the dataset's `locked-by` field is set -
         the two-person deniability lock takes precedence over the drop.
 
-        The workspace's `delete_protection` does NOT apply here: it protects the
+        The workspace's `deletion_protection` does NOT apply here: it protects the
         workspace from being deleted, not the assets inside it. Per-asset
         protection is `locked-by`.
 
@@ -1169,14 +1203,14 @@ class OpteryxCatalog(Metastore):
         `$dropped-workspaces` collection so the sweep can find this workspace
         without enumerating every workspace name blindly.
 
-        Raises `WorkspaceDeleteProtected` if the workspace is delete-protected.
+        Raises `WorkspaceDeletionProtected` if the workspace is deletion-protected.
         This is the only operation that flag guards - it protects the workspace
         from deletion, not the assets inside it.
         """
         if author is None:
             raise ValueError("author must be provided when soft-deleting a workspace")
 
-        self._assert_not_delete_protected()
+        self._assert_not_deletion_protected()
 
         now_ms = int(time.time() * 1000)
         self._catalog_ref.document("$properties").update(
@@ -1293,10 +1327,16 @@ class OpteryxCatalog(Metastore):
             author=author,
         )
 
-    def _assert_not_delete_protected(self) -> None:
-        """Refuse deletion of this workspace while it is delete-protected.
+    def _assert_not_deletion_protected(self) -> None:
+        """Refuse deletion of this workspace while it is deletion-protected.
 
-        Scope is the workspace itself and nothing else: `delete_protection`
+        **On by default** (see `_guard_is_on`): a workspace is protected from
+        birth, and deleting one is a deliberate two-step - turn the flag off,
+        then delete. Losing a whole workspace is not something an operator
+        should be able to do in a single statement they half-meant, and the
+        cost of the default being wrong is one extra statement.
+
+        Scope is the workspace itself and nothing else: `deletion_protection`
         does not guard the datasets, collections or views inside it. Per-asset
         protection is the `locked-by` two-person lock, which is a separate
         mechanism with separate semantics.
@@ -1309,11 +1349,12 @@ class OpteryxCatalog(Metastore):
         A Firestore read error propagates rather than being swallowed into
         "not protected".
         """
-        if self.get_workspace_properties().get("delete_protection"):
-            raise WorkspaceDeleteProtected(
-                f"Cannot delete workspace '{self.workspace}': it is delete-protected. "
+        if _guard_is_on(self.get_workspace_properties(), DELETION_PROTECTION_PROPERTY):
+            raise WorkspaceDeletionProtected(
+                f"Cannot delete workspace '{self.workspace}': it is deletion-protected "
+                "(workspaces are protected unless the flag is explicitly turned off). "
                 f"Clear it with ALTER WORKSPACE {self.workspace} "
-                "SET delete_protection TO OFF."
+                f"SET {DELETION_PROTECTION_PROPERTY} TO OFF."
             )
 
     def get_workspace_properties(self) -> dict:
@@ -1334,6 +1375,111 @@ class OpteryxCatalog(Metastore):
         if not doc.exists:
             return {}
         return doc.to_dict() or {}
+
+    # ------------------------------------------------------------------
+    # Egress lock
+    # ------------------------------------------------------------------
+
+    def _foreign_properties_ref(self, workspace: str):
+        """The `$properties` document of any workspace in this database.
+
+        Workspaces are sibling root collections of one Firestore database
+        (`self._catalog_ref` is `client.collection(self.workspace)`), so a
+        handle bound to one workspace can read another's properties without
+        constructing a second catalog - which would re-run the constructor's
+        existence and soft-delete gates and raise for exactly the workspaces
+        an egress check most wants an answer about.
+        """
+        if workspace == self.workspace:
+            return self._catalog_ref.document("$properties")
+        return self.firestore_client.collection(workspace).document("$properties")
+
+    def is_egress_restricted(self, workspace: str | None = None) -> bool:
+        """Whether `workspace` (default: this one) restricts egress.
+
+        **On by default** (see `_guard_is_on`): unset reads as restricted, and
+        so does a workspace with no `$properties` document at all. Sharing a
+        workspace's data out is opt-in, not opt-out - the whole point is that
+        `reader` should not silently carry the right to mirror the data
+        somewhere else, and a default of "unrestricted until someone notices"
+        would leave every workspace nobody has thought about wide open.
+
+        A name matching no workspace reads as restricted too. That is
+        fail-closed on a typo - and the only cost is a clear refusal on a copy
+        that had no valid source to read anyway.
+
+        Read fresh every time, for the same reason `_assert_not_deletion_protected`
+        does: a cached answer would let a long-lived catalog handle keep copying
+        after the lock went on.
+        """
+        workspace = workspace or self.workspace
+        doc = self._foreign_properties_ref(workspace).get()
+        if not doc.exists:
+            return True
+        return _guard_is_on(doc.to_dict() or {}, EGRESS_PROTECTION_PROPERTY)
+
+    def enforce_egress_policy(
+        self,
+        source_workspaces: Iterable[str],
+        destination_workspace: str,
+        operation: str,
+    ) -> None:
+        """Refuse a copy that would land a source workspace's data elsewhere.
+
+        The shared gate behind every automated copy path: materialized-view
+        creation and refresh here, CTAS in the engine. Callers that already
+        know each source's workspace (the engine parses fully-qualified names)
+        pass them directly; the MV paths in this class go through
+        `enforce_materialized_view_egress`, which resolves them first.
+
+        `enforce_` rather than this class's usual `_assert_` because these two
+        are public and called across a duck-typed catalog boundary (the firing
+        path, the engine): `unittest.mock` refuses any attribute starting with
+        `assert`, so an `assert_`-named method is unusable on a stubbed catalog.
+
+        The **source** workspace's flag decides, not the destination's: the
+        property protects data leaving. A copy that stays inside the source
+        workspace is not egress and is always allowed, whatever the flag says -
+        which is what keeps the default-on posture liveable, since the ordinary
+        same-workspace view or CTAS never touches this at all.
+
+        Because the flag defaults to ON, a cross-workspace copy is refused
+        until the *source* workspace's owner opts out. Sharing out is a
+        decision someone makes, not a state a workspace drifts into.
+
+        What this is NOT: containment. Anyone with read on the source can
+        SELECT it and paste the rows anywhere they like, and this does nothing
+        about that - it is leaky by construction, the same way a VPC Service
+        Controls perimeter is an egress boundary rather than a permission. What
+        it stops is the systematic, automated, recurring copy: the standing MV
+        or CTAS that keeps a full mirror of someone else's data fresh forever
+        off the back of a single `reader` grant. That is where the real leakage
+        volume is, and it is the part a read grant is never understood to
+        include.
+
+        Args:
+            source_workspaces: workspace of each table the copy reads.
+            destination_workspace: workspace the copy writes into.
+            operation: what is being attempted, for the error message - e.g.
+                "create materialized view mart.daily".
+
+        Raises:
+            EgressRestricted: if any source workspace differs from the
+                destination and has `egress_protection` set.
+        """
+        checked: set[str] = set()
+        for source_workspace in source_workspaces:
+            if source_workspace == destination_workspace or source_workspace in checked:
+                continue
+            checked.add(source_workspace)
+            if self.is_egress_restricted(source_workspace):
+                raise EgressRestricted(
+                    f"Cannot {operation}: it would copy data out of workspace "
+                    f"'{source_workspace}' into '{destination_workspace}', and "
+                    f"'{source_workspace}' restricts egress. Clear it with "
+                    f"ALTER WORKSPACE {source_workspace} SET "
+                    f"{EGRESS_PROTECTION_PROPERTY} TO OFF."
+                )
 
     # Fields on `$properties` that only their own dedicated methods may write.
     # Each one gates real control flow - `deleted-at-ms` makes the constructor
@@ -1496,7 +1642,7 @@ class OpteryxCatalog(Metastore):
         individually, but no longer reachable through `list_collections()`).
         Raises `CollectionLocked` if the collection's `locked-by` field is
         set - the two-person deniability lock takes precedence over the drop.
-        The workspace's `delete_protection` does not apply; it protects the
+        The workspace's `deletion_protection` does not apply; it protects the
         workspace itself, not the assets inside it.
 
         An author is required, as it is to create one.
@@ -1721,7 +1867,7 @@ class OpteryxCatalog(Metastore):
         No tombstone: a view owns no storage, so dropping it leaves nothing to
         reclaim - unlike `drop_dataset`.
 
-        The workspace's `delete_protection` does not apply; it protects the
+        The workspace's `deletion_protection` does not apply; it protects the
         workspace itself, not the assets inside it.
 
         An author is required, as it is to create one - see `drop_dataset` for
@@ -1816,6 +1962,74 @@ class OpteryxCatalog(Metastore):
         if len(parts) >= 2:
             return table
         raise MaterializedViewError(f"source table must be at least 'collection.dataset': {table}")
+
+    def _source_workspace(self, table: str) -> str:
+        """Which workspace a source-table name actually refers to.
+
+        The counterpart to `_relative_identifier`, and it exists because that
+        method's rule is lossy: `a.b.c` from workspace `ws` is returned
+        unchanged, whether `a` is a collection here holding a dataset called
+        `b.c` or the name of another workspace entirely. `_relative_identifier`
+        can afford the ambiguity - guessing wrong just means the source lookup
+        misses and `DatasetNotFound` says so - but an egress decision cannot,
+        because guessing wrong the other way blocks a legitimate copy.
+
+        So the local reading wins: a name that resolves to a dataset in THIS
+        workspace is this workspace's, full stop. Only a 3+-part name whose
+        leading segment is not this workspace AND which resolves to nothing
+        locally is read as cross-workspace.
+
+        The local-dataset probe is the only Firestore read, and only for names
+        that could be cross-workspace at all; the ordinary relative source
+        (`collection.dataset`) returns without touching Firestore.
+
+        When cross-workspace MV sources land, `_relative_identifier` has to
+        stop collapsing a foreign prefix into a relative name, and the pair
+        should be revisited together: once a source can carry its workspace
+        explicitly, resolution stops being a guess and this probe becomes a
+        compatibility path for names stored under the old rule. Until then the
+        probe is what keeps the guard from misfiring on a collection that
+        happens to share a workspace's name.
+        """
+        parts = table.split(".")
+        if len(parts) < 3 or parts[0] == self.workspace:
+            return self.workspace
+        collection, dataset_name = table.split(".", 1)
+        if self._dataset_doc_ref(collection, dataset_name).get().exists:
+            return self.workspace
+        return parts[0]
+
+    def enforce_materialized_view_egress(
+        self, identifier: str, source_tables: Iterable[str], operation: str = "refresh"
+    ) -> None:
+        """Egress gate for a materialized view, at creation and at refresh.
+
+        Resolves each source's workspace and hands the answer to
+        `enforce_egress_policy`. The destination is always this catalog's
+        workspace: an MV materializes into its own workspace.
+
+        Checked at BOTH ends of the view's life because the lock and the view
+        move independently - a workspace can be locked long after a view that
+        reads it was registered, and each refresh is a fresh copy that the lock
+        has to be able to stop.
+
+        Where this stands relative to the feature it guards: cross-workspace MV
+        sources are not representable yet - `_relative_identifier` collapses a
+        foreign prefix into a relative name, and the engine's
+        `register_materialized_view` rejects one outright - but they are coming,
+        and this is the guard waiting for them. Building it first is the point:
+        the flag defaults to ON, so the day a view can read another workspace,
+        it needs that workspace's owner to have said yes, and there is no
+        window in which the feature ships ahead of the boundary. Until then it
+        fires for a caller driving this library directly with a
+        foreign-qualified source, and CTAS (in the engine) is the path where
+        `enforce_egress_policy` is load-bearing today.
+        """
+        self.enforce_egress_policy(
+            (self._source_workspace(source) for source in source_tables),
+            self.workspace,
+            f"{operation} materialized view {identifier}",
+        )
 
     def create_trigger(
         self,
@@ -1931,12 +2145,63 @@ class OpteryxCatalog(Metastore):
         """The auto-generated name of an MV's refresh trigger on a source."""
         return f"refresh__{collection}__{dataset_name}"
 
+    def _assert_no_stacked_materialized_view(
+        self, identifier: str, source_tables: list[str]
+    ) -> None:
+        """Reject an MV that would sit on top of, or underneath, another MV.
+
+        Policy: a materialized view reads plain datasets only. Stacking them
+        makes staleness unreasonable - the outer view refreshes off the inner
+        view's refresh commit, so it is always at least one hop behind, and a
+        failed inner refresh silently pins everything above it. Both directions
+        are checked, because registration can create the stack from either end:
+
+        - a source that is already a materialized view (the obvious case), and
+        - registering a dataset that is already *read by* a materialized view,
+          which would turn that reader into an MV-over-MV after the fact.
+
+        The second check reads this dataset's own triggers: an MV's refresh
+        trigger lives on each of its sources, so a refresh trigger here that
+        targets some other view is exactly the evidence that a view reads it.
+        """
+        for source in source_tables:
+            coll, name = source.split(".", 1)
+            data = self._dataset_doc_ref(coll, name).get().to_dict() or {}
+            if data.get("dataset-type") == MATERIALIZED_VIEW_TYPE:
+                raise MaterializedViewError(
+                    f"a materialized view cannot read another materialized view: "
+                    f"{identifier} reads {source}"
+                )
+
+        collection, dataset_name = identifier.split(".", 1)
+        for doc in self._triggers_collection(collection, dataset_name).stream():
+            trigger = doc.to_dict() or {}
+            if trigger.get("kind") != MV_REFRESH_TRIGGER_KIND:
+                continue
+            target = trigger.get("target-view")
+            # A target too short to name a dataset is a broken trigger, not a
+            # stack; leave it to whoever fires it to complain.
+            if not target or "." not in target:
+                continue
+            target = self._relative_identifier(target)
+            if target != identifier:
+                raise MaterializedViewError(
+                    f"cannot register {identifier} as a materialized view: it is a source "
+                    f"of materialized view {target}"
+                )
+
     def _assert_no_materialized_view_cycle(self, identifier: str, source_tables: list[str]) -> None:
         """Reject a source graph that reaches back to the MV being registered.
 
-        Checked at creation rather than fire time: MV-over-MV chains are legal
-        and refresh by construction (a refresh commit is user-created and fires
-        downstream triggers), so a cycle would refresh forever.
+        With the no-stacking policy above this is unreachable through the public
+        API - an MV's sources are all plain datasets, so the walk terminates at
+        depth one. It stays as a backstop for registrations that predate the
+        policy, for documents edited outside this class, and for the racing pair
+        of registrations that could each pass the depth-one check.
+
+        Checked at creation rather than fire time: a refresh commit is
+        user-created and fires downstream triggers, so a cycle would refresh
+        forever.
         """
         stack = list(source_tables)
         seen = set()
@@ -1976,6 +2241,12 @@ class OpteryxCatalog(Metastore):
         writes a new statement version and reconciles triggers against the new
         source list.
 
+        Sources must be plain datasets: an MV may neither read another MV nor be
+        registered over a dataset some other MV already reads. See
+        `_assert_no_stacked_materialized_view`. A source in a workspace that
+        restricts egress is refused with `EgressRestricted`, at refresh time as
+        well as here.
+
         Args:
             identifier: 'collection.dataset' of the (existing) backing table.
             sql: the defining SELECT, as executable text.
@@ -2013,10 +2284,17 @@ class OpteryxCatalog(Metastore):
                 "a materialized view needs at least one catalog-resident source table "
                 "- nothing could ever fire its refresh"
             )
+        # Egress before existence: a source in an egress-locked workspace must
+        # be told it was refused, not that it was not found. (Nothing outside
+        # this workspace resolves as a source today, so in practice the
+        # not-found arm is the one a cross-workspace source reaches - see
+        # `enforce_materialized_view_egress`.)
+        self.enforce_materialized_view_egress(identifier, relative_sources, "create")
         for relative in relative_sources:
             src_coll, src_name = relative.split(".", 1)
             if not self._dataset_doc_ref(src_coll, src_name).get().exists:
                 raise DatasetNotFound(f"Source dataset not found: {relative}")
+        self._assert_no_stacked_materialized_view(identifier, relative_sources)
         self._assert_no_materialized_view_cycle(identifier, relative_sources)
 
         # Statement version, following the view convention exactly.
