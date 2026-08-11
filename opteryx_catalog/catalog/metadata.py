@@ -113,6 +113,12 @@ class DatasetMetadata:
     # that dropped it would silently return the view to running as whoever's
     # write fired it - the behaviour the pin exists to remove, failing open.
     runs_as: str | None = None
+    # Refresh suspended by an operator. On the VIEW rather than on its triggers:
+    # a view with four sources has four triggers, and suspending three of
+    # them would not suspend the view, it would refresh from a subset of its
+    # sources - silently partial data. One flag cannot be partially applied.
+    suspended_at_ms: int | None = None
+    suspended_by: str | None = None
     last_refreshed_at_ms: int | None = None
     last_refresh_status: str | None = None
     last_refresh_execution_id: str | None = None

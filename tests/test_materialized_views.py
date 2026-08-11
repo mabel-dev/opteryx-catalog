@@ -9,6 +9,7 @@ rules in drop/rename, and the workspace egress lock.
 
 from __future__ import annotations
 
+from unittest.mock import MagicMock
 from unittest.mock import patch
 
 import pytest
@@ -798,3 +799,70 @@ def test_egress_lock_turned_on_after_registration_blocks_refresh():
 
     (trigger,) = catalog.list_triggers("src.a")
     assert trigger["last-fired-status"] == "egress-blocked"
+
+
+# --- suspension ---------------------------------------------------------
+
+
+def test_a_suspended_view_does_not_refresh():
+    """SUSPEND stops the refresh without dismantling the machinery that does
+    it. The trigger still fires and still records that it did - a suspended
+    view says it is deliberately off, where a dropped trigger looked identical
+    to one that was never created or that something broke."""
+    catalog = _catalog()
+    _add_dataset(catalog, "src.a")
+    _register_mv(catalog, "mart.daily", sources=("src.a",))
+    catalog.set_materialized_view_suspended("mart.daily", True, author="admin")
+
+    with (
+        patch.object(trigger_firing, "_jobs_client") as jobs,
+        patch.object(trigger_firing, "_enqueue_refresh_task") as enq,
+        patch.object(trigger_firing, "_alert") as alert,
+    ):
+        fire_triggers(catalog, "src.a", author="alice", snapshot_id=1)
+
+    jobs.assert_not_called()
+    enq.assert_not_called()
+    alert.assert_not_called()  # suspension is the setting working, not a failure
+    assert catalog.list_triggers("src.a")[0]["last-fired-status"] == "suspended"
+
+    record = catalog.get_materialized_view("mart.daily")
+    assert record["suspended-by"] == "admin"
+    assert isinstance(record["suspended-at-ms"], int)
+
+
+def test_resume_lets_it_refresh_again():
+    catalog = _catalog()
+    _add_dataset(catalog, "src.a")
+    _register_mv(catalog, "mart.daily", sources=("src.a",))
+    catalog.set_materialized_view_suspended("mart.daily", True, author="admin")
+    catalog.set_materialized_view_suspended("mart.daily", False, author="admin")
+
+    record = catalog.get_materialized_view("mart.daily")
+    assert record["suspended-at-ms"] is None
+    assert record["suspended-by"] is None
+
+    with (
+        patch.object(trigger_firing, "_jobs_client", return_value=MagicMock()),
+        patch.object(trigger_firing, "_enqueue_refresh_task", return_value="enqueued") as enq,
+        patch.object(trigger_firing, "_policies_for", return_value=None),
+    ):
+        fire_triggers(catalog, "src.a", author="alice", snapshot_id=1)
+    enq.assert_called_once()
+
+
+def test_suspension_survives_a_commit():
+    """Same trap `runs-as` fell into: `save_dataset_metadata` replaces the whole
+    document, so a suspended view that took any commit would silently resume."""
+    catalog = _catalog()
+    _add_dataset(catalog, "src.a")
+    _register_mv(catalog, "mart.daily", sources=("src.a",))
+    catalog.set_materialized_view_suspended("mart.daily", True, author="admin")
+
+    doc = catalog._dataset_doc_ref("mart", "daily").get()
+    dataset = catalog._build_dataset("mart.daily", "mart", "daily", doc, False)
+    catalog.save_dataset_metadata("mart.daily", dataset.metadata)
+
+    record = catalog.get_materialized_view("mart.daily")
+    assert record["suspended-by"] == "admin"
+    assert isinstance(record["suspended-at-ms"], int)

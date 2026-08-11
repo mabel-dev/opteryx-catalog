@@ -355,6 +355,15 @@ def _fire_refresh(
     if not mv.get("sql"):
         raise MaterializedViewError(f"materialized view has no defining SQL: {target_view}")
 
+    # Suspended by an operator. Not an error and not alerted - a suspended refresh
+    # is the setting working, the same reasoning as a blocked egress copy. The
+    # trigger still records that it fired and why nothing came of it, so the
+    # suppression is visible where someone looks for the view's staleness rather
+    # than only in whatever they remember pausing.
+    if mv.get("suspended-at-ms"):
+        catalog.mark_trigger_fired(dataset_identifier, trigger["name"], status="suspended")
+        return
+
     # Re-checked here and not only at creation: a source workspace can take the
     # egress lock long after the view was registered, and every refresh writes
     # a fresh copy. Before the job document, so a blocked refresh leaves no
