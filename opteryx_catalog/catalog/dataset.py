@@ -353,13 +353,26 @@ class SimpleDataset(Dataset):
         """Return a Snapshot.
 
         - If `snapshot_id` is None, return the in-memory current snapshot.
-        - If a `snapshot_id` is provided, prefer a Firestore lookup via the
-          attached `catalog` (O(1) document get). Fall back to the in-memory
-          `metadata.snapshots` list only when no catalog is attached or the
-          remote lookup fails.
+        - If a `snapshot_id` is provided, answer it from whatever copy is
+          already in hand — `metadata.snapshots`, then the catalog's id-keyed
+          `_snapshot_cache` — and only read the Firestore document when neither
+          holds it, seeding the cache with what comes back.
         - If `user_only` is True (with no `snapshot_id`), return the most
           recent USER-created snapshot instead of the current one — see
           `last_user_snapshot`.
+
+        Looking before fetching is safe for exactly the reason the catalog's
+        caches exist (see the note on `_snapshot_cache` in
+        `OpteryxCatalog.__init__`): a snapshot id addresses write-once content,
+        so a copy already held IS the answer and the document read cannot
+        return anything different. Only the dataset doc's `current-*-id`
+        pointers are mutable, and those are re-read on every `get_relation()`.
+
+        This used to try Firestore first and treat memory as the failure path,
+        which cost a document read per call for a snapshot `load_dataset()` had
+        just fetched. `get_dataset_metadata()` asks for the same id twice — once
+        via `scan()`, once via `manifest_sketch_vectors()` — so planning a
+        single-table query made three document reads of one document.
         """
         if user_only:
             if snapshot_id is not None:
@@ -376,10 +389,24 @@ class SimpleDataset(Dataset):
         if snapshot_id is None:
             return self.metadata.current_snapshot()
 
+        # Already in memory: load_dataset() puts the current snapshot here, and
+        # load_history=True puts every live one here.
+        for s in self.metadata.snapshots:
+            if s.snapshot_id == snapshot_id:
+                return s
+
         # Try Firestore document lookup when catalog attached
         if self.catalog:
             try:
                 collection, dataset_name = self.identifier.split(".")
+                # The identifier split stays inside the try with the read it
+                # keys: an identifier that is not `collection.dataset` raises
+                # here, and that has always degraded to `None` rather than
+                # propagating out of a read-only lookup.
+                cache_key = (collection, dataset_name, snapshot_id)
+                cached = self.catalog._snapshot_cache.get(cache_key)
+                if cached is not None:
+                    return cached
                 doc = (
                     self.catalog._dataset_doc_ref(collection, dataset_name)
                     .collection("snapshots")
@@ -401,6 +428,10 @@ class SimpleDataset(Dataset):
                         parent_snapshot_id=sd.get("parent-snapshot-id"),
                         commit_message=sd.get("commit-message"),
                     )
+                    # Seed the id-keyed cache the same way load_dataset() does,
+                    # so a historical id fetched once is not fetched again by
+                    # the next Dataset built from this catalog.
+                    self.catalog._snapshot_cache[cache_key] = snap
                     return snap
             except Exception as exc:  # noqa: BLE001 - Firestore client boundary
                 # The google-cloud-firestore surface raises a wide, mostly
@@ -416,11 +447,10 @@ class SimpleDataset(Dataset):
                     exc,
                 )
 
-        # Fallback: search in-memory snapshots (only used when no catalog)
-        for s in self.metadata.snapshots:
-            if s.snapshot_id == snapshot_id:
-                return s
-
+        # No in-memory copy, no cached copy, and either no catalog to ask or a
+        # read that did not answer. There is nowhere left to look - the search
+        # of `metadata.snapshots` that used to sit here has moved above the
+        # remote read, so reaching this point already means it missed.
         return None
 
     def last_user_snapshot(self, lookback: int | None = None) -> Snapshot | None:

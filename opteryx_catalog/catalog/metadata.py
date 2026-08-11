@@ -108,6 +108,11 @@ class DatasetMetadata:
     # own refresh - the registration would not survive the first one.
     statement_id: str | None = None
     source_tables: list[str] = field(default_factory=list)
+    # The pinned identity a refresh executes as. Here for exactly the reason
+    # above: it is set once at registration and never rewritten, so a commit
+    # that dropped it would silently return the view to running as whoever's
+    # write fired it - the behaviour the pin exists to remove, failing open.
+    runs_as: str | None = None
     last_refreshed_at_ms: int | None = None
     last_refresh_status: str | None = None
     last_refresh_execution_id: str | None = None

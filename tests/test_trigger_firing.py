@@ -83,6 +83,52 @@ def test_task_id_sanitized():
 # --- fire_triggers flow --------------------------------------------------
 
 
+def test_a_view_with_no_owner_refuses_to_fire():
+    """A registered view with no `runs-as` is a damaged record, not a caller
+    error, and the tempting default - the committing user - is the one answer
+    guaranteed to be wrong: it silently reinstates invoker semantics, so the
+    loss resurfaces hours later as a baffling permission denial.
+
+    Nothing is enqueued, the trigger records why, and it alerts.
+    """
+    mv = dict(_catalog_stub().get_materialized_view.return_value)
+    mv.pop("runs-as")
+    catalog = _catalog_stub(triggers=[_refresh_trigger()], mv=mv)
+    jobs_collection = MagicMock()
+    jobs_client = MagicMock()
+    jobs_client.collection.return_value = jobs_collection
+
+    with (
+        patch.object(trigger_firing, "_alert") as alert,
+        patch.object(trigger_firing, "_jobs_client", return_value=jobs_client),
+        patch.object(trigger_firing, "_enqueue_refresh_task") as enq,
+        patch.object(trigger_firing, "_policies_for", return_value=None),
+    ):
+        # Never raises into the commit path, whatever it finds.
+        fire_triggers(catalog, "src.a", author="alice", snapshot_id=123)
+
+    jobs_collection.document.return_value.set.assert_not_called()
+    enq.assert_not_called()
+    alert.assert_called_once()
+    catalog.mark_trigger_fired.assert_called_once_with(
+        "src.a", "refresh__mart__daily", status="owner-missing"
+    )
+
+
+def test_the_missing_owner_error_is_alertable():
+    """It means the platform is broken, so a human has to be told - unlike a
+    caller error, which must never file a ticket."""
+    from opteryx_catalog.exceptions import Alertable
+    from opteryx_catalog.exceptions import CatalogError
+    from opteryx_catalog.exceptions import MaterializedViewError
+    from opteryx_catalog.exceptions import MaterializedViewOwnerMissing
+
+    assert issubclass(MaterializedViewOwnerMissing, Alertable)
+    assert issubclass(MaterializedViewOwnerMissing, CatalogError)
+    # ...and distinct from the ordinary caller-error type, which is not.
+    assert not issubclass(MaterializedViewError, Alertable)
+
+
 def test_fire_writes_job_doc_and_enqueues():
     catalog = _catalog_stub(triggers=[_refresh_trigger()])
     jobs_collection = MagicMock()

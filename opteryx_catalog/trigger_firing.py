@@ -58,6 +58,7 @@ from .alerts import report as _alert
 from .audit import write_audit_record
 from .exceptions import EgressRestricted
 from .exceptions import MaterializedViewError
+from .exceptions import MaterializedViewOwnerMissing
 
 # Refreshes fired inside one window share a task name, and Cloud Tasks
 # rejects a name it has already seen - that rejection IS the debounce.
@@ -390,9 +391,22 @@ def _fire_refresh(
     #
     # An owner whose grants have been revoked yields no policies, the binder
     # denies, and `last-refresh-status` records it. That is the intended
-    # failure: falling back to the committer here would rebuild the confused
-    # deputy this design exists to remove.
-    runs_as = mv.get("runs-as") or author
+    # failure.
+    #
+    # A MISSING owner is a different thing entirely - a damaged record - and is
+    # refused rather than defaulted. Defaulting to the committer is the one
+    # answer guaranteed to be wrong: it silently reinstates invoker semantics,
+    # so a field lost by some unrelated write reappears hours later as a
+    # baffling permission denial (or, if the committer happens to be
+    # privileged, as a refresh running with authority the view never had).
+    runs_as = mv.get("runs-as")
+    if not runs_as:
+        catalog.mark_trigger_fired(dataset_identifier, trigger["name"], status="owner-missing")
+        raise MaterializedViewOwnerMissing(
+            f"materialized view {target_view} has no runs-as identity; refusing to "
+            "refresh it as the committing user. Set one with ALTER MATERIALIZED "
+            f"VIEW {target_view} OWNER TO <principal>."
+        )
 
     execution_id = _make_job_id()
     _write_refresh_job(
