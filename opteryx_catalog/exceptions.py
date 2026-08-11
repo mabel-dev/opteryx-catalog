@@ -186,6 +186,24 @@ class EgressRestricted(CatalogError):
     blocked refresh also means a view is going stale."""
 
 
+class MaterializedViewOwnerMissing(Alertable, CatalogError):
+    """A registered materialized view has no `runs-as` identity.
+
+    Every registration writes one, and nothing but `set_materialized_view_owner`
+    rewrites it, so its absence means the record was damaged - a document edited
+    out of band, or a write path that replaced the dataset document without
+    carrying the field (the trap `DatasetMetadata` exists to close).
+
+    `Alertable` because it is a should-be-impossible state, not a caller error.
+    And raised rather than defaulted, deliberately: the obvious fallback is the
+    identity of whoever's commit fired the refresh, which is exactly the invoker
+    behaviour a pinned owner exists to remove. A refresh under the wrong
+    identity either fails confusingly - the failure looks like a permissions
+    problem hours away from the write that caused it - or, worse, succeeds with
+    more authority than the view was granted. Refusing to guess turns a silent
+    revert into one loud, findable failure."""
+
+
 class ManifestReadError(Alertable, CatalogError):
     """A parent snapshot's manifest could not be read while building a commit.
 

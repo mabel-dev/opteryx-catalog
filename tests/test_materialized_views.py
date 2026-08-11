@@ -532,6 +532,11 @@ def test_registration_survives_a_commit():
     assert record["sql"] == "SELECT * FROM src.a"
     assert record["last-refresh-status"] == "success"
     assert record["last-refresh-execution-id"] == "job-1"
+    # The pinned owner must survive too. It is written once at registration and
+    # never rewritten, so a commit that dropped it would silently return the
+    # view to running as whoever's write fired it - failing open, and only
+    # visible as a permission denial on the next refresh.
+    assert record["runs-as"] == "alice"
 
 
 def test_mark_materialized_view_refreshed():

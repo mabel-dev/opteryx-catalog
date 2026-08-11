@@ -722,6 +722,7 @@ class OpteryxCatalog(Metastore):
         metadata.dataset_type = data.get("dataset-type")
         metadata.statement_id = data.get("statement-id")
         metadata.source_tables = data.get("source-tables") or []
+        metadata.runs_as = data.get("runs-as")
         metadata.last_refreshed_at_ms = data.get("last-refreshed-at-ms")
         metadata.last_refresh_status = data.get("last-refresh-status")
         metadata.last_refresh_execution_id = data.get("last-refresh-execution-id")
@@ -3019,6 +3020,7 @@ class OpteryxCatalog(Metastore):
                 "dataset-type": metadata.dataset_type,
                 "statement-id": metadata.statement_id,
                 "source-tables": metadata.source_tables,
+                "runs-as": metadata.runs_as,
                 "last-refreshed-at-ms": metadata.last_refreshed_at_ms,
                 "last-refresh-status": metadata.last_refresh_status,
                 "last-refresh-execution-id": metadata.last_refresh_execution_id,
