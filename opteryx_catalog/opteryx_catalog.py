@@ -723,6 +723,8 @@ class OpteryxCatalog(Metastore):
         metadata.statement_id = data.get("statement-id")
         metadata.source_tables = data.get("source-tables") or []
         metadata.runs_as = data.get("runs-as")
+        metadata.suspended_at_ms = data.get("suspended-at-ms")
+        metadata.suspended_by = data.get("suspended-by")
         metadata.last_refreshed_at_ms = data.get("last-refreshed-at-ms")
         metadata.last_refresh_status = data.get("last-refresh-status")
         metadata.last_refresh_execution_id = data.get("last-refresh-execution-id")
@@ -2508,12 +2510,65 @@ class OpteryxCatalog(Metastore):
             "statement-id": statement_id,
             "source-tables": data.get("source-tables") or [],
             "runs-as": data.get("runs-as"),
+            "suspended-at-ms": data.get("suspended-at-ms"),
+            "suspended-by": data.get("suspended-by"),
             "last-updated-by": last_updated_by,
             "last-updated-at-ms": last_updated_at_ms,
             "last-refreshed-at-ms": data.get("last-refreshed-at-ms"),
             "last-refresh-status": data.get("last-refresh-status"),
             "last-refresh-execution-id": data.get("last-refresh-execution-id"),
         }
+
+    def set_materialized_view_suspended(
+        self, identifier: str, suspended: bool, author: str | None = None
+    ) -> None:
+        """Suspend or resume a materialized view's automatic refresh.
+
+        Suspending leaves the triggers in place and the view queryable; it simply
+        stops each firing from becoming a refresh. That is the difference from
+        dropping the triggers, which was previously the only way to stop a view
+        refreshing: a dropped trigger is indistinguishable from one that was
+        never created or that something broke, so "deliberately off" and "quietly
+        broken" looked identical. A suspended view says which it is, since when,
+        and by whom.
+
+        The state lives on the VIEW, not on its triggers. A view with four
+        sources has four triggers, and pausing three of them would not pause the
+        view - it would refresh from a subset of its sources and produce
+        silently partial data. One flag cannot be partially applied.
+
+        `last-refresh-status` is deliberately left alone: it records the last
+        real refresh outcome, which is still the truth. Suspension is a
+        separate fact and readers should show both.
+        """
+        if not author:
+            raise ValueError("author must be provided when suspending a materialized view")
+
+        identifier = self._qualify(identifier)
+        collection, dataset_name = self._local_parts(identifier)
+        doc_ref = self._dataset_doc_ref(collection, dataset_name)
+        doc = doc_ref.get()
+        if not doc.exists:
+            raise DatasetNotFound(f"Dataset not found: {identifier}")
+        data = doc.to_dict() or {}
+        if data.get("dataset-type") != MATERIALIZED_VIEW_TYPE:
+            raise MaterializedViewError(f"Not a materialized view: {identifier}")
+
+        doc_ref.update(
+            {
+                "suspended-at-ms": int(time.time() * 1000) if suspended else None,
+                "suspended-by": author if suspended else None,
+            }
+        )
+
+        emit_audit(
+            "suspend_materialized_view" if suspended else "resume_materialized_view",
+            resource_type=ResourceType.MATERIALIZED_VIEW,
+            workspace=self.workspace,
+            collection=collection,
+            resource=dataset_name,
+            author=author,
+        )
 
     def set_materialized_view_owner(
         self, identifier: str, new_owner: str, author: str | None = None
@@ -3021,6 +3076,8 @@ class OpteryxCatalog(Metastore):
                 "statement-id": metadata.statement_id,
                 "source-tables": metadata.source_tables,
                 "runs-as": metadata.runs_as,
+                "suspended-at-ms": metadata.suspended_at_ms,
+                "suspended-by": metadata.suspended_by,
                 "last-refreshed-at-ms": metadata.last_refreshed_at_ms,
                 "last-refresh-status": metadata.last_refresh_status,
                 "last-refresh-execution-id": metadata.last_refresh_execution_id,
