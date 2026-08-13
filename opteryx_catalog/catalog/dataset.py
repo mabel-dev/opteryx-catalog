@@ -948,6 +948,166 @@ class SimpleDataset(Dataset):
         )
         return manifest_entry
 
+    def alter_columns(
+        self,
+        add: list[dict] | None = None,
+        drop: list[str] | None = None,
+        rename: dict | None = None,
+        retype: dict | None = None,
+        author: str | None = None,
+        commit_message: str | None = None,
+    ):
+        """Change the dataset's COLUMNS - ``ALTER TABLE ... ADD/DROP/RENAME/ALTER COLUMN``.
+
+        Every current data file is rewritten to the new shape and committed as a
+        new snapshot, so reads need to know nothing about schema generations:
+        by the time this returns, every file the dataset points at matches its
+        current schema.
+
+        The rewrite does not decode the columns it is not changing. Parquet
+        keeps the schema and the per-chunk byte offsets in a footer separate
+        from the encoded pages, so each surviving column's pages are copied
+        byte-for-byte and only a new footer is written (see
+        ``rugo.parquet.patch_columns``). The cost tracks the dataset's SIZE, not
+        the number of values in it - close to what moving the bytes costs.
+
+        Files are written to NEW paths; the old ones are left alone for older
+        snapshots to keep reading, and are reclaimed by the same sweep that
+        reclaims dropped datasets. Nothing is ever mutated in place, so time
+        travel keeps answering with the shape each snapshot was written under.
+
+        Args:
+            add: New columns, appended in order. Each is a stored-column dict
+                (``{"name", "type", "element-type", "precision", "scale"}``)
+                plus a ``"donor"``: a one-column, one-row parquet file carrying
+                that column's type and the value existing rows are filled with
+                (a null row means fill with NULL). Donors are built by the
+                query engine, which owns the type vocabulary; the catalog only
+                forwards them.
+            drop: Column names to remove. Their pages are not carried over at
+                all - the rewrite is a compaction that happens to drop a column.
+            rename: ``{old_name: new_name}``. Touches no data whatsoever.
+            retype: ``{name: {"type", ..., "donor": bytes}}``. The donor carries
+                the TARGET type; its value is ignored.
+            author: The identity making the change - None when unauthenticated,
+                never substituted (see audit.emit_audit).
+            commit_message: Optional message recorded on the snapshot.
+
+        Raises:
+            ValueError: If no author was given, or the requested change is not
+                valid against the current schema (checked by the catalog before
+                anything is written).
+            AddFilesReadError: If a data file cannot be read to rewrite it.
+
+        Note:
+            The schema document and the snapshot are two writes, and the
+            catalog has no transaction spanning them. Between them the dataset
+            names the new columns while its current snapshot still lists the
+            old files. The window is one Firestore round trip; it is called out
+            here rather than papered over.
+        """
+        from rugo import parquet as _rugo_parquet
+
+        # A rugo without the patcher cannot do this at all. Saying so beats the
+        # bare ImportError the direct form would raise, which names a symbol
+        # rather than the thing to upgrade.
+        patch_columns = getattr(_rugo_parquet, "patch_columns", None)
+        if patch_columns is None:
+            raise RuntimeError(
+                "Cannot alter columns: this deployment's rugo has no "
+                "parquet.patch_columns. Upgrade rugo."
+            )
+
+        if author is None:
+            raise ValueError("author must be provided when altering columns")
+        add = [dict(c) for c in (add or [])]
+        drop = list(drop or [])
+        rename = dict(rename or {})
+        retype = {k: dict(v) for k, v in (retype or {}).items()}
+        if not (add or drop or rename or retype):
+            raise ValueError("alter_columns was given no changes to make")
+        if self.catalog is None:
+            raise ValueError("alter_columns needs an attached catalog to record the schema")
+
+        # Donors describe the FILES; everything else describes the SCHEMA. Split
+        # them here so each half is handed only what it can act on.
+        add_donors = [c.pop("donor", None) for c in add]
+        retype_donors = {name: spec.pop("donor", None) for name, spec in retype.items()}
+        for column, donor in zip(add, add_donors):
+            if donor is None:
+                raise ValueError(f"ADD COLUMN {column.get('name')!r} was given no donor file")
+        for name, donor in retype_donors.items():
+            if donor is None:
+                raise ValueError(f"ALTER COLUMN {name!r} was given no donor file")
+
+        prev = self.snapshot(None)
+        prev_entries = []
+        if prev and getattr(prev, "manifest_list", None):
+            prev_entries = self._parent_manifest_entries(prev)
+        current_files = [
+            e.get("file_path") for e in prev_entries if isinstance(e, dict) and e.get("file_path")
+        ]
+
+        new_files = []
+        for source_path in current_files:
+            try:
+                inp = self.io.new_input(source_path)
+                with inp.open() as f:
+                    data = f.read()
+            except Exception as err:
+                raise AddFilesReadError(
+                    f"Cannot read {source_path} to alter {self.identifier}: {err}. "
+                    "Refusing to commit a schema its own files do not match."
+                ) from err
+
+            patched = patch_columns(
+                data,
+                drop=drop or None,
+                rename=rename or None,
+                add=add_donors or None,
+                retype=retype_donors or None,
+            )
+
+            fname = f"{time.time_ns():x}-{self._get_node()}.parquet"
+            data_path = f"{self.metadata.location}/data/{fname}"
+            out = self.io.new_output(data_path).create()
+            out.write(patched)
+            out.close()
+            new_files.append(data_path)
+
+        # Schema before snapshot: the manifest entries written below are keyed
+        # by field id (`_field_id_by_name`), which has to resolve against the
+        # schema the files now match, not the one they used to.
+        schema_id = self.catalog.alter_dataset_schema(
+            self.identifier,
+            add=add or None,
+            drop=drop or None,
+            rename=rename or None,
+            retype=retype or None,
+            author=author,
+        )
+        self.metadata.current_schema_id = schema_id
+
+        # truncate_and_add_files recomputes every statistic from the bytes it
+        # just read, so nothing carries a stale bound from the old shape - the
+        # positional remap a manifest-preserving commit would need does not
+        # arise here at all.
+        self.truncate_and_add_files(new_files, author=author, commit_message=commit_message)
+
+        emit_audit(
+            "alter_columns",
+            resource_type=ResourceType.DATASET,
+            workspace=getattr(self.catalog, "workspace", None),
+            resource=self.identifier,
+            author=author,
+            added=[c.get("name") for c in add],
+            dropped=drop,
+            renamed=rename,
+            retyped=sorted(retype),
+            files_rewritten=len(new_files),
+        )
+        return schema_id
+
     def overwrite(self, table: Any, author: str | None = None, commit_message: str | None = None):
         """Replace the dataset entirely with `table` in a single snapshot.
 
@@ -1053,7 +1213,11 @@ class SimpleDataset(Dataset):
         self._after_commit(author, snap)
 
     def add_files(
-        self, files: list[str], author: str | None = None, commit_message: str | None = None
+        self,
+        files: list[str],
+        author: str | None = None,
+        commit_message: str | None = None,
+        footer_only: bool = False,
     ):
         """Add filenames to the dataset manifest without writing the files.
 
@@ -1063,6 +1227,13 @@ class SimpleDataset(Dataset):
           (deduplicates by `file_path`).
         - Creates a cumulative manifest for the new snapshot (previous
           entries + new unique entries).
+        - `footer_only`, when set, builds each new entry's stats from the
+          parquet footer alone instead of decoding every row group — see
+          `build_parquet_manifest_entry_from_bytes`'s `footer_only` doc for
+          what that trades away (no min/max/null-count/histogram pruning
+          stats). This still fully downloads each file via `self.io` first
+          (there's no ranged/partial-read path in `FileIO` yet) — it saves
+          decode CPU, not network transfer.
         """
         if author is None:
             raise ValueError("author must be provided when adding files to a dataset")
@@ -1083,7 +1254,7 @@ class SimpleDataset(Dataset):
         }
 
         # Build new entries for files that don't already exist. Only accept
-        # Parquet files and compute full statistics for each file.
+        # Parquet files; compute full statistics per file unless footer_only.
         new_entries = []
         seen = set()
         for fp in files:
@@ -1094,17 +1265,20 @@ class SimpleDataset(Dataset):
                 continue
             seen.add(fp)
 
-            # Read file and compute full statistics
+            # Read file and compute statistics (full, or footer-only — see docstring)
             try:
                 inp = self.io.new_input(fp)
                 with inp.open() as f:
                     data = f.read()
 
                 if data:
-                    # Compute statistics using a single read of the compressed bytes
                     file_size = len(data)
                     manifest_entry = build_parquet_manifest_entry_from_bytes(
-                        data, fp, file_size, field_id_by_name=self._field_id_by_name()
+                        data,
+                        fp,
+                        file_size,
+                        field_id_by_name=self._field_id_by_name(),
+                        footer_only=footer_only,
                     )
                 else:
                     # A genuinely empty object is a real state, not a failure:
