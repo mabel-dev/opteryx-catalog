@@ -181,6 +181,32 @@ def _core_type_to_stored(column_type: Any) -> tuple:
     return (type_name, None, None, None)
 
 
+def _expand_column_type(column: dict) -> dict:
+    """Resolve a ``column_type`` key into the stored ``type``/``element-type``/
+    ``precision``/``scale`` quartet.
+
+    Schema evolution (``alter_dataset_schema``) is handed columns by the query
+    engine, which holds Opteryx ``ColumnType`` objects, not the catalog's stored
+    spelling. Converting here rather than at the caller keeps
+    ``_core_type_to_stored`` the single place that mapping happens - a caller
+    that spelled a type itself would drift from what ``CREATE TABLE`` writes for
+    the identical column.
+
+    A column that already carries an explicit ``type`` is passed through
+    untouched, so a caller with a stored dict in hand does not have to
+    round-trip it through a ``ColumnType``.
+    """
+    if "column_type" not in column:
+        return column
+    resolved = {k: v for k, v in column.items() if k != "column_type"}
+    type_name, element_type, precision, scale = _core_type_to_stored(column["column_type"])
+    resolved["type"] = type_name
+    resolved["element-type"] = element_type
+    resolved["precision"] = precision
+    resolved["scale"] = scale
+    return resolved
+
+
 # draken physical type name (DrakenType.name, from Morsel.schema) -> the name to
 # STORE. Every entry must be a spelling opteryx's parse_column_type reads back,
 # which is why this is not simply `DrakenType.name`: DATE32, TIMESTAMP64, TIME32,
@@ -2923,6 +2949,166 @@ class OpteryxCatalog(Metastore):
             columns=columns,
         )
 
+    def alter_dataset_schema(
+        self,
+        identifier: str | tuple,
+        add: list[dict] | None = None,
+        drop: list[str] | None = None,
+        rename: dict | None = None,
+        retype: dict | None = None,
+        author: str | None = None,
+    ) -> str:
+        """Evolve a dataset's schema (``ALTER TABLE ... ADD/DROP/RENAME/ALTER COLUMN``).
+
+        Writes a NEW schema document and points ``current-schema-id`` at it;
+        earlier schemas stay where they are, so a snapshot taken before this
+        keeps resolving the shape it was written under.
+
+        **Field ids are the identity, not names.** A surviving column keeps the
+        id it already had - including through a rename, where the name is the
+        only thing that changes - and an added column takes a fresh id from
+        ``next-field-id``. Manifest statistics are keyed by field id
+        (``_field_id_by_name``), so preserving ids is what keeps a column's
+        min/max attached to that column rather than to whatever now sits in its
+        old position.
+
+        This does NOT touch data files. The caller rewrites them (see
+        ``SimpleDataset.alter_columns``, which sequences the two) - this is the
+        catalog half alone.
+
+        Args:
+            identifier: Dataset identifier in format 'collection.dataset_name'
+            add: New columns, appended in order. Each is a stored-column dict
+                without an ``id``: ``{"name", "type", "element-type",
+                "precision", "scale"}``.
+            drop: Column names to remove.
+            rename: ``{old_name: new_name}``; the column keeps its field id.
+            retype: ``{name: {"type", "element-type", "precision", "scale"}}``;
+                the column keeps its field id.
+            author: The identity making the change - None when unauthenticated,
+                never substituted (see audit.emit_audit).
+
+        Returns:
+            The new schema id.
+
+        Raises:
+            DatasetNotFound: If the dataset does not exist.
+            ValueError: If no operation was given, a named column is absent, a
+                name would collide, or every column would be dropped.
+        """
+        add = list(add or [])
+        drop = list(drop or [])
+        rename = dict(rename or {})
+        retype = dict(retype or {})
+        if not (add or drop or rename or retype):
+            raise ValueError("alter_dataset_schema was given no changes to make")
+
+        if isinstance(identifier, (tuple, list)):
+            collection, dataset_name = identifier[0], identifier[1]
+        else:
+            collection, dataset_name = identifier.split(".")
+
+        doc_ref = self._dataset_doc_ref(collection, dataset_name)
+        doc = doc_ref.get()
+        if not doc.exists:
+            raise DatasetNotFound(f"Dataset not found: {collection}.{dataset_name}")
+
+        data = doc.to_dict() or {}
+        current_schema_id = data.get("current-schema-id")
+        if not current_schema_id:
+            raise ValueError(
+                f"{collection}.{dataset_name} has no current schema to alter"
+            )
+        schema_doc = doc_ref.collection("schemas").document(str(current_schema_id)).get()
+        if not schema_doc.exists:
+            raise ValueError(
+                f"{collection}.{dataset_name} points at schema {current_schema_id}, "
+                "which does not exist"
+            )
+        columns = list((schema_doc.to_dict() or {}).get("columns", []))
+        by_name = {c.get("name") for c in columns}
+
+        # Every name is checked against the CURRENT schema before anything is
+        # written. A partially-applied schema edit is not a state to reach: the
+        # dataset would be pointing at a schema nobody asked for.
+        for name in list(drop) + list(rename) + list(retype):
+            if name not in by_name:
+                raise ValueError(
+                    f"{collection}.{dataset_name} has no column named '{name}'"
+                )
+
+        surviving = {c["name"] for c in columns if c.get("name") not in drop}
+        for old, new in rename.items():
+            surviving.discard(old)
+            if new in surviving:
+                raise ValueError(
+                    f"renaming '{old}' to '{new}' would give "
+                    f"{collection}.{dataset_name} two columns called '{new}'"
+                )
+            surviving.add(new)
+        for column in add:
+            name = column.get("name")
+            if name in surviving:
+                raise ValueError(
+                    f"{collection}.{dataset_name} already has a column called '{name}'"
+                )
+            surviving.add(name)
+        if not surviving:
+            raise ValueError(
+                f"dropping every column of {collection}.{dataset_name} would leave "
+                "no relation"
+            )
+
+        next_field_id = data.get("next-field-id") or (
+            max((c.get("id") or 0) for c in columns) + 1 if columns else 1
+        )
+
+        new_columns = []
+        for column in columns:
+            name = column.get("name")
+            if name in drop:
+                continue
+            # Copied, not rebuilt: anything this method does not understand
+            # (expectation-policies, annotations, fields added later) rides
+            # through untouched rather than being silently dropped.
+            evolved = dict(column)
+            if name in retype:
+                evolved.update(_expand_column_type(retype[name]))
+            if name in rename:
+                evolved["name"] = rename[name]
+            new_columns.append(evolved)
+
+        for column in add:
+            evolved = {
+                "type": None,
+                "element-type": None,
+                "scale": None,
+                "precision": None,
+                "expectation-policies": [],
+                "annotations": [],
+                **_expand_column_type(column),
+                "id": next_field_id,
+            }
+            next_field_id += 1
+            new_columns.append(evolved)
+
+        sid = self._write_schema_columns(collection, dataset_name, new_columns, author)
+        doc_ref.update({"current-schema-id": sid, "next-field-id": next_field_id})
+
+        emit_audit(
+            "alter_schema",
+            resource_type=ResourceType.DATASET,
+            workspace=self.workspace,
+            collection=collection,
+            resource=dataset_name,
+            author=author,
+            added=[c.get("name") for c in add],
+            dropped=drop,
+            renamed=rename,
+            retyped=sorted(retype),
+        )
+        return sid
+
     def write_parquet_manifest(
         self, snapshot_id: int, entries: list[dict], dataset_location: str
     ) -> str | None:
@@ -3259,6 +3445,20 @@ class OpteryxCatalog(Metastore):
         """Persist a schema document in the dataset's `schemas` subcollection and
         return the new schema id.
         """
+        cols = self._schema_to_columns(schema, field_ids=field_ids)
+        return self._write_schema_columns(namespace, dataset_name, cols, author)
+
+    def _write_schema_columns(
+        self, namespace: str, dataset_name: str, cols: list, author: str
+    ) -> str:
+        """Persist an already-built column list as a new schema document.
+
+        Split out of `_write_schema` so schema EVOLUTION (alter_dataset_schema)
+        and schema CREATION share one writer. Evolution builds its columns by
+        editing the current schema's stored dicts - preserving each surviving
+        column's field id - rather than re-deriving them from a relation
+        schema, which cannot express "this column keeps id 7".
+        """
         import uuid
 
         doc_ref = self._dataset_doc_ref(namespace, dataset_name)
@@ -3268,11 +3468,10 @@ class OpteryxCatalog(Metastore):
         # Nothing below is guarded, and each step used to be. Between them they
         # could return `sid` for a schema that has no columns, that is numbered
         # behind every schema already written, or that was never written at all
-        # - and the sole caller stamps that id onto the dataset as
+        # - and the callers stamp that id onto the dataset as
         # `current-schema-id` either way. A dataset pointing at a schema
         # document that does not exist is not a state worth reaching quietly;
         # failing here leaves the caller able to retry.
-        cols = self._schema_to_columns(schema, field_ids=field_ids)
         now_ms = int(time.time() * 1000)
         if author is None:
             raise ValueError("author must be provided when writing a schema")

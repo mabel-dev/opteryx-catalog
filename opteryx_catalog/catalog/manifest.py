@@ -764,6 +764,7 @@ def build_parquet_manifest_entry_from_bytes(
     file_size_in_bytes: int | None = None,
     orig_morsel: Any | None = None,
     field_id_by_name: dict[str, int] | None = None,
+    footer_only: bool = False,
 ) -> ParquetManifestEntry:
     """Build a manifest entry by reading a parquet file's bytes.
 
@@ -774,6 +775,22 @@ def build_parquet_manifest_entry_from_bytes(
     re-read and get exact stats via :func:`build_parquet_manifest_entry_from_morsel`.
 
     ``field_id_by_name``: see :func:`build_parquet_manifest_entry_from_morsel`.
+
+    ``footer_only``: skip decoding row-group data entirely and build the
+    entry from the parquet footer alone (``record_count``/schema only — one
+    small metadata parse over ``data_bytes``, not a decode of the file's
+    column data). This is a CPU/time saving on bytes already in hand, NOT a
+    network-egress saving — ``data_bytes`` must already be the full file
+    (this function has no way to fetch less; callers reading from remote
+    storage still transfer the whole object before calling it). rugo's
+    ``read_metadata_from_memoryview`` doesn't expose per-column-chunk footer
+    statistics (min/max/null-count) the way Parquet's own footer format
+    carries them, only ``num_rows``/schema, so a footer-only entry has no
+    min/max/null-count/histogram/min-k stats at all — every per-column list
+    is left empty, same sentinel already used for the empty-file case in
+    ``add_files``. Callers get a registered, queryable file with none of the
+    file-pruning stats; those columns just never prune. Ignored when
+    ``orig_morsel`` is given, since that path is already free.
     """
     if orig_morsel is not None:
         return build_parquet_manifest_entry_from_morsel(
@@ -781,13 +798,39 @@ def build_parquet_manifest_entry_from_bytes(
         )
 
     from rugo.parquet import read_metadata_from_memoryview
-    from rugo.parquet import read_parquet
 
     t_start = time.perf_counter()
     _manifest_metrics["files_read"] += 1
     _manifest_metrics["bytes_read"] += len(data_bytes)
 
     meta = read_metadata_from_memoryview(memoryview(data_bytes))
+
+    if footer_only:
+        entry = ParquetManifestEntry(
+            file_path=file_path,
+            file_format="parquet",
+            record_count=int(meta.num_rows),
+            file_size_in_bytes=int(file_size_in_bytes or len(data_bytes)),
+            uncompressed_size_in_bytes=0,
+            column_uncompressed_sizes_in_bytes=[],
+            null_counts=[],
+            min_k_hashes=[],
+            histogram_counts=[],
+            histogram_bins=0,
+            min_values=[],
+            max_values=[],
+            min_lengths=[],
+            max_lengths=[],
+        )
+        logger.debug(
+            "build_parquet_manifest_entry_from_bytes(footer_only) %s files=%d dur=%.3fs",
+            file_path,
+            _manifest_metrics["files_read"],
+            time.perf_counter() - t_start,
+        )
+        return entry
+
+    from rugo.parquet import read_parquet
     # name -> category from Parquet's own logical-type annotations, since a
     # re-read Vector's own .type is the flattened physical storage type (e.g.
     # a DATE column reads back as plain INT64).
