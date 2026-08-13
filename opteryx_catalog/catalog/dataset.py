@@ -1040,6 +1040,38 @@ class SimpleDataset(Dataset):
             if donor is None:
                 raise ValueError(f"ALTER COLUMN {name!r} was given no donor file")
 
+        # Check the change against the current schema BEFORE rewriting a single
+        # file. The catalog validates it too, but only once the files are
+        # written - so a typo'd column name would rewrite every file and then
+        # fail in the parquet patcher, with a message about parquet rather than
+        # about the column, leaving the rewritten files behind as orphans.
+        schema = self.schema()
+        known = {c.name for c in schema.columns} if schema is not None else set()
+        if known:
+            for name in list(drop) + list(rename) + list(retype):
+                if name not in known:
+                    raise ValueError(f"{self.identifier} has no column named '{name}'")
+            surviving = {n for n in known if n not in drop}
+            for old, new in rename.items():
+                surviving.discard(old)
+                if new in surviving:
+                    raise ValueError(
+                        f"renaming '{old}' to '{new}' would give {self.identifier} "
+                        f"two columns called '{new}'"
+                    )
+                surviving.add(new)
+            for column in add:
+                if column.get("name") in surviving:
+                    raise ValueError(
+                        f"{self.identifier} already has a column called "
+                        f"'{column.get('name')}'"
+                    )
+                surviving.add(column.get("name"))
+            if not surviving:
+                raise ValueError(
+                    f"dropping every column of {self.identifier} would leave no relation"
+                )
+
         prev = self.snapshot(None)
         prev_entries = []
         if prev and getattr(prev, "manifest_list", None):

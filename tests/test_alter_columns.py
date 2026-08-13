@@ -390,3 +390,35 @@ def test_an_unreadable_file_stops_the_whole_operation(dataset):
         ds.alter_columns(drop=["label"], author="alice")
 
     assert catalog.altered is None, "the schema was changed despite the failure"
+
+
+def test_a_bad_column_name_is_refused_before_any_file_is_rewritten(dataset):
+    """The catalog validates the change too, but only after the files are
+    written. Catching it here means a typo costs nothing and reports the COLUMN,
+    not a parquet-level message, and leaves no rewritten files behind."""
+    ds, store, catalog, paths, committed = dataset
+    ds.schema = lambda *a, **k: type(
+        "S", (), {"columns": [type("C", (), {"name": n})() for n in ("id", "small", "label")]}
+    )()
+    before = dict(store)
+
+    with pytest.raises(ValueError, match="no column named 'nope'"):
+        ds.alter_columns(drop=["nope"], author="alice")
+
+    assert store == before, "files were rewritten despite the refusal"
+    assert catalog.altered is None
+    assert not committed
+
+
+def test_a_colliding_rename_is_refused_before_any_file_is_rewritten(dataset):
+    ds, store, catalog, _paths, _committed = dataset
+    ds.schema = lambda *a, **k: type(
+        "S", (), {"columns": [type("C", (), {"name": n})() for n in ("id", "small", "label")]}
+    )()
+    before = dict(store)
+
+    with pytest.raises(ValueError, match="two columns called 'small'"):
+        ds.alter_columns(rename={"label": "small"}, author="alice")
+
+    assert store == before
+    assert catalog.altered is None

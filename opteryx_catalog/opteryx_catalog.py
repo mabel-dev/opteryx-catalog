@@ -3350,15 +3350,24 @@ class OpteryxCatalog(Metastore):
         for snap in metadata.snapshots:
             snaps_coll.document(str(snap.snapshot_id)).set(_snapshot_to_document(snap))
 
-        # Persist schemas subcollection
+        # Upsert schema documents. Do NOT delete schema documents that are not
+        # in `metadata.schemas` — the same rule the snapshot upsert above
+        # follows, and for the same reason.
+        #
+        # `metadata.schemas` is NOT the complete set. The default
+        # `load_dataset(load_history=False)` — which every write path uses —
+        # populates it with the CURRENT schema only, so reconciling against it
+        # deleted every older schema document on any commit. Each snapshot
+        # records the schema id it was written under, so deleting those makes
+        # time travel resolve a schema that no longer exists: an AS OF query
+        # against an older snapshot fails, from an INSERT that had nothing to
+        # do with schemas. Schema documents are small and bounded by the number
+        # of schema changes; keeping them costs nothing worth this.
         schemas_coll = doc_ref.collection("schemas")
-        existing_schema_ids = {d.id for d in schemas_coll.stream()}
-        new_schema_ids = set()
         for s in metadata.schemas:
             sid = s.get("schema_id")
             if not sid:
                 continue
-            new_schema_ids.add(sid)
             schemas_coll.document(sid).set(
                 {
                     "columns": s.get("columns", []),
@@ -3367,9 +3376,6 @@ class OpteryxCatalog(Metastore):
                     "sequence-number": s.get("sequence-number"),
                 }
             )
-        # Delete stale schema docs
-        for stale in existing_schema_ids - new_schema_ids:
-            schemas_coll.document(stale).delete()
 
     def _schema_to_columns(self, schema: Any, field_ids: list | None = None) -> list:
         """Convert a schema into a simple columns list for storage.
