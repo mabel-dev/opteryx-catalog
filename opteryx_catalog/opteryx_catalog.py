@@ -4,6 +4,7 @@ import hashlib
 import logging
 import time
 from collections.abc import Iterable
+from dataclasses import dataclass
 from typing import Any
 
 from google.cloud import firestore
@@ -87,6 +88,36 @@ EGRESS_PROTECTION_PROPERTY = "egress_protection"
 
 # Workspace `$properties` flag: when on, the workspace itself cannot be deleted.
 DELETION_PROTECTION_PROPERTY = "deletion_protection"
+
+
+@dataclass(frozen=True)
+class EgressRefusal:
+    """One source workspace refusing to let a copy of its data leave.
+
+    Returned by `OpteryxCatalog.egress_verdict`, which reports EVERY refusal
+    rather than stopping at the first, so a caller can tell someone all the
+    workspaces they have to clear instead of one per attempt.
+
+    The wording lives here, in one place, because both shapes of the gate use
+    it: `enforce_egress_policy` raises with `str(refusal)`, and a caller
+    composing its own message reads `workspace` and `remediation` off it.
+    """
+
+    workspace: str
+    destination: str
+    operation: str
+
+    @property
+    def remediation(self) -> str:
+        """The statement that clears this refusal - run against the SOURCE."""
+        return f"ALTER WORKSPACE {self.workspace} SET {EGRESS_PROTECTION_PROPERTY} TO OFF."
+
+    def __str__(self) -> str:
+        return (
+            f"Cannot {self.operation}: it would copy data out of workspace "
+            f"'{self.workspace}' into '{self.destination}', and "
+            f"'{self.workspace}' restricts egress. Clear it with {self.remediation}"
+        )
 
 
 def _guard_is_on(properties: dict, name: str) -> bool:
@@ -1435,6 +1466,54 @@ class OpteryxCatalog(Metastore):
             return True
         return _guard_is_on(doc.to_dict() or {}, EGRESS_PROTECTION_PROPERTY)
 
+    def egress_verdict(
+        self,
+        source_workspaces: Iterable[str],
+        destination_workspace: str,
+        operation: str,
+    ) -> list[EgressRefusal]:
+        """Every source workspace that refuses this copy, in first-seen order.
+
+        The decision itself - `enforce_egress_policy` is this plus a raise, so
+        there is one implementation of what egress protection means and not two
+        that can drift. Callers that need to *compose* a refusal with something
+        else (an engine reporting several reasons a statement cannot run, a UI
+        listing what would have to change) read this; callers that just need the
+        statement stopped use `enforce_egress_policy`.
+
+        Empty means allowed. That makes an accidental empty return a silent
+        permit, so a caller that could not reach this at all - a version skew, an
+        unreachable store - must produce a refusal of its own rather than an
+        empty list.
+
+        Unlike the raising form this reads every crossing workspace's flag
+        rather than stopping at the first refusal, which is the point: someone
+        clearing egress on a three-workspace join should be told all three at
+        once instead of discovering them one failed statement at a time. The
+        extra reads happen only on the path that is already refusing.
+
+        Args:
+            source_workspaces: workspace of each table the copy reads.
+            destination_workspace: workspace the copy writes into.
+            operation: what is being attempted, for the message - e.g.
+                "create materialized view mart.daily".
+        """
+        refusals: list[EgressRefusal] = []
+        checked: set[str] = set()
+        for source_workspace in source_workspaces:
+            if source_workspace == destination_workspace or source_workspace in checked:
+                continue
+            checked.add(source_workspace)
+            if self.is_egress_restricted(source_workspace):
+                refusals.append(
+                    EgressRefusal(
+                        workspace=source_workspace,
+                        destination=destination_workspace,
+                        operation=operation,
+                    )
+                )
+        return refusals
+
     def enforce_egress_policy(
         self,
         source_workspaces: Iterable[str],
@@ -1484,19 +1563,9 @@ class OpteryxCatalog(Metastore):
             EgressRestricted: if any source workspace differs from the
                 destination and has `egress_protection` set.
         """
-        checked: set[str] = set()
-        for source_workspace in source_workspaces:
-            if source_workspace == destination_workspace or source_workspace in checked:
-                continue
-            checked.add(source_workspace)
-            if self.is_egress_restricted(source_workspace):
-                raise EgressRestricted(
-                    f"Cannot {operation}: it would copy data out of workspace "
-                    f"'{source_workspace}' into '{destination_workspace}', and "
-                    f"'{source_workspace}' restricts egress. Clear it with "
-                    f"ALTER WORKSPACE {source_workspace} SET "
-                    f"{EGRESS_PROTECTION_PROPERTY} TO OFF."
-                )
+        refusals = self.egress_verdict(source_workspaces, destination_workspace, operation)
+        if refusals:
+            raise EgressRestricted(str(refusals[0]))
 
     # Fields on `$properties` that only their own dedicated methods may write.
     # Each one gates real control flow - `deleted-at-ms` makes the constructor
