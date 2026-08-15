@@ -150,13 +150,17 @@ def _pages(raw):
 
 
 def _read(raw):
+    """Column values, read the way the catalog itself reads parquet - through
+    draken vectors, not arrow. The catalog has no pyarrow dependency and its
+    tests must not introduce one."""
     from rugo.parquet import read_parquet
 
     out = {}
     with read_parquet(raw) as reader:
         for morsel in reader:
-            for name, values in morsel.to_arrow().to_pydict().items():
-                out.setdefault(name, []).extend(values)
+            for name in morsel.column_names:
+                key = name.decode("utf-8") if isinstance(name, (bytes, bytearray)) else name
+                out.setdefault(key, []).extend(morsel.column(name).to_pylist())
     return out
 
 
