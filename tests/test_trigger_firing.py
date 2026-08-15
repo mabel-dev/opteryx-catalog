@@ -141,6 +141,7 @@ def test_fire_writes_job_doc_and_enqueues():
         patch.object(
             trigger_firing, "_policies_for", return_value=[{"role": "owner", "pattern": "*"}]
         ),
+        patch.object(trigger_firing, "_billing_account_for_workspace", return_value="acme"),
     ):
         fire_triggers(catalog, "src.a", author="alice", snapshot_id=123)
 
@@ -155,10 +156,17 @@ def test_fire_writes_job_doc_and_enqueues():
     assert job_doc["sql_text"] == "REFRESH MATERIALIZED VIEW ws.mart.daily"
     assert "SELECT" not in job_doc["sql_text"]
     assert job_doc["status"] == "SUBMITTED"
-    # The view's pinned owner runs and is billed, not the committer - `alice`
-    # fired this by writing to a source and may have no rights on the view.
+    # The view's pinned owner RUNS it, not the committer - `alice` fired this by
+    # writing to a source and may hold no rights on the view.
     assert job_doc["submitted_by"] == "olive"
-    assert job_doc["billing_account"] == "olive"
+    # ...but the owner does not PAY for it. `runs-as` is an identity, and for
+    # every platform-owned view it is the same service account (`federator`),
+    # so billing it made the platform the largest account on its own meter. The
+    # workspace holding the view is what benefits from the standing refresh, so
+    # it pays - and the workspace the account was derived from travels with it,
+    # or the derivation cannot be checked after the fact.
+    assert job_doc["billing_account"] == "acme"
+    assert job_doc["workspace"] == "ws"
     # ...but the commit that caused it is still recorded.
     assert job_doc["trigger"]["fired_by"] == "alice"
     assert job_doc["origin"] == "trigger"
@@ -170,6 +178,48 @@ def test_fire_writes_job_doc_and_enqueues():
     catalog.mark_trigger_fired.assert_called_once_with(
         "src.a", "refresh__mart__daily", status="enqueued"
     )
+
+
+def _workspace_doc(data):
+    """A `workspaces/{name}` snapshot stub. `data is None` means no document."""
+    snapshot = MagicMock()
+    snapshot.exists = data is not None
+    snapshot.to_dict.return_value = data
+    client = MagicMock()
+    client.collection.return_value.document.return_value.get.return_value = snapshot
+    return client
+
+
+def test_refresh_bills_the_target_workspaces_account():
+    client = _workspace_doc({"billing_account": "acme"})
+    with patch.object(trigger_firing, "_jobs_client", return_value=client):
+        assert trigger_firing._billing_account_for_workspace(MagicMock(), "ws") == "acme"
+    # Read from the DEFAULT database's `workspaces` collection, which is where
+    # billing.opteryx writes it - not the catalog's own `catalogs` database.
+    client.collection.assert_called_once_with("workspaces")
+    client.collection.return_value.document.assert_called_once_with("ws")
+
+
+def test_a_workspace_with_no_billing_record_falls_back_to_the_house():
+    """Not to `runs-as`. Billing a service identity is the failure being removed;
+    the house absorbing it is wrong in a bounded, findable way instead."""
+    for data in ({}, {"billing_account": None}, {"billing_account": ""}, None):
+        with patch.object(trigger_firing, "_jobs_client", return_value=_workspace_doc(data)):
+            assert (
+                trigger_firing._billing_account_for_workspace(MagicMock(), "ws")
+                == trigger_firing.HOUSE_BILLING_ACCOUNT
+            )
+
+
+def test_a_billing_lookup_failure_never_blocks_the_refresh():
+    """A stale materialized view is a worse outcome than a misattributed charge."""
+    client = MagicMock()
+    client.collection.side_effect = RuntimeError("firestore is unreachable")
+    with patch.object(trigger_firing, "_jobs_client", return_value=client):
+        assert (
+            trigger_firing._billing_account_for_workspace(MagicMock(), "ws")
+            == trigger_firing.HOUSE_BILLING_ACCOUNT
+        )
 
 
 def test_duplicate_targets_fire_once():

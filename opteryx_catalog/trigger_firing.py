@@ -41,6 +41,7 @@ pattern) is exactly what this does NOT do.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import secrets
@@ -72,6 +73,8 @@ JOB_TTL_DAYS = int(os.environ.get("JOB_TTL_DAYS", "14"))
 _TASK_ID_UNSAFE = re.compile(r"[^A-Za-z0-9_-]+")
 
 _KILL_SWITCH_ENV = "OPTERYX_TRIGGER_FIRING"
+
+logger = logging.getLogger(__name__)
 
 # The service's own identity, from the metadata server. Same endpoint and
 # timeout as `alerts/_secrets.py` uses for the project id.
@@ -172,6 +175,45 @@ def _jobs_client(catalog):
     if database:
         kwargs["database"] = database
     return firestore.Client(**kwargs)
+
+
+HOUSE_BILLING_ACCOUNT = "opteryx"
+
+
+def _billing_account_for_workspace(catalog, workspace: str) -> str:
+    """The account that pays for work done on behalf of `workspace`.
+
+    A refresh used to bill the view's `runs-as` identity, which for every
+    platform-owned view is `federator` - an identity, not an account, and by
+    volume the largest single thing on the meter. The party that benefits from
+    a materialized view is the workspace holding it, so that is who pays.
+
+    `workspaces/{name}` lives in the project's DEFAULT database - the one
+    `_jobs_client` already talks to. The catalog's own `catalogs` database does
+    not hold it.
+
+    A workspace with no billing record falls back to the house account rather
+    than to `runs-as`. Neither answer is knowably right, but this one is wrong
+    in a bounded way: the house absorbs it, and the event carries `workspace`,
+    so the gap is findable by name. Billing `runs-as` instead invents a payer
+    out of a service identity, which is the failure this replaces.
+
+    Never raises. A refresh must not fail because a billing lookup did.
+    """
+    try:
+        snapshot = _jobs_client(catalog).collection("workspaces").document(workspace).get()
+        account = (snapshot.to_dict() or {}).get("billing_account") if snapshot.exists else None
+    except Exception as exc:  # noqa: BLE001 - see docstring
+        logger.warning(f"could not read the billing account for workspace {workspace!r}: {exc}")
+        account = None
+
+    if not account:
+        logger.warning(
+            f"workspace {workspace!r} has no billing account; billing this refresh to "
+            f"{HOUSE_BILLING_ACCOUNT!r}"
+        )
+        return HOUSE_BILLING_ACCOUNT
+    return account
 
 
 def _make_job_id(now: datetime | None = None) -> str:
@@ -291,6 +333,7 @@ def _write_refresh_job(
     trigger_name: str,
     target_view: str,
     snapshot_id: Any | None,
+    billing_account: str,
     fired_by: str | None = None,
 ) -> None:
     """Write the jobs/{execution_id} document the worker will execute from."""
@@ -304,12 +347,19 @@ def _write_refresh_job(
         "created_at": firestore.SERVER_TIMESTAMP,
         "updated_at": firestore.SERVER_TIMESTAMP,
         # The view's pinned owner (`runs-as`), not the commit's author. This is
-        # the identity the worker hands the engine, the one the binder
-        # authorizes, and the one billed - the party that chose to create a
-        # standing refresh cost, rather than whoever happened to write to a
-        # source. `trigger.fired_by` below keeps the link to that commit.
+        # the identity the worker hands the engine and the one the binder
+        # authorizes. `trigger.fired_by` below keeps the link to that commit.
         "submitted_by": author,
-        "billing_account": author,
+        # Who PAYS, which is a different question from who ACTS and is no longer
+        # answered with the same value. `runs-as` is a service identity - for
+        # every platform-owned view, `federator` - and billing it made the
+        # platform's own automation the largest account on the meter. The
+        # workspace holding the view is the party that benefits from it.
+        "billing_account": billing_account,
+        # The one workspace this job is on behalf of. Recorded because the
+        # billing account above is derived from it: without it the derivation
+        # is unauditable after the fact.
+        "workspace": catalog.workspace,
         "entitlements": [],
         "purge_at": now + timedelta(days=JOB_TTL_DAYS),
         # `origin` keeps this off /jobs/recent and tells the worker to stamp
@@ -418,6 +468,7 @@ def _fire_refresh(
         )
 
     execution_id = _make_job_id()
+    billing_account = _billing_account_for_workspace(catalog, catalog.workspace)
     _write_refresh_job(
         catalog,
         execution_id=execution_id,
@@ -428,6 +479,7 @@ def _fire_refresh(
         trigger_name=trigger["name"],
         target_view=target_view,
         snapshot_id=snapshot_id,
+        billing_account=billing_account,
         fired_by=author,
     )
     outcome = _enqueue_refresh_task(
@@ -445,6 +497,7 @@ def _fire_refresh(
             "execution_id": execution_id,
             "outcome": outcome,
             "author": author,
+            "billing_account": billing_account,
         }
     )
 
