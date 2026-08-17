@@ -1,7 +1,6 @@
-"""Tests for CAT-1/CAT-2/CAT-3/CAT-5: workspace soft-delete/lock, the
-construction-time gate, the root-level `$dropped-workspaces` tombstone
-registry, and the dataset/collection lock fields on `drop_dataset()` /
-`drop_collection()`.
+"""Tests for CAT-1/CAT-2/CAT-3/CAT-5: workspace drop/lock, the
+construction-time gate, and the dataset/collection lock fields on
+`drop_dataset()` / `drop_collection()`.
 """
 
 from __future__ import annotations
@@ -14,6 +13,7 @@ from opteryx_catalog.exceptions import CollectionLocked
 from opteryx_catalog.exceptions import CollectionNotFound
 from opteryx_catalog.exceptions import DatasetLocked
 from opteryx_catalog.exceptions import WorkspaceDeleted
+from opteryx_catalog.exceptions import WorkspaceDeletionProtected
 from opteryx_catalog.exceptions import WorkspaceNotFound
 from opteryx_catalog.opteryx_catalog import OpteryxCatalog
 
@@ -188,7 +188,7 @@ def test_init_creates_properties_doc_with_all_fields_when_missing():
 # --- Workspace lifecycle methods (CAT-2/CAT-3) --------------------------
 
 
-def _catalog_with_properties(props_data=None, tombstone_data=None):
+def _catalog_with_properties(props_data=None):
     log = []
     catalog = object.__new__(OpteryxCatalog)
     catalog.workspace = "ws"
@@ -198,33 +198,54 @@ def _catalog_with_properties(props_data=None, tombstone_data=None):
         "$properties", data=props_data or {}, exists=True, log=log
     )
     catalog._catalog_ref = catalog_collection
+    catalog.firestore_client = _FirestoreClient(catalog_collection)
 
-    dropped_workspaces = _Collection("$dropped-workspaces", log=log)
-    if tombstone_data is not None:
-        dropped_workspaces._docs["ws"] = _DocRef("ws", data=tombstone_data, exists=True, log=log)
-    catalog.firestore_client = _FirestoreClient(dropped_workspaces)
-
-    return catalog, catalog_collection, dropped_workspaces, log
+    return catalog, catalog_collection, log
 
 
-def test_soft_delete_workspace_sets_properties_and_writes_tombstone():
+def _catalog_with_contents(props_data=None, collections=None):
+    """A catalog whose list_collections/list_datasets/list_views/drop_dataset/
+    drop_view are stubbed directly rather than built up from fake Firestore
+    docs - drop_workspace only calls the public enumeration/drop methods, so
+    faking Firestore itself under them would test nothing extra.
+
+    `collections` is `{collection_name: {"datasets": [...], "views": [...]}}`.
+    """
+    catalog, catalog_collection, log = _catalog_with_properties(props_data)
+    collections = collections or {}
+
+    catalog.list_collections = lambda: list(collections)
+    catalog.list_datasets = lambda c: list(collections.get(c, {}).get("datasets", []))
+    catalog.list_views = lambda c: list(collections.get(c, {}).get("views", []))
+
+    dropped = []
+    catalog.drop_dataset = lambda identifier, author=None: dropped.append(("dataset", identifier, author))
+    catalog.drop_view = lambda identifier, author=None: dropped.append(("view", identifier, author))
+
+    return catalog, catalog_collection, dropped, log
+
+
+def test_drop_workspace_drops_everything_then_the_properties_doc():
     # deletion_protection is ON unless explicitly cleared, so a workspace that is
-    # about to be deleted has had it turned off first.
-    catalog, catalog_collection, dropped_workspaces, _log = _catalog_with_properties(
-        props_data={"deletion_protection": False}
+    # about to be dropped has had it turned off first.
+    catalog, _cc, dropped, log = _catalog_with_contents(
+        props_data={"deletion_protection": False},
+        collections={
+            "coll1": {"datasets": ["tbl1", "tbl2"], "views": ["v1"]},
+            "coll2": {"datasets": [], "views": []},
+        },
     )
 
     with patch("opteryx_catalog.opteryx_catalog.send_webhook") as hook:
-        catalog.soft_delete_workspace(author="alice")
+        catalog.drop_workspace(author="alice")
 
-    props = catalog_collection.document("$properties").get().to_dict()
-    assert props["deleted-by"] == "alice"
-    assert isinstance(props["deleted-at-ms"], int)
+    assert ("dataset", "coll1.tbl1", "alice") in dropped
+    assert ("dataset", "coll1.tbl2", "alice") in dropped
+    assert ("view", "coll1.v1", "alice") in dropped
+    assert len(dropped) == 3
 
-    tombstone = dropped_workspaces.document("ws").written
-    assert tombstone["workspace"] == "ws"
-    assert tombstone["dropped-by"] == "alice"
-    assert isinstance(tombstone["dropped-at-ms"], int)
+    # No tombstone, no grace period - the $properties doc itself is gone.
+    assert ("delete", "$properties") in log
 
     assert hook.call_count == 1
     kwargs = hook.call_args.kwargs
@@ -234,40 +255,25 @@ def test_soft_delete_workspace_sets_properties_and_writes_tombstone():
     assert kwargs["payload"]["dropped_by"] == "alice"
 
 
-def test_soft_delete_workspace_requires_author():
-    catalog, _cc, _dw, _log = _catalog_with_properties()
+def test_drop_workspace_requires_author():
+    catalog, _cc, _dropped, _log = _catalog_with_contents()
     with pytest.raises(ValueError):
-        catalog.soft_delete_workspace(author=None)
+        catalog.drop_workspace(author=None)
 
 
-def test_restore_workspace_clears_properties_and_deletes_tombstone():
-    catalog, catalog_collection, _dw, log = _catalog_with_properties(
-        props_data={"deleted-at-ms": 111, "deleted-by": "alice"},
-        tombstone_data={"workspace": "ws", "dropped-at-ms": 111, "dropped-by": "alice"},
+def test_drop_workspace_blocked_when_deletion_protected():
+    catalog, _cc, dropped, _log = _catalog_with_contents(
+        props_data={"deletion_protection": True},
+        collections={"coll1": {"datasets": ["tbl1"], "views": []}},
     )
-
-    with patch("opteryx_catalog.opteryx_catalog.send_webhook"):
-        catalog.restore_workspace(author="bob")
-
-    props = catalog_collection.document("$properties").get().to_dict()
-    assert props["deleted-at-ms"] is None
-    assert props["deleted-by"] is None
-
-    # The tombstone must be cleared too - otherwise a restored workspace is
-    # still a candidate for the 24h sweep and would be hard-deleted anyway.
-    # (The stub records the delete in `log` rather than materializing it -
-    # see `_DocRef.delete` - so that's what's asserted here.)
-    assert ("delete", "ws") in log
-
-
-def test_restore_workspace_requires_author():
-    catalog, _cc, _dw, _log = _catalog_with_properties()
-    with pytest.raises(ValueError):
-        catalog.restore_workspace(author=None)
+    with pytest.raises(WorkspaceDeletionProtected):
+        catalog.drop_workspace(author="alice")
+    # Refused before touching anything inside the workspace.
+    assert dropped == []
 
 
 def test_lock_workspace_sets_fields():
-    catalog, catalog_collection, _dw, _log = _catalog_with_properties()
+    catalog, catalog_collection, _log = _catalog_with_properties()
 
     with patch("opteryx_catalog.opteryx_catalog.send_webhook") as hook:
         catalog.lock_workspace(author="alice")
@@ -279,13 +285,13 @@ def test_lock_workspace_sets_fields():
 
 
 def test_lock_workspace_requires_author():
-    catalog, _cc, _dw, _log = _catalog_with_properties()
+    catalog, _cc, _log = _catalog_with_properties()
     with pytest.raises(ValueError):
         catalog.lock_workspace(author=None)
 
 
 def test_unlock_workspace_clears_fields():
-    catalog, catalog_collection, _dw, _log = _catalog_with_properties(
+    catalog, catalog_collection, _log = _catalog_with_properties(
         props_data={"locked-by": "alice", "locked-at-ms": 123}
     )
 
@@ -299,27 +305,9 @@ def test_unlock_workspace_clears_fields():
 
 
 def test_unlock_workspace_requires_author():
-    catalog, _cc, _dw, _log = _catalog_with_properties()
+    catalog, _cc, _log = _catalog_with_properties()
     with pytest.raises(ValueError):
         catalog.unlock_workspace(author=None)
-
-
-def test_list_dropped_workspaces():
-    catalog, _cc, _dw, _log = _catalog_with_properties(
-        tombstone_data={"workspace": "ws", "dropped-at-ms": 111, "dropped-by": "alice"}
-    )
-
-    listed = catalog.list_dropped_workspaces()
-    assert len(listed) == 1
-    assert listed[0]["id"] == "ws"
-    assert listed[0]["dropped-by"] == "alice"
-
-
-def test_delete_workspace_tombstone():
-    catalog, _cc, _dw, log = _catalog_with_properties(tombstone_data={"workspace": "ws"})
-
-    catalog.delete_workspace_tombstone("ws")
-    assert ("delete", "ws") in log
 
 
 # --- Dataset/collection lock fields (CAT-5) ------------------------------
