@@ -74,27 +74,30 @@ def _catalog(protected: bool):
     catalog._datasets_collection = lambda c: _Collection()
     catalog._views_collection = lambda c: _Collection()
     catalog._view_doc_ref = lambda c, n: view_ref
-    catalog._dropped_workspaces_collection = lambda: _Collection()
+    # drop_workspace enumerates collections/datasets/views before dropping
+    # each - empty here since these tests are about the protection gate
+    # itself, not about what gets swept up once it's cleared.
+    catalog.list_collections = lambda: []
     return catalog, dataset_ref, collection_ref, view_ref
 
 
 # --- What deletion_protection guards: the workspace, and only the workspace ---
 
 
-def test_soft_delete_workspace_blocked():
+def test_drop_workspace_blocked():
     catalog, _d, _c, _v = _catalog(protected=True)
 
     with pytest.raises(WorkspaceDeletionProtected, match="deletion-protected"):
-        catalog.soft_delete_workspace(author="alice")
+        catalog.drop_workspace(author="alice")
 
-    assert catalog.get_workspace_properties().get("deleted-at-ms") is None
+    assert catalog._catalog_ref.document("$properties")._doc.exists is True
 
 
 def test_error_names_the_statement_that_clears_it():
     catalog, _d, _c, _v = _catalog(protected=True)
 
     with pytest.raises(WorkspaceDeletionProtected, match="SET deletion_protection TO OFF"):
-        catalog.soft_delete_workspace(author="alice")
+        catalog.drop_workspace(author="alice")
 
 
 @pytest.mark.parametrize(
@@ -115,9 +118,9 @@ def test_workspace_is_protected_from_birth(props):
     catalog._catalog_ref.document("$properties")._doc._data = dict(props)
 
     with pytest.raises(WorkspaceDeletionProtected, match="deletion-protected"):
-        catalog.soft_delete_workspace(author="alice")
+        catalog.drop_workspace(author="alice")
 
-    assert catalog.get_workspace_properties().get("deleted-at-ms") is None
+    assert catalog._catalog_ref.document("$properties")._doc.exists is True
 
 
 @pytest.mark.parametrize(
@@ -129,9 +132,10 @@ def test_explicitly_unprotected_workspace_deletes_normally(props, monkeypatch):
     catalog, _d, _c, _v = _catalog(protected=False)
     catalog._catalog_ref.document("$properties")._doc._data = dict(props)
 
-    catalog.soft_delete_workspace(author="alice")
+    catalog.drop_workspace(author="alice")
 
-    assert catalog.get_workspace_properties()["deleted-at-ms"] is not None
+    # No flag, no tombstone - the $properties doc itself is gone.
+    assert catalog._catalog_ref.document("$properties")._doc.exists is False
 
 
 def test_protection_is_re_read_not_cached(monkeypatch):
@@ -144,18 +148,18 @@ def test_protection_is_re_read_not_cached(monkeypatch):
     catalog._catalog_ref.document("$properties")._doc._data = {"deletion_protection": True}
 
     with pytest.raises(WorkspaceDeletionProtected):
-        catalog.soft_delete_workspace(author="alice")
+        catalog.drop_workspace(author="alice")
 
 
 def test_setting_the_flag_then_deleting_is_blocked(capsys):
     """End to end through the public setter: ALTER WORKSPACE ... TO ON, then
-    deleting the workspace is refused."""
+    dropping the workspace is refused."""
     catalog, _d, _c, _v = _catalog(protected=False)
 
     catalog.set_workspace_properties({"deletion_protection": True}, author="alice")
 
     with pytest.raises(WorkspaceDeletionProtected):
-        catalog.soft_delete_workspace(author="alice")
+        catalog.drop_workspace(author="alice")
 
 
 def test_clearing_the_flag_re_enables_deletion(monkeypatch, capsys):
@@ -163,9 +167,9 @@ def test_clearing_the_flag_re_enables_deletion(monkeypatch, capsys):
     catalog, _d, _c, _v = _catalog(protected=True)
 
     catalog.set_workspace_properties({"deletion_protection": False}, author="alice")
-    catalog.soft_delete_workspace(author="alice")
+    catalog.drop_workspace(author="alice")
 
-    assert catalog.get_workspace_properties()["deleted-at-ms"] is not None
+    assert catalog._catalog_ref.document("$properties")._doc.exists is False
 
 
 # --- What it deliberately does NOT guard: everything inside the workspace ---

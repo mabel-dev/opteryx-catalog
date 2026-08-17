@@ -45,7 +45,6 @@ from .webhooks.events import view_created_payload
 from .webhooks.events import view_deleted_payload
 from .webhooks.events import workspace_deleted_payload
 from .webhooks.events import workspace_locked_payload
-from .webhooks.events import workspace_restored_payload
 from .webhooks.events import workspace_unlocked_payload
 
 logger = logging.getLogger(__name__)
@@ -54,16 +53,6 @@ logger = logging.getLogger(__name__)
 # `list_collections()`, which filters `$`-prefixed documents, so tombstones are
 # invisible to normal catalog enumeration.
 DROPPED_DOC = "$dropped"
-
-# Root-level Firestore collection (a sibling to every workspace's own top-level
-# collection, not nested under any single workspace) holding tombstones for
-# workspaces that have been soft-deleted. Dataset tombstones live *inside* the
-# workspace they were dropped from (`DROPPED_DOC` above) - that doesn't work
-# for a workspace tombstoning itself, since a hard-deleted workspace's own
-# top-level collection may no longer be a safe place to look. The 24h sweep
-# reads this collection to find candidates without enumerating every
-# workspace name blindly.
-DROPPED_WORKSPACES_COLLECTION = "$dropped-workspaces"
 
 # Subcollection under a dataset document holding that dataset's triggers - one
 # document per trigger, keyed by trigger name. A subcollection rather than a
@@ -497,16 +486,6 @@ class OpteryxCatalog(Metastore):
     def _tombstones_collection(self):
         """Subcollection of drop tombstones for this workspace."""
         return self._catalog_ref.document(DROPPED_DOC).collection("datasets")
-
-    def _dropped_workspaces_collection(self):
-        """Root-level collection of workspace-drop tombstones.
-
-        A sibling to every workspace's own top-level collection, in the same
-        Firestore database - NOT nested under `self._catalog_ref`. See
-        `DROPPED_WORKSPACES_COLLECTION` for why this can't live inside the
-        workspace it tombstones.
-        """
-        return self.firestore_client.collection(DROPPED_WORKSPACES_COLLECTION)
 
     @staticmethod
     def _delete_subcollection(coll_ref) -> None:
@@ -1259,45 +1238,48 @@ class OpteryxCatalog(Metastore):
         """Remove a tombstone once its storage location has been reclaimed."""
         self._tombstones_collection().document(tombstone_id).delete()
 
-    # --- Workspace lifecycle (soft-delete / lock) ----------------------
+    # --- Workspace lifecycle (drop / lock) ------------------------------
     #
     # These methods execute the state change and record who asked - they do
-    # NOT enforce identity rules (e.g. "a different owner must unlock",
-    # "billing_admin required to delete"). That authorization decision lives
-    # in the calling service (billing.opteryx), which originates both the
-    # decision and the call with nothing in between.
+    # NOT enforce identity rules (e.g. "a different owner must unlock").
+    # That authorization decision lives in the calling engine
+    # (opteryx.managers.permissions.can_perform_workspace_action, via
+    # opteryx-access's ACTION_ROLES), which originates both the decision and
+    # the call with nothing in between - see DROP WORKSPACE's binder step.
 
-    def soft_delete_workspace(self, author: str) -> None:
-        """Mark this workspace deleted, and tombstone it for the 24h sweep.
+    def drop_workspace(self, author: str) -> None:
+        """Permanently drop this workspace: every dataset and view in every
+        collection, then the workspace's own `$properties` document. No
+        tombstone, no grace period, no restore - turning off
+        `deletion_protection` (checked here, via `_assert_not_deletion_protected`)
+        is the deliberate signal of intent; there is nothing left to undo
+        after this returns.
 
-        Sets `deleted-at-ms`/`deleted-by` on the `$properties` doc, which is
-        what `__init__`'s construction-time gate checks - once this is set, no
-        new `OpteryxCatalog` handle for this workspace can be obtained without
-        `include_deleted=True`. Also writes an entry to the root-level
-        `$dropped-workspaces` collection so the sweep can find this workspace
-        without enumerating every workspace name blindly.
+        Reuses `drop_dataset`/`drop_view` per item rather than deleting
+        storage directly: each already tombstones its own location for
+        `DroppedDatasetSweep` to reclaim, which is the only code in this
+        codebase that safely accounts for a write still in flight when the
+        drop lands. A dataset held by its own per-asset `locked-by` lock
+        raises `DatasetLocked` out of `drop_dataset` and stops this partway
+        through, the same as it would dropping that one dataset directly -
+        clear the lock and re-run, rather than this silently skipping it.
 
-        Raises `WorkspaceDeletionProtected` if the workspace is deletion-protected.
-        This is the only operation that flag guards - it protects the workspace
-        from deletion, not the assets inside it.
+        Raises `WorkspaceDeletionProtected` if the workspace is
+        deletion-protected. This is the only thing that flag ever guarded -
+        it protects the workspace itself, not the assets inside it.
         """
         if author is None:
-            raise ValueError("author must be provided when soft-deleting a workspace")
+            raise ValueError("author must be provided when dropping a workspace")
 
         self._assert_not_deletion_protected()
 
-        now_ms = int(time.time() * 1000)
-        self._catalog_ref.document("$properties").update(
-            {"deleted-at-ms": now_ms, "deleted-by": author}
-        )
+        for collection in self.list_collections():
+            for dataset in list(self.list_datasets(collection)):
+                self.drop_dataset(f"{collection}.{dataset}", author=author)
+            for view in list(self.list_views(collection)):
+                self.drop_view(f"{collection}.{view}", author=author)
 
-        self._dropped_workspaces_collection().document(self.workspace).set(
-            {
-                "workspace": self.workspace,
-                "dropped-at-ms": now_ms,
-                "dropped-by": author,
-            }
-        )
+        self._catalog_ref.document("$properties").delete()
 
         send_webhook(
             action="delete",
@@ -1309,41 +1291,7 @@ class OpteryxCatalog(Metastore):
         )
 
         emit_audit(
-            "soft_delete_workspace",
-            resource_type=ResourceType.WORKSPACE,
-            workspace=self.workspace,
-            resource=self.workspace,
-            author=author,
-        )
-
-    def restore_workspace(self, author: str) -> None:
-        """Clear a workspace's soft-delete state.
-
-        Clears `deleted-at-ms`/`deleted-by` on `$properties`, and removes the
-        `$dropped-workspaces` tombstone written by `soft_delete_workspace` -
-        without that, the workspace would still be a candidate for the 24h
-        sweep despite having been restored.
-        """
-        if author is None:
-            raise ValueError("author must be provided when restoring a workspace")
-
-        self._catalog_ref.document("$properties").update(
-            {"deleted-at-ms": None, "deleted-by": None}
-        )
-
-        self.delete_workspace_tombstone(self.workspace)
-
-        send_webhook(
-            action="restore",
-            workspace=self.workspace,
-            collection=None,
-            resource_type=ResourceType.WORKSPACE,
-            resource_name=self.workspace,
-            payload=workspace_restored_payload(restored_by=author),
-        )
-
-        emit_audit(
-            "restore_workspace",
+            "drop_workspace",
             resource_type=ResourceType.WORKSPACE,
             workspace=self.workspace,
             resource=self.workspace,
@@ -1652,27 +1600,6 @@ class OpteryxCatalog(Metastore):
             author=author,
             properties=sorted(properties),
         )
-
-    def list_dropped_workspaces(self) -> list[dict]:
-        """Tombstones for workspaces soft-deleted anywhere in this Firestore
-        database - not scoped to `self.workspace`. Root-level, mirroring
-        `list_dropped_datasets()` one level up. Consumed by the 24h sweep,
-        which walks each overdue workspace and then calls
-        `delete_workspace_tombstone()`.
-        """
-        return [
-            {**(doc.to_dict() or {}), "id": doc.id}
-            for doc in self._dropped_workspaces_collection().stream()
-        ]
-
-    def delete_workspace_tombstone(self, workspace: str) -> None:
-        """Remove a workspace's `$dropped-workspaces` tombstone.
-
-        Takes an explicit `workspace` name (rather than always using
-        `self.workspace`) since the sweep operates across workspaces from a
-        single catalog handle.
-        """
-        self._dropped_workspaces_collection().document(workspace).delete()
 
     def list_datasets(self, collection: str) -> Iterable[str]:
         coll = self._datasets_collection(collection)
