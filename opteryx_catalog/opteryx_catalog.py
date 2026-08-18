@@ -34,6 +34,7 @@ from .exceptions import ViewAlreadyExists
 from .exceptions import ViewNotFound
 from .exceptions import WorkspaceDeletionProtected
 from .exceptions import WorkspaceNotFound
+from .exceptions import WorkspaceStorageReclaimFailed
 from .iops.base import FileIO
 from .resource_types import ResourceType
 from .webhooks import send_webhook
@@ -1253,21 +1254,63 @@ class OpteryxCatalog(Metastore):
     # the call with nothing in between - see DROP WORKSPACE's binder step.
 
     def drop_workspace(self, author: str) -> None:
-        """Permanently drop this workspace: every dataset and view in every
-        collection, then the workspace's own `$properties` document. No
-        tombstone, no grace period, no restore - turning off
-        `deletion_protection` (checked here, via `_assert_not_deletion_protected`)
-        is the deliberate signal of intent; there is nothing left to undo
-        after this returns.
+        """Permanently drop this workspace: every materialized view, then
+        every remaining dataset, then every view, then every now-empty
+        collection document itself, in every collection, their storage
+        reclaimed; policy.opteryx's access grants for this workspace
+        (`$policies/access` - a different service's data, sharing this same
+        Firestore database, with no webhook consumer of its own to clean it
+        up); then the workspace's own `$properties` document. No tombstone,
+        no grace period, no restore - turning off `deletion_protection`
+        (checked here, via `_assert_not_deletion_protected`) is the
+        deliberate signal of intent; there is nothing left to undo, and
+        nothing left in Firestore or on disk, after this returns.
 
-        Reuses `drop_dataset`/`drop_view` per item rather than deleting
-        storage directly: each already tombstones its own location for
-        `DroppedDatasetSweep` to reclaim, which is the only code in this
-        codebase that safely accounts for a write still in flight when the
-        drop lands. A dataset held by its own per-asset `locked-by` lock
-        raises `DatasetLocked` out of `drop_dataset` and stops this partway
+        Materialized views go first, workspace-wide, across a full pass over
+        every collection before any plain dataset in ANY collection is
+        touched - not per-collection interleaved with datasets. `drop_dataset`
+        refuses to drop a dataset that a materialized view still reads from
+        (see its own docstring), and that source can be in a different
+        collection than the MV, so a per-collection ordering would still
+        raise `MaterializedViewError` partway through whenever a source and
+        its MV don't happen to share a collection. `drop_materialized_view`
+        clears the MV's own refresh triggers before dropping its backing
+        dataset, which is what `drop_dataset`'s check on the *source*
+        actually reads - so by the time any plain dataset is reached, no
+        materialized view anywhere in this workspace can still be blocking
+        it. A materialized view whose SOURCE lives in a *different*
+        workspace entirely (only possible if egress_protection was off when
+        it was created) is out of scope here and still refuses correctly -
+        that is a real, external dependency this operation cannot and must
+        not silently override, not a bug in the ordering.
+
+        Reuses `drop_dataset`/`drop_view`/`drop_materialized_view` per item
+        rather than deleting storage directly - each tombstones its own
+        location the same way a standalone `DROP TABLE` does - but then
+        sweeps those tombstones itself, synchronously, with `min_age_ms=0`
+        rather than `DroppedDatasetSweep`'s normal wait: that grace period
+        exists to protect a write still in flight in a *live* workspace,
+        which doesn't apply here, deletion_protection having just been
+        cleared is the caller's own attestation that this workspace is not
+        "live" in that sense, and nothing else in this codebase runs that
+        sweep on a schedule - reclaiming inline is the only way this
+        doesn't leave every dropped dataset's files stranded indefinitely,
+        which used to be exactly what happened.
+
+        A dataset held by its own per-asset `locked-by` lock raises
+        `DatasetLocked` out of `drop_dataset` and stops this partway
         through, the same as it would dropping that one dataset directly -
         clear the lock and re-run, rather than this silently skipping it.
+
+        A sweep failure on any one location (e.g. a storage listing error)
+        raises `WorkspaceStorageReclaimFailed` rather than letting the drop
+        finish anyway - `$properties` is deliberately NOT deleted in that
+        case, because deleting it removes the only way to construct a
+        normal handle on this workspace again to retry the leftover
+        tombstone(s). Every dataset/view/collection has still been dropped
+        by that point; only the storage confirmation and the final
+        `$properties` delete are held back. Re-run `drop_workspace` once
+        the underlying storage issue is resolved.
 
         Raises `WorkspaceDeletionProtected` if the workspace is
         deletion-protected. This is the only thing that flag ever guarded -
@@ -1278,11 +1321,69 @@ class OpteryxCatalog(Metastore):
 
         self._assert_not_deletion_protected()
 
-        for collection in self.list_collections():
+        collections = list(self.list_collections())
+
+        for collection in collections:
+            for mv in list(self.list_materialized_views(collection)):
+                self.drop_materialized_view(f"{collection}.{mv}", author=author)
+
+        for collection in collections:
             for dataset in list(self.list_datasets(collection)):
                 self.drop_dataset(f"{collection}.{dataset}", author=author)
+
+        for collection in collections:
             for view in list(self.list_views(collection)):
                 self.drop_view(f"{collection}.{view}", author=author)
+
+        for collection in collections:
+            # The collection document itself, not just its datasets/views -
+            # left behind otherwise, since Firestore does not cascade a
+            # delete into (or out of) a parent. CollectionNotFound is
+            # tolerated: a collection created only implicitly, by a dataset
+            # inside it rather than through create_collection() explicitly,
+            # stops existing on its own once that last child is gone -
+            # Firestore has no document that doesn't exist through either
+            # its own data or a live descendant. drop_dataset/drop_view have
+            # the same tolerance built in for the same reason; this is that
+            # rule applied one level up.
+            try:
+                self.drop_collection(collection, author=author)
+            except CollectionNotFound:
+                pass
+
+        from .catalog.dropped_sweep import DroppedDatasetSweep
+
+        sweep_result = DroppedDatasetSweep(self, author=author, min_age_ms=0).sweep(
+            dry_run=False
+        )
+        if sweep_result.get("errors"):
+            # Must not proceed to delete $properties: once it's gone there is
+            # no way to construct a normal handle on this workspace again to
+            # retry whatever tombstone(s) this left behind - see
+            # WorkspaceStorageReclaimFailed's docstring.
+            failed = [d for d in sweep_result.get("details", []) if d.get("action") == "error"]
+            raise WorkspaceStorageReclaimFailed(
+                f"Dropped every dataset/view in {self.workspace!r}, but "
+                f"{sweep_result['errors']} of {sweep_result['tombstones']} "
+                f"storage location(s) could not be confirmed reclaimed: "
+                f"{failed}. The workspace's $properties document was NOT "
+                f"deleted - re-run the drop once the underlying storage "
+                f"issue is resolved."
+            )
+
+        # $policies/access is policy.opteryx's own data - the access grants
+        # for this workspace - not opteryx_catalog's. It lives here anyway,
+        # in the same `catalogs` Firestore database the two services
+        # deliberately share, and policy.opteryx has no webhook consumer
+        # for workspace deletion to clean it up itself (checked: there is
+        # none). Left behind, this is not just an orphan - if this
+        # workspace name is ever reused, its old grants would silently
+        # reactivate for whatever gets created under the same name next,
+        # handing out access nobody asked for to data that has nothing to
+        # do with why those grants existed. Cleared here directly rather
+        # than left to a cross-service webhook that does not exist and
+        # would add its own delivery-reliability question if it did.
+        self._delete_subcollection(self._catalog_ref.document("$policies").collection("access"))
 
         self._catalog_ref.document("$properties").delete()
 
