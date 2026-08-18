@@ -149,7 +149,7 @@ class WorkspaceNotFound(KeyError, CatalogError):
 
 
 class WorkspaceDeletionProtected(CatalogError):
-    """Raised by `soft_delete_workspace` when the workspace is deletion-protected.
+    """Raised by `drop_workspace` when the workspace is deletion-protected.
 
     Protection is ON unless `deletion_protection` is explicitly turned off, so
     this is the *default* answer for a workspace nobody has configured - see
@@ -160,6 +160,26 @@ class WorkspaceDeletionProtected(CatalogError):
     inside a protected workspace is unaffected. Per-asset protection is the
     `locked-by` two-person lock (`DatasetLocked`/`CollectionLocked`), a separate
     mechanism cleared by an unlock rather than by a property change."""
+
+
+class WorkspaceStorageReclaimFailed(Alertable, CatalogError):
+    """`drop_workspace` could not confirm every dropped dataset's storage
+    was actually reclaimed.
+
+    Raised instead of silently deleting the workspace's `$properties` doc
+    anyway: once that doc is gone, nothing can construct a normal handle on
+    this workspace again to retry a leftover tombstone, so a file that
+    failed to delete here would be orphaned with no path back to it short
+    of a manual, out-of-band fix. The message names every tombstone that
+    did not fully reclaim.
+
+    Alertable because this means storage is now permanently unreachable
+    through the normal lifecycle, not that anything was left "still there"
+    in a way a caller can retry on their own.
+    """
+
+    alert_severity = AlertSeverity.ERROR
+    alert_summary = "A workspace drop could not confirm all storage was reclaimed."
 
 
 class EgressRestricted(CatalogError):
