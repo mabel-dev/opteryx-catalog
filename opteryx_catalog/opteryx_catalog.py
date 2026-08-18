@@ -32,7 +32,6 @@ from .exceptions import SnapshotMissingError
 from .exceptions import TriggerNotFound
 from .exceptions import ViewAlreadyExists
 from .exceptions import ViewNotFound
-from .exceptions import WorkspaceDeleted
 from .exceptions import WorkspaceDeletionProtected
 from .exceptions import WorkspaceNotFound
 from .iops.base import FileIO
@@ -387,10 +386,9 @@ class OpteryxCatalog(Metastore):
             project=firestore_project, database=firestore_database
         )
         self._catalog_ref = self.firestore_client.collection(workspace)
-        # Gate construction on the workspace existing, and on its soft-delete
-        # state. The $properties doc records metadata for the workspace such as
-        # 'timestamp-ms', 'author', 'billing-account-id', 'owner', and the
-        # soft-delete/lock fields below.
+        # Gate construction on the workspace existing. The $properties doc
+        # records metadata for the workspace such as 'timestamp-ms',
+        # 'author', 'billing-account-id', 'owner', and the lock fields below.
         #
         # Constructing a handle is a READ, not a provisioning step. Writing
         # $properties here for an unknown name is what makes the workspace
@@ -398,12 +396,23 @@ class OpteryxCatalog(Metastore):
         # mistyped workspace name in a query used to silently conjure an empty
         # workspace. Provisioning is now opt-in via `create_if_missing`.
         #
-        # The existence-check read and the gates below are deliberately NOT
-        # under the same broad `except Exception: pass` - a Firestore read
+        # `include_deleted` is now inert - kept only so existing callers
+        # across other repos (billing.opteryx in particular) don't need a
+        # coordinated signature change. It used to also gate construction on
+        # 'deleted-at-ms', back when workspaces were soft-deleted with a
+        # restore grace period; DROP WORKSPACE replaced that model with an
+        # immediate, total drop (deletes this very doc, see drop_workspace())
+        # and 'deleted-at-ms' is no longer written by anything. Leaving that
+        # gate in blocked drop_workspace() itself from ever reaching a
+        # workspace stuck with a legacy 'deleted-at-ms' from before this
+        # change - the exact bug this comment replaces.
+        #
+        # The existence-check read is deliberately NOT under the same broad
+        # `except Exception: pass` as the write below - a Firestore read
         # failure here is tolerated (conservative: don't fail catalog init on
         # transient Firestore errors, and don't claim a workspace is missing
-        # when we simply couldn't look), but WorkspaceNotFound/WorkspaceDeleted
-        # are real business-logic decisions and must always propagate.
+        # when we simply couldn't look), but WorkspaceNotFound is a real
+        # business-logic decision and must always propagate.
         props_doc = None
         try:
             props_ref = self._catalog_ref.document("$properties")
@@ -435,10 +444,6 @@ class OpteryxCatalog(Metastore):
                 except Exception as exc:  # noqa: BLE001 - Firestore client boundary
                     # Be conservative: don't fail catalog initialization on Firestore errors
                     logger.debug("Could not seed $properties for %s (%s)", workspace, exc)
-            elif not include_deleted:
-                data = props_doc.to_dict() or {}
-                if data.get("deleted-at-ms") is not None:
-                    raise WorkspaceDeleted(f"Workspace has been deleted: {workspace}")
         self.gcs_bucket = gcs_bucket
         self._storage_client = storage.Client() if gcs_bucket else None
         # Caches for immutable, version-addressed artifacts. Snapshots, schemas
@@ -1542,12 +1547,13 @@ class OpteryxCatalog(Metastore):
             raise EgressRestricted(str(refusals[0]))
 
     # Fields on `$properties` that only their own dedicated methods may write.
-    # Each one gates real control flow - `deleted-at-ms` makes the constructor
-    # raise WorkspaceDeleted, `locked-by` makes drop_dataset/drop_collection
-    # raise Locked - so letting a generic property setter touch them would let
-    # a caller resurrect a deleted workspace or clear a lock while bypassing
-    # drop_workspace/restore_workspace/lock_workspace/unlock_workspace and the
-    # audit records and webhooks those emit.
+    # `locked-by` gates real control flow (drop_dataset/drop_collection raise
+    # Locked when it's set), so letting a generic property setter touch it
+    # would let a caller clear a lock while bypassing lock_workspace /
+    # unlock_workspace and the audit records and webhooks those emit.
+    # `deleted-at-ms`/`deleted-by` are legacy fields from the soft-delete
+    # model DROP WORKSPACE replaced - nothing reads them anymore, but they
+    # stay reserved rather than becoming a plain writable property.
     _RESERVED_WORKSPACE_PROPERTIES = frozenset(
         {
             "timestamp-ms",

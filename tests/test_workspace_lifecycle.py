@@ -12,7 +12,6 @@ import pytest
 from opteryx_catalog.exceptions import CollectionLocked
 from opteryx_catalog.exceptions import CollectionNotFound
 from opteryx_catalog.exceptions import DatasetLocked
-from opteryx_catalog.exceptions import WorkspaceDeleted
 from opteryx_catalog.exceptions import WorkspaceDeletionProtected
 from opteryx_catalog.exceptions import WorkspaceNotFound
 from opteryx_catalog.opteryx_catalog import OpteryxCatalog
@@ -117,18 +116,25 @@ def _properties_client(props_data=None, props_exists=True):
     return _FirestoreClient(catalog_collection), catalog_collection, log
 
 
-def test_init_raises_for_deleted_workspace():
+def test_init_succeeds_for_workspace_with_legacy_deleted_at_ms():
+    """`deleted-at-ms` is a legacy field from the soft-delete model DROP
+    WORKSPACE replaced - nothing sets it anymore, and construction must not
+    refuse a workspace just because it still carries one from before this
+    change (that was the exact bug: it blocked drop_workspace() itself from
+    ever reaching such a workspace, since _get_catalog constructs with the
+    default include_deleted=False)."""
     client, _cc, _log = _properties_client(
         props_data={"deleted-at-ms": 12345, "deleted-by": "alice"}
     )
-    with (
-        patch("opteryx_catalog.opteryx_catalog.firestore.Client", return_value=client),
-        pytest.raises(WorkspaceDeleted),
-    ):
-        OpteryxCatalog(workspace="ws")
+    with patch("opteryx_catalog.opteryx_catalog.firestore.Client", return_value=client):
+        catalog = OpteryxCatalog(workspace="ws")
+    assert catalog.workspace == "ws"
 
 
 def test_init_succeeds_for_deleted_workspace_with_include_deleted():
+    """include_deleted is now inert - True behaves identically to the
+    default False. Kept as its own test so a future reader can see both
+    spellings are equivalent, not just the default one."""
     client, _cc, _log = _properties_client(
         props_data={"deleted-at-ms": 12345, "deleted-by": "alice"}
     )
