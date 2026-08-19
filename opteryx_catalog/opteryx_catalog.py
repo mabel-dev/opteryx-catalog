@@ -170,6 +170,72 @@ def _core_type_to_stored(column_type: Any) -> tuple:
     return (type_name, None, None, None)
 
 
+def _stored_columns_of(schema: Any):
+    """`(name, quartet)` per column when `schema` is already in stored spelling.
+
+    None when it is not, so the caller falls through to the duck-typed shapes.
+    A caller holding `{"name": "source_ip", "type": "IPV4"}` has said everything
+    this method needs; the only work left is filling in the parameters that the
+    name already carries, so `DECIMAL(10, 2)` still stores a precision and a
+    scale and `ARRAY<VARCHAR>` still stores an element type.
+
+    An explicit `precision`, `scale` or `element-type` on the column wins over
+    the parsed one. A caller that spelled them out means them, and evolution
+    hands back stored dicts that carry exactly those keys.
+    """
+    columns = schema.get("columns") if isinstance(schema, dict) else schema
+    if not isinstance(columns, (list, tuple)):
+        return None
+    if not all(isinstance(column, dict) and "name" in column for column in columns):
+        return None
+    if not columns:
+        return []
+
+    out = []
+    for column in columns:
+        declared = column.get("type")
+        type_name, element_type, precision, scale = _parse_stored_type(declared)
+        out.append(
+            (
+                column["name"],
+                (
+                    type_name,
+                    column.get("element-type", element_type),
+                    column.get("precision", precision),
+                    column.get("scale", scale),
+                ),
+            )
+        )
+    return out
+
+
+def _parse_stored_type(declared: Any) -> tuple:
+    """Split a stored type name into the quartet the column document holds.
+
+    The name is authoritative and is stored unchanged - `parse_column_type` on
+    the engine side reads it back whole. What is pulled out of it is only the
+    redundant copies other readers consume.
+    """
+    if declared is None:
+        return ("VARCHAR", None, None, None)
+    name = str(declared).strip()
+    upper = name.upper()
+    if upper.startswith("DECIMAL(") and name.endswith(")"):
+        parameters = name[name.index("(") + 1 : -1].split(",")
+        if len(parameters) == 2:
+            try:
+                return (name, None, int(parameters[0].strip()), int(parameters[1].strip()))
+            except ValueError:
+                # A name we cannot read the parameters out of is still a name.
+                # Storing it whole and leaving the copies empty is better than
+                # refusing a dataset over the redundant half of the record.
+                return (name, None, None, None)
+        return (name, None, None, None)
+    if upper.startswith("ARRAY<") and name.endswith(">"):
+        return (name, name[name.index("<") + 1 : -1].strip() or None, None, None)
+    return (name, None, None, None)
+
+
 def _expand_column_type(column: dict) -> dict:
     """Resolve a ``column_type`` key into the stored ``type``/``element-type``/
     ``precision``/``scale`` quartet.
@@ -3418,12 +3484,26 @@ class OpteryxCatalog(Metastore):
         ``{"id": field-id, "name", "type", "element-type", "scale",
         "precision", "expectation-policies", "annotations"}``.
 
-        Accepts a draken ``Morsel`` (the schema of a table being written) or
-        any relation-schema-like object exposing a ``.columns`` list of
-        columns with ``.name``/``.column_type`` (duck-typed, so a real
-        Opteryx ``RelationSchema`` works without importing opteryx-core
-        here). The stored ``type`` is a category/type name (``INTEGER``,
-        ``DECIMAL``, ``ARRAY``, ...) that round-trips through
+        Accepts a draken ``Morsel`` (the schema of a table being written), any
+        relation-schema-like object exposing a ``.columns`` list of columns with
+        ``.name``/``.column_type`` (duck-typed, so a real Opteryx
+        ``RelationSchema`` works without importing opteryx-core here), or
+        columns already in the stored spelling - either a list of
+        ``{"name", "type"}`` dicts or a mapping with a ``"columns"`` key holding
+        one.
+
+        That last form is here because a caller that already knows its types as
+        strings had no way in. ``create_dataset(schema={"columns": [...]})``
+        reads as the obvious call, matches exactly what this method returns, and
+        is what ``_expand_column_type`` already documents as supported for
+        evolution - but it arrived here as a dict, whose ``columns`` is a key and
+        not an attribute, and was refused as an unsupported schema type. A
+        service that holds its own type vocabulary should not have to
+        manufacture a fake ColumnType, or take a dependency on the query engine,
+        to say ``VARCHAR``.
+
+        The stored ``type`` is a category/type name (``INTEGER``, ``DECIMAL``,
+        ``ARRAY``, ...) that round-trips through
         ``opteryx.types.logical_type.parse_column_type`` on the query-engine
         side.
 
@@ -3434,7 +3514,10 @@ class OpteryxCatalog(Metastore):
         back to the historical ``enumerate(..., start=1)`` behavior for
         callers that haven't been updated to pass allocated ids.
         """
-        if hasattr(schema, "columns"):
+        stored = _stored_columns_of(schema)
+        if stored is not None:
+            entries = [(name, quartet) for name, quartet in stored]
+        elif hasattr(schema, "columns"):
             entries = [(col.name, _core_type_to_stored(col.column_type)) for col in schema.columns]
         elif hasattr(schema, "num_rows") and hasattr(schema, "column_names"):
             # Duck-typed as a draken Morsel. Don't check for `.schema`
@@ -3447,8 +3530,11 @@ class OpteryxCatalog(Metastore):
             ]
         else:
             raise ValueError(
-                "Unsupported schema type, expected a relation-schema-like object "
-                "with a `.columns` attribute or a draken.morsels.morsel.Morsel"
+                f"Unsupported schema type {type(schema).__name__}: expected a "
+                "relation-schema-like object with a `.columns` attribute, a "
+                "draken.morsels.morsel.Morsel, or columns already in the stored "
+                'spelling - a list of {"name", "type"} dicts, or a mapping with a '
+                '"columns" key holding one'
             )
 
         if field_ids is not None and len(field_ids) != len(entries):
