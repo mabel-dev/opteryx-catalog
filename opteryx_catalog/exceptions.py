@@ -370,3 +370,20 @@ class SnapshotMissingError(Alertable, CatalogError):
     alert_severity = AlertSeverity.CRITICAL
     alert_labels = ("data-loss-risk", "metastore")
     alert_summary = "A dataset's current snapshot document is missing."
+
+
+class InvalidCatalogBinding(ValueError, CatalogError):
+    """A workspace catalog-binding write was rejected before reaching Firestore.
+
+    Raised by `opteryx_catalog.binding`'s validation: an unusable `kind`, a
+    reserved key in `config` (`workspace`/`connector`/`prefix` - the engine
+    injects or strips those itself), or an inconsistent auth block (a stored
+    credential missing its ciphertext/key/target, an ambient one carrying
+    them). Validation happens at write time on purpose: a malformed binding
+    must fail where its author can see the error, not at some later query's
+    resolution.
+
+    Subclasses ValueError so callers that validate inputs generically catch it
+    without importing catalog-specific types. Deliberately NOT Alertable: a
+    rejected write is a caller error, not a platform failure.
+    """
