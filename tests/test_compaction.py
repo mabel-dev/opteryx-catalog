@@ -1011,6 +1011,32 @@ def test_commit_proceeds_when_rows_balance():
     dataset.io.delete.assert_not_called()
 
 
+def test_commit_preserves_current_schema_id():
+    """Regression test: the compaction commit must carry the dataset's current
+    schema id forward onto the new snapshot. Compaction never changes schema,
+    but the snapshot builder used to read a dead ``metadata.schema`` attribute
+    (always None on a real Dataset) instead of ``metadata.current_schema_id``,
+    so every compacted snapshot silently lost its schema_id."""
+    dataset = _perf_dataset()
+    dataset.metadata.current_snapshot = Mock(return_value=None)
+    dataset.metadata.current_schema_id = "55700292-3f3f-4947-870b-f19002ddbc73"
+    compactor = DatasetCompactor(dataset, strategy="performance", author="t", agent="t")
+    dataset.catalog.write_parquet_manifest = Mock(return_value="/tmp/manifest2.parquet")
+
+    inputs = [
+        {"file_path": "/tmp/test_data/data/a.parquet", "record_count": 100},
+        {"file_path": "/tmp/test_data/data/b.parquet", "record_count": 100},
+    ]
+    outputs = [{"file_path": "/tmp/test_data/data/c.parquet", "record_count": 200}]
+
+    snapshot = compactor._finalize_compaction_snapshot(
+        list(inputs), inputs, outputs, 1234, 200, 0, "native"
+    )
+
+    assert snapshot is not None
+    assert snapshot.schema_id == "55700292-3f3f-4947-870b-f19002ddbc73"
+
+
 def test_reconcile_failure_aborts_instead_of_dropping_rows():
     """An unreconcilable morsel used to be skipped, so its rows vanished from
     the output while its source file was still deleted by the commit."""
@@ -1100,6 +1126,7 @@ if __name__ == "__main__":
     test_file_pruning_never_drops_a_candidate_it_cannot_rule_out()
     test_commit_refused_when_rows_go_missing()
     test_commit_proceeds_when_rows_balance()
+    test_commit_preserves_current_schema_id()
     test_reconcile_failure_aborts_instead_of_dropping_rows()
     test_commit_refused_when_another_writer_committed_first()
     print("\n✅ All tests passed!")
