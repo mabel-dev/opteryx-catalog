@@ -1411,7 +1411,7 @@ class DatasetCompactor:
             manifest_list=manifest_path,
             operation_type="compact",
             parent_snapshot_id=current.snapshot_id if current else None,
-            schema_id=getattr(self.dataset.metadata.schema, "schema_id", None),
+            schema_id=self.dataset.metadata.current_schema_id,
             commit_message=f"Compaction: {self.strategy} strategy, {deleted_files} files → {added_files} files",
             summary={
                 "added-data-files": added_files,
