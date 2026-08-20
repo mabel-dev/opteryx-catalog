@@ -1,6 +1,9 @@
 name: Semgrep Scan
 
-on: push
+on:
+  push:
+  schedule:
+    - cron: '17 6 * * *'
 
 jobs:
   semgrep:
