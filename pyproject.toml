@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "opteryx-catalog"
-version = "0.4.100"
+version = "0.4.101"
 description = "Opteryx Cloud Catalog"
 readme = { file = "README.md", content-type = "text/markdown" }
 authors = [
@@ -60,6 +60,14 @@ s3 = [
 # Manager. The default stdout sink needs nothing beyond the core dependencies.
 alerts = [
     "google-cloud-secret-manager>=2.20.0"
+]
+# Only opteryx_catalog/security/kms.py needs these, and only lazily (imported
+# inside encrypt_secret/decrypt_secret) -- catalogs that never touch a stored
+# credential (workspace catalog bindings, external-table credentials) work
+# without them installed.
+kms = [
+    "google-cloud-kms>=2.24",
+    "cryptography>=42",
 ]
 # The suite writes and reads real Parquet, so it pulls in the parquet extra
 # rather than restating the rugo requirement. `draken` must NOT be added here --
