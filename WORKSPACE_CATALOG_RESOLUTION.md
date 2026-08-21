@@ -289,11 +289,52 @@ them. Options considered:
 - **Punt** — acceptable fallback for v1 if no OData consumer needs bound workspaces yet; the
   stub mechanism can land later without schema changes.
 
-Stub docs carry only `workspace`/`collection`/`name`/`external-catalog: true` — no
-snapshots, schemas, or sort orders. The marker keeps anything snapshot-hungry (compaction,
-sweeps, `DatasetInfo` sort-order resolution) from treating a stub as a real dataset.
-Permission filtering of the listing is unchanged: it pattern-matches the stub-derived
-resource names exactly as it does native ones.
+Stub docs carry `workspace`/`collection`/`name`/`external-catalog: true`, plus — since the
+name-only projection proved insufficient, see below — an inline `schema` and a `statistics`
+block. No snapshots and no sort orders. The marker keeps anything snapshot-hungry
+(compaction, sweeps, `DatasetInfo` sort-order resolution) from treating a stub as a real
+dataset. Permission filtering of the listing is unchanged: it pattern-matches the
+stub-derived resource names exactly as it does native ones.
+
+**Why names alone were not enough (revised after Phase 6 landed).** odata's `$metadata`
+emits no `EntityType` — and therefore no `EntitySet` — for a dataset with no resolvable
+columns. A name-only stub was consequently visible in the service document and *invisible*
+in `$metadata`: fine for a browser, useless for Excel and Power BI, which read `$metadata`
+first. Closing that needs the columns, and once a table is being loaded for its schema its
+row count and per-column bounds are cheap by comparison. So the projection now carries them.
+
+A refresh costs one `list_tables` per namespace plus one table load per TABLE, and stops
+there. **The line is drawn at what the catalog gives away**: a load hands back a metadata
+document that already contains the schema, the snapshot summary (row count, data-file count,
+total size, delete counts), the last-updated time, the sort order and the partition spec, so
+taking all of those is free.
+
+Per-column min/max, null counts and column sizes are deliberately NOT taken. They live in
+the manifests — a further read per table, scaling with the table's file *count* rather than
+its size and unbounded on a table with many small files — and nothing in the product reads
+them: odata needs columns for `$metadata` and takes ordering from `sort-orders`, and queries
+resolve live statistics through the engine's own connector. A cost with no reader is not
+worth charging a customer's catalog for on every refresh. If something ever needs them they
+are one `scan()` away and belong behind their own opt-in. (For the record, no data file is
+opened either way: pyiceberg's `plan_files()` reads manifests, not Parquet footers.)
+
+`timestamp-ms`, `sort-orders` and `partition-columns` are stored spelled the way odata
+already reads them, so an external table reports its last-modified time and its
+`ordered`/`orderBy` with no special case anywhere. The sort order's column NAME is resolved
+at projection time from the schema already in hand, because resolving it later would cost a
+schema-document read a stub cannot satisfy.
+
+One honesty note on the row count: Iceberg's `total-records` counts rows in data files, and
+row-level deletes are tracked separately, so the projected count is approximate on a
+merge-on-read table. The delete counts are stored alongside it rather than folded into it,
+so a reader can see that.
+Two properties keep it honest: every part beyond the four identity fields degrades
+independently (a table that will not load still projects its name; one whose manifests will
+not read still projects its schema), and a table that could not be re-read *retains* what an
+earlier run stored rather than having it erased — a schema we failed to refresh is stale at
+worst, while a schema we deleted is a table that vanished from Excel because of a transient
+error. None of it is authoritative: queries resolve the live schema through the engine's own
+connector and never consult these documents.
 
 The marker is also the reconciler's delete guard: a sync only ever removes documents that
 carry it, and never overwrites one that doesn't, so a projection cannot eat a dataset

@@ -255,3 +255,270 @@ def test_unusable_listing_entries_are_rejected_before_any_write(db, entry):
 def test_malformed_listing_entry_is_rejected(db):
     with pytest.raises(ValueError):
         sync_stub_datasets(db, WS, ["interop.people"])
+
+
+# ---------------------------------------------------------------------------
+# Schema and statistics
+#
+# Names alone left a stub in odata's service document but out of its
+# $metadata, which emits no EntityType for a dataset with no resolvable
+# columns. These are optional and independently degradable: a table the caller
+# could not load still projects its name, and a table whose manifests it could
+# not read still projects its schema.
+# ---------------------------------------------------------------------------
+
+
+COLUMNS = [
+    {"id": 1, "name": "user_id", "type": "BIGINT", "nullable": False},
+    {"id": 2, "name": "country", "type": "VARCHAR", "nullable": True},
+]
+STATS = {
+    "row-count": 1200,
+    "data-file-count": 3,
+    "columns": {"country": {"min": "AU", "max": "ZW", "null-count": 0}},
+}
+
+
+def test_schema_and_statistics_are_stored_on_the_stub(db):
+    sync_stub_datasets(
+        db, WS, [("interop", "people", {"schema": COLUMNS, "statistics": STATS})]
+    )
+    stored = _stubs(db)[("interop", "people")]
+    assert stored["schema"] == COLUMNS
+    assert stored["statistics"] == STATS
+    # the identity fields are untouched by the addition
+    assert stored["name"] == "people"
+    assert stored[STUB_MARKER] is True
+
+
+def test_a_name_only_entry_still_projects_name_only(db):
+    sync_stub_datasets(db, WS, [("interop", "people")])
+    stored = _stubs(db)[("interop", "people")]
+    # absent keys, not explicit nulls: "not collected" and "no columns" are
+    # different statements and a null would conflate them
+    assert "schema" not in stored
+    assert "statistics" not in stored
+
+
+def test_detailed_and_name_only_entries_mix_in_one_listing(db):
+    result = sync_stub_datasets(
+        db,
+        WS,
+        [("interop", "people", {"schema": COLUMNS}), ("interop", "orders")],
+    )
+    assert result.added == 2
+    stubs = _stubs(db)
+    assert stubs[("interop", "people")]["schema"] == COLUMNS
+    assert "schema" not in stubs[("interop", "orders")]
+
+
+def test_an_unchanged_detailed_stub_is_not_rewritten(db):
+    listing = [("interop", "people", {"schema": COLUMNS, "statistics": STATS})]
+    sync_stub_datasets(db, WS, listing)
+    result = sync_stub_datasets(db, WS, listing)
+    # the steady state stays zero writes even now that a stub carries content
+    assert (result.added, result.removed, result.updated) == (0, 0, 0)
+
+
+def test_a_changed_schema_counts_as_updated(db):
+    sync_stub_datasets(db, WS, [("interop", "people", {"schema": COLUMNS})])
+    evolved = COLUMNS + [{"id": 3, "name": "signup_ts", "type": "TIMESTAMP", "nullable": True}]
+    result = sync_stub_datasets(db, WS, [("interop", "people", {"schema": evolved})])
+    assert (result.added, result.removed, result.updated) == (0, 0, 1)
+    assert _stubs(db)[("interop", "people")]["schema"] == evolved
+
+
+def test_a_changed_row_count_counts_as_updated(db):
+    sync_stub_datasets(db, WS, [("interop", "people", {"statistics": STATS})])
+    moved = dict(STATS, **{"row-count": 1300})
+    result = sync_stub_datasets(db, WS, [("interop", "people", {"statistics": moved})])
+    assert result.updated == 1
+    assert _stubs(db)[("interop", "people")]["statistics"]["row-count"] == 1300
+
+
+def test_losing_detail_rewrites_the_stub_back_to_name_only(db):
+    # the caller could load the table last time and could not this time; the
+    # name survives, and the stale schema does not linger as if still true
+    sync_stub_datasets(db, WS, [("interop", "people", {"schema": COLUMNS})])
+    result = sync_stub_datasets(db, WS, [("interop", "people")])
+    assert result.updated == 1
+    assert "schema" not in _stubs(db)[("interop", "people")]
+
+
+def test_detail_never_revives_a_removed_stub(db):
+    sync_stub_datasets(db, WS, [("interop", "people", {"schema": COLUMNS})])
+    result = sync_stub_datasets(db, WS, [])
+    assert (result.removed, result.total) == (1, 0)
+    assert _stubs(db) == {}
+
+
+def test_detail_is_never_written_over_a_real_dataset(db):
+    _seed_real_dataset(db, "interop", "people")
+    result = sync_stub_datasets(
+        db, WS, [("interop", "people", {"schema": COLUMNS, "statistics": STATS})]
+    )
+    assert (result.added, result.updated, result.removed) == (0, 0, 0)
+    stored = db.collection(WS).document("interop").collection("datasets").document(
+        "people"
+    ).get().to_dict()
+    assert stored["location"] == "gs://real"
+    assert "schema" not in stored
+
+
+def test_a_duplicate_entry_takes_the_last_detail(db):
+    # deterministic rather than dependent on iteration order
+    result = sync_stub_datasets(
+        db,
+        WS,
+        [("interop", "people"), ("interop", "people", {"schema": COLUMNS})],
+    )
+    assert (result.added, result.total) == (1, 1)
+    assert _stubs(db)[("interop", "people")]["schema"] == COLUMNS
+
+
+def test_malformed_detail_is_rejected(db):
+    with pytest.raises(ValueError):
+        sync_stub_datasets(db, WS, [("interop", "people", ["not", "a", "dict"])])
+    assert _stubs(db) == {}
+
+
+def test_over_long_entries_are_rejected(db):
+    with pytest.raises(ValueError):
+        sync_stub_datasets(db, WS, [("interop", "people", {}, "extra")])
+
+
+# -- values Firestore will actually accept ----------------------------------
+
+
+def test_bounds_are_normalised_to_storable_values(db):
+    import datetime
+    import decimal
+    import uuid
+
+    identifier = uuid.UUID("12345678-1234-5678-1234-567812345678")
+    stats = {
+        "columns": {
+            "price": {"min": decimal.Decimal("0.10"), "max": decimal.Decimal("99.99")},
+            "born": {"min": datetime.date(1999, 12, 31)},
+            "seen": {"min": datetime.datetime(2026, 8, 21, 12, 0, 0)},
+            "ref": {"min": identifier},
+        }
+    }
+    sync_stub_datasets(db, WS, [("interop", "people", {"statistics": stats})])
+    columns = _stubs(db)[("interop", "people")]["statistics"]["columns"]
+
+    # a decimal bound stays exact - rendering 0.10 as a float would make the
+    # stored bound disagree with the column it describes
+    assert columns["price"]["min"] == "0.10"
+    assert columns["born"]["min"] == "1999-12-31"
+    # datetime is a Firestore-native value and survives as one
+    assert columns["seen"]["min"] == datetime.datetime(2026, 8, 21, 12, 0, 0)
+    assert columns["ref"]["min"] == str(identifier)
+
+
+def test_an_unrecognised_bound_is_rendered_not_dropped():
+    from opteryx_catalog.stub_projection import firestore_safe
+
+    class Opaque:
+        def __str__(self):
+            return "opaque-bound"
+
+    assert firestore_safe(Opaque()) == "opaque-bound"
+    assert firestore_safe(None) is None
+    assert firestore_safe(True) is True
+
+
+# -- "I listed it but could not look inside it this time" --------------------
+
+
+def test_retain_keeps_stored_detail_when_the_caller_could_not_collect(db):
+    from opteryx_catalog.stub_projection import RETAIN_DETAIL
+
+    sync_stub_datasets(
+        db, WS, [("interop", "people", {"schema": COLUMNS, "statistics": STATS})]
+    )
+    result = sync_stub_datasets(db, WS, [("interop", "people", {RETAIN_DETAIL: True})])
+    # nothing changed, so nothing was written - and crucially the schema did
+    # not evaporate because one table failed to load during a good refresh
+    assert (result.added, result.removed, result.updated) == (0, 0, 0)
+    stored = _stubs(db)[("interop", "people")]
+    assert stored["schema"] == COLUMNS
+    assert stored["statistics"] == STATS
+
+
+def test_retain_on_a_table_with_nothing_stored_is_just_a_name(db):
+    from opteryx_catalog.stub_projection import RETAIN_DETAIL
+
+    result = sync_stub_datasets(db, WS, [("interop", "people", {RETAIN_DETAIL: True})])
+    assert result.added == 1
+    assert "schema" not in _stubs(db)[("interop", "people")]
+
+
+def test_retain_still_removes_a_table_that_left_the_listing(db):
+    from opteryx_catalog.stub_projection import RETAIN_DETAIL
+
+    sync_stub_datasets(db, WS, [("interop", "people", {"schema": COLUMNS})])
+    result = sync_stub_datasets(db, WS, [("interop", "orders", {RETAIN_DETAIL: True})])
+    assert (result.added, result.removed) == (1, 1)
+    assert set(_stubs(db)) == {("interop", "orders")}
+
+
+# -- the structural facts a catalog's own metadata already knows -------------
+
+
+SORT_ORDERS = [{"order-id": 1, "fields": [{"source-id": 2, "name": "country", "direction": "desc"}]}]
+
+
+def test_structural_facts_land_in_the_fields_odata_reads(db):
+    sync_stub_datasets(
+        db,
+        WS,
+        [
+            (
+                "interop",
+                "people",
+                {
+                    "schema": COLUMNS,
+                    "timestamp_ms": 1_755_000_000_000,
+                    "sort_orders": SORT_ORDERS,
+                    "partition_columns": ["country"],
+                },
+            )
+        ],
+    )
+    stored = _stubs(db)[("interop", "people")]
+    # kebab-case, because that is what the readers key off: odata's $metadata
+    # reads `timestamp-ms`, its service document reads `sort-orders`
+    assert stored["timestamp-ms"] == 1_755_000_000_000
+    assert stored["sort-orders"] == SORT_ORDERS
+    assert stored["partition-columns"] == ["country"]
+
+
+def test_a_typo_in_detail_is_refused_rather_than_ignored(db):
+    # a silently-dropped field is indistinguishable from "the catalog did not
+    # say", which is the failure this rejection exists to prevent
+    with pytest.raises(ValueError, match="unknown key"):
+        sync_stub_datasets(db, WS, [("interop", "people", {"sort_order": SORT_ORDERS})])
+    assert _stubs(db) == {}
+
+
+def test_structural_facts_are_retained_when_a_table_will_not_open(db):
+    from opteryx_catalog.stub_projection import RETAIN_DETAIL
+
+    sync_stub_datasets(
+        db,
+        WS,
+        [("interop", "people", {"sort_orders": SORT_ORDERS, "timestamp_ms": 1_755_000_000_000})],
+    )
+    result = sync_stub_datasets(db, WS, [("interop", "people", {RETAIN_DETAIL: True})])
+    assert result.updated == 0
+    stored = _stubs(db)[("interop", "people")]
+    assert stored["sort-orders"] == SORT_ORDERS
+    assert stored["timestamp-ms"] == 1_755_000_000_000
+
+
+def test_a_table_that_lost_its_sort_order_loses_the_field(db):
+    sync_stub_datasets(db, WS, [("interop", "people", {"sort_orders": SORT_ORDERS})])
+    result = sync_stub_datasets(db, WS, [("interop", "people", {"schema": COLUMNS})])
+    assert result.updated == 1
+    assert "sort-orders" not in _stubs(db)[("interop", "people")]
