@@ -299,6 +299,11 @@ class Datafile:
 
 @dataclass
 class SimpleDataset(Dataset):
+    # This catalog's own stats builder writes ordinal keys -- see
+    # catalog/manifest.py's compressible-categories note, and the contract
+    # on `Dataset.bounds_are_ordinal`.
+    bounds_are_ordinal = True
+
     identifier: str
     _metadata: DatasetMetadata
     io: Any = None

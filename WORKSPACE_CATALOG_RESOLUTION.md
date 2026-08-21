@@ -412,6 +412,33 @@ entirely different catalog.
   a hard gate before the resolver can serve Iceberg kinds from a deployed worker — same gate
   the hardcoded `tarchia` registration already sits behind.
 
+### jobs.opteryx — the same resolver, for the check endpoint
+
+**Missed by the original list, and it mattered.** This document names six repos and
+jobs.opteryx is not one of them — but `POST /api/v1/check`, the edit-time bind that drives
+the Studio's autocomplete and its error markers, resolves relations through the very same
+`connector_factory` chain. `app/query_check.py` carried the static registrations
+(`set_default_connector`, `register_workspace("mabel_data", …)`) and no resolver, so a bound
+workspace fell through to slot 3 and was checked against the NATIVE catalog. Its datasets
+there are name-and-schema stubs, so every column came back unknown: no completions, and
+markers on columns a query would have resolved perfectly well.
+
+- `app/catalog_resolver.py`: a sibling of the worker's, installed with
+  `set_workspace_resolver` at import. Kept as a COPY, not a shared import: the resolver maps
+  a `kind` to code spanning opteryx-core and opteryx-iceberg, and neither candidate home
+  works — opteryx-catalog would be circular (opteryx-iceberg already imports it) and
+  opteryx-core deliberately holds no catalog, Firestore or KMS knowledge. `mabel_data`'s
+  registration and the permissions-capability install are already duplicated between these
+  two services for the same reason. If a third service ever needs it, extract then.
+- Adds `opteryx-iceberg` and `opteryx-catalog[kms]` to jobs.opteryx.
+- One difference from the worker, recorded in the module: this service holds a
+  `CatalogCache` keyed by relation name, so REBINDING a workspace leaves that TTL's window
+  of cached lookups pointing at the old catalog. Bounded, brief, and only affects editor
+  hints — the worker rotates on the binding version immediately.
+- The rule to hold: **anything that binds SQL needs the resolver.** The registrations and
+  the resolver are one thing, not two, and a service with only the first half is silently
+  wrong for exactly the workspaces this design exists to support.
+
 ### control.opteryx — binding CRUD
 
 - New `app/routes/v1/workspace_catalog.py` following the `workspaces.py` conventions
@@ -443,12 +470,38 @@ entirely different catalog.
   triggers it automatically; stale-listing failures recommend it in their error message
   instead.
 
-### odata.opteryx — no code change (by design)
+### odata.opteryx — one change; the "no code change" claim was incomplete
 
-- The stub-projection decision (§5) exists precisely so odata's collection-group listing
-  keeps working unmodified. Only follow-up: verify the listing renders a stub
-  (`external-catalog: true`, no snapshots/sort-orders) as a plain `Table` without warnings,
-  and add that as a test case.
+- The stub-projection decision (§5) keeps odata's **collection-group listing** working
+  unmodified, and that much held: the service document and the service-wide `/$metadata`
+  both build straight from the catalog documents and read a stub's inline `schema`
+  without special-casing anything.
+- **Source type: `ExternalTable`, not `Table`.** An earlier draft of §5 said a stub should
+  render "as a plain `Table`", and that was wrong — the web contract
+  (`sql_ide.js`'s `Custom.SourceType` list) already distinguishes the two, and it is a
+  distinction a client needs: a `Table` is stored by Opteryx and describable from its own
+  manifests, an `ExternalTable` is a name-and-schema projection whose data lives elsewhere
+  and whose listing is only as fresh as the last refresh. Three places decide this from the
+  `external-catalog` marker — the service document, the service-wide `$metadata` and the
+  per-dataset one — and all three are pinned by one test, because two of three agreeing is
+  how this went wrong the first time.
+- **What the claim missed is that odata has a SECOND `$metadata`.** The per-dataset route
+  (`interface.py`, `/{workstream}/{collection}/{dataset}/$metadata` — the one the Studio's
+  column view actually calls) does not read the catalog document's fields at all: it builds
+  an `OpteryxCatalog`, calls `load_dataset`, and asks the loaded dataset for its schema,
+  which resolves through `current-schema-id` and a `schemas` subcollection. A stub has
+  neither, so a bound workspace's tables listed correctly and then 404ed with "dataset
+  schema unavailable in catalog" — visible in the dataset tree, empty when opened.
+- The fix is a third branch in that endpoint: when the document carries
+  `external-catalog: true`, serve columns from the inline `schema`, row counts from
+  `statistics`, last-modified from `timestamp-ms` and ordering from `sort-orders`, with no
+  catalog handle and no GCS fetch. The stub's schema stays a thin façade and is
+  deliberately NOT given a `schemas` subcollection just to satisfy this path: the external
+  catalog owns schema evolution, so there is no history to version.
+- Lesson worth keeping: "odata reads datasets one way" was the assumption that made the
+  original claim, and it was wrong. `tests/test_dataset_metadata_external_catalog_stub.py`
+  ends with a test that runs both implementations over the same stub document and requires
+  the same columns out of each, so the divergence cannot silently return.
 
 ## 7. Migration
 
