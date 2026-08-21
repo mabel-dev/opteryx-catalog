@@ -295,6 +295,19 @@ sweeps, `DatasetInfo` sort-order resolution) from treating a stub as a real data
 Permission filtering of the listing is unchanged: it pattern-matches the stub-derived
 resource names exactly as it does native ones.
 
+The marker is also the reconciler's delete guard: a sync only ever removes documents that
+carry it, and never overwrites one that doesn't, so a projection cannot eat a dataset
+document this catalog owns.
+
+Because the refresh is user-initiated and cost-impacting, the binding block also carries
+`listing-synced-at-ms` and `listing-count`, written by the same call that reconciles and
+surfaced by control.opteryx's `GET …/catalog`. Stating the age of the list is the ONLY
+automatic behaviour permitted here — without it, a refresh control has no "last refreshed"
+beside it and gets pressed repeatedly just to find out whether it needed pressing, which is
+the cost this decision was avoiding. Absent fields mean "never refreshed"; a binding write
+replaces the block and so resets them, deliberately, since a rebind may point at an
+entirely different catalog.
+
 ## 6. Per-repo change list
 
 ### opteryx-core — resolution-first rewrite of the connector layer
