@@ -231,16 +231,60 @@ DELETE reverts to native (subsequent resolution takes the native branch); the lo
 ## Phase 6 — stub projection sync
 **Repos:** opteryx-catalog (primitive) + control.opteryx (endpoint). Lowest urgency — the
 engine and permissions work without it; only OData listing needs it (§5).
-**Status: implemented 2026-08-21** — `opteryx_catalog/stub_projection.py` (+18 tests in
-`tests/test_stub_projection.py`, opteryx-catalog 0.4.102);
+**Status: implemented 2026-08-21** — `opteryx_catalog/stub_projection.py` (35 tests in
+`tests/test_stub_projection.py`, opteryx-catalog 0.4.103);
 `POST /v1/workspaces/{name}/catalog/sync` in control.opteryx's
-`app/routes/v1/workspace_catalog.py` (+21 tests); the odata stub-listing test as
-`tests/test_service_document_external_catalog_stubs.py`.
+`app/routes/v1/workspace_catalog.py` (38 sync tests inside
+`tests/test_workspace_catalog_endpoints.py`, 69 in the file); the odata stub-listing tests
+as `tests/test_service_document_external_catalog_stubs.py` (6, covering both the service
+document and `$metadata`); the stale-listing hint in worker.opteryx (14 tests). 0.4.103 is
+the first release carrying the schema/statistics projection and `RETAIN_DETAIL`, which
+control.opteryx requires.
 
 - opteryx-catalog: a stub-writing primitive — given a workspace and a listing
   (`[(collection, name), …]`), reconcile stub docs (`workspace`/`collection`/`name`/
   `external-catalog: true`) under the shell workspace, returning `(added, removed)`.
   The listing itself is produced by the caller.
+- **Extended after the name-only version landed — schema and statistics.** Entries may now
+  be `(collection, name, detail)`, where `detail` carries an inline `schema` (stored-spelling
+  column dicts), a `statistics` block (`row-count`, `data-file-count`,
+  `total-file-size-bytes`, and the delete counts that make the row count readable on a
+  merge-on-read table), and the structural facts `timestamp_ms`, `sort_orders` and
+  `partition_columns`. The trigger was a gap the
+  name-only projection left: odata's `$metadata` emits no `EntityType` for a dataset with no
+  resolvable columns, so a stub appeared in the service document and vanished from
+  `$metadata` — visible to a browser, invisible to Excel and Power BI. Consequences worth
+  knowing before touching this:
+  - **Cost, and where the line is drawn.** A refresh costs one `list_tables` per namespace
+    plus one table load per TABLE, and stops there. Everything projected comes out of the
+    metadata document that load already fetches — schema, snapshot summary
+    (row/file/size/delete counts), `last-updated-ms`, sort order, partition spec — so it is
+    free. `timestamp-ms`, `sort-orders` and `partition-columns` are stored in the spelling
+    odata already reads: `$metadata` takes last-modified from `timestamp-ms`, the service
+    document takes `ordered`/`orderBy` from `sort-orders`, with the column name resolved at
+    projection time so no schema-document read is needed. **Per-column min/max, null counts
+    and column sizes are deliberately not collected** — they need a manifest read per table
+    that scales with the table's file count, and nothing in the product reads them. An
+    earlier revision did collect them behind a file cap; it was removed rather than kept
+    behind a flag nobody would turn on. `FakeDataset.scan()` in the control tests raises, so
+    every sync test guards against the manifest tier coming back by accident. (No data file
+    is opened either way — `plan_files()` reads manifests, not Parquet.)
+  - **Degradation is per-part, not per-run.** A table that will not load still projects its
+    name; one whose manifests will not read still projects its schema. A table that could
+    not be opened is projected with `RETAIN_DETAIL`, keeping what an earlier run stored — a
+    schema we failed to re-read is stale at worst, a schema we deleted is a table that
+    vanished from Excel over a transient error. Every table listed and none readable is
+    treated as an unreachable catalog (502), not as a catalog of unreadable tables.
+  - **`updated`.** Carrying content means a re-sync of an unchanged NAME list is no longer
+    necessarily a no-op, so the result gained an `updated` count; reporting only
+    added/removed would describe such a run as "nothing happened" while it rewrote half the
+    workspace. Unchanged stubs are still not rewritten — the steady state stays zero writes.
+  - **Storage spelling.** `schema` is inline rather than a `schemas` subcollection with a
+    `current-schema-id`: a stub has no schema history to keep, and odata reads an inline
+    schema off the document it already fetched instead of paying a second read per dataset.
+    Column bounds are normalised to Firestore-storable values (`Decimal` → string, to keep
+    the bound exact; `date` → ISO string; anything unrecognised rendered rather than
+    dropped).
 - control.opteryx: `POST /v1/workspaces/{name}/catalog/sync` — reads the binding, builds
   the external catalog's listing via `IcebergMetastore.list_datasets`, calls the primitive.
   **Noted decision:** this puts `opteryx-iceberg` (and pyiceberg) into control.opteryx's
@@ -259,8 +303,16 @@ engine and permissions work without it; only OData listing needs it (§5).
   and carrying an old stamp forward would report freshness for someone else's listing.
 - Stale-listing failure messaging: where a bound workspace's query fails with
   dataset-not-found, the error recommends running the sync — it must not trigger it
-  (cost-impacting; the user decides). **Still outstanding** — the endpoint and the
-  freshness stamp it needs now exist; the engine/Studio-side wording does not.
+  (cost-impacting; the user decides). Landed in worker.opteryx:
+  `catalog_resolver.stale_listing_hint(workspace)` turns the binding block's
+  `listing-count`/`listing-synced-at-ms` into a sentence, and `worker._failure_message`
+  appends it — through the engine's own `compose` — to a `DatasetNotFoundError` whose
+  workspace segment resolves to a bound workspace. It reads one document and writes
+  nothing; a native workspace, an unqualified relation name, a non-not-found failure or an
+  unreadable binding all leave the engine's message exactly as it was. It rides the
+  existing `error` → `error_message` channel, so jobs.opteryx and the Studio banner needed
+  no change. Tests: `tests/test_catalog_resolver.py` (8 new) and
+  `tests/test_worker_stale_listing_hint.py` (6 new).
 - odata.opteryx: no code change; add the test that a stub renders as a plain `Table` in the
   service document without warnings.
 
@@ -276,6 +328,20 @@ engine and permissions work without it; only OData listing needs it (§5).
   endpoint prefers `list_collections()` when the installed opteryx-iceberg has one and
   otherwise walks pyiceberg's `list_namespaces` on the wrapped catalog handle (bounded
   depth). Adding the method upstream retires the fallback with no change at the call site.
+- Schema and statistics are gathered entirely through `IcebergDataset` (`schema()`,
+  `snapshot()`, `scan()`), which already returns Opteryx's display type vocabulary and
+  field-id-keyed manifest bounds — so opteryx-iceberg needed no change for any of it, and
+  control.opteryx still touches no pyiceberg API directly except the namespace walk above.
+- The sync response gained `updated` and `unreadable` alongside the four fields
+  `catalog-panel.js` renders. The UI ignores unknown fields, so its line is unchanged until
+  it is taught to say more.
+
+**Deliberately not built here:** §6.5 of web.opteryx's WORKSPACE-CATALOG-DESIGN.md asks for
+the same recommendation on a second surface — an EMPTY odata listing for a bound workspace,
+recommended in the dataset tree, linking to `permissions.html?workspace=X#catalog`. That is
+UI work in web.opteryx against data it does not fetch today, not part of this plan's Phase 6
+bullet (which names the query failure only). The query-failure half is done; the empty-tree
+half is not, and nothing here blocks it.
 
 **Depends on:** Phases 1, 2, 5.
 
