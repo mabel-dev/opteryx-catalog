@@ -38,6 +38,21 @@ Block schema (kebab-case field names, matching `$properties` convention):
                                      # the next lookup, in every process
       updated-at-ms: int
       updated-by: str
+      listing-synced-at-ms: int      # written by stub_projection.py, NOT here:
+      listing-count: int             # when the workspace's dataset listing was
+                                     # last projected into Firestore, and how
+                                     # many names it held. Read back so a UI can
+                                     # state the age of the list beside its
+                                     # refresh control - see stub_projection's
+                                     # module docstring for why that matters.
+                                     # Absent means "never refreshed".
+
+Writing a binding REPLACES the whole block, so the two listing fields do not
+survive it. That is the honest direction: a rebind can point the workspace at
+a different catalog entirely, and carrying an old stamp forward would report
+freshness for a listing that was taken from somewhere else. The workspace
+reads as "never refreshed" until someone runs a sync, which is what section
+6.5 of the UI design asks for after a settings change anyway.
 
 The version is `max(now_ms, previous + 1, floor + 1)`, where `floor` is a
 `catalog-version-floor` field `clear_catalog_binding` leaves on the doc
@@ -86,6 +101,8 @@ class CatalogBinding:
     version: int = 0
     updated_at_ms: int | None = None
     updated_by: str | None = None
+    listing_synced_at_ms: int | None = None
+    listing_count: int | None = None
 
 
 def _properties_ref(firestore_client, workspace: str):
@@ -168,6 +185,8 @@ def read_catalog_binding(firestore_client, workspace: str) -> CatalogBinding | N
         version=int(block.get("version", 0)),
         updated_at_ms=block.get("updated-at-ms"),
         updated_by=block.get("updated-by"),
+        listing_synced_at_ms=block.get("listing-synced-at-ms"),
+        listing_count=block.get("listing-count"),
     )
 
 
