@@ -6,7 +6,16 @@ rationale or the decisions, which are settled there.
 
 Six repos are touched: `opteryx-core`, `opteryx-catalog`, `opteryx-iceberg`,
 `worker.opteryx`, `control.opteryx`, `odata.opteryx` (the last one deliberately with no
-code change). Shares one module with the external-tables plan
+code change).
+
+**Both of those counts turned out to be wrong, and in the same way — a second place doing
+the same job that nobody listed.** odata needed a change after all (its per-dataset
+`$metadata` is a separate implementation from the service-wide one), and the repo count is
+seven: **jobs.opteryx** binds SQL for `/api/v1/check` and needs the Phase 3 resolver exactly
+as the worker does. Without it the Studio's autocomplete offered no columns for any bound
+workspace. Both are written up in the design's per-repo list. The general lesson is worth
+more than either fix: when this design says "the place that does X", check whether there is
+a second one. Shares one module with the external-tables plan
 (`~/.claude/plans/bind-time-this-atomic-hamster.md`): `opteryx_catalog/security/kms.py` —
 whichever plan lands first builds it, the other reuses it.
 
@@ -313,8 +322,22 @@ control.opteryx requires.
   existing `error` → `error_message` channel, so jobs.opteryx and the Studio banner needed
   no change. Tests: `tests/test_catalog_resolver.py` (8 new) and
   `tests/test_worker_stale_listing_hint.py` (6 new).
-- odata.opteryx: no code change; add the test that a stub renders as a plain `Table` in the
-  service document without warnings.
+- odata.opteryx: **one change, contrary to the original "no code change" line.** The
+  service document and the service-wide `/$metadata` did need nothing — both read a stub's
+  inline `schema` already. But odata has a SECOND `$metadata`: the per-dataset route in
+  `interface.py`, which the Studio's column view calls, resolved columns through
+  `OpteryxCatalog.load_dataset` + `current-schema-id` + a `schemas` subcollection. A stub
+  has none of those, so bound workspaces listed fine and 404ed when opened. Fixed with a
+  stub branch that serves columns, counts, last-modified and sort order off the document.
+  Tests: `tests/test_service_document_external_catalog_stubs.py` (10) and
+  `tests/test_dataset_metadata_external_catalog_stub.py` (7, the last of which runs both
+  `$metadata` implementations over the same document and requires identical columns AND an
+  identical source type, so they cannot drift again).
+- **Source type corrected to `ExternalTable`.** This plan's original bullet said "a stub
+  renders as a plain `Table`"; the web contract already listed `ExternalTable` as a
+  `Custom.SourceType` the Studio understands and draws its own glyph for, and odata emitted
+  `Table` from all three of its source-type decisions. Now driven off the `external-catalog`
+  marker in each.
 
 **Implementation notes, where reality differed from the text above:**
 - The primitive returns a `StubSyncResult` NamedTuple (`added`, `removed`, `total`,
