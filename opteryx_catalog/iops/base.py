@@ -4,14 +4,26 @@ from io import BytesIO
 from typing import BinaryIO
 
 
+# Why a content-less InputFile has no content. Both end as FileNotFoundError -
+# callers rightly treat either as "no such object" - but they are diagnosed in
+# completely different places, and for one evening they were indistinguishable
+# in the logs: an unreadable manifest that named a path sitting in the bucket,
+# with nothing to say whether anything had ever gone looking for it.
+NOT_FETCHED = "no storage backend is configured for this catalog, so nothing was requested"
+FETCH_404 = "storage returned HTTP 404"
+
+
 class InputFile:
-    def __init__(self, location: str, content: bytes | None = None):
+    def __init__(
+        self, location: str, content: bytes | None = None, absent_reason: str = NOT_FETCHED
+    ):
         self.location = location
         self._content = content
+        self.absent_reason = absent_reason
 
     def open(self) -> BinaryIO:
         if self._content is None:
-            raise FileNotFoundError(self.location)
+            raise FileNotFoundError(f"{self.location} ({self.absent_reason})")
         return BytesIO(self._content)
 
 

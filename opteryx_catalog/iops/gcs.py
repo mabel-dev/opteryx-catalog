@@ -20,6 +20,7 @@ from requests.adapters import HTTPAdapter
 from opteryx_catalog.exceptions import CredentialsUnavailable
 from opteryx_catalog.exceptions import StorageReadError
 
+from .base import FETCH_404
 from .base import FileIO
 from .base import InputFile
 from .base import OutputFile
@@ -249,7 +250,7 @@ class _GcsInputFile(InputFile):
             # here: swallowing it produced a content-less InputFile whose later
             # `open()` reported the object missing, discarding the status code
             # and body that said why the read actually failed.
-            super().__init__(location, None)
+            super().__init__(location, None, absent_reason=FETCH_404)
 
 
 class _GcsOutputFile(OutputFile):
