@@ -7,6 +7,8 @@ from __future__ import annotations
 import io
 import logging
 import os
+import random
+import time
 import urllib.parse
 from collections import OrderedDict
 from collections.abc import Callable
@@ -15,12 +17,23 @@ import requests
 from google.auth.transport.requests import Request
 from requests.adapters import HTTPAdapter
 
+from opteryx_catalog.exceptions import StorageReadError
+
 from .base import FileIO
 from .base import InputFile
 from .base import OutputFile
 
 # we keep a local cache of recently read files
 MAX_CACHE_SIZE: int = 32
+
+# Statuses where trying again is the right move: the request was rejected for a
+# reason that has nothing to do with the request itself. Everything else - 401,
+# 403, 404 - will answer identically however many times it is asked, so retrying
+# only delays the error.
+RETRYABLE_STATUSES: frozenset = frozenset({408, 429, 500, 502, 503, 504})
+MAX_ATTEMPTS: int = 4
+BACKOFF_BASE_SECONDS: float = 0.25
+MAX_BACKOFF_SECONDS: float = 8.0
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +50,105 @@ def _get_storage_credentials():
     return storage_client._credentials
 
 
+def _backoff_seconds(response, attempt: int) -> float:
+    """How long to wait before attempt `attempt` + 1.
+
+    `Retry-After` is honoured when the service sends one - it knows more about
+    when it will be ready than an exponential curve does. Otherwise the wait
+    doubles per attempt, with jitter so a fleet of readers that all hit the same
+    throttle do not come back in lockstep and reproduce it.
+    """
+    if response is not None:
+        retry_after = response.headers.get("Retry-After")
+        if retry_after:
+            try:
+                return min(float(retry_after), MAX_BACKOFF_SECONDS)
+            except ValueError:
+                pass
+    delay = min(BACKOFF_BASE_SECONDS * (2**attempt), MAX_BACKOFF_SECONDS)
+    return delay * (0.5 + random.random() / 2)
+
+
+def _get_with_retry(
+    url: str,
+    location: str,
+    session: requests.Session,
+    access_token_getter: Callable[[], str],
+) -> requests.Response:
+    """GET an object, retrying only the failures that retrying can fix.
+
+    The token is fetched inside the loop rather than once up front: a read that
+    spans a token expiry otherwise spends every remaining attempt re-sending the
+    same dead credential.
+
+    Returns the 200 response. Raises `FileNotFoundError` for a 404 and
+    `StorageReadError` for anything else, including a transport failure that
+    outlived the retries.
+    """
+    last_response = None
+    last_error = None
+
+    for attempt in range(MAX_ATTEMPTS):
+        if attempt:
+            time.sleep(_backoff_seconds(last_response, attempt - 1))
+
+        access_token = access_token_getter()
+        headers = {"Accept-Encoding": "identity"}
+        if access_token:
+            headers["Authorization"] = f"Bearer {access_token}"
+
+        try:
+            last_error = None
+            last_response = session.get(url, headers=headers, timeout=30)
+        except requests.RequestException as err:
+            # No response at all - a connection reset or a timeout. Worth
+            # another attempt for the same reason a 503 is.
+            last_response = None
+            last_error = err
+            logger.warning(
+                "Read of '%s' failed on attempt %d/%d: %s",
+                location,
+                attempt + 1,
+                MAX_ATTEMPTS,
+                err,
+            )
+            continue
+
+        if last_response.status_code == 200:
+            return last_response
+
+        if last_response.status_code not in RETRYABLE_STATUSES:
+            break
+
+        logger.warning(
+            "Read of '%s' returned %d on attempt %d/%d",
+            location,
+            last_response.status_code,
+            attempt + 1,
+            MAX_ATTEMPTS,
+        )
+
+    if last_error is not None:
+        raise StorageReadError(
+            f"Unable to read '{location}' after {MAX_ATTEMPTS} attempts: {last_error}"
+        ) from last_error
+
+    status = last_response.status_code
+    body = last_response.text[:500]
+
+    if status == 404:
+        # The one status that means what `FileNotFoundError` means. Message
+        # discarded on purpose: callers catch this to mean "no such object", and
+        # the path is the whole story.
+        raise FileNotFoundError(location)
+
+    raise StorageReadError(
+        f"Unable to read '{location}' - status {status}: {body}",
+        status=status,
+        body=body,
+    )
+
+
 class _GcsInputStream(io.BytesIO):
     def __init__(
         self, path: str, session: requests.Session, access_token_getter: Callable[[], str]
@@ -47,21 +159,7 @@ class _GcsInputStream(io.BytesIO):
         object_full_path = urllib.parse.quote(path[(len(bucket) + 1) :], safe="")
         url = f"https://storage.googleapis.com/{bucket}/{object_full_path}"
 
-        access_token = access_token_getter()
-        headers = {"Accept-Encoding": "identity"}
-        if access_token:
-            headers["Authorization"] = f"Bearer {access_token}"
-
-        response = session.get(
-            url,
-            headers=headers,
-            timeout=30,
-        )
-
-        if response.status_code != 200:
-            raise FileNotFoundError(
-                f"Unable to read '{path}' - status {response.status_code}: {response.text}"
-            )
+        response = _get_with_retry(url, path, session, access_token_getter)
 
         super().__init__(response.content)
 
@@ -144,6 +242,12 @@ class _GcsInputFile(InputFile):
 
             super().__init__(location, data)
         except FileNotFoundError:
+            # A genuinely absent object is represented as content-less, which is
+            # what `InputFile.open()` turns back into a `FileNotFoundError` at
+            # the point of read. A `StorageReadError` is deliberately NOT caught
+            # here: swallowing it produced a content-less InputFile whose later
+            # `open()` reported the object missing, discarding the status code
+            # and body that said why the read actually failed.
             super().__init__(location, None)
 
 
@@ -249,7 +353,21 @@ class GcsFileIO(FileIO):
         if token:
             headers["Authorization"] = f"Bearer {token}"
         response = self._session.head(url, headers=headers, timeout=10)
-        return response.status_code == 200
+
+        if response.status_code == 200:
+            return True
+        if response.status_code == 404:
+            return False
+
+        # Every other status is a failure to answer the question, not an answer
+        # of "no". Returning False for a 403 tells a caller the object is absent
+        # when it is sitting there unread, and the GC paths act on absence.
+        raise StorageReadError(
+            f"Unable to determine whether '{location}' exists - "
+            f"status {response.status_code}: {response.text[:500]}",
+            status=response.status_code,
+            body=response.text[:500],
+        )
 
     def list_files(self, prefix: str) -> list:
         """List files under a storage prefix (gs://bucket/path).

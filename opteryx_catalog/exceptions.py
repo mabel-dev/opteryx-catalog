@@ -372,6 +372,38 @@ class SnapshotMissingError(Alertable, CatalogError):
     alert_summary = "A dataset's current snapshot document is missing."
 
 
+class StorageReadError(OSError, CatalogError):
+    """An object read failed for a reason that is NOT "the object isn't there".
+
+    The distinction matters because the whole catalog treats `FileNotFoundError`
+    as a fact about the data: a missing manifest means a dataset really has lost
+    its history, and callers act on that. A 403 from a permissions change, a 429
+    from throttling, a 503 from the storage service - none of those say anything
+    about whether the object exists, and reporting them as "not found" sends
+    every one of those callers down the wrong branch with an error message that
+    names a path which is sitting right there in the bucket.
+
+    Carries the HTTP status and the response body so the failure names its own
+    cause. `status` is None when the read never got a response at all (a
+    connection error or timeout that survived the retries).
+
+    Subclasses `OSError` so the broad `except OSError` handlers at the storage
+    boundary keep catching it, and so it matches what the S3 implementation has
+    always raised for the same condition.
+
+    Deliberately NOT `Alertable`. This is raised from the IO layer, under both
+    platform-driven reads and caller-supplied paths (`add_files`), so it cannot
+    know which it is - see the note on `Alertable`. The paths where an
+    unreadable object does mean the platform is broken already wrap it in
+    something that alerts: `ManifestReadError`, `ManifestProtectionError`.
+    """
+
+    def __init__(self, message: str, *, status: int | None = None, body: str = ""):
+        super().__init__(message)
+        self.status = status
+        self.body = body
+
+
 class InvalidCatalogBinding(ValueError, CatalogError):
     """A workspace catalog-binding write was rejected before reaching Firestore.
 

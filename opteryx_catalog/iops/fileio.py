@@ -4,6 +4,8 @@ import logging
 from io import BytesIO
 from typing import BinaryIO
 
+from opteryx_catalog.exceptions import StorageReadError
+
 logger = logging.getLogger(__name__)
 
 
@@ -140,6 +142,13 @@ class GcsFileIO(FileIO):
             # question about existence and must not leak the handle.
             with impl_in.open():
                 return True
+        except FileNotFoundError:
+            return False
+        except StorageReadError:
+            # The storage layer could not answer. False would be a lie a caller
+            # cannot detect, and the GC paths delete on absence - so this one
+            # propagates rather than collapsing into the boolean.
+            raise
         except Exception:  # noqa: BLE001 - storage boundary; the question is boolean
             return False
 
