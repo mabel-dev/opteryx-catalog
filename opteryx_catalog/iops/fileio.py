@@ -6,17 +6,23 @@ from typing import BinaryIO
 
 from opteryx_catalog.exceptions import StorageReadError
 
+from .base import FETCH_404
+from .base import NOT_FETCHED
+
 logger = logging.getLogger(__name__)
 
 
 class InputFile:
-    def __init__(self, location: str, content: bytes | None = None):
+    def __init__(
+        self, location: str, content: bytes | None = None, absent_reason: str = NOT_FETCHED
+    ):
         self.location = location
         self._content = content
+        self.absent_reason = absent_reason
 
     def open(self) -> BinaryIO:
         if self._content is None:
-            raise FileNotFoundError(self.location)
+            raise FileNotFoundError(f"{self.location} ({self.absent_reason})")
         return BytesIO(self._content)
 
 
@@ -124,7 +130,7 @@ class GcsFileIO(FileIO):
             data = stream.read()
             return InputFile(location, data)
         except FileNotFoundError:
-            return InputFile(location, None)
+            return InputFile(location, None, absent_reason=FETCH_404)
 
     def new_output(self, location: str) -> OutputFile:
         return _GcsAdapterOutputFile(location, self._impl)

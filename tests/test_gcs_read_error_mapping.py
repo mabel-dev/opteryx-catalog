@@ -229,3 +229,26 @@ def test_a_valid_credential_is_returned(monkeypatch):
     io = _file_io(_Credentials(valid=True, token="a-real-token"), monkeypatch)
 
     assert io.get_access_token() == "a-real-token"
+
+
+def test_a_404_and_a_missing_backend_do_not_look_alike():
+    """Both are FileNotFoundError; only the message says which.
+
+    They were identical for one evening, and the ambiguity cost hours: a
+    catalog with no storage backend and a genuine 404 both raised
+    `FileNotFoundError(location)` from the same line, so the logs could not say
+    whether anything had gone looking for the object at all.
+    """
+    from opteryx_catalog.iops.base import FileIO
+
+    with pytest.raises(FileNotFoundError) as never_fetched:
+        FileIO().new_input("gs://bucket/object").open()
+
+    session = _Session(_Response(404, b"No such object"))
+    handle = gcs._GcsInputFile("gs://bucket/object", session, lambda: "token", None)
+    with pytest.raises(FileNotFoundError) as fetched_404:
+        handle.open()
+
+    assert "nothing was requested" in str(never_fetched.value)
+    assert "HTTP 404" in str(fetched_404.value)
+    assert str(never_fetched.value) != str(fetched_404.value)
