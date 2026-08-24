@@ -372,6 +372,24 @@ class SnapshotMissingError(Alertable, CatalogError):
     alert_summary = "A dataset's current snapshot document is missing."
 
 
+class CredentialsUnavailable(Alertable, OSError, CatalogError):
+    """No usable credential could be obtained for a storage request.
+
+    Separated from `StorageReadError` because the two send you to opposite
+    places: a 403 that reaches the caller means the identity was rejected, and
+    this means no identity was presented at all. Conflating them cost an evening
+    - a swallowed refresh failure produced anonymous requests, GCS answered 403,
+    and the 403 pointed at an IAM configuration that turned out to be correct.
+
+    Alertable: a service that cannot authenticate to its own storage is broken
+    outright, and every read it attempts will fail until someone intervenes.
+    """
+
+    alert_severity = AlertSeverity.CRITICAL
+    alert_labels = ("storage", "auth")
+    alert_summary = "Storage credentials could not be obtained; reads are failing."
+
+
 class StorageReadError(OSError, CatalogError):
     """An object read failed for a reason that is NOT "the object isn't there".
 

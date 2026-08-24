@@ -17,6 +17,7 @@ import requests
 from google.auth.transport.requests import Request
 from requests.adapters import HTTPAdapter
 
+from opteryx_catalog.exceptions import CredentialsUnavailable
 from opteryx_catalog.exceptions import StorageReadError
 
 from .base import FileIO
@@ -290,14 +291,33 @@ class GcsFileIO(FileIO):
                     self._credentials.refresh(req)
                 self._access_token = self._credentials.token
             except Exception as e:  # noqa: BLE001 - google-auth boundary
-                logger.warning("Failed to refresh GCS credentials: %s", e)
+                # Raised, not warned-and-nulled. A None token does not stop the
+                # request: it goes out with no Authorization header, and a
+                # private bucket answers 403 - which reads as a permissions
+                # problem and sends whoever is holding the pager into the IAM
+                # console, where they find the service account's grants are
+                # perfectly correct. Failing here names the real cause once,
+                # instead of disguising it as a different failure on every
+                # subsequent read.
                 self._access_token = None
+                raise CredentialsUnavailable(
+                    f"Could not obtain GCS credentials: {e}"
+                ) from e
 
         self._refresh_credentials = _refresh_credentials
 
         def get_access_token():
             # Refresh credentials on demand to avoid using expired tokens
             self._refresh_credentials()
+            if not self._access_token and not os.environ.get("STORAGE_EMULATOR_HOST"):
+                # A refresh that "succeeded" and produced nothing is the same
+                # unauthenticated request by a quieter route. The emulator is
+                # the one place an empty token is legitimate - it runs on
+                # AnonymousCredentials by design (see _get_storage_credentials).
+                raise CredentialsUnavailable(
+                    "GCS credentials resolved to an empty access token; requests "
+                    "would be sent unauthenticated"
+                )
             return self._access_token
 
         self.get_access_token = get_access_token

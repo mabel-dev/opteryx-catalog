@@ -166,3 +166,66 @@ def test_a_failed_read_is_not_cached():
         gcs._GcsInputFile("gs://bucket/object", session, lambda: "token", cache)
 
     assert cache == {}
+
+
+class _Credentials:
+    """Stands in for google-auth credentials, refreshing however it's told to."""
+
+    def __init__(self, *, valid=False, token="token", refresh_error=None):
+        self.valid = valid
+        self.token = token
+        self._refresh_error = refresh_error
+
+    def refresh(self, _request):
+        if self._refresh_error is not None:
+            raise self._refresh_error
+        self.valid = True
+
+
+def _file_io(credentials, monkeypatch):
+    """A GcsFileIO wired to `credentials`, without touching google-auth."""
+    monkeypatch.setattr(gcs, "_get_storage_credentials", lambda: credentials)
+    return gcs.GcsFileIO()
+
+
+def test_a_failed_refresh_is_raised_not_swallowed(monkeypatch):
+    """The bug that made a working IAM policy look broken.
+
+    The refresh failure was logged and the token set to None; the request then
+    went out with no Authorization header and GCS answered 403. Every reader of
+    that 403 - logs, alerts, the person on call - was pointed at permissions.
+    """
+    from opteryx_catalog.exceptions import CredentialsUnavailable
+
+    io = _file_io(_Credentials(refresh_error=RuntimeError("metadata server timeout")), monkeypatch)
+
+    with pytest.raises(CredentialsUnavailable) as caught:
+        io.get_access_token()
+
+    assert "metadata server timeout" in str(caught.value)
+
+
+def test_an_empty_token_is_refused(monkeypatch):
+    """A refresh that reports success and yields nothing is the same anonymous
+    request arriving by a quieter route."""
+    from opteryx_catalog.exceptions import CredentialsUnavailable
+
+    io = _file_io(_Credentials(token=None), monkeypatch)
+
+    with pytest.raises(CredentialsUnavailable):
+        io.get_access_token()
+
+
+def test_the_emulator_may_have_no_token(monkeypatch):
+    """`_get_storage_credentials` hands back AnonymousCredentials against the
+    emulator on purpose, so an empty token there is correct."""
+    monkeypatch.setenv("STORAGE_EMULATOR_HOST", "localhost:9023")
+    io = _file_io(_Credentials(token=None), monkeypatch)
+
+    assert io.get_access_token() is None
+
+
+def test_a_valid_credential_is_returned(monkeypatch):
+    io = _file_io(_Credentials(valid=True, token="a-real-token"), monkeypatch)
+
+    assert io.get_access_token() == "a-real-token"
