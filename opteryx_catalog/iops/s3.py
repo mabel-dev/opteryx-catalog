@@ -7,6 +7,8 @@ from __future__ import annotations
 import logging
 from collections import OrderedDict
 
+from opteryx_catalog.exceptions import StorageReadError
+
 from .base import FileIO
 from .base import InputFile
 from .base import OutputFile
@@ -52,7 +54,7 @@ class _S3InputFile(InputFile):
             if code in ("NoSuchKey", "404"):
                 super().__init__(location, None)
                 return
-            raise OSError(f"Unable to read '{location}': {err}") from err
+            raise StorageReadError(f"Unable to read '{location}': {err}") from err
 
         if cache is not None:
             cache[location] = data
