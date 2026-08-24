@@ -378,16 +378,24 @@ ROW_GROUP_HARD_CAP_ROWS = 272_000
 # purpose is bounded memory. See ``DatasetCompactor._iter_key_runs``.
 KEY_SCAN_CHUNK_ROWS = 1_000_000
 
-# How much of the candidate files' COMPRESSED bytes the source cache may hold in
-# RAM before spilling the rest to local disk. See ``_SourceFileCache``.
-SOURCE_CACHE_RAM_BYTES = (
-    int(os.environ.get("OPTERYX_COMPACTION_SOURCE_CACHE_MB") or 2048) * 1024 * 1024
+# How much local disk the source cache may consume before it stops caching and
+# falls back to re-fetching. Cloud Run's ephemeral disk is billed separately
+# from - and far more cheaply than - the memory limit, which is the whole point
+# of this cache: the read amplification streaming execution pays for is kept off
+# the network AND off the heap.
+# Where the source cache spills. None = the system default temp directory. Set
+# this when that default is not backed by real disk. See
+# ``_execute_compaction_streaming``.
+COMPACTION_TMPDIR = os.environ.get("OPTERYX_COMPACTION_TMPDIR") or None
+
+SOURCE_CACHE_DISK_BYTES = (
+    int(os.environ.get("OPTERYX_COMPACTION_SOURCE_CACHE_DISK_MB") or 32 * 1024) * 1024 * 1024
 )
 
 
 class _SourceFileCache:
-    """Fetch each candidate file's bytes from object storage AT MOST ONCE per
-    compaction, then serve them locally for every window that needs them.
+    """Fetch each candidate file from object storage AT MOST ONCE per compaction,
+    then serve it from LOCAL DISK for every window that needs it.
 
     Streaming execution reads each candidate file once per chunk group it
     contributes to. Reading straight from ``io`` meant re-DOWNLOADING the whole
@@ -397,45 +405,68 @@ class _SourceFileCache:
     bounded memory and avoids write amplification), but it should be paid
     against local storage, not the network.
 
-    Bytes are kept in RAM up to ``SOURCE_CACHE_RAM_BYTES`` and spilled to files
-    under ``tmpdir`` beyond it, so the cache never competes with the window
-    budget that makes streaming viable in the first place.
+    ``source()`` returns a local FILENAME rather than bytes. Both are valid
+    ``rugo.parquet.read_parquet`` sources, but the filename form is what keeps
+    this cheap:
+
+      * bytes meant every window re-materialised the whole compressed file
+        (~470 MB at target size) on the heap, per candidate file, defeating the
+        window budget that makes streaming viable. A path lets rugo do its own
+        I/O and hold one row group.
+      * bloom-filter row-group pruning is only available on FILE sources, so the
+        "hot value" ``= value`` predicate gets pruning it could not use before.
+
+    Only when a file cannot be cached locally (no space, or the write failed)
+    does ``source()`` fall back to returning bytes, so a full disk degrades to
+    the old behaviour rather than failing the compaction.
     """
 
-    def __init__(self, io, tmpdir: str, ram_budget: int = SOURCE_CACHE_RAM_BYTES):
+    def __init__(self, io, tmpdir: str, disk_budget: int = SOURCE_CACHE_DISK_BYTES):
         self._io = io
         self._tmpdir = tmpdir
-        self._ram_budget = ram_budget
-        self._ram_used = 0
-        self._memory: dict = {}
-        self._spilled: dict = {}
+        self._disk_budget = disk_budget
+        self._disk_used = 0
+        self._local: dict = {}
 
-    def read(self, file_path: str) -> bytes:
-        cached = self._memory.get(file_path)
+    def source(self, file_path: str):
+        """A ``read_parquet`` source for ``file_path``: a local filename when the
+        file is (or can be) cached on disk, else its raw bytes."""
+        cached = self._local.get(file_path)
         if cached is not None:
             return cached
 
-        local = self._spilled.get(file_path)
-        if local is not None:
-            with open(local, "rb") as fh:
-                return fh.read()
+        data = self._fetch(file_path)
+        if self._disk_used + len(data) > self._disk_budget:
+            # Budget exhausted - serve this one from RAM and keep going. Nothing
+            # is evicted: the files already cached are the ones being re-read
+            # every window, so dropping one to admit another just trades a hit
+            # for a miss.
+            return data
 
+        local = os.path.join(self._tmpdir, f"src-{len(self._local):x}.parquet")
+        try:
+            with open(local, "wb") as fh:
+                fh.write(data)
+        except OSError as exc:
+            # No local space; fall back to re-fetching this file next time.
+            logger.debug("compaction: could not spill %s locally (%s)", file_path, exc)
+            return data
+
+        self._local[file_path] = local
+        self._disk_used += len(data)
+        return local
+
+    def _fetch(self, file_path: str) -> bytes:
+        """The one network read of ``file_path``.
+
+        Held whole in RAM for the moment it takes to land on disk: the FileIO
+        layer materialises the full object anyway (``GcsFileIO.new_input`` reads
+        it into a ``BytesIO``), so there is no streaming download to exploit
+        here. Making that layer stream would drop this last transient to a
+        chunk, and is the remaining piece of work on this path.
+        """
         with self._io.new_input(file_path).open() as f:
-            data = bytes(f.read())
-
-        if self._ram_used + len(data) <= self._ram_budget:
-            self._memory[file_path] = data
-            self._ram_used += len(data)
-        else:
-            local = os.path.join(self._tmpdir, f"src-{len(self._spilled):x}.parquet")
-            try:
-                with open(local, "wb") as fh:
-                    fh.write(data)
-                self._spilled[file_path] = local
-            except OSError as exc:
-                # No local space; fall back to re-fetching this file next time.
-                logger.debug("compaction: could not spill %s locally (%s)", file_path, exc)
-        return data
+            return bytes(f.read())
 
 
 class DatasetCompactor:
@@ -975,6 +1006,12 @@ class DatasetCompactor:
         the mismatched columns so every morsel shares one unified schema
         before concatenation.
 
+        Column ORDER counts as part of the schema here: ``Morsel.combine``
+        compares its inputs' column-name lists positionally and rejects the
+        same set of columns in a different order, so the returned morsels are
+        all projected onto one order (the first morsel's, extended by any
+        columns only later morsels carry).
+
         Args:
             morsels: List of draken Morsels with potentially mismatched schemas
 
@@ -1005,16 +1042,30 @@ class DatasetCompactor:
                     unified_types[name] = dtype_name
 
         reconciled = []
+        unified_order = list(unified_types)
         for morsel in morsels:
             morsel_types = {
                 name: getattr(dtype, "name", str(dtype))
                 for name, dtype in morsel_schema_dict(morsel).items()
             }
-            if morsel_types == unified_types:
-                reconciled.append(morsel)
-                continue
-
             try:
+                if morsel_types == unified_types:
+                    # Same column names, same types - but dict equality says
+                    # nothing about ORDER, and ``Morsel.combine`` requires one
+                    # shared column order across its inputs (it rejects
+                    # same-set-different-order outright). Two files written
+                    # either side of a schema evolution routinely disagree on
+                    # order alone, so project onto the unified order. ``select``
+                    # hands back the existing column buffers under a new name
+                    # list - a handle reshuffle, not a copy - and is skipped
+                    # entirely when the order already matches.
+                    reconciled.append(
+                        morsel
+                        if list(morsel_types) == unified_order
+                        else morsel.select(unified_order)
+                    )
+                    continue
+
                 rebuilt = Morsel()
                 for name, target_type in unified_types.items():
                     if name in morsel_types:
@@ -1039,6 +1090,32 @@ class DatasetCompactor:
                 return None
 
         return reconciled
+
+    def _combine_reconciled(self, morsels: list):
+        """``Morsel.combine`` with a ``_reconcile_schemas`` pass in front.
+
+        Row groups read from DIFFERENT files can disagree on schema: a column
+        NULL-typed in one file and concrete in another, a column missing
+        entirely, or - the common case after a schema evolution - the same
+        columns in a different order. ``Morsel.combine`` requires one shared
+        schema in one shared column order and raises otherwise, so every
+        CROSS-FILE concatenation goes through here instead of calling
+        ``combine`` directly. Row groups from a SINGLE file always share one
+        schema (the writer enforces it), so those may still combine directly.
+
+        Raises:
+            ValueError: the inputs could not be brought to a unified schema.
+                Callers abort the pass; dropping the offending morsel would
+                lose its rows while the commit still deleted its source file.
+        """
+        from draken.morsels.morsel import Morsel
+
+        if len(morsels) == 1:
+            return morsels[0]
+        reconciled = self._reconcile_schemas(morsels)
+        if not reconciled:
+            raise ValueError("could not reconcile input schemas")
+        return Morsel.combine(reconciled)
 
     def _execute_compaction(self, all_entries: list[dict], plan: dict) -> Snapshot | None:
         """
@@ -1558,7 +1635,6 @@ class DatasetCompactor:
         one column, vs 10GB+ for the same rows with all columns). Returns None
         if any file can't be read (caller falls back to hold-everything).
         """
-        from draken.morsels.morsel import Morsel
         from rugo.parquet import read_parquet
 
         parts = []
@@ -1569,8 +1645,8 @@ class DatasetCompactor:
             try:
                 # Reading through the cache means pass 2 gets these files for
                 # free - pass 1 already had to fetch every one of them.
-                data = source_cache.read(file_path)
-                with read_parquet(data, columns=[sort_column]) as reader:
+                src_file = source_cache.source(file_path)
+                with read_parquet(src_file, columns=[sort_column]) as reader:
                     parts.extend(reader)
             except Exception:  # noqa: BLE001 - caller falls back to a brute merge
                 # One unreadable input means no reliable global key order, so the
@@ -1579,7 +1655,13 @@ class DatasetCompactor:
                 return None
         if not parts:
             return None
-        return Morsel.combine(parts) if len(parts) > 1 else parts[0]
+        try:
+            # Even a one-column projection can diverge across files: the sort
+            # column comes back NULL-typed from any file where every value in
+            # it was null. Reconcile before concatenating.
+            return self._combine_reconciled(parts)
+        except Exception:  # noqa: BLE001 - caller falls back, this must not raise
+            return None
 
     @staticmethod
     def _iter_key_runs(key_chunks):
@@ -1784,7 +1866,6 @@ class DatasetCompactor:
                   flush at the same row-count cap.
         """
         from draken.interop.vector_sequence import vector_from_sequence
-        from draken.morsels.morsel import Morsel
         from rugo.parquet import read_parquet
 
         def sort_and_yield(morsel):
@@ -1805,11 +1886,11 @@ class DatasetCompactor:
                     bounds_by_path.get(file_path), low, low_inc, high, high_inc
                 ):
                     continue
-                data = source_cache.read(file_path)
-                with read_parquet(data, predicates=preds) as reader:
+                src_file = source_cache.source(file_path)
+                with read_parquet(src_file, predicates=preds) as reader:
                     parts.extend(reader)
             if parts:
-                combined = Morsel.combine(parts) if len(parts) > 1 else parts[0]
+                combined = self._combine_reconciled(parts)
                 yield from sort_and_yield(combined)
             return
 
@@ -1824,13 +1905,13 @@ class DatasetCompactor:
                     bounds_by_path.get(file_path), value, True, value, True
                 ):
                     continue
-                data = source_cache.read(file_path)
-                with read_parquet(data, predicates=preds) as reader:
+                src_file = source_cache.source(file_path)
+                with read_parquet(src_file, predicates=preds) as reader:
                     for rg in reader:
                         acc.append(rg)
                         acc_rows += rg.num_rows
                         while acc_rows >= ROW_GROUP_TARGET_ROWS:
-                            combined = Morsel.combine(acc) if len(acc) > 1 else acc[0]
+                            combined = self._combine_reconciled(acc)
                             head = combined.slice(0, ROW_GROUP_TARGET_ROWS)
                             tail_len = combined.num_rows - ROW_GROUP_TARGET_ROWS
                             yield head
@@ -1841,7 +1922,7 @@ class DatasetCompactor:
                             )
                             acc_rows = tail_len
             if acc_rows:
-                yield Morsel.combine(acc) if len(acc) > 1 else acc[0]
+                yield self._combine_reconciled(acc)
             return
 
         if group["type"] == "nulls":
@@ -1851,8 +1932,8 @@ class DatasetCompactor:
                 file_path = entry.get("file_path")
                 if file_path not in null_bearing_paths:
                     continue
-                data = source_cache.read(file_path)
-                with read_parquet(data) as reader:
+                src_file = source_cache.source(file_path)
+                with read_parquet(src_file) as reader:
                     for rg in reader:
                         col = rg.column(sort_column)
                         mask_bytes = col.is_null()
@@ -1865,7 +1946,7 @@ class DatasetCompactor:
                         acc.append(nulls_only)
                         acc_rows += nulls_only.num_rows
                         while acc_rows >= ROW_GROUP_TARGET_ROWS:
-                            combined = Morsel.combine(acc) if len(acc) > 1 else acc[0]
+                            combined = self._combine_reconciled(acc)
                             head = combined.slice(0, ROW_GROUP_TARGET_ROWS)
                             tail_len = combined.num_rows - ROW_GROUP_TARGET_ROWS
                             yield head
@@ -1876,7 +1957,7 @@ class DatasetCompactor:
                             )
                             acc_rows = tail_len
             if acc_rows:
-                yield Morsel.combine(acc) if len(acc) > 1 else acc[0]
+                yield self._combine_reconciled(acc)
             return
 
     def _execute_compaction_streaming(self, all_entries: list[dict], plan: dict) -> Snapshot | None:
@@ -1894,7 +1975,16 @@ class DatasetCompactor:
 
         # One cache for the whole execution: every candidate file is fetched
         # from object storage at most once, however many windows read it.
-        with tempfile.TemporaryDirectory(prefix="opteryx-compact-") as tmpdir:
+        #
+        # ``dir=`` matters at deploy time, not just here: the point of the cache
+        # is to spend cheap storage instead of RAM, which only holds if the
+        # spill lands on a real ephemeral disk. Where the platform's default
+        # temp directory is an in-memory filesystem, point
+        # OPTERYX_COMPACTION_TMPDIR at the mounted disk or the cache is just
+        # heap by another name. None = the system default.
+        with tempfile.TemporaryDirectory(
+            prefix="opteryx-compact-", dir=COMPACTION_TMPDIR
+        ) as tmpdir:
             source_cache = _SourceFileCache(self.dataset.io, tmpdir)
             return self._execute_compaction_streaming_inner(all_entries, plan, source_cache)
 

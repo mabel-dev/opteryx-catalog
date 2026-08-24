@@ -186,6 +186,40 @@ rates watched.
 
 ## Phase 4 — backfill + cutover
 **Repos:** worker.opteryx + a one-off script. **Gate: opteryx-iceberg published/vendored.**
+**Status: implemented 2026-08-21** — with one process deviation worth recording, because it
+cost a later reviewer real time: the `tarchia` binding was written through
+control.opteryx's `PUT /v1/workspaces/{name}/catalog` (Phase 5's CRUD, which landed first)
+rather than the one-off script step 1 imagined. So there is no script in any repo and no
+local `write_catalog_binding` call in any transcript to find — the write exists only as the
+block itself (`updated-at-ms` 2026-08-21 20:18 local, `updated-by` the calling identity),
+followed by a stub-projection sync at 20:20 (`listing-count: 1`). **A code-side search for
+evidence of this phase returns nothing; check the registry, not the repos.** Binding
+verified field-by-field against the deleted static registration: `catalog_type`, `uri`,
+`warehouse`, the nested `auth` block and `header.x-goog-user-project` identical (the dotted
+key round-trips through Firestore intact), `catalog=IcebergMetastore` correctly supplied by
+the worker's KINDS allowlist rather than stored, `mode: "ambient"` so the KMS branch is
+skipped, `preserve-sql-case: false` matching the old registration. `register_default_connector`
+was deliberately KEPT, deviating from step 2 below — it is the slot-3 floor under the
+remaining `mabel_data` static registration and goes when that does; `mabel_data` separately
+gained a `mabel` kind in the worker's KINDS (worker.opteryx `1b7cac1`) so its binding can
+license a stub projection while slot 1 still routes it.
+
+**Step 2 completed 2026-08-23.** `mabel_data`'s binding was already written and
+stub-synced (`kind: "mabel"`, `preserve-sql-case: true`, `auth.mode: "ambient"`,
+`listing-count: 2`), so the exit condition the deviation named was met. Both the static
+`mabel_data` registration and `register_default_connector` (definition, import-time call,
+and the per-query call site) are deleted, along with the four imports that went unused
+with them. `tests/test_worker.py` gained
+`test_the_worker_installs_no_static_workspace_routing`, which records rather than
+discards `register_workspace`/`set_default_connector` calls and asserts both lists empty
+- mutation-checked to fail when a registration is re-added. Worker suite: 122 passed
+(baseline 121, no pre-existing failure remaining).
+
+One behavioral consequence, accepted deliberately: slot 2 is consulted only for
+identifier-shaped names, so a NON-identifier dataset reference (`gs://...`) that used to
+land on the native connector via slot 3 now falls through to slot 4, local disk.
+
+Remaining: the step-3 deploy probes.
 
 1. Script writes the `tarchia` binding (§1 schema, `mode: "ambient"`) via
    `write_catalog_binding`. Verify in a REPL: `resolve_workspace("tarchia")` returns the

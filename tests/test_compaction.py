@@ -1097,6 +1097,79 @@ def test_commit_refused_when_another_writer_committed_first():
     dataset.io.delete.assert_not_called()
 
 
+def _ordered_table(order, num_rows=3):
+    """A Morsel with the same two columns as ``create_test_table`` but with the
+    column order given by ``order``. Two data files written either side of a
+    schema evolution routinely differ in exactly this way."""
+    from draken.interop.vector_sequence import vector_from_sequence
+    from draken.morsels.morsel import Morsel
+
+    cols = {
+        "timestamp": (list(range(num_rows)), "INTEGER"),
+        "value": ([f"value_{i}" for i in range(num_rows)], "VARCHAR"),
+    }
+    m = Morsel()
+    for name in order:
+        values, dtype = cols[name]
+        m.append_vector(name, vector_from_sequence(values, dtype=dtype))
+    return m
+
+
+def _names(morsel):
+    return [n.decode("utf-8") if isinstance(n, bytes) else n for n in morsel.column_names]
+
+
+def test_reconcile_normalizes_column_order():
+    """Same columns in a different order is a schema mismatch as far as
+    Morsel.combine is concerned - it compares name lists positionally. The
+    reconcile pass used to compare schemas as dicts, so a reordered morsel took
+    the fast path out unchanged and blew up in combine."""
+    compactor = DatasetCompactor(_perf_dataset(), strategy="performance")
+
+    morsels = [_ordered_table(["timestamp", "value"]), _ordered_table(["value", "timestamp"])]
+    assert _names(morsels[1]) != _names(morsels[0])  # the inputs really do differ
+
+    reconciled = compactor._reconcile_schemas(morsels)
+    assert [_names(m) for m in reconciled] == [["timestamp", "value"]] * 2
+
+
+def test_combine_reconciled_merges_reordered_columns():
+    """The end-to-end guarantee the streaming merge relies on: cross-file
+    concatenation succeeds, and every column keeps its own values (a
+    name-blind positional concat would swap them)."""
+    compactor = DatasetCompactor(_perf_dataset(), strategy="performance")
+
+    combined = compactor._combine_reconciled(
+        [_ordered_table(["timestamp", "value"]), _ordered_table(["value", "timestamp"])]
+    )
+
+    assert _names(combined) == ["timestamp", "value"]
+    assert combined.num_rows == 6
+    assert combined.column("timestamp").to_pylist() == [0, 1, 2, 0, 1, 2]
+    assert combined.column("value").to_pylist() == ["value_0", "value_1", "value_2"] * 2
+
+
+def test_combine_reconciled_raises_rather_than_dropping_rows():
+    """Streaming callers must abort the pass on an unreconcilable input; a
+    silently dropped morsel loses rows whose source file the commit deletes."""
+    compactor = DatasetCompactor(_perf_dataset(), strategy="performance")
+
+    class _BrokenMorsel:
+        num_rows = 4
+        column_names: ClassVar[list[str]] = ["timestamp"]  # missing "value" -> needs a rebuild
+        column_types: ClassVar[list[str]] = ["INTEGER"]
+
+        def column(self, name):
+            raise RuntimeError("unreadable")
+
+    try:
+        compactor._combine_reconciled([create_test_table(4), _BrokenMorsel()])
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("expected ValueError")
+
+
 if __name__ == "__main__":
     print("Running compaction tests...\n")
     test_brute_compaction()
@@ -1128,5 +1201,8 @@ if __name__ == "__main__":
     test_commit_proceeds_when_rows_balance()
     test_commit_preserves_current_schema_id()
     test_reconcile_failure_aborts_instead_of_dropping_rows()
+    test_reconcile_normalizes_column_order()
+    test_combine_reconciled_merges_reordered_columns()
+    test_combine_reconciled_raises_rather_than_dropping_rows()
     test_commit_refused_when_another_writer_committed_first()
     print("\n✅ All tests passed!")
