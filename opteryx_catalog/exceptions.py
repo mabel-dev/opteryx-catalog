@@ -112,6 +112,30 @@ class TriggerNotFound(KeyError, CatalogError):
     pass
 
 
+class TagError(CatalogError):
+    """Base for snapshot-tag failures."""
+
+
+class TagNotFound(KeyError, TagError):
+    pass
+
+
+class TagAlreadyExists(TagError):
+    """A tag of that name already exists on the dataset.
+
+    Tags are immutable, so this is never resolved by overwriting: the caller
+    drops the existing tag first, which is the act that unpins its snapshot.
+    """
+
+
+class TagLimitExceeded(TagError):
+    """The dataset already holds the maximum number of tags.
+
+    Tags pin their snapshot from expiry indefinitely, so the limit is the only
+    bound on how much history one dataset can hold alive.
+    """
+
+
 class MaterializedViewError(CatalogError):
     """A materialized-view registration or drop that cannot proceed:
     the named dataset is not a materialized view, a source is invalid,

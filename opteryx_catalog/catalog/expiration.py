@@ -23,6 +23,13 @@ Until the files hard-delete, `scripts/restore_snapshot.py` can rebuild the
 snapshot into a new dataset - via the tombstone's manifest path while the
 record exists, or via the storage listing of soft-deleted manifests in the
 final stretch after the tombstone is gone.
+
+A TAGGED snapshot never enters that timeline at all. A tag pins its snapshot,
+and every file the snapshot references, from expiry indefinitely - no
+retention setting reaches past it (SNAPSHOT_TAGS_DESIGN.md S4). The pin is
+released only by dropping the tag, at which point the snapshot rejoins normal
+retention and expires on the next run if it is already past the window; that
+is deliberate, and there is no grace period. See `pinned_snapshot_ids`.
 """
 
 from __future__ import annotations
@@ -76,6 +83,46 @@ MANIFEST_ORPHAN_MIN_AGE_MS = 24 * 60 * 60 * 1000  # 1 day
 # not-old-enough. This guards against deleting a file that was just uploaded
 # by an in-flight append/compaction whose snapshot commit hasn't landed yet.
 DATA_FILE_ORPHAN_MIN_AGE_MS = MANIFEST_ORPHAN_MIN_AGE_MS
+
+
+def pinned_snapshot_ids(catalog, identifier: str, metadata) -> set[int]:
+    """Snapshot ids held alive by a tag.
+
+    A tag pins its snapshot from expiry until the tag is dropped
+    (SNAPSHOT_TAGS_DESIGN.md S4), so this set is a PROTECTED input: it decides
+    what may not be touched.
+
+    Two sources, in order, because pinning must not depend on how the caller
+    happened to load the dataset - a tag that pins only sometimes is not a pin:
+
+    * the metadata, when a history load already carried the tags (`tags_loaded`).
+      This is the normal case and costs no extra read;
+    * otherwise `catalog.list_tags`, a direct subcollection read.
+
+    Neither path answers an unreadable tag set with an empty one, and a catalog
+    that cannot answer at all is refused rather than assumed untagged. That
+    reading is the one that deletes exactly the data the tag exists to keep,
+    so the failure is raised as `ManifestProtectionError` and the run aborts -
+    the same treatment, for the same reason, as an unreadable manifest on a
+    retained snapshot.
+    """
+    if getattr(metadata, "tags_loaded", False):
+        return metadata.pinned_snapshot_ids()
+
+    lister = getattr(catalog, "list_tags", None)
+    if lister is None:
+        raise ManifestProtectionError(
+            f"Cannot establish which snapshots of {identifier} are pinned by a tag: "
+            "this catalog cannot list tags. Refusing to expire anything for it."
+        )
+    try:
+        tags = lister(identifier)
+    except Exception as exc:
+        raise ManifestProtectionError(
+            f"Cannot read the snapshot tags of {identifier}: {exc}. Refusing to expire "
+            "anything for this dataset while it is unknown which snapshots are pinned."
+        ) from exc
+    return {int(tag["snapshot-id"]) for tag in tags if tag.get("snapshot-id") is not None}
 
 
 class SnapshotExpiration:
@@ -211,6 +258,10 @@ class SnapshotExpiration:
             if not dataset or not dataset.metadata.snapshots:
                 return None
 
+            # Resolved BEFORE any retention maths, so a dataset whose pins
+            # cannot be established is refused before it has any candidates.
+            pinned_ids = pinned_snapshot_ids(self.catalog, identifier, dataset.metadata)
+
             # Get retention policy
             policy = dataset.metadata.maintenance_policy or {}
             retention_days = policy.get("retained-snapshot-age-days")
@@ -238,6 +289,35 @@ class SnapshotExpiration:
                 # Always keep at least the current snapshot
                 if snapshots[-1] not in snapshots_to_keep:
                     snapshots_to_keep.append(snapshots[-1])
+
+            # A tagged snapshot is never an expiry candidate, in EITHER branch
+            # above - including the "keep only the latest" one, where a tag is
+            # the only thing standing between a snapshot and immediate
+            # condemnation. The pin does not weaken with age and no retention
+            # setting reaches past it: a tag is held until it is dropped.
+            #
+            # This one insertion is all three protections the design calls for.
+            # Being in `snapshots_to_keep` keeps the snapshot out of
+            # `snapshots_to_delete` (so it is not tombstoned - and a tombstoned
+            # snapshot is invisible to reads AND to storage billing), puts its
+            # files into `kept_files` at every site that computes a retained set
+            # (so they are not orphan candidates), and makes its manifest a
+            # `required=True` read (so an unreadable one raises
+            # ManifestProtectionError and aborts, rather than yielding a short
+            # protected set and deleting the tag's data).
+            #
+            # DROP TAG unpins immediately and deliberately: the snapshot comes
+            # back here unpinned on the very next run and expires then if it is
+            # already past the window. Dropping a tag is how you agree to lose
+            # the data, so there is no grace period.
+            for pinned in (s for s in snapshots if s.snapshot_id in pinned_ids):
+                if pinned not in snapshots_to_keep:
+                    snapshots_to_keep.append(pinned)
+                    logger.info(
+                        "Retaining tagged snapshot %s of %s (pinned by a tag)",
+                        pinned.snapshot_id,
+                        identifier,
+                    )
 
             # Always retain the most recent USER commit, in both branches
             # above. Maintenance writes snapshots of its own — compaction,
@@ -881,6 +961,15 @@ class SnapshotExpiration:
                     file_path = entry.get("file_path")
                     if file_path:
                         files[file_path] = int(entry.get("file_size_in_bytes") or 0)
+                    # Merge-on-read delete sidecar (catalog/deletes.py): it
+                    # must be in the protected set whenever any retained
+                    # snapshot's manifest references it, or the sweep deletes
+                    # the live vector and every row it deleted resurrects.
+                    # Size 0: the sidecar's on-disk size is not recorded on
+                    # the entry, and the reclaimed-bytes tally is reporting.
+                    delete_file = entry.get("delete_file_path")
+                    if delete_file and delete_file not in files:
+                        files[delete_file] = 0
             except Exception as e:
                 # Broad on purpose: a corrupt/unreadable manifest (including
                 # native-decoder errors like RuntimeError) must be handled here
@@ -1129,12 +1218,29 @@ def identify_expiring_datasets(catalog) -> dict[str, list[str]]:
                 policy = dataset.metadata.maintenance_policy or {}
                 retention_days = policy.get("retained-snapshot-age-days")
 
+                # Tagged snapshots are pinned and will not expire, so they are
+                # not excess. This is a report, not the deleting path, but a
+                # report that counts pinned snapshots as expiring tells an
+                # operator their tagged data is about to go - the one thing
+                # pinning guarantees will not happen.
+                #
+                # Unlike the deleting path this degrades rather than aborting:
+                # nothing here removes anything, so an unreadable tag set costs
+                # accuracy in one row instead of the whole scan.
+                try:
+                    pinned = pinned_snapshot_ids(catalog, identifier, dataset.metadata)
+                except ManifestProtectionError as exc:
+                    logger.error("Could not read tags of %s for reporting: %s", identifier, exc)
+                    pinned = set()
+
                 # Determine expiration eligibility
                 if retention_days is None or retention_days == 0:
                     # Keep only current - check if there are older snapshots
-                    if len(snapshots) > 1:
-                        # For "current only" retention we always keep 1 snapshot
-                        retained_snapshots = 1
+                    pinned_count = sum(1 for s in snapshots[:-1] if s.snapshot_id in pinned)
+                    if len(snapshots) - pinned_count > 1:
+                        # For "current only" retention we always keep 1 snapshot,
+                        # plus every tagged one.
+                        retained_snapshots = 1 + pinned_count
                         excess_snapshots = max(0, len(snapshots) - retained_snapshots)
                         expiring_datasets.append(
                             {
@@ -1143,6 +1249,7 @@ def identify_expiring_datasets(catalog) -> dict[str, list[str]]:
                                 "retained_policy": "current only",
                                 "retained_snapshots": retained_snapshots,
                                 "excess_snapshots": excess_snapshots,
+                                "pinned_snapshots": pinned_count,
                             }
                         )
                 elif retention_days > 0:
@@ -1151,7 +1258,9 @@ def identify_expiring_datasets(catalog) -> dict[str, list[str]]:
                     cutoff_time_ms = current_time_ms - (retention_days * 24 * 60 * 60 * 1000)
 
                     outside_window = [
-                        s for s in snapshots if (s.timestamp_ms or 0) < cutoff_time_ms
+                        s
+                        for s in snapshots
+                        if (s.timestamp_ms or 0) < cutoff_time_ms and s.snapshot_id not in pinned
                     ]
 
                     if outside_window:
@@ -1168,6 +1277,9 @@ def identify_expiring_datasets(catalog) -> dict[str, list[str]]:
                                 "retained_snapshots": retained_snapshots,
                                 "excess_snapshots": excess_snapshots,
                                 "outside_window": len(outside_window),
+                                "pinned_snapshots": len(
+                                    pinned & {s.snapshot_id for s in snapshots}
+                                ),
                             }
                         )
             except (ValueError, KeyError, AttributeError) as e:

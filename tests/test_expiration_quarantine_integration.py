@@ -127,6 +127,11 @@ class _FakeCatalog:
     def load_dataset(self, identifier, load_history=False):
         return self._dataset
 
+    def list_tags(self, identifier):
+        # Untagged: expiration reads this on every dataset, and an
+        # unreadable tag list must never be answered as "no tags".
+        return []
+
     def _dataset_doc_ref(self, collection, dataset_name):
         return _FakeDatasetDoc(self.store, f"{collection}/{dataset_name}")
 

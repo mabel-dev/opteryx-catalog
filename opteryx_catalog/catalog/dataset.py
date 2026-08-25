@@ -630,7 +630,7 @@ class SimpleDataset(Dataset):
         - create a simple Parquet manifest (one entry)
         - persist manifest and snapshot metadata using the attached `catalog`
         """
-        snapshot_id = int(time.time() * 1000)
+        snapshot_id = self._allocate_snapshot_id()
 
         if not hasattr(table, "num_rows") or not hasattr(table, "column_names"):
             raise TypeError("append() expects a draken.morsels.morsel.Morsel-like object")
@@ -1155,7 +1155,7 @@ class SimpleDataset(Dataset):
           new files as added (logical replace)
         """
         # Similar validation as append
-        snapshot_id = int(time.time() * 1000)
+        snapshot_id = self._allocate_snapshot_id()
 
         if not hasattr(table, "num_rows") or not hasattr(table, "column_names"):
             raise TypeError("overwrite() expects a draken.morsels.morsel.Morsel-like object")
@@ -1249,53 +1249,26 @@ class SimpleDataset(Dataset):
 
         self._after_commit(author, snap)
 
-    def add_files(
+    def _build_entries_for_files(
         self,
-        files: list[str],
-        author: str | None = None,
-        commit_message: str | None = None,
+        files: "list[str] | None",
+        existing_paths: "set[str]",
         footer_only: bool = False,
-    ):
-        """Add filenames to the dataset manifest without writing the files.
+    ) -> list[dict]:
+        """Build manifest entries for files already written to storage.
 
-        - `files` is a list of file paths (strings). Files are assumed to
-          already exist in storage; this method only updates the manifest.
-        - Does not add files that already appear in the current manifest
-          (deduplicates by `file_path`).
-        - Creates a cumulative manifest for the new snapshot (previous
-          entries + new unique entries).
-        - `footer_only`, when set, builds each new entry's stats from the
-          parquet footer alone instead of decoding every row group — see
-          `build_parquet_manifest_entry_from_bytes`'s `footer_only` doc for
-          what that trades away (no min/max/null-count/histogram pruning
-          stats). This still fully downloads each file via `self.io` first
-          (there's no ranged/partial-read path in `FileIO` yet) — it saves
-          decode CPU, not network transfer.
+        Shared by `add_files` and `merge_commit`, which differ in what else
+        their snapshot carries but not in how a data file becomes an entry.
+
+        Skips anything already in `existing_paths` (a re-added file must not
+        appear twice in one manifest) and anything that is not Parquet. A file
+        that cannot be read stops the commit: registering an entry whose
+        statistics are unknown would hand the planner fabricated pruning data.
         """
-        if author is None:
-            raise ValueError("author must be provided when adding files to a dataset")
-
-        snapshot_id = int(time.time() * 1000)
-
-        # Gather the previous manifest entries this commit must carry forward.
-        # A previous manifest that cannot be read stops the commit — see
-        # `_parent_manifest_entries`.
-        prev = self.snapshot(None)
-        prev_entries = []
-        if prev and getattr(prev, "manifest_list", None):
-            prev_entries = self._parent_manifest_entries(prev)
-            self._warn_if_summary_disagrees(prev, prev_entries)
-
-        existing = {
-            e.get("file_path") for e in prev_entries if isinstance(e, dict) and e.get("file_path")
-        }
-
-        # Build new entries for files that don't already exist. Only accept
-        # Parquet files; compute full statistics per file unless footer_only.
-        new_entries = []
-        seen = set()
-        for fp in files:
-            if not fp or fp in existing or fp in seen:
+        entries: list[dict] = []
+        seen: set = set()
+        for fp in files or ():
+            if not fp or fp in existing_paths or fp in seen:
                 continue
             if not fp.lower().endswith(".parquet"):
                 # only accept parquet files
@@ -1342,7 +1315,51 @@ class SimpleDataset(Dataset):
                     f"Cannot read {fp} to add it to {self.identifier}: {err}. "
                     "Refusing to register a file whose statistics are unknown."
                 ) from err
-            new_entries.append(manifest_entry.to_dict())
+            entries.append(manifest_entry.to_dict())
+        return entries
+
+    def add_files(
+        self,
+        files: list[str],
+        author: str | None = None,
+        commit_message: str | None = None,
+        footer_only: bool = False,
+    ):
+        """Add filenames to the dataset manifest without writing the files.
+
+        - `files` is a list of file paths (strings). Files are assumed to
+          already exist in storage; this method only updates the manifest.
+        - Does not add files that already appear in the current manifest
+          (deduplicates by `file_path`).
+        - Creates a cumulative manifest for the new snapshot (previous
+          entries + new unique entries).
+        - `footer_only`, when set, builds each new entry's stats from the
+          parquet footer alone instead of decoding every row group — see
+          `build_parquet_manifest_entry_from_bytes`'s `footer_only` doc for
+          what that trades away (no min/max/null-count/histogram pruning
+          stats). This still fully downloads each file via `self.io` first
+          (there's no ranged/partial-read path in `FileIO` yet) — it saves
+          decode CPU, not network transfer.
+        """
+        if author is None:
+            raise ValueError("author must be provided when adding files to a dataset")
+
+        snapshot_id = self._allocate_snapshot_id()
+
+        # Gather the previous manifest entries this commit must carry forward.
+        # A previous manifest that cannot be read stops the commit — see
+        # `_parent_manifest_entries`.
+        prev = self.snapshot(None)
+        prev_entries = []
+        if prev and getattr(prev, "manifest_list", None):
+            prev_entries = self._parent_manifest_entries(prev)
+            self._warn_if_summary_disagrees(prev, prev_entries)
+
+        existing = {
+            e.get("file_path") for e in prev_entries if isinstance(e, dict) and e.get("file_path")
+        }
+
+        new_entries = self._build_entries_for_files(files, existing, footer_only=footer_only)
 
         merged_entries = prev_entries + new_entries
 
@@ -1426,7 +1443,7 @@ class SimpleDataset(Dataset):
         if author is None:
             raise ValueError("author must be provided when truncating/adding files")
 
-        snapshot_id = int(time.time() * 1000)
+        snapshot_id = self._allocate_snapshot_id()
 
         # Read previous summary for reporting deleted counts
         prev = self.snapshot(None)
@@ -1581,6 +1598,523 @@ class SimpleDataset(Dataset):
             self.catalog.save_dataset_metadata(self.identifier, self.metadata)
 
         self._after_commit(author, snap)
+
+    # ------------------------------------------------------------------
+    # Merge-on-read deletes (see catalog/deletes.py and MOR_DELETES_DESIGN.md)
+    # ------------------------------------------------------------------
+
+    def _allocate_snapshot_id(self) -> int:
+        """A snapshot id strictly greater than every one already recorded.
+
+        Snapshot ids are wall-clock milliseconds by convention, but two
+        commits in the same millisecond would collide — and for a delete
+        commit the id also names the sidecar
+        (``metadata/deletes-<id>.parquet``), so a collision silently
+        overwrites the previous commit's delete state rather than merely
+        racing a snapshot document.
+        """
+        snapshot_id = int(time.time() * 1000)
+        highest = max((s.snapshot_id for s in self.metadata.snapshots), default=0)
+        return max(snapshot_id, highest + 1)
+
+    def _read_current_delete_vectors(self, entries: list[dict]) -> dict[str, list[int]]:
+        """Resolve the delete state the current manifest describes.
+
+        Fail-closed on the same doctrine as `_parent_manifest_entries`: a
+        sidecar the manifest references but cannot be read stops the commit,
+        because merging against "no deletes" would silently resurrect rows.
+        """
+        from .deletes import read_delete_vectors_for_entries
+
+        return read_delete_vectors_for_entries(self.io, entries)
+
+    def _commit_delete_snapshot(
+        self,
+        *,
+        new_entries: list[dict],
+        author: str,
+        commit_message: str,
+        removed_entries: list[dict],
+        newly_deleted_records: int,
+        snapshot_id: int,
+        audit_detail: dict,
+        added_entries: "Iterable[dict]" = (),
+        operation_type: str = "delete",
+        audit_action: str = "delete",
+    ) -> Snapshot:
+        """Shared tail of delete_rows/delete_files/merge_commit: manifest,
+        snapshot, persist.
+
+        `new_entries` is always the COMPLETE entry list for the new manifest.
+        `added_entries` is the subset of it that this commit newly registered —
+        it exists only so the summary's `added-*` counters can be computed, and
+        it stays empty for the two delete paths, whose snapshots add nothing.
+        A merge is the only caller that both adds files and marks rows deleted
+        in one snapshot, which is exactly the atomicity MERGE requires: a reader
+        must never see the deletes without the appends."""
+        manifest_path = None
+        if self.catalog and hasattr(self.catalog, "write_parquet_manifest"):
+            manifest_path = self.catalog.write_parquet_manifest(
+                snapshot_id, new_entries, self.metadata.location
+            )
+
+        self.metadata.author = author
+        self.metadata.timestamp_ms = snapshot_id
+
+        removed_files_size = sum(int(e.get("file_size_in_bytes") or 0) for e in removed_entries)
+        removed_data_size = sum(
+            int(e.get("uncompressed_size_in_bytes") or 0) for e in removed_entries
+        )
+        total_deleted_records = sum(
+            int(e.get("deleted_record_count") or 0) for e in new_entries
+        )
+
+        added_entries = list(added_entries)
+        summary = {
+            "added-data-files": len(added_entries),
+            "added-files-size": sum(int(e.get("file_size_in_bytes") or 0) for e in added_entries),
+            "added-data-size": sum(
+                int(e.get("uncompressed_size_in_bytes") or 0) for e in added_entries
+            ),
+            "added-records": sum(int(e.get("record_count") or 0) for e in added_entries),
+            "deleted-data-files": len(removed_entries),
+            "deleted-files-size": removed_files_size,
+            "deleted-data-size": removed_data_size,
+            # Rows removed by THIS commit, computed by the caller: newly
+            # marked positions (delete_rows — a fully-deleted file's rows are
+            # all marked, so dropping its entry adds nothing more) or the
+            # dropped files' remaining LIVE rows (delete_files).
+            "deleted-records": newly_deleted_records,
+            **self._totals_from_entries(new_entries),
+            # Totals above are PHYSICAL (they describe the manifest's bytes,
+            # which delete vectors do not change). Live rows for the snapshot
+            # are total-records minus this.
+            "total-deleted-records": total_deleted_records,
+        }
+
+        snap = Snapshot(
+            snapshot_id=snapshot_id,
+            timestamp_ms=snapshot_id,
+            author=author,
+            sequence_number=self._next_sequence_number(),
+            user_created=True,
+            operation_type=operation_type,
+            parent_snapshot_id=self.metadata.current_snapshot_id,
+            manifest_list=manifest_path,
+            schema_id=self.metadata.current_schema_id,
+            commit_message=commit_message,
+            summary=summary,
+        )
+
+        self.metadata.snapshots.append(snap)
+        self.metadata.current_snapshot_id = snapshot_id
+
+        if self.catalog and hasattr(self.catalog, "save_snapshot"):
+            self.catalog.save_snapshot(self.identifier, snap)
+        if self.catalog and hasattr(self.catalog, "save_dataset_metadata"):
+            self.catalog.save_dataset_metadata(self.identifier, self.metadata)
+
+        self._emit_audit(
+            audit_action,
+            author=author,
+            snapshot_id=snapshot_id,
+            **audit_detail,
+        )
+        self._after_commit(author, snap)
+        return snap
+
+    def delete_rows(
+        self,
+        positions: dict[str, Iterable[int]],
+        author: str | None = None,
+        commit_message: str | None = None,
+    ) -> Snapshot:
+        """Merge-on-read delete: mark row ordinals of named data files deleted.
+
+        `positions` maps data-file paths (as they appear in the current
+        manifest) to file-local, zero-based row ordinals in physical row
+        order. No data file is rewritten: the positions are merged into each
+        file's existing delete vector and written as one sidecar for this
+        snapshot (`metadata/deletes-<snapshot_id>.parquet`), which the new
+        manifest references per file. Readers subtract the vector; compaction
+        eventually materialises it.
+
+        A file whose every row ends up deleted is dropped from the manifest
+        outright — an all-deleted file must never reach a reader.
+
+        Ordinals already deleted are tolerated (idempotent re-delete). An
+        ordinal out of range, a file not in the current manifest, or an
+        unreadable current sidecar each abort the whole commit.
+        """
+        from .deletes import DELETE_FILE_PATH_KEY
+        from .deletes import DELETED_RECORD_COUNT_KEY
+        from .deletes import delete_vector_path
+        from .deletes import write_delete_vector_file
+
+        if author is None:
+            raise ValueError("author must be provided when deleting from a dataset")
+        if not positions:
+            raise ValueError("delete_rows requires at least one file's positions")
+
+        prev_snap = self.snapshot(None)
+        if prev_snap is None or not getattr(prev_snap, "manifest_list", None):
+            raise ValueError(f"{self.identifier} has no current manifest to delete from")
+
+        entries = self._parent_manifest_entries(prev_snap)
+        by_path = {e.get("file_path"): e for e in entries}
+
+        missing = [p for p in positions if p not in by_path]
+        if missing:
+            raise ValueError(
+                f"delete_rows: file(s) not in the current manifest of {self.identifier}: "
+                f"{sorted(missing)}. The dataset may have been compacted or overwritten "
+                "since the positions were computed; recompute against the current snapshot."
+            )
+
+        # Current delete state (fail-closed), then merge the new positions in.
+        vectors = self._read_current_delete_vectors(entries)
+        newly_deleted = 0
+        for file_path, ordinals in positions.items():
+            entry = by_path[file_path]
+            record_count = int(entry.get("record_count") or 0)
+            new_positions = set(int(o) for o in ordinals)
+            if not new_positions:
+                continue
+            out_of_range = [o for o in new_positions if o < 0 or o >= record_count]
+            if out_of_range:
+                raise ValueError(
+                    f"delete_rows: position(s) {sorted(out_of_range)[:5]} out of range "
+                    f"for {file_path} ({record_count} rows)"
+                )
+            existing = set(vectors.get(file_path, ()))
+            added = new_positions - existing
+            if not added:
+                continue
+            newly_deleted += len(added)
+            vectors[file_path] = sorted(existing | added)
+
+        if newly_deleted == 0:
+            raise ValueError("delete_rows: every named position is already deleted")
+
+        snapshot_id = self._allocate_snapshot_id()
+
+        # Fully-deleted files leave the manifest (and the sidecar) entirely.
+        removed_entries = []
+        for file_path in list(vectors):
+            entry = by_path.get(file_path)
+            if entry is not None and len(vectors[file_path]) >= int(
+                entry.get("record_count") or 0
+            ):
+                removed_entries.append(entry)
+                del vectors[file_path]
+        removed_paths = {e.get("file_path") for e in removed_entries}
+
+        # One sidecar per snapshot holds ALL live delete state — touched files
+        # merged, untouched vectors copied forward — so a snapshot's deletes
+        # are addressable through exactly one object (time travel reads the
+        # snapshot's own sidecar, nothing older).
+        sidecar_path = None
+        if vectors:
+            sidecar_path = delete_vector_path(self.metadata.location, snapshot_id)
+            write_delete_vector_file(self.io, sidecar_path, vectors)
+
+        new_entries = []
+        for entry in entries:
+            file_path = entry.get("file_path")
+            if file_path in removed_paths:
+                continue
+            e = dict(entry)
+            if file_path in vectors:
+                e[DELETE_FILE_PATH_KEY] = sidecar_path
+                e[DELETED_RECORD_COUNT_KEY] = len(vectors[file_path])
+            else:
+                e[DELETE_FILE_PATH_KEY] = None
+                e[DELETED_RECORD_COUNT_KEY] = 0
+            new_entries.append(e)
+
+        if commit_message is None:
+            files_touched = len(positions)
+            commit_message = (
+                f"delete {newly_deleted} row(s) across {files_touched} file(s) by {author}"
+            )
+
+        return self._commit_delete_snapshot(
+            new_entries=new_entries,
+            author=author,
+            commit_message=commit_message,
+            removed_entries=removed_entries,
+            newly_deleted_records=newly_deleted,
+            snapshot_id=snapshot_id,
+            audit_detail={
+                "mode": "positions",
+                "rows_deleted": newly_deleted,
+                "files_touched": len(positions),
+                "files_removed": len(removed_entries),
+                "delete_vector": sidecar_path,
+            },
+        )
+
+    def merge_commit(
+        self,
+        files: "Iterable[str]",
+        positions: "dict[str, Iterable[int]]",
+        author: str | None = None,
+        commit_message: str | None = None,
+        footer_only: bool = False,
+    ) -> Snapshot:
+        """Register data files AND mark row ordinals deleted, in ONE snapshot.
+
+        This is `add_files` and `delete_rows` fused, and the fusion is the
+        point rather than a convenience: MERGE replaces a row by marking the
+        old ordinal deleted and appending its replacement, and a reader that
+        observed either half alone would see the row twice or not at all.
+        Neither existing primitive can express that — `add_files` marks nothing
+        deleted, and a `delete_rows` snapshot adds no files.
+
+        `files` are paths already written to storage, as `add_files` takes
+        them. `positions` maps data-file paths in the CURRENT manifest to
+        file-local, zero-based ordinals in physical row order, as `delete_rows`
+        takes them. Either may be empty — an insert-only merge names no
+        positions, a delete-only merge names no files — but not both.
+
+        Unlike `delete_rows`, positions that are all already deleted are NOT an
+        error: a merge whose deletes are entirely redundant may still have rows
+        to append, and refusing it would fail a statement that has real work to
+        do. A merge that is a complete no-op is still refused, since it would
+        write a snapshot describing nothing.
+
+        A file whose every row ends up deleted is dropped from the manifest
+        outright — an all-deleted file must never reach a reader.
+        """
+        from .deletes import DELETE_FILE_PATH_KEY
+        from .deletes import DELETED_RECORD_COUNT_KEY
+        from .deletes import delete_vector_path
+        from .deletes import write_delete_vector_file
+
+        if author is None:
+            raise ValueError("author must be provided when merging into a dataset")
+
+        files = list(files or ())
+        positions = positions or {}
+        if not files and not positions:
+            raise ValueError("merge_commit requires files to add, positions to delete, or both")
+
+        prev_snap = self.snapshot(None)
+        if prev_snap is None or not getattr(prev_snap, "manifest_list", None):
+            raise ValueError(f"{self.identifier} has no current manifest to merge into")
+
+        entries = self._parent_manifest_entries(prev_snap)
+        self._warn_if_summary_disagrees(prev_snap, entries)
+        by_path = {e.get("file_path"): e for e in entries}
+
+        missing = [p for p in positions if p not in by_path]
+        if missing:
+            raise ValueError(
+                f"merge_commit: file(s) not in the current manifest of {self.identifier}: "
+                f"{sorted(missing)}. The dataset may have been compacted or overwritten "
+                "since the positions were computed; recompute against the current snapshot."
+            )
+
+        # Current delete state (fail-closed), then merge the new positions in.
+        vectors = self._read_current_delete_vectors(entries)
+        newly_deleted = 0
+        for file_path, ordinals in positions.items():
+            entry = by_path[file_path]
+            record_count = int(entry.get("record_count") or 0)
+            new_positions = set(int(o) for o in ordinals)
+            if not new_positions:
+                continue
+            out_of_range = [o for o in new_positions if o < 0 or o >= record_count]
+            if out_of_range:
+                raise ValueError(
+                    f"merge_commit: position(s) {sorted(out_of_range)[:5]} out of range "
+                    f"for {file_path} ({record_count} rows)"
+                )
+            existing_positions = set(vectors.get(file_path, ()))
+            added = new_positions - existing_positions
+            if not added:
+                continue
+            newly_deleted += len(added)
+            vectors[file_path] = sorted(existing_positions | added)
+
+        snapshot_id = self._allocate_snapshot_id()
+
+        # Fully-deleted files leave the manifest (and the sidecar) entirely.
+        removed_entries = []
+        for file_path in list(vectors):
+            entry = by_path.get(file_path)
+            if entry is not None and len(vectors[file_path]) >= int(
+                entry.get("record_count") or 0
+            ):
+                removed_entries.append(entry)
+                del vectors[file_path]
+        removed_paths = {e.get("file_path") for e in removed_entries}
+
+        # One sidecar per snapshot holds ALL live delete state — touched files
+        # merged, untouched vectors copied forward — so a snapshot's deletes
+        # are addressable through exactly one object.
+        sidecar_path = None
+        if vectors:
+            sidecar_path = delete_vector_path(self.metadata.location, snapshot_id)
+            write_delete_vector_file(self.io, sidecar_path, vectors)
+
+        carried_entries = []
+        for entry in entries:
+            file_path = entry.get("file_path")
+            if file_path in removed_paths:
+                continue
+            e = dict(entry)
+            if file_path in vectors:
+                e[DELETE_FILE_PATH_KEY] = sidecar_path
+                e[DELETED_RECORD_COUNT_KEY] = len(vectors[file_path])
+            else:
+                e[DELETE_FILE_PATH_KEY] = None
+                e[DELETED_RECORD_COUNT_KEY] = 0
+            carried_entries.append(e)
+
+        # New files carry no delete debt: nothing can have marked a row of a
+        # file that did not exist until this commit.
+        added_entries = self._build_entries_for_files(
+            files, set(by_path), footer_only=footer_only
+        )
+
+        if not added_entries and newly_deleted == 0 and not removed_entries:
+            raise ValueError(
+                "merge_commit: nothing to commit — no new files registered and every "
+                "named position is already deleted"
+            )
+
+        if commit_message is None:
+            commit_message = (
+                f"merge: {len(added_entries)} file(s) added, {newly_deleted} row(s) "
+                f"deleted across {len(positions)} file(s) by {author}"
+            )
+
+        return self._commit_delete_snapshot(
+            new_entries=carried_entries + added_entries,
+            added_entries=added_entries,
+            operation_type="merge",
+            audit_action="merge",
+            author=author,
+            commit_message=commit_message,
+            removed_entries=removed_entries,
+            newly_deleted_records=newly_deleted,
+            snapshot_id=snapshot_id,
+            audit_detail={
+                "files_added": len(added_entries),
+                "rows_deleted": newly_deleted,
+                "files_touched": len(positions),
+                "files_removed": len(removed_entries),
+                "delete_vector": sidecar_path,
+            },
+        )
+
+    def delete_files(
+        self,
+        paths: Iterable[str],
+        author: str | None = None,
+        commit_message: str | None = None,
+    ) -> Snapshot:
+        """Copy-on-write whole-file delete: drop named data files from the manifest.
+
+        The cheap path for a delete that provably covers whole files (e.g. a
+        partition-aligned predicate settled from manifest bounds): one
+        manifest write, no data read, no delete-vector debt. The files' bytes
+        stay in storage for older snapshots; the reclamation sweeps collect
+        them once no retained snapshot references them.
+        """
+        from .deletes import DELETE_FILE_PATH_KEY
+        from .deletes import DELETED_RECORD_COUNT_KEY
+        from .deletes import delete_vector_path
+        from .deletes import write_delete_vector_file
+
+        if author is None:
+            raise ValueError("author must be provided when deleting from a dataset")
+        target_paths = set(paths)
+        if not target_paths:
+            raise ValueError("delete_files requires at least one path")
+
+        prev_snap = self.snapshot(None)
+        if prev_snap is None or not getattr(prev_snap, "manifest_list", None):
+            raise ValueError(f"{self.identifier} has no current manifest to delete from")
+
+        entries = self._parent_manifest_entries(prev_snap)
+        by_path = {e.get("file_path"): e for e in entries}
+        missing = [p for p in target_paths if p not in by_path]
+        if missing:
+            raise ValueError(
+                f"delete_files: file(s) not in the current manifest of {self.identifier}: "
+                f"{sorted(missing)}"
+            )
+
+        removed_entries = [by_path[p] for p in sorted(target_paths)]
+        snapshot_id = self._allocate_snapshot_id()
+
+        # Carry surviving files' delete vectors forward into this snapshot's
+        # own sidecar (dropped files' vectors die with their entries).
+        vectors = self._read_current_delete_vectors(
+            [e for e in entries if e.get("file_path") not in target_paths]
+        )
+        sidecar_path = None
+        if vectors:
+            sidecar_path = delete_vector_path(self.metadata.location, snapshot_id)
+            write_delete_vector_file(self.io, sidecar_path, vectors)
+
+        new_entries = []
+        for entry in entries:
+            file_path = entry.get("file_path")
+            if file_path in target_paths:
+                continue
+            e = dict(entry)
+            if file_path in vectors:
+                e[DELETE_FILE_PATH_KEY] = sidecar_path
+                e[DELETED_RECORD_COUNT_KEY] = len(vectors[file_path])
+            else:
+                e[DELETE_FILE_PATH_KEY] = None
+                e[DELETED_RECORD_COUNT_KEY] = 0
+            new_entries.append(e)
+
+        if commit_message is None:
+            commit_message = f"delete {len(removed_entries)} file(s) by {author}"
+
+        removed_live_records = sum(
+            int(e.get("record_count") or 0) - int(e.get("deleted_record_count") or 0)
+            for e in removed_entries
+        )
+
+        return self._commit_delete_snapshot(
+            new_entries=new_entries,
+            author=author,
+            commit_message=commit_message,
+            removed_entries=removed_entries,
+            newly_deleted_records=removed_live_records,
+            snapshot_id=snapshot_id,
+            audit_detail={
+                "mode": "files",
+                "files_removed": len(removed_entries),
+                "delete_vector": sidecar_path,
+            },
+        )
+
+    def delete_vectors(self, snapshot_id: int | None = None) -> dict[str, list[int]]:
+        """The delete state a snapshot's manifest describes.
+
+        Returns ``{data_file_path: sorted deleted row ordinals}`` for exactly
+        the files the manifest attributes deletes to — empty for a dataset
+        with no delete debt. This is the read-side entry point: a scan
+        subtracts these ordinals from each file. Raises if a referenced
+        sidecar cannot be read (serving unfiltered rows would silently
+        resurrect deleted data).
+        """
+        from .deletes import read_delete_vectors_for_entries
+
+        snap = self.snapshot(snapshot_id)
+        if snap is None or not getattr(snap, "manifest_list", None):
+            return {}
+        from .manifest import get_parsed_manifest
+
+        entries = get_parsed_manifest(self.io, snap.manifest_list)
+        return read_delete_vectors_for_entries(self.io, entries)
 
     def scan(self, row_filter=None, snapshot_id: int | None = None) -> Iterable[Datafile]:
         """Return Datafile objects for the given snapshot.
@@ -1973,7 +2507,7 @@ class SimpleDataset(Dataset):
         # Use same author/commit-timestamp as previous snapshot unless overridden
         use_author = author if author is not None else getattr(prev, "author", None)
 
-        snapshot_id = int(time.time() * 1000)
+        snapshot_id = self._allocate_snapshot_id()
 
         # Rebuild manifest entries by re-reading each data file
         entries = []
@@ -2014,6 +2548,13 @@ class SimpleDataset(Dataset):
                     data, fp, file_size, field_id_by_name=self._field_id_by_name()
                 )
                 dent = manifest_entry.to_dict()
+                # The rebuild reads the DATA file, which knows nothing about
+                # merge-on-read deletes — dropping the delete columns here
+                # would silently resurrect every deleted row of this file.
+                # Carry them over from the entry being replaced.
+                for key in ("delete_file_path", "deleted_record_count"):
+                    if ent.get(key):
+                        dent[key] = ent.get(key)
             except Exception as exc:  # noqa: BLE001 - collected, then raised below
                 # Collect and keep going: a bad batch write or bucket issue
                 # usually affects many files at once, and surfacing them one
@@ -2185,7 +2726,7 @@ class SimpleDataset(Dataset):
 
         # Create a new empty Parquet manifest (entries=[]) to represent the
         # truncated dataset for the new snapshot. Do not delete objects.
-        snapshot_id = int(time.time() * 1000)
+        snapshot_id = self._allocate_snapshot_id()
 
         # Do NOT write an empty Parquet manifest when there are no entries.
         # Per policy, create the snapshot without a manifest so older

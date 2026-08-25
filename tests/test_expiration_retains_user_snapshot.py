@@ -57,6 +57,11 @@ class _FakeCatalog:
     def load_dataset(self, identifier, load_history=False):
         return self._dataset
 
+    def list_tags(self, identifier):
+        # Untagged: expiration reads this on every dataset, and an
+        # unreadable tag list must never be answered as "no tags".
+        return []
+
 
 def _run(snapshots):
     """Return (kept_ids, deleted_ids) for a dry-run expiration."""

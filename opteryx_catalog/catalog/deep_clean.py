@@ -329,6 +329,13 @@ class DatasetDeepClean:
                     file_path = entry.get("file_path")
                     if file_path:
                         manifest_files.add(file_path)
+                    # Merge-on-read delete sidecar: referenced per data file
+                    # via delete_file_path (see catalog/deletes.py). Missing
+                    # it here would quarantine and then delete the live
+                    # vector — resurrecting deleted rows dataset-wide.
+                    delete_file = entry.get("delete_file_path")
+                    if delete_file:
+                        manifest_files.add(delete_file)
 
                 logger.debug(f"Read manifest {snapshot.manifest_list}: {len(entries)} files")
             except Exception as e:

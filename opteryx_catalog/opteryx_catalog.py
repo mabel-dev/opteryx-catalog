@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -13,6 +14,7 @@ from google.cloud import storage
 from .alerts import report as _alert
 from .audit import emit_audit
 from .catalog.dataset import SimpleDataset
+from .catalog.dataset import _as_int
 from .catalog.metadata import DatasetMetadata
 from .catalog.metadata import Snapshot
 from .catalog.metadata import snapshot_is_tombstoned
@@ -29,6 +31,9 @@ from .exceptions import DatasetNotFound
 from .exceptions import EgressRestricted
 from .exceptions import MaterializedViewError
 from .exceptions import SnapshotMissingError
+from .exceptions import TagAlreadyExists
+from .exceptions import TagLimitExceeded
+from .exceptions import TagNotFound
 from .exceptions import TriggerNotFound
 from .exceptions import ViewAlreadyExists
 from .exceptions import ViewNotFound
@@ -60,6 +65,32 @@ DROPPED_DOC = "$dropped"
 # dataset document on every call and must not pay for opt-in state. The commit
 # path reads this subcollection to decide what to fire.
 TRIGGERS_SUBCOLLECTION = "triggers"
+
+# Subcollection under a dataset document holding that dataset's snapshot tags -
+# one document per tag, keyed by the NORMALIZED tag name. The document id doing
+# the naming is the point: uniqueness is then Firestore's (a create-if-absent
+# write, with no read-then-write race to lose) rather than ours, and
+# immutability is structural - tag documents are created and deleted, never
+# updated.
+#
+# A subcollection rather than a field on the dataset document, because
+# `save_dataset_metadata` writes that document whole with `set()`: a field
+# `DatasetMetadata` does not carry is DESTROYED by the next commit, not left
+# stale. Tags here are never in that blast radius, and a tag write never
+# contends with a commit.
+TAGS_SUBCOLLECTION = "tags"
+
+# Most tags one dataset may hold. A tag pins its snapshot from expiry until it
+# is dropped - nothing ages one out - so this is the only bound on how much
+# history a single dataset can hold alive, and every byte of it is charged.
+MAX_TAGS_PER_DATASET = 100
+
+# A tag name is a SQL identifier: a letter, then letters, digits or
+# underscores. No dots (they are the catalog's own separator) and no hyphens.
+_TAG_NAME_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
+
+# Longest accepted tag name, in characters.
+MAX_TAG_NAME_LENGTH = 128
 
 # The only trigger kind in v1: re-run a materialized view's defining SQL when
 # the dataset carrying the trigger takes a user-created commit.
@@ -773,6 +804,42 @@ class OpteryxCatalog(Metastore):
             commit_message=sd.get("commit-message"),
         )
 
+    def _load_tags(self, collection: str, dataset_name: str) -> tuple[dict[str, int], bool]:
+        """Read the `tags` subcollection into a {name: snapshot_id} map.
+
+        Returns `(tags, loaded)`. `loaded` is False when the subcollection
+        could not be streamed - the caller must NOT read that as "no tags".
+        A tag is a retention pin, so an unreadable tag set has the same shape
+        of consequence as an unreadable manifest: the protected set comes back
+        short and the pinned data looks reclaimable. See
+        `DatasetMetadata.tags_loaded`.
+
+        A tag document with no `snapshot-id` is skipped rather than admitted
+        with a null target: it pins nothing and would resolve to nothing.
+        """
+        tags: dict[str, int] = {}
+        try:
+            # Read by (collection, dataset_name) rather than through
+            # `list_tags`, which re-parses an identifier we have already split.
+            for tag_doc in self._tags_collection(collection, dataset_name).stream():
+                snapshot_id = (tag_doc.to_dict() or {}).get("snapshot-id")
+                if snapshot_id is None:
+                    logger.error(
+                        "Tag %s of %s.%s names no snapshot; ignoring",
+                        tag_doc.id,
+                        collection,
+                        dataset_name,
+                    )
+                    continue
+                tags[str(tag_doc.id).lower()] = int(snapshot_id)
+        except Exception as exc:  # noqa: BLE001 - Firestore client boundary
+            # Broad on purpose, and reported rather than raised: reads must
+            # still work. What must not happen is a caller treating the empty
+            # map as fact, which the False guards against.
+            logger.error("Could not read tags for %s.%s: %s", collection, dataset_name, exc)
+            return {}, False
+        return tags, True
+
     def _schema_entry_from_doc(self, sdoc) -> dict:
         sd = sdoc.to_dict() or {}
         return {
@@ -859,9 +926,15 @@ class OpteryxCatalog(Metastore):
             metadata.snapshots = snaps
             metadata.schemas = [self._schema_entry_from_doc(s) for s in schemas_coll.stream()]
             metadata.current_schema_id = data.get("current-schema-id")
+            metadata.tags, metadata.tags_loaded = self._load_tags(collection, dataset_name)
             return SimpleDataset(
                 identifier=identifier, _metadata=metadata, io=self.io, catalog=self
             )
+
+        # The non-history path deliberately does NOT fetch tags: it exists to be
+        # cheap, and every write path uses it. `tags_loaded` stays at its False
+        # default, which is what makes a caller that needs the pins go and read
+        # them rather than conclude from an empty map that nothing is pinned.
 
         current_snap_id = data.get("current-snapshot-id")
         current_schema_id = data.get("current-schema-id")
@@ -1012,6 +1085,7 @@ class OpteryxCatalog(Metastore):
                 self.drop_trigger(source, trigger_name, author=author, missing_ok=True)
 
         self._delete_subcollection(self._snapshots_collection(collection, dataset_name))
+        self._delete_subcollection(self._tags_collection(collection, dataset_name))
         self._delete_subcollection(doc_ref.collection("schemas"))
         self._delete_subcollection(doc_ref.collection(MAINTENANCE_SUBCOLLECTION))
         self._delete_subcollection(doc_ref.collection("statement"))
@@ -1219,6 +1293,15 @@ class OpteryxCatalog(Metastore):
                 schema_doc.to_dict() or {}
             )
 
+        # Tags travel with the dataset. They name snapshot ids, and the ids are
+        # preserved by the copy below, so the documents move verbatim - but they
+        # MUST move: a rename that left them behind would unpin every tagged
+        # snapshot silently, and the next expiration run would reclaim exactly
+        # the data the tags exist to hold.
+        new_tags = self._tags_collection(new_collection, new_dataset_name)
+        for tag_doc in self._tags_collection(collection, dataset_name).stream():
+            new_tags.document(tag_doc.id).set(tag_doc.to_dict() or {})
+
         new_snapshots = self._snapshots_collection(new_collection, new_dataset_name)
         for snapshot_doc in snapshot_docs:
             snapshot_data, new_manifest_path = rewritten_manifests.get(
@@ -1234,6 +1317,7 @@ class OpteryxCatalog(Metastore):
         # location, which no longer exist, so the renamed dataset starts with a
         # clean record and its files each need two fresh sightings.
         self._delete_subcollection(self._snapshots_collection(collection, dataset_name))
+        self._delete_subcollection(self._tags_collection(collection, dataset_name))
         self._delete_subcollection(doc_ref.collection("schemas"))
         self._delete_subcollection(doc_ref.collection(MAINTENANCE_SUBCOLLECTION))
         doc_ref.delete()
@@ -2492,6 +2576,222 @@ class OpteryxCatalog(Metastore):
         )
 
     # ------------------------------------------------------------------
+    # Snapshot tags
+    # ------------------------------------------------------------------
+
+    def _tags_collection(self, collection: str, dataset_name: str):
+        return self._dataset_doc_ref(collection, dataset_name).collection(TAGS_SUBCOLLECTION)
+
+    @staticmethod
+    def normalize_tag_name(name: str) -> str:
+        """Validate a tag name and return its canonical (lowercase) spelling.
+
+        Tag names are SQL identifiers, and they are normalized to lowercase on
+        the way in: `MyTag` and `mytag` are one tag with one spelling, and
+        nothing downstream has to remember which casing was typed. The
+        normalized name is also the Firestore document id, so document-id
+        uniqueness and tag-name uniqueness are the same constraint rather than
+        two that could disagree.
+        """
+        if not isinstance(name, str) or not name:
+            raise ValueError("A tag name is required.")
+        if len(name) > MAX_TAG_NAME_LENGTH:
+            raise ValueError(
+                f"Tag name is {len(name)} characters; the maximum is {MAX_TAG_NAME_LENGTH}."
+            )
+        if not _TAG_NAME_PATTERN.match(name):
+            raise ValueError(
+                f"'{name}' is not a valid tag name. A tag name starts with a letter and "
+                "contains only letters, digits and underscores - no dots, no hyphens."
+            )
+        return name.lower()
+
+    def create_tag(
+        self,
+        dataset_identifier: str,
+        name: str,
+        snapshot_id: int,
+        author: str | None = None,
+        comment: str | None = None,
+    ) -> dict:
+        """Bind a name to one snapshot, and pin that snapshot from expiry.
+
+        A tag is immutable and immortal: the binding never changes, and nothing
+        ages it out. It holds its snapshot - and every data file that snapshot
+        references - alive until someone drops it, and the storage it holds is
+        charged. Creating one is therefore an open-ended cost commitment, which
+        is why the returned record carries the pinned byte count for the caller
+        to report.
+
+        The liveness check and the create are ONE transaction across two
+        documents. Expiration retires a snapshot by writing its snapshot
+        document; a read-then-write here could create a tag against a snapshot
+        being tombstoned in the same instant, which is precisely the dangling
+        tag that pinning exists to make impossible.
+        """
+        if author is None:
+            raise ValueError("author must be provided when creating a tag")
+
+        tag_name = self.normalize_tag_name(name)
+        collection, dataset_name = self._local_parts(dataset_identifier)
+        if not self._dataset_doc_ref(collection, dataset_name).get().exists:
+            raise DatasetNotFound(f"Dataset not found: {collection}.{dataset_name}")
+
+        snapshot_id = int(snapshot_id)
+        tags_collection = self._tags_collection(collection, dataset_name)
+        tag_ref = tags_collection.document(tag_name)
+        snapshot_ref = self._snapshots_collection(collection, dataset_name).document(
+            str(snapshot_id)
+        )
+        qualified = f"{collection}.{dataset_name}"
+
+        @firestore.transactional
+        def _create(transaction) -> dict:
+            # Every read first: a Firestore transaction refuses a read that
+            # follows a write in the same transaction.
+            snapshot_doc = snapshot_ref.get(transaction=transaction)
+            existing = tag_ref.get(transaction=transaction)
+            held = sum(1 for _ in tags_collection.stream(transaction=transaction))
+
+            if not snapshot_doc.exists:
+                raise SnapshotMissingError(
+                    f"No snapshot {snapshot_id} for {qualified} - it may not exist, "
+                    "or may have expired."
+                )
+            if snapshot_is_tombstoned(snapshot_doc.to_dict() or {}):
+                raise SnapshotMissingError(
+                    f"Snapshot {snapshot_id} of {qualified} has expired and cannot be tagged."
+                )
+            if existing.exists:
+                bound = (existing.to_dict() or {}).get("snapshot-id")
+                raise TagAlreadyExists(
+                    f"Tag {tag_name} already exists on {qualified} and names snapshot "
+                    f"{bound}. Tags are immutable - drop it first to release that "
+                    "snapshot, then create it again."
+                )
+            if held >= MAX_TAGS_PER_DATASET:
+                raise TagLimitExceeded(
+                    f"{qualified} already holds {held} tags, the maximum is "
+                    f"{MAX_TAGS_PER_DATASET}. Each tag pins its snapshot's storage "
+                    "indefinitely; drop one that is no longer needed."
+                )
+
+            summary = (snapshot_doc.to_dict() or {}).get("summary") or {}
+            record = {
+                "name": tag_name,
+                "snapshot-id": snapshot_id,
+                "created-by": author,
+                "created-at-ms": int(time.time() * 1000),
+                "comment": comment,
+            }
+            transaction.set(tag_ref, record)
+            # The LOGICAL size, because that is what the pin will be CHARGED.
+            # Storage billing meters `uncompressed_size_in_bytes` deliberately -
+            # a customer is billed for the data they handed over, whatever we
+            # manage to compress it to, and the spread is margin (see the
+            # "Logical bytes, deliberately" note in xb500.opteryx
+            # app/operations/record_storage_billing.py). Reporting the on-disk
+            # size here would quote a number ~96% below the invoice, which is
+            # the one way this figure could mislead the person taking on the
+            # cost. The physical size is carried alongside, never as the answer.
+            record["pinned-bytes"] = _as_int(summary.get("total-data-size")) or 0
+            record["pinned-bytes-on-disk"] = _as_int(summary.get("total-files-size")) or 0
+            return record
+
+        record = _create(self.firestore_client.transaction())
+
+        emit_audit(
+            "create_tag",
+            resource_type=ResourceType.DATASET,
+            workspace=self.workspace,
+            collection=collection,
+            resource=dataset_name,
+            author=author,
+            tag=tag_name,
+            snapshot_id=snapshot_id,
+            pinned_bytes=record["pinned-bytes"],
+            pinned_bytes_on_disk=record["pinned-bytes-on-disk"],
+        )
+        return record
+
+    def drop_tag(
+        self,
+        dataset_identifier: str,
+        name: str,
+        author: str | None = None,
+        missing_ok: bool = False,
+    ) -> None:
+        """Remove a tag, releasing the snapshot it pinned.
+
+        The snapshot returns to the ordinary retention rules immediately, and
+        if it is already past the window it expires on the next run. That is
+        the intended consequence, not a side effect: dropping a tag IS how you
+        agree to lose the data it was holding.
+        """
+        if not author:
+            raise ValueError("author must be provided when dropping a tag")
+
+        tag_name = self.normalize_tag_name(name)
+        collection, dataset_name = self._local_parts(dataset_identifier)
+        tag_ref = self._tags_collection(collection, dataset_name).document(tag_name)
+
+        existing = tag_ref.get()
+        if not existing.exists:
+            if missing_ok:
+                return
+            raise TagNotFound(f"Tag not found: {tag_name} on {collection}.{dataset_name}")
+        snapshot_id = (existing.to_dict() or {}).get("snapshot-id")
+        tag_ref.delete()
+
+        emit_audit(
+            "drop_tag",
+            resource_type=ResourceType.DATASET,
+            workspace=self.workspace,
+            collection=collection,
+            resource=dataset_name,
+            author=author,
+            tag=tag_name,
+            snapshot_id=snapshot_id,
+        )
+
+    def list_tags(self, dataset_identifier: str) -> list[dict]:
+        """Every tag on a dataset, as plain dicts, ordered by name.
+
+        One subcollection read. `SHOW SNAPSHOTS` groups these by `snapshot-id`
+        to show which snapshots are held; expiration reads the same rows to
+        know which snapshots it may not retire.
+        """
+        collection, dataset_name = self._local_parts(dataset_identifier)
+        tags = []
+        for doc in self._tags_collection(collection, dataset_name).stream():
+            data = doc.to_dict() or {}
+            data.setdefault("name", doc.id)
+            tags.append(data)
+        return sorted(tags, key=lambda tag: tag["name"])
+
+    def resolve_tag(self, dataset_identifier: str, name: str) -> int:
+        """The snapshot id a tag names.
+
+        One document get by id - the read path pays this only when a statement
+        actually names a tag.
+
+        A tag that resolves to nothing is not a normal outcome to degrade
+        through: pinning means the snapshot cannot have expired underneath it,
+        so an unresolvable tag is a broken pin and says so.
+        """
+        tag_name = self.normalize_tag_name(name)
+        collection, dataset_name = self._local_parts(dataset_identifier)
+        doc = self._tags_collection(collection, dataset_name).document(tag_name).get()
+        if not doc.exists:
+            raise TagNotFound(f"Tag not found: {tag_name} on {collection}.{dataset_name}")
+        snapshot_id = (doc.to_dict() or {}).get("snapshot-id")
+        if snapshot_id is None:
+            raise SnapshotMissingError(
+                f"Tag {tag_name} on {collection}.{dataset_name} names no snapshot."
+            )
+        return int(snapshot_id)
+
+    # ------------------------------------------------------------------
     # Materialized views
     # ------------------------------------------------------------------
 
@@ -3354,6 +3654,15 @@ class OpteryxCatalog(Metastore):
             "element_min_values": "ARRAY",
             "element_max_values": "ARRAY",
             "element_min_k_hashes": "ARRAY",
+            # Merge-on-read deletes: which sidecar holds this data file's
+            # delete vector, and how many of its rows are deleted. NULL / 0
+            # (including on every manifest written before these columns
+            # existed) means "no deletes" — readers must treat absence and
+            # zero identically. record_count above stays PHYSICAL rows;
+            # live rows are record_count - deleted_record_count. See
+            # catalog/deletes.py and MOR_DELETES_DESIGN.md.
+            "delete_file_path": "VARCHAR",
+            "deleted_record_count": "INTEGER",
         }
 
         # Normalize entries to match the column set above:
@@ -3373,6 +3682,7 @@ class OpteryxCatalog(Metastore):
                 "record_count",
                 "file_size_in_bytes",
                 "uncompressed_size_in_bytes",
+                "deleted_record_count",
             ):
                 if e.get(_numeric) is None:
                     e[_numeric] = 0
@@ -3390,6 +3700,9 @@ class OpteryxCatalog(Metastore):
             e.setdefault("element_min_values", [])
             e.setdefault("element_max_values", [])
             e.setdefault("element_min_k_hashes", [])
+            # delete_file_path is a nullable VARCHAR: None IS the "no deletes"
+            # value, so setdefault only ensures the key exists for the writer.
+            e.setdefault("delete_file_path", None)
 
             # min/max values are stored as compressed int64 values
             mv = e.get("min_values") or []
@@ -3464,6 +3777,13 @@ class OpteryxCatalog(Metastore):
             # pointing at a manifest that was never written; the next commit
             # then couldn't read its parent. Let it raise.
             out.close()
+
+        # A manifest rewritten at the same path (e.g. two commits allocating
+        # the same millisecond snapshot id) must not be served stale from the
+        # parsed-manifest LRU.
+        from .catalog.manifest import invalidate_parsed_manifest
+
+        invalidate_parsed_manifest(parquet_path)
 
         return parquet_path
 

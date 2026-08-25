@@ -81,6 +81,28 @@ class DatasetMetadata:
     # Compaction policy lives under maintenance_policy as 'compaction-policy'
     snapshots: list[Snapshot] = field(default_factory=list)
     current_snapshot_id: int | None = None
+    # Tags: normalized (lowercase) tag name -> the snapshot id it is bound to.
+    # Stored in a `tags` subcollection beside `snapshots` and `schemas`, NOT on
+    # the dataset document - `save_dataset_metadata` writes that document whole
+    # with `set()`, and a tag is a retention pin, so losing one to a routine
+    # commit would un-protect data somebody is paying to keep.
+    #
+    # The direction is deliberate (see SNAPSHOT_TAGS_DESIGN.md S3): a tag points
+    # at a snapshot; a snapshot knows nothing about its tags. Snapshot documents
+    # are written once and thereafter only tombstoned, so tag names must not
+    # live on them.
+    #
+    # Populated only by a history load (see `tags_loaded`).
+    tags: dict[str, int] = field(default_factory=dict)
+    # True only when `tags` above was actually populated from the catalog.
+    # It defaults to FALSE because that is the honest answer for metadata
+    # nobody has fetched tags for - a non-history load, or a hand-built
+    # object. "No tags found" and "tags not established" must never collapse
+    # into the same answer: the first means nothing is pinned, the second
+    # means the pins are invisible, and acting on the second deletes exactly
+    # the data a tag exists to keep. Anything deciding what to delete reads
+    # this and goes back to the catalog (or refuses) rather than assuming.
+    tags_loaded: bool = False
     # Schema management: schemas are stored in a subcollection in Firestore.
     # `schemas` contains dicts with keys: schema_id, columns (list of {id,name,type}).
     # Each schema dict may also include `timestamp-ms` and `author`.
@@ -122,6 +144,16 @@ class DatasetMetadata:
     last_refreshed_at_ms: int | None = None
     last_refresh_status: str | None = None
     last_refresh_execution_id: str | None = None
+
+    def pinned_snapshot_ids(self) -> set[int]:
+        """Snapshot ids held alive by a tag.
+
+        A tag pins its snapshot from expiry forever, until the tag is dropped
+        (SNAPSHOT_TAGS_DESIGN.md S4). Dropping a tag unpins immediately - the
+        snapshot returns to normal retention on the next expiration run - which
+        is why this is derived from `tags` on every call rather than cached.
+        """
+        return {sid for sid in self.tags.values() if sid is not None}
 
     def current_snapshot(self) -> Snapshot | None:
         if self.current_snapshot_id is None:

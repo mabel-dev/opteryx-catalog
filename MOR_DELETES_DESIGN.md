@@ -1,6 +1,38 @@
 # Merge-on-Read Deletes — Design
 
-Status: **design only, not scheduled**. Nothing here is implemented.
+Status: **backend implemented, no SQL surface** (2026-08-25).
+
+Built: the delete-vector sidecar (`catalog/deletes.py`), the two manifest
+columns, `SimpleDataset.delete_rows` / `delete_files` / `delete_vectors`, GC
+protection in deep-clean and expiration, compaction exclusion +
+refresh-preservation, and read-side elimination in opteryx-core (FileEntry
+delete fields resolved at binding, per-row-group subtraction in
+ParquetReadNode, live `Manifest.get_record_count`, statistics-only MIN/MAX/
+COUNT(col) declined under deletes, compiled fast-path scan sources gated to
+the streaming path for delete-bearing scans). Tests:
+`tests/test_mor_deletes.py` (catalog) and opteryx-core
+`tests/integration/test_mor_deletes_local.py` (end to end).
+
+Also built (2026-08-25, second pass): **compaction materialisation**.
+Deleted rows are dropped wherever a merge reads an input file — the streaming
+source cache rewrites delete-bearing bytes at fetch
+(`deletes.materialise_live_parquet`), the hold-everything reader drops rows
+per row group — so rules A/B materialise opportunistically whenever they
+touch a delete-bearing file, and outputs carry no delete columns.
+`_row_counts_balance` now asserts LIVE-rows-in == rows-out. A new **rule C
+(`compact(rule="debt")`)** rewrites a file purely to shed debt when
+`deleted_record_count / record_count >= 0.10` (per-dataset override:
+`maintenance_policy["delete-debt-threshold"]`), one worst-ratio file per
+pass, as an order-preserving single-file brute combine. Snapshot-id
+allocation is collision-proof across all commit paths
+(`_allocate_snapshot_id`), and `write_parquet_manifest` invalidates the
+parsed-manifest cache on write. NOTE: the housekeeping service
+(xb500.opteryx) must add `compact(rule="debt")` to its per-dataset rule
+series for rule C to run on a schedule.
+
+Not built: any SQL `DELETE` surface, `row_group_mask` (readers decode the
+bitmap; whole-group skipping still happens when a group's slice is fully
+deleted), CAS commits, and latmat/native-scan delete awareness.
 
 ## 1. Problem
 
