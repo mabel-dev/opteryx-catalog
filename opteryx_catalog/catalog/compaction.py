@@ -57,6 +57,13 @@ logger = logging.getLogger(__name__)
 # Stable node identifier for this process (hex-mac-hex-pid)
 _NODE = f"{uuid.getnode():x}-{os.getpid():x}"
 
+# Merge-on-read delete debt: the fraction of a file's rows that must be
+# deleted before the file is rewritten PURELY to shed them (rule C — see
+# _select_delete_debt). Below this, debt is only paid opportunistically when
+# a file is selected by rules A/B for ordinary reasons. Per-dataset override:
+# maintenance_policy["delete-debt-threshold"].
+DELETE_DEBT_THRESHOLD = 0.10
+
 # Concurrency for _refresh_manifest_from_data_files: that path can touch
 # every file in a dataset (a full-manifest-rebuild fallback), and each
 # file's read+stats is independent (network I/O plus native decode that
@@ -421,12 +428,25 @@ class _SourceFileCache:
     the old behaviour rather than failing the compaction.
     """
 
-    def __init__(self, io, tmpdir: str, disk_budget: int = SOURCE_CACHE_DISK_BYTES):
+    def __init__(
+        self,
+        io,
+        tmpdir: str,
+        disk_budget: int = SOURCE_CACHE_DISK_BYTES,
+        delete_vectors: dict | None = None,
+    ):
         self._io = io
         self._tmpdir = tmpdir
         self._disk_budget = disk_budget
         self._disk_used = 0
         self._local: dict = {}
+        # Merge-on-read delete vectors for the pass's input files
+        # ({file_path: sorted ordinals}). Applied in _fetch, so every
+        # consumer of this cache — predicate reads, sort-column projection,
+        # chunk streaming — sees a physically-live file and none of them
+        # needs ordinal awareness. Ordinals are positions in the ORIGINAL
+        # bytes; rewriting at the fetch boundary is what keeps that true.
+        self._delete_vectors = delete_vectors or {}
 
     def source(self, file_path: str):
         """A ``read_parquet`` source for ``file_path``: a local filename when the
@@ -466,7 +486,13 @@ class _SourceFileCache:
         chunk, and is the remaining piece of work on this path.
         """
         with self._io.new_input(file_path).open() as f:
-            return bytes(f.read())
+            data = bytes(f.read())
+        positions = self._delete_vectors.get(file_path)
+        if positions:
+            from .deletes import materialise_live_parquet
+
+            data = materialise_live_parquet(data, positions)
+        return data
 
 
 class DatasetCompactor:
@@ -581,17 +607,35 @@ class DatasetCompactor:
         if not entries:
             return None
 
-        if self.strategy == "brute":
+        # Merge-on-read deletes are MATERIALISED by compaction: every path
+        # that reads an input file subtracts its delete vector first (the
+        # source cache rewrites delete-bearing bytes at fetch; the
+        # hold-everything reader drops rows per row group), so any merge that
+        # touches a delete-bearing file pays its debt as a side effect and
+        # emits vector-free outputs. `_row_counts_balance` accordingly checks
+        # LIVE-rows-in == rows-out. Rule C ("debt") additionally rewrites a
+        # file whose debt ratio alone justifies it — the case rules A/B never
+        # reach (e.g. a lone target-size file that is half deleted).
+        if rule == "debt":
+            # Checked before the legacy-brute strategy override: the debt rule
+            # has no sort-order dependence, so "this dataset has no sort key"
+            # is no reason to ignore an explicit request to shed delete debt.
+            compaction_plan = self._select_delete_debt(entries)
+        elif self.strategy == "brute":
             compaction_plan = self._select_brute_compaction(entries)
         elif rule == "brute":
             compaction_plan = self._select_brute_merge(entries)
         elif rule == "sort_aware":
             compaction_plan = self._select_sort_aware_merge(entries)
         elif rule is not None:
-            raise ValueError(f"rule must be 'brute', 'sort_aware', or None; got {rule!r}")
+            raise ValueError(
+                f"rule must be 'brute', 'sort_aware', 'debt', or None; got {rule!r}"
+            )
         else:
-            compaction_plan = self._select_brute_merge(entries) or self._select_sort_aware_merge(
-                entries
+            compaction_plan = (
+                self._select_brute_merge(entries)
+                or self._select_sort_aware_merge(entries)
+                or self._select_delete_debt(entries)
             )
 
         if not compaction_plan:
@@ -835,6 +879,63 @@ class DatasetCompactor:
             "mode": "brute",
             "files": selected,
             "reason": "small-file-brute",
+            "sort_column": sort_column_name,
+        }
+
+    def _delete_debt_threshold(self) -> float:
+        """Rule C's entry ratio, per-dataset overridable.
+
+        Read from maintenance_policy["delete-debt-threshold"] (beside
+        compaction-policy); an absent or unparseable value falls back to
+        DELETE_DEBT_THRESHOLD rather than disabling or zeroing the rule.
+        """
+        policy = getattr(self.dataset.metadata, "maintenance_policy", None) or {}
+        raw = policy.get("delete-debt-threshold")
+        if raw is None:
+            return DELETE_DEBT_THRESHOLD
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return DELETE_DEBT_THRESHOLD
+        return value if 0 < value <= 1 else DELETE_DEBT_THRESHOLD
+
+    def _select_delete_debt(self, entries: list[dict]) -> dict | None:
+        """Rule C: rewrite a file purely to shed merge-on-read delete debt.
+
+        Entry criterion: deleted_record_count / record_count >= the
+        delete-debt threshold. No size floor and no partner requirement —
+        this rule exists precisely for the file rules A/B never select (a
+        lone at-target file that is heavily deleted), and a tiny file with
+        debt is cheap to rewrite. One file per pass, worst debt ratio first,
+        consistent with one-operation-per-pass everywhere else; repeated
+        passes work through the backlog.
+
+        The plan is a single-file brute combine: concatenating a file's own
+        (live) row groups preserves its existing row order, so a sorted file
+        comes out still sorted — no morsel_sort needed or wanted.
+        """
+        threshold = self._delete_debt_threshold()
+        worst = None
+        worst_ratio = 0.0
+        for entry in entries:
+            deleted = entry_int(entry, "deleted_record_count")
+            if not deleted:
+                continue
+            records = entry_int(entry, "record_count")
+            if records <= 0:
+                continue
+            ratio = deleted / records
+            if ratio >= threshold and ratio > worst_ratio:
+                worst = entry
+                worst_ratio = ratio
+        if worst is None:
+            return None
+        sort_column_name, _, _ = self._resolve_sort_columns_for_entries(entries)
+        return {
+            "type": "combine",
+            "mode": "brute",
+            "files": [worst],
+            "reason": f"delete-debt {worst_ratio:.0%}",
             "sort_column": sort_column_name,
         }
 
@@ -1131,6 +1232,19 @@ class DatasetCompactor:
         plan_type = plan["type"]
         files_to_compact = plan["files"]
         sort_column = plan.get("sort_column")
+
+        # Merge-on-read deletes: resolve the input files' delete vectors ONCE
+        # for the pass, fail-closed — merging a delete-bearing file against
+        # "no vector" would resurrect its deleted rows into the output.
+        from .deletes import read_delete_vectors_for_entries
+
+        try:
+            self._pass_delete_vectors = read_delete_vectors_for_entries(
+                self.dataset.io, files_to_compact
+            )
+        except Exception as exc:  # noqa: BLE001 - aborts the pass, see _abort
+            return self._abort("could not resolve delete vectors for input files", exc)
+
         # ``mode`` threads the merge kind through the plan: "brute" (rule 2 -
         # concatenate, NO sort) vs "sort-aware" (rules 1 & 3 - sort + disjoint
         # split). Brute plans are always type "combine" (single output, no
@@ -1183,6 +1297,18 @@ class DatasetCompactor:
                     data = f.read()
                 with read_parquet(bytes(data)) as reader:
                     row_group_morsels = list(reader)
+                positions = self._pass_delete_vectors.get(file_path)
+                if positions:
+                    from .deletes import drop_deleted_rows_from_morsels
+
+                    row_group_morsels = drop_deleted_rows_from_morsels(
+                        row_group_morsels, positions
+                    )
+                    if not row_group_morsels:
+                        # An all-deleted file is dropped from the manifest at
+                        # delete-commit time, so this means the vector and the
+                        # file disagree — abort rather than write a wrong merge.
+                        return self._abort(f"delete vector covers every row of {file_path}")
                 file_morsel = (
                     Morsel.combine(row_group_morsels)
                     if len(row_group_morsels) > 1
@@ -1277,7 +1403,7 @@ class DatasetCompactor:
         from ..iops.fileio import COMPACTION_WRITE_PARQUET_OPTIONS
 
         new_entries = []
-        snapshot_id = int(time.time() * 1000)
+        snapshot_id = self.dataset._allocate_snapshot_id()
 
         for lo, hi in ranges:
             if perm is not None:
@@ -1463,7 +1589,10 @@ class DatasetCompactor:
             deleted_files = len(files_to_compact)
             deleted_size = sum(entry_int(e, "file_size_in_bytes") for e in files_to_compact)
             deleted_data_size = sum(entry_size(e) for e in files_to_compact)
-            deleted_records = sum(entry_int(e, "record_count") for e in files_to_compact)
+            deleted_records = sum(
+                entry_int(e, "record_count") - entry_int(e, "deleted_record_count")
+                for e in files_to_compact
+            )
 
             added_files = len(new_entries)
             added_size = sum(entry_int(e, "file_size_in_bytes") for e in new_entries)
@@ -1582,7 +1711,17 @@ class DatasetCompactor:
         input_counts = [e.get("record_count") for e in files_to_compact]
         if any(c is None for c in input_counts):
             return True
-        expected = sum(input_counts)
+        # Merge-on-read deletes are materialised during the merge, so the
+        # outputs must hold the inputs' LIVE rows: physical minus each file's
+        # delete-vector cardinality. For a debt-free input this is identical
+        # to the physical check this has always been — and it remains the
+        # tripwire between "declined to commit" and silent row loss, in both
+        # directions (a resurrected deleted row overshoots, a lost live row
+        # undershoots).
+        expected = sum(
+            int(c) - entry_int(e, "deleted_record_count")
+            for c, e in zip(input_counts, files_to_compact)
+        )
         actual = sum(entry_int(e, "record_count") for e in new_entries)
         if expected == actual:
             return True
@@ -1985,7 +2124,11 @@ class DatasetCompactor:
         with tempfile.TemporaryDirectory(
             prefix="opteryx-compact-", dir=COMPACTION_TMPDIR
         ) as tmpdir:
-            source_cache = _SourceFileCache(self.dataset.io, tmpdir)
+            source_cache = _SourceFileCache(
+                self.dataset.io,
+                tmpdir,
+                delete_vectors=getattr(self, "_pass_delete_vectors", None),
+            )
             return self._execute_compaction_streaming_inner(all_entries, plan, source_cache)
 
     def _execute_compaction_streaming_inner(
@@ -2100,7 +2243,7 @@ class DatasetCompactor:
 
         gen = master_chunks()
         new_entries = []
-        snapshot_id = int(time.time() * 1000)
+        snapshot_id = self.dataset._allocate_snapshot_id()
         try:
             while True:
                 sub = file_chunk_source(gen, target_rows_per_file)
@@ -2288,6 +2431,13 @@ class DatasetCompactor:
 
             entry_dict = self._to_dict(rebuilt_entry)
             if isinstance(entry_dict, dict):
+                # The rebuild reads the DATA file, which knows nothing about
+                # merge-on-read deletes — a rebuilt entry that dropped the
+                # delete columns would silently resurrect every deleted row
+                # of this file. Carry them over from the entry being replaced.
+                for key in ("delete_file_path", "deleted_record_count"):
+                    if entry.get(key):
+                        entry_dict[key] = entry.get(key)
                 return entry_dict
             return entry  # Fall back to original if rebuild failed
         except Exception:  # noqa: BLE001 - per-entry recovery, contract documented above

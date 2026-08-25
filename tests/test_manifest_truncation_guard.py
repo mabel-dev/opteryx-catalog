@@ -249,6 +249,11 @@ def test_expire_collection_skips_the_unprotectable_dataset_and_continues():
         def load_dataset(self, identifier, load_history=False):
             return self._dataset
 
+        def list_tags(self, identifier):
+            # Untagged: expiration reads this on every dataset, and an
+            # unreadable tag list must never be answered as "no tags".
+            return []
+
         def _snapshots_collection(self, collection, dataset_name):
             raise AssertionError("must not reach snapshot deletion")
 
@@ -291,6 +296,11 @@ def test_deep_clean_holds_back_files_too_new_to_reclaim():
         def load_dataset(self, identifier, load_history=False):
             return self._dataset
 
+        def list_tags(self, identifier):
+            # Untagged: expiration reads this on every dataset, and an
+            # unreadable tag list must never be answered as "no tags".
+            return []
+
     cleaner = DatasetDeepClean(_Catalog(io, ds))
     cleaner.clean_dataset("landing.scan_metadata", dry_run=False)
 
@@ -320,6 +330,11 @@ def test_deep_clean_aborts_rather_than_deleting_on_an_unreadable_manifest():
 
         def load_dataset(self, identifier, load_history=False):
             return self._dataset
+
+        def list_tags(self, identifier):
+            # Untagged: expiration reads this on every dataset, and an
+            # unreadable tag list must never be answered as "no tags".
+            return []
 
     cleaner = DatasetDeepClean(_Catalog(io, ds))
     with pytest.raises(ManifestProtectionError):
