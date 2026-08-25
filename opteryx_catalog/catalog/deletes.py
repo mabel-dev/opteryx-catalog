@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import base64
 import re
+import secrets
 from collections.abc import Iterable
 
 # Manifest columns carrying the per-data-file delete reference. Absent (None/0)
@@ -54,15 +55,37 @@ DELETED_RECORD_COUNT_KEY = "deleted_record_count"
 _ENC_VARINT_DELTAS = 0x00
 _ENC_DENSE_BITSET = 0x01
 
-# deletes-<snapshot_id>.parquet — the snapshot id doubles as a write timestamp
-# (same convention as manifest-<snapshot_id>.parquet), which age-gated sweeps
-# may parse from the name.
-DELETE_VECTOR_FILENAME_RE = re.compile(r"deletes-(\d+)\.parquet$")
+# deletes-<snapshot_id>-<nonce>.parquet — the snapshot id doubles as a write
+# timestamp (same convention as manifest-<snapshot_id>-<nonce>.parquet), which
+# age-gated sweeps parse from the name.
+#
+# The nonce is what makes the NAME unique, because the id is not. Snapshot ids
+# are wall-clock milliseconds bumped past the highest in the writer's OWN
+# in-memory history (SimpleDataset._allocate_snapshot_id), so two writers
+# holding the same parent snapshot compute the SAME id. Without a nonce they
+# write the same path, and the loser of that race silently overwrites the
+# winner's delete state — before either has reached the commit that would have
+# detected the race. A per-write nonce makes that collision impossible, so a
+# losing writer only ever leaves an orphan for the reclamation sweeps.
+#
+# The suffix is OPTIONAL in the pattern: datasets written before it exists hold
+# un-suffixed names, and a sweep that stopped recognising them would leak every
+# one of those files forever.
+DELETE_VECTOR_FILENAME_RE = re.compile(r"deletes-(\d+)(?:-[0-9a-f]+)?\.parquet$")
 
 
 def delete_vector_path(dataset_location: str, snapshot_id: int) -> str:
-    """The sidecar path for a snapshot, beside the manifests under metadata/."""
-    return f"{dataset_location}/metadata/deletes-{snapshot_id}.parquet"
+    """Mint a sidecar path for a snapshot, beside the manifests under metadata/.
+
+    Returns a NEW path on every call — the nonce is minted here rather than
+    passed in, because every caller is minting a path to write and none
+    reconstructs an existing one. Written paths are stored on the manifest
+    entries that reference them (DELETE_FILE_PATH_KEY), never recomputed.
+    """
+    return (
+        f"{dataset_location}/metadata/"
+        f"deletes-{snapshot_id}-{secrets.token_hex(6)}.parquet"
+    )
 
 
 def is_delete_vector_path(path: str) -> bool:

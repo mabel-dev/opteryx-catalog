@@ -500,8 +500,22 @@ class DatasetCompactor:
     Incremental compaction for datasets to optimize file layout.
 
     Supports two strategies:
-    - 'brute': Combines small files to reach target size (128MB)
-    - 'performance': Optimizes pruning by merging overlapping ranges
+    - 'brute': combines files below the small-file floor (MIN_FILE_SIZE_MB) into
+      files up to TARGET_SIZE_MB, splitting a large accumulated mass into
+      several target-sized outputs rather than one oversized one.
+    - 'performance': sort-aware. Merges files whose key ranges overlap so the
+      outputs stay disjoint and prunable, preserving the sort order.
+
+    ⚠️ Every size threshold in this module is measured in
+    `uncompressed_size_in_bytes`, NOT on-disk size - see the constants block
+    above. At the ~8.6x zstd ratio measured on github.events, the 4 GB
+    uncompressed target lands around 470 MB on disk. Reading a threshold as an
+    on-disk size gets the answer wrong by most of an order of magnitude.
+
+    The constants are the single source of truth for the numbers; do not restate
+    them here. They were raised from ~512 MB to ~4 GB on measurement, and this
+    docstring went on claiming 128 MB - a figure that matched neither the old
+    value nor the new one.
 
     Each compact() call performs one compaction operation.
     """
@@ -576,9 +590,10 @@ class DatasetCompactor:
         manifest fresh at its own start and commits independently, so neither
         call's read-to-write window is any longer than a single operation's;
         chaining them in one call would double that window and raise the odds
-        of losing a concurrent writer's commit (``save_dataset_metadata`` has
-        no compare-and-swap - a later write unconditionally clobbers an
-        earlier one). Calling both in series bounds each commit's exposure to
+        of losing a concurrent writer's commit. ``save_dataset_metadata`` now
+        refuses a write whose parent has moved, so the loss shows up as a
+        SnapshotRaceError rather than silent clobbering - but a refused pass is
+        still a wasted one. Calling both in series bounds each commit's exposure to
         one operation, same as a single-rule pass always had, and a writer
         that commits between the two calls is picked up by the second call
         instead of silently overwritten by it.
@@ -1488,12 +1503,14 @@ class DatasetCompactor:
             return None
 
         if self._dataset_moved_under_us():
-            # ``save_dataset_metadata`` has no compare-and-swap, so committing
-            # now would unconditionally clobber whatever landed while we were
-            # reading and rewriting - including that writer's new data files,
-            # which our manifest knows nothing about. This is a read-back, not
-            # a real CAS: it cannot close the window between this check and the
-            # write, only the (much longer) one covering the merge itself.
+            # Committing now would publish a manifest that knows nothing about
+            # whatever landed while we were reading and rewriting - including
+            # that writer's new data files. `save_dataset_metadata` would refuse
+            # it, but only after this pass had already written its output files.
+            # This read-back is the cheap early-out: it cannot close the window
+            # between the check and the write (the conditional save does that),
+            # but it catches the much longer one covering the merge itself
+            # before any bytes are spent.
             self._delete_written_files(new_entries)
             return self._abort(
                 "dataset changed during compaction; discarding this pass rather "
@@ -1646,13 +1663,12 @@ class DatasetCompactor:
         # Commit snapshot
         try:
             self.dataset.metadata.snapshots.append(snapshot)
-            self.dataset.metadata.current_snapshot_id = snapshot.snapshot_id
+            self.dataset._advance_current_snapshot(snapshot.snapshot_id)
 
-            # Persist metadata via catalog
-            if self.dataset.catalog:
-                self.dataset.catalog.save_dataset_metadata(
-                    self.dataset.identifier, self.dataset.metadata
-                )
+            # Persist metadata via catalog. Conditional on the pointer still
+            # holding the parent this pass read - `_dataset_moved_under_us`
+            # above narrows the window, this closes it.
+            self.dataset._persist_metadata()
         except Exception as e:
             raise RuntimeError(
                 f"Failed to persist compaction snapshot {snapshot_id} to metastore"

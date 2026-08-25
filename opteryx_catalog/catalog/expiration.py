@@ -1125,7 +1125,12 @@ class SnapshotExpiration:
         skipped_recent: list[str] = []
         for manifest in orphaned_manifests:
             name = manifest.rsplit("/", 1)[-1]
-            match = re.search(r"manifest-(\d+)\.parquet$", name)
+            # Optional nonce suffix — see write_parquet_manifest. It must stay
+            # OPTIONAL: manifests written before the nonce existed have bare
+            # names, and a pattern that stopped matching them would leak every
+            # one of those files forever (an unmatched name is treated as
+            # too-recent-to-reclaim, not as a parse failure).
+            match = re.search(r"manifest-(\d+)(?:-[0-9a-f]+)?\.parquet$", name)
             if match and now_ms - int(match.group(1)) >= MANIFEST_ORPHAN_MIN_AGE_MS:
                 eligible.append(manifest)
             else:

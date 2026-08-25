@@ -104,7 +104,7 @@ class _FakeCatalog:
     def save_snapshot(self, identifier, snapshot):
         pass
 
-    def save_dataset_metadata(self, identifier, metadata):
+    def save_dataset_metadata(self, identifier, metadata, **kwargs):
         pass
 
 

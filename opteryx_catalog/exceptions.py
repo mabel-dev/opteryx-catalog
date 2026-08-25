@@ -461,3 +461,31 @@ class InvalidCatalogBinding(ValueError, CatalogError):
     without importing catalog-specific types. Deliberately NOT Alertable: a
     rejected write is a caller error, not a platform failure.
     """
+
+
+class SnapshotRaceError(CatalogError):
+    """Raised when a commit's parent snapshot is no longer the dataset's current one.
+
+    Every commit writes NEW immutable files - `manifest-<id>-<nonce>.parquet`,
+    `deletes-<id>-<nonce>.parquet` - and then moves one pointer: the dataset
+    document's `current-snapshot-id`. Nothing is ever overwritten, so the only
+    contended resource is that pointer.
+
+    Two writers reading the same parent each build a complete manifest from it,
+    and whichever moves the pointer second wins outright: the loser's data files
+    are intact on disk and referenced by nothing, its rows are gone, and it
+    reported success. The dataset document is written whole, so the loser's
+    entry in the snapshot history goes with it - there is not even a snapshot to
+    point back at.
+
+    The commit is therefore conditional on the pointer still holding the parent
+    it was built against. This is a real compare-and-swap at the store, not a
+    read-back: a read-back can only narrow the window, never close it (see
+    compaction's `_dataset_moved_under_us`, which says as much).
+
+    Retrying is usually correct but is NOT automatic, because whether the work
+    survives the race depends on what won it. A winner that appended leaves an
+    earlier writer's assumptions intact; a winner that compacted has moved rows
+    between files, which invalidates any row addresses computed against the old
+    manifest - the case MERGE cares about.
+    """

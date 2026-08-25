@@ -3,6 +3,11 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+import secrets
+
+# The "no expectation" sentinel for save_dataset_metadata, defined with the
+# commit paths that pass it (catalog/dataset.py).
+from .catalog.dataset import _NO_SNAPSHOT_EXPECTATION
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -3604,7 +3609,17 @@ class OpteryxCatalog(Metastore):
         if entries is None:
             return None
 
-        parquet_path = f"{dataset_location}/metadata/manifest-{snapshot_id}.parquet"
+        # manifest-<snapshot_id>-<nonce>.parquet. The nonce is what makes the
+        # name unique: snapshot ids are wall-clock milliseconds bumped past the
+        # highest in the WRITER'S OWN in-memory history, so two writers holding
+        # the same parent compute the same id and would otherwise write the same
+        # path — one silently replacing the other's manifest before either
+        # reaches the commit that detects the race. With a nonce the loser only
+        # leaves an orphan, which the reclamation sweeps collect.
+        parquet_path = (
+            f"{dataset_location}/metadata/"
+            f"manifest-{snapshot_id}-{secrets.token_hex(6)}.parquet"
+        )
 
         # Use provided FileIO if it supports writing; otherwise write to GCS.
         # Nothing below is recoverable - see the note on out.close() - so this
@@ -3793,13 +3808,63 @@ class OpteryxCatalog(Metastore):
         snaps = self._snapshots_collection(namespace, dataset_name)
         snaps.document(str(snapshot.snapshot_id)).set(_snapshot_to_document(snapshot))
 
-    def save_dataset_metadata(self, identifier: str, metadata: DatasetMetadata) -> None:
+    def _refuse_if_pointer_moved(self, doc_ref, identifier: str, expected) -> None:
+        """Refuse the commit if another writer already moved the pointer.
+
+        Read and compare inside a Firestore transaction so the check binds the
+        write that follows it. Firestore refuses a read that follows a write in
+        the same transaction, so the read comes first - the same ordering
+        `create_dataset` uses.
+        """
+        from google.cloud import firestore
+
+        from .exceptions import SnapshotRaceError
+
+
+        @firestore.transactional
+        def _check(transaction) -> None:
+            doc = doc_ref.get(transaction=transaction)
+            stored = doc.to_dict().get("current-snapshot-id") if doc.exists else None
+            if stored != expected:
+                raise SnapshotRaceError(
+                    f"{identifier} moved while this commit was being built: it was "
+                    f"built against snapshot {expected} but the dataset now points "
+                    f"at {stored}. Nothing has been published - the files this "
+                    "commit wrote are orphans the reclamation sweeps will collect. "
+                    "Re-read the dataset and rebuild the commit against its current "
+                    "snapshot."
+                )
+
+        _check(self.firestore_client.transaction())
+
+    def save_dataset_metadata(
+        self,
+        identifier: str,
+        metadata: DatasetMetadata,
+        expected_current_snapshot_id=_NO_SNAPSHOT_EXPECTATION,
+    ) -> None:
         """Persist dataset-level metadata and snapshots to Firestore.
 
         This writes the dataset document and upserts snapshot documents.
+
+        `expected_current_snapshot_id` makes the write CONDITIONAL: the stored
+        `current-snapshot-id` must still be that value or the write is refused
+        with SnapshotRaceError. A commit passes the parent it built its manifest
+        from; anything that does not move the pointer (an annotation, a
+        description) passes nothing and writes unconditionally.
+
+        The check and the write are ONE Firestore transaction. A read-back
+        followed by a write would only narrow the race, never close it - which
+        is exactly what compaction's `_dataset_moved_under_us` says about itself.
         """
         collection, dataset_name = identifier.split(".")
         doc_ref = self._dataset_doc_ref(collection, dataset_name)
+
+        if expected_current_snapshot_id is not _NO_SNAPSHOT_EXPECTATION:
+            self._refuse_if_pointer_moved(
+                doc_ref, identifier, expected_current_snapshot_id
+            )
+
         doc_ref.set(
             {
                 "name": dataset_name,

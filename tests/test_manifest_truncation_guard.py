@@ -116,7 +116,7 @@ class _RecordingCatalog:
     def save_snapshot(self, identifier, snap):
         pass
 
-    def save_dataset_metadata(self, identifier, metadata):
+    def save_dataset_metadata(self, identifier, metadata, **kwargs):
         pass
 
 

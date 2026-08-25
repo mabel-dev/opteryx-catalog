@@ -297,6 +297,11 @@ class Datafile:
         return {fid: v for fid, v in zip(field_ids, max_values) if fid is not None}
 
 
+# "no expectation" — distinct from None, which is a real value meaning "this
+# dataset had no current snapshot yet" (the first commit of a fresh dataset).
+_NO_SNAPSHOT_EXPECTATION = object()
+
+
 @dataclass
 class SimpleDataset(Dataset):
     # This catalog's own stats builder writes ordinal keys -- see
@@ -711,13 +716,12 @@ class SimpleDataset(Dataset):
         )
 
         self.metadata.snapshots.append(snap)
-        self.metadata.current_snapshot_id = snapshot_id
+        self._advance_current_snapshot(snapshot_id)
 
         # persist metadata (let errors propagate)
         if self.catalog and hasattr(self.catalog, "save_snapshot"):
             self.catalog.save_snapshot(self.identifier, snap)
-        if self.catalog and hasattr(self.catalog, "save_dataset_metadata"):
-            self.catalog.save_dataset_metadata(self.identifier, self.metadata)
+        self._persist_metadata()
 
         self._emit_audit(
             "append",
@@ -1240,12 +1244,11 @@ class SimpleDataset(Dataset):
 
         # Replace in-memory snapshots
         self.metadata.snapshots.append(snap)
-        self.metadata.current_snapshot_id = snapshot_id
+        self._advance_current_snapshot(snapshot_id)
 
         if self.catalog and hasattr(self.catalog, "save_snapshot"):
             self.catalog.save_snapshot(self.identifier, snap)
-        if self.catalog and hasattr(self.catalog, "save_dataset_metadata"):
-            self.catalog.save_dataset_metadata(self.identifier, self.metadata)
+        self._persist_metadata()
 
         self._after_commit(author, snap)
 
@@ -1422,12 +1425,11 @@ class SimpleDataset(Dataset):
         )
 
         self.metadata.snapshots.append(snap)
-        self.metadata.current_snapshot_id = snapshot_id
+        self._advance_current_snapshot(snapshot_id)
 
         if self.catalog and hasattr(self.catalog, "save_snapshot"):
             self.catalog.save_snapshot(self.identifier, snap)
-        if self.catalog and hasattr(self.catalog, "save_dataset_metadata"):
-            self.catalog.save_dataset_metadata(self.identifier, self.metadata)
+        self._persist_metadata()
 
         self._after_commit(author, snap)
 
@@ -1590,18 +1592,49 @@ class SimpleDataset(Dataset):
 
         # Replace in-memory snapshots: append snapshot and update current id
         self.metadata.snapshots.append(snap)
-        self.metadata.current_snapshot_id = snapshot_id
+        self._advance_current_snapshot(snapshot_id)
 
         if self.catalog and hasattr(self.catalog, "save_snapshot"):
             self.catalog.save_snapshot(self.identifier, snap)
-        if self.catalog and hasattr(self.catalog, "save_dataset_metadata"):
-            self.catalog.save_dataset_metadata(self.identifier, self.metadata)
+        self._persist_metadata()
 
         self._after_commit(author, snap)
 
     # ------------------------------------------------------------------
     # Merge-on-read deletes (see catalog/deletes.py and MOR_DELETES_DESIGN.md)
     # ------------------------------------------------------------------
+
+    def _advance_current_snapshot(self, snapshot_id: int) -> None:
+        """Point the dataset at a new snapshot, remembering what it pointed at.
+
+        The parent is captured here rather than re-read at save time because by
+        then it is gone: `_persist_metadata` needs the value the commit was
+        BUILT against, which is exactly what this call overwrites.
+        """
+        self._expected_current_snapshot_id = self.metadata.current_snapshot_id
+        self.metadata.current_snapshot_id = snapshot_id
+
+    def _persist_metadata(self) -> None:
+        """Write the dataset document, conditional on the pointer not having moved.
+
+        The condition is the whole point: every commit builds its manifest from a
+        parent it read, and a writer that lost the race would otherwise publish a
+        manifest that silently drops whatever the winner added. See
+        SnapshotRaceError.
+
+        A save that did not advance the pointer (an annotation, a description)
+        passes no expectation - it is not racing anything.
+        """
+        if not (self.catalog and hasattr(self.catalog, "save_dataset_metadata")):
+            return
+        self.catalog.save_dataset_metadata(
+            self.identifier,
+            self.metadata,
+            expected_current_snapshot_id=getattr(
+                self, "_expected_current_snapshot_id", _NO_SNAPSHOT_EXPECTATION
+            ),
+        )
+        self._expected_current_snapshot_id = _NO_SNAPSHOT_EXPECTATION
 
     def _allocate_snapshot_id(self) -> int:
         """A snapshot id strictly greater than every one already recorded.
@@ -1707,12 +1740,11 @@ class SimpleDataset(Dataset):
         )
 
         self.metadata.snapshots.append(snap)
-        self.metadata.current_snapshot_id = snapshot_id
+        self._advance_current_snapshot(snapshot_id)
 
         if self.catalog and hasattr(self.catalog, "save_snapshot"):
             self.catalog.save_snapshot(self.identifier, snap)
-        if self.catalog and hasattr(self.catalog, "save_dataset_metadata"):
-            self.catalog.save_dataset_metadata(self.identifier, self.metadata)
+        self._persist_metadata()
 
         self._emit_audit(
             audit_action,
@@ -1854,6 +1886,15 @@ class SimpleDataset(Dataset):
             },
         )
 
+    # What a merge_commit may call itself in the snapshot log and the audit
+    # trail. MERGE, UPDATE and DELETE are the SAME physical operation - retire
+    # addresses, append files - but they are not the same statement, and a
+    # reader of the history cannot tell which one ran if all three say "merge".
+    # A closed set rather than a free string: this is a vocabulary other tools
+    # read, so a caller must not be able to coin a word in it. "delete" is the
+    # word `delete_rows` already uses, deliberately reused rather than doubled.
+    MERGE_OPERATIONS = ("merge", "update", "delete")
+
     def merge_commit(
         self,
         files: "Iterable[str]",
@@ -1861,6 +1902,7 @@ class SimpleDataset(Dataset):
         author: str | None = None,
         commit_message: str | None = None,
         footer_only: bool = False,
+        operation: str = "merge",
     ) -> Snapshot:
         """Register data files AND mark row ordinals deleted, in ONE snapshot.
 
@@ -1885,7 +1927,18 @@ class SimpleDataset(Dataset):
 
         A file whose every row ends up deleted is dropped from the manifest
         outright — an all-deleted file must never reach a reader.
+
+        `operation` names the STATEMENT for the snapshot log and the audit
+        trail, and must be one of `MERGE_OPERATIONS`. It changes nothing about
+        what is committed — UPDATE and DELETE are MERGE with a degenerate
+        source, and reach here through this same method — only what the history
+        says ran.
         """
+        if operation not in self.MERGE_OPERATIONS:
+            raise ValueError(
+                f"merge_commit: operation must be one of {self.MERGE_OPERATIONS}, "
+                f"got {operation!r}"
+            )
         from .deletes import DELETE_FILE_PATH_KEY
         from .deletes import DELETED_RECORD_COUNT_KEY
         from .deletes import delete_vector_path
@@ -1986,15 +2039,15 @@ class SimpleDataset(Dataset):
 
         if commit_message is None:
             commit_message = (
-                f"merge: {len(added_entries)} file(s) added, {newly_deleted} row(s) "
-                f"deleted across {len(positions)} file(s) by {author}"
+                f"{operation}: {len(added_entries)} file(s) added, {newly_deleted} "
+                f"row(s) deleted across {len(positions)} file(s) by {author}"
             )
 
         return self._commit_delete_snapshot(
             new_entries=carried_entries + added_entries,
             added_entries=added_entries,
-            operation_type="merge",
-            audit_action="merge",
+            operation_type=operation,
+            audit_action=operation,
             author=author,
             commit_message=commit_message,
             removed_entries=removed_entries,
@@ -2632,13 +2685,12 @@ class SimpleDataset(Dataset):
 
         # update in-memory metadata
         self.metadata.snapshots.append(snap)
-        self.metadata.current_snapshot_id = snapshot_id
+        self._advance_current_snapshot(snapshot_id)
 
         # persist
         if self.catalog and hasattr(self.catalog, "save_snapshot"):
             self.catalog.save_snapshot(self.identifier, snap)
-        if self.catalog and hasattr(self.catalog, "save_dataset_metadata"):
-            self.catalog.save_dataset_metadata(self.identifier, self.metadata)
+        self._persist_metadata()
 
         return snapshot_id
 
@@ -2784,7 +2836,7 @@ class SimpleDataset(Dataset):
 
         # Append new snapshot and update current snapshot id
         self.metadata.snapshots.append(snap)
-        self.metadata.current_snapshot_id = snapshot_id
+        self._advance_current_snapshot(snapshot_id)
 
         if self.catalog and hasattr(self.catalog, "save_snapshot"):
             self.catalog.save_snapshot(self.identifier, snap)
