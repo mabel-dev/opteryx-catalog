@@ -88,6 +88,9 @@ class _Collection:
     def stream(self):
         return [ref._doc for ref in self._docs.values()]
 
+    def list_documents(self):
+        return list(self._docs.values())
+
 
 class _FirestoreClient:
     """A stand-in for `google.cloud.firestore.Client`.
@@ -622,3 +625,132 @@ def test_create_collection_initializes_lock_fields_to_none():
 
     assert coll_ref.written["locked-by"] is None
     assert coll_ref.written["locked-at-ms"] is None
+
+
+# ---------------------------------------------------------------------------
+# Dropping an EXTERNALLY-BOUND workspace unlinks it
+#
+# Its tables live in the catalog it is bound to; what is in Firestore is a
+# projection of that catalog's listing. So the drop deletes the projection,
+# the grants and `$properties`, and does not touch - or even call - the bound
+# catalog. Nothing is reclaimed because a stub has no storage behind it.
+# ---------------------------------------------------------------------------
+
+
+def _bound_catalog(collections=None, props_data=None):
+    """A bound workspace whose datasets are stub documents.
+
+    The drop/enumeration methods are stubbed to RECORD rather than act, so a
+    test can assert they were never reached - the unlink path must not go
+    anywhere near the machinery that reclaims storage.
+    """
+    props = {"deletion_protection": False, "catalog": {"kind": "iceberg", "version": 7}}
+    props.update(props_data or {})
+    catalog, catalog_collection, log = _catalog_with_properties(props)
+
+    for collection_name, datasets in (collections or {}).items():
+        collection_doc = catalog_collection.document(collection_name)
+        for dataset in datasets:
+            collection_doc.collection("datasets").document(dataset)
+
+    reached = []
+    catalog.list_collections = lambda: reached.append("list_collections") or []
+    catalog.drop_dataset = lambda *a, **k: reached.append("drop_dataset")
+    catalog.drop_view = lambda *a, **k: reached.append("drop_view")
+    catalog.drop_materialized_view = lambda *a, **k: reached.append("drop_materialized_view")
+    catalog.drop_collection = lambda *a, **k: reached.append("drop_collection")
+
+    return catalog, catalog_collection, reached, log
+
+
+def test_dropping_a_bound_workspace_unlinks_rather_than_drops():
+    catalog, _cc, reached, log = _bound_catalog(collections={"interop": ["people", "orders"]})
+
+    with patch("opteryx_catalog.opteryx_catalog.send_webhook"):
+        catalog.drop_workspace(author="alice")
+
+    # None of the dataset-dropping machinery is reached: those tables are not
+    # this catalog's to drop, and drop_dataset would tombstone a storage
+    # location a stub does not have.
+    assert reached == []
+
+    # The projection and the workspace document are gone.
+    assert ("delete", "people") in log
+    assert ("delete", "orders") in log
+    assert ("delete", "interop") in log
+    assert ("delete", "$properties") in log
+
+
+def test_unlink_still_clears_the_access_grants():
+    # Same reason drop_workspace clears them: left behind, they silently
+    # reactivate if the workspace name is ever reused.
+    catalog, catalog_collection, _reached, log = _bound_catalog()
+    grants = catalog_collection.document("$policies").collection("access")
+    grants.document("reader@example.com")
+
+    with patch("opteryx_catalog.opteryx_catalog.send_webhook"):
+        catalog.drop_workspace(author="alice")
+
+    assert ("delete", "reader@example.com") in log
+
+
+def test_unlink_is_still_gated_by_deletion_protection():
+    # Unlinking is not a lesser act needing a lesser gate - it destroys the
+    # binding and the grants, and rebuilding them means re-provisioning a
+    # credential this catalog cannot recover on its own.
+    catalog, _cc, reached, log = _bound_catalog(props_data={"deletion_protection": True})
+
+    with pytest.raises(WorkspaceDeletionProtected):
+        catalog.drop_workspace(author="alice")
+
+    assert reached == []
+    assert ("delete", "$properties") not in log
+
+
+def test_unlink_still_requires_an_author():
+    catalog, _cc, _reached, _log = _bound_catalog()
+    with pytest.raises(ValueError):
+        catalog.drop_workspace(author=None)
+
+
+def test_unlink_emits_the_workspace_delete_webhook():
+    catalog, _cc, _reached, _log = _bound_catalog()
+
+    with patch("opteryx_catalog.opteryx_catalog.send_webhook") as hook:
+        catalog.drop_workspace(author="alice")
+
+    assert hook.call_count == 1
+    kwargs = hook.call_args.kwargs
+    assert kwargs["action"] == "delete"
+    assert kwargs["resource_type"] == "workspace"
+    assert kwargs["payload"]["dropped_by"] == "alice"
+
+
+def test_unlink_is_audited_under_its_own_action_name():
+    # "drop_workspace" and "unlink_workspace" are materially different events -
+    # one destroyed data, the other did not - so the audit log must not spell
+    # them the same way.
+    catalog, _cc, _reached, _log = _bound_catalog()
+
+    with (
+        patch("opteryx_catalog.opteryx_catalog.send_webhook"),
+        patch("opteryx_catalog.opteryx_catalog.emit_audit") as audit,
+    ):
+        catalog.drop_workspace(author="alice")
+
+    assert audit.call_args.args[0] == "unlink_workspace"
+
+
+def test_an_unbound_workspace_still_takes_the_full_drop_path():
+    # The regression guard on the other side: adding the unlink branch must
+    # not divert a workspace that domiciles its own data.
+    catalog, _cc, dropped, log = _catalog_with_contents(
+        props_data={"deletion_protection": False},
+        collections={"coll1": {"datasets": ["tbl1"], "views": []}},
+    )
+
+    with patch("opteryx_catalog.opteryx_catalog.send_webhook"):
+        catalog.drop_workspace(author="alice")
+
+    assert ("dataset", "coll1.tbl1", "alice") in dropped
+    assert ("delete", "$properties") in log

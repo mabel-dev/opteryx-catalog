@@ -169,7 +169,15 @@ def test_nested_external_namespace_splits_left_anchored(db):
 
 
 # ---------------------------------------------------------------------------
-# Real dataset documents are not ours to touch, in either direction
+# A real dataset document in a bound workspace is impossible, and refused
+#
+# An externally-bound workspace cannot domicile datasets of this catalog's
+# own: every relation-scoped write against one is routed at its bound
+# metastore, which refuses. So one found here means that routing has been
+# breached upstream. This used to be skipped silently in both directions,
+# which let such a document sit in a bound workspace with nothing saying so;
+# the projection's next act is to overwrite or delete it, and doing either to
+# a real dataset loses data.
 # ---------------------------------------------------------------------------
 
 
@@ -179,22 +187,36 @@ def _seed_real_dataset(db, collection, name):
     )
 
 
-def test_a_real_dataset_is_never_overwritten_by_a_stub(db):
+def test_a_real_dataset_in_a_bound_workspace_is_refused(db):
     _seed_real_dataset(db, "interop", "people")
-    result = sync_stub_datasets(db, WS, [("interop", "people")])
-    assert (result.added, result.removed, result.total) == (0, 0, 1)
-    doc = db.collection(WS).document("interop").collection("datasets").document("people").get()
-    assert doc.to_dict()["location"] == "gs://real"
-    assert STUB_MARKER not in doc.to_dict()
+    with pytest.raises(InvalidCatalogBinding):
+        sync_stub_datasets(db, WS, [("interop", "people")])
 
 
-def test_a_real_dataset_missing_from_the_listing_is_not_deleted(db):
+def test_the_refusal_fires_even_when_the_name_is_not_listed(db):
+    # Being absent from the listing does not make it legitimate - and this is
+    # the direction the old code was quietest about.
     _seed_real_dataset(db, "interop", "people")
-    result = sync_stub_datasets(db, WS, [("interop", "orders")])
-    assert (result.added, result.removed) == (1, 0)
-    assert db.collection(WS).document("interop").collection("datasets").document(
-        "people"
-    ).get().exists
+    with pytest.raises(InvalidCatalogBinding):
+        sync_stub_datasets(db, WS, [("interop", "orders")])
+
+
+def test_the_refusal_names_the_offending_dataset(db):
+    _seed_real_dataset(db, "interop", "people")
+    with pytest.raises(InvalidCatalogBinding) as raised:
+        sync_stub_datasets(db, WS, [("interop", "people")])
+    assert "interop.people" in str(raised.value)
+
+
+def test_nothing_is_written_when_the_refusal_fires(db):
+    # The refusal must come BEFORE any write, or a partial projection is left
+    # behind next to the dataset it refused to touch.
+    _seed_real_dataset(db, "interop", "people")
+    with pytest.raises(InvalidCatalogBinding):
+        sync_stub_datasets(db, WS, [("interop", "orders")])
+    # "orders" was listed and would have been written had the refusal come any
+    # later; only the seeded document remains.
+    assert set(_stubs(db)) == {("interop", "people")}
 
 
 # ---------------------------------------------------------------------------
@@ -352,17 +374,14 @@ def test_detail_never_revives_a_removed_stub(db):
     assert _stubs(db) == {}
 
 
-def test_detail_is_never_written_over_a_real_dataset(db):
+def test_detail_over_a_real_dataset_is_refused_too(db):
+    # Carrying schema/statistics does not make the write acceptable - the
+    # refusal is about what is already stored, not about what is being written.
     _seed_real_dataset(db, "interop", "people")
-    result = sync_stub_datasets(
-        db, WS, [("interop", "people", {"schema": COLUMNS, "statistics": STATS})]
-    )
-    assert (result.added, result.updated, result.removed) == (0, 0, 0)
-    stored = db.collection(WS).document("interop").collection("datasets").document(
-        "people"
-    ).get().to_dict()
-    assert stored["location"] == "gs://real"
-    assert "schema" not in stored
+    with pytest.raises(InvalidCatalogBinding):
+        sync_stub_datasets(
+            db, WS, [("interop", "people", {"schema": COLUMNS, "statistics": STATS})]
+        )
 
 
 def test_a_duplicate_entry_takes_the_last_detail(db):

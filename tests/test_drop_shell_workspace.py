@@ -14,14 +14,29 @@ from unittest.mock import patch
 from opteryx_catalog.opteryx_catalog import OpteryxCatalog
 
 
+class _FakeSnapshot:
+    def __init__(self, data):
+        self.exists = data is not None
+        self._data = data
+
+    def to_dict(self):
+        return self._data
+
+
 class _FakeDoc:
     def __init__(self, id_=""):
         self.id = id_
         self.deleted = False
+        self.data = {}
         self._collections = {}
 
     def collection(self, name):
         return self._collections.setdefault(name, _FakeCollection())
+
+    def get(self):
+        # A shell workspace's `$properties` carries no `catalog` block, so
+        # drop_workspace reads this and takes the domiciled-data path.
+        return _FakeSnapshot(None if self.deleted else self.data)
 
     def delete(self):
         self.deleted = True

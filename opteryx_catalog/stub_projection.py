@@ -304,15 +304,21 @@ def _stub_document(
 
 
 def _existing_datasets(firestore_client, workspace: str) -> dict:
-    """Every dataset document in the workspace -> `(is_stub, stored_document)`.
+    """Every dataset document in the workspace -> its stored document.
 
-    Reads the real ones too, deliberately: they are what stops an `add` from
-    overwriting a dataset this catalog owns, and they must NOT be deleted when
-    the external catalog stops listing a name. The stored document comes back
-    with them so an unchanged stub can be recognised WITHOUT writing it - now
-    that a stub carries schema and statistics, "already listed" is no longer
-    the same question as "already correct", and blind re-writing would turn
-    every refresh into one write per table forever.
+    The stored document comes back so an unchanged stub can be recognised
+    WITHOUT writing it - now that a stub carries schema and statistics,
+    "already listed" is no longer the same question as "already correct", and
+    blind re-writing would turn every refresh into one write per table forever.
+
+    An externally-bound workspace cannot domicile datasets of this catalog's
+    own: every relation-scoped write against one is routed at its bound
+    metastore, which refuses. So every document here is a stub, and one that
+    is not means that routing has been breached somewhere upstream. That is
+    raised, not handled: this function's next act would be to overwrite or
+    delete the document, and doing either to a real dataset loses data. There
+    is no safe way to carry on, and carrying on quietly is how it would go
+    unnoticed.
     """
     found = {}
     workspace_ref = firestore_client.collection(workspace)
@@ -321,7 +327,14 @@ def _existing_datasets(firestore_client, workspace: str) -> dict:
             continue
         for snapshot in collection_doc.collection(DATASETS_SUBCOLLECTION).stream():
             data = snapshot.to_dict() or {}
-            found[(collection_doc.id, snapshot.id)] = (bool(data.get(STUB_MARKER)), data)
+            if not data.get(STUB_MARKER):
+                raise InvalidCatalogBinding(
+                    f"workspace {workspace!r} is externally bound but "
+                    f"{collection_doc.id}.{snapshot.id} is a dataset this catalog "
+                    "owns, which a bound workspace cannot hold - refusing to "
+                    "project stubs over it"
+                )
+            found[(collection_doc.id, snapshot.id)] = data
     return found
 
 
@@ -343,11 +356,10 @@ def sync_stub_datasets(
     - listed and absent              -> a stub is written
     - listed, a stub, unchanged      -> left alone (no write, no churn)
     - listed, a stub, now different  -> rewritten, counted as `updated`
-    - listed and a REAL dataset      -> left alone; a document this catalog
-                                        owns is never overwritten by a
-                                        projection
     - a stub no longer listed        -> deleted
-    - a real dataset not listed      -> left alone
+
+    Every dataset document in a bound workspace is a stub - see
+    `_existing_datasets`, which refuses outright if it finds one that is not.
 
     Raises `WorkspaceNotFound` if the workspace has no `$properties` document
     and `InvalidCatalogBinding` if it has one with no `catalog` block: a stub
@@ -377,9 +389,7 @@ def sync_stub_datasets(
     updated = 0
     for key in sorted(desired):
         collection, name = key
-        is_stub, stored = existing.get(key, (False, None))
-        if key in existing and not is_stub:
-            continue  # a real dataset document - never overwritten
+        stored = existing.get(key)
         document = _stub_document(workspace, collection, name, desired[key], stored)
         if key in existing:
             if stored == document:
@@ -393,8 +403,6 @@ def sync_stub_datasets(
 
     removed = 0
     for key in sorted(set(existing) - set(desired)):
-        if not existing[key][0]:
-            continue  # a real dataset document - not ours to remove
         collection, name = key
         workspace_ref.document(collection).collection(DATASETS_SUBCOLLECTION).document(
             name
