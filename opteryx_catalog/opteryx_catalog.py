@@ -1320,7 +1320,15 @@ class OpteryxCatalog(Metastore):
     # the call with nothing in between - see DROP WORKSPACE's binder step.
 
     def drop_workspace(self, author: str) -> None:
-        """Permanently drop this workspace: every materialized view, then
+        """Permanently drop this workspace.
+
+        An EXTERNALLY-BOUND workspace is unlinked instead - see
+        `_unlink_bound_workspace`, which this delegates to. Its datasets are
+        someone else's, so nothing below applies to it: no dataset is dropped,
+        no storage is reclaimed, and the bound catalog is never called. The
+        rest of this describes a workspace that domiciles its own data.
+
+        Drops every materialized view, then
         every remaining dataset, then every view, then every now-empty
         collection document itself, in every collection, their storage
         reclaimed; policy.opteryx's access grants for this workspace
@@ -1386,6 +1394,16 @@ class OpteryxCatalog(Metastore):
             raise ValueError("author must be provided when dropping a workspace")
 
         self._assert_not_deletion_protected()
+
+        # An externally-bound workspace is UNLINKED, not emptied: its tables
+        # live in someone else's catalog and this one has no business deleting
+        # them. Decided here, from the binding on this workspace's own
+        # `$properties`, rather than by the caller - a caller that got this
+        # wrong in the deleting direction would destroy data this catalog does
+        # not own, so the choice must not be theirs to make.
+        if (self.get_workspace_properties() or {}).get("catalog"):
+            self._unlink_bound_workspace(author=author)
+            return
 
         collections = list(self.list_collections())
 
@@ -1464,6 +1482,62 @@ class OpteryxCatalog(Metastore):
 
         emit_audit(
             "drop_workspace",
+            resource_type=ResourceType.WORKSPACE,
+            workspace=self.workspace,
+            resource=self.workspace,
+            author=author,
+        )
+
+    def _unlink_bound_workspace(self, author: str) -> None:
+        """Drop an externally-bound workspace by unlinking it.
+
+        The tables of a bound workspace live in the catalog it is bound to.
+        What is in Firestore is a PROJECTION of that catalog's listing - stub
+        documents carrying a name, a collection, and at most a schema and some
+        statistics (see stub_projection._stub_document). So unlinking deletes
+        the projection, the workspace's access grants and its `$properties` -
+        and the external catalog is not called at all. Nothing in the bound
+        catalog is dropped, renamed or otherwise touched; a workspace can be
+        unlinked and re-bound with its tables entirely unaware.
+
+        Deliberately NOT built out of `drop_dataset`, the way `drop_workspace`
+        is. That path tombstones each dataset's storage location and then
+        sweeps the tombstones to reclaim the files behind them, which is right
+        for datasets this catalog domiciles and meaningless for a stub, which
+        has no location and no files. Running it here would ask the storage
+        layer to reclaim addresses that were never ours, and there is no
+        reclaim step at all in what follows because there is nothing to
+        reclaim.
+
+        `deletion_protection` has already been checked by the caller: unlinking
+        is not a lesser act needing a lesser gate. It destroys the binding and
+        the grants, and re-establishing them means re-provisioning a credential
+        this catalog cannot recover on its own.
+        """
+        for collection_doc in list(self._catalog_ref.list_documents()):
+            if collection_doc.id.startswith("$"):
+                continue
+            self._delete_subcollection(collection_doc.collection("datasets"))
+            collection_doc.delete()
+
+        # policy.opteryx's grants for this workspace, cleared for exactly the
+        # reason drop_workspace clears them: left behind, they silently
+        # reactivate if this workspace name is ever reused.
+        self._delete_subcollection(self._catalog_ref.document("$policies").collection("access"))
+
+        self._catalog_ref.document("$properties").delete()
+
+        send_webhook(
+            action="delete",
+            workspace=self.workspace,
+            collection=None,
+            resource_type=ResourceType.WORKSPACE,
+            resource_name=self.workspace,
+            payload=workspace_deleted_payload(dropped_by=author),
+        )
+
+        emit_audit(
+            "unlink_workspace",
             resource_type=ResourceType.WORKSPACE,
             workspace=self.workspace,
             resource=self.workspace,
