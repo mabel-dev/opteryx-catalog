@@ -218,3 +218,33 @@ def test_manifest_is_readable_and_totals_reflect_live_rows():
         rows = read_manifest_rows(f.read())
     assert sum(int(r.get("record_count") or 0) for r in rows) == 6  # physical
     assert snap.summary["total-deleted-records"] == 2  # live = 6 - 2
+
+
+# ---------------------------------------------------------------------------
+# Which statement ran
+# ---------------------------------------------------------------------------
+# UPDATE and DELETE are MERGE with a degenerate source and commit through this
+# same method. `operation` is the only thing that lets the snapshot log and the
+# audit trail say which of the three a reader is looking at.
+
+
+def test_the_operation_defaults_to_merge():
+    ds, _ = _seed_dataset({"f1.parquet": [1, 2]})
+    snap = ds.merge_commit([], {"f1.parquet": [0]}, author="tester")
+    assert snap.operation_type == "merge"
+
+
+@pytest.mark.parametrize("operation", ["merge", "update", "delete"])
+def test_the_operation_is_stamped_on_the_snapshot(operation):
+    ds, _ = _seed_dataset({"f1.parquet": [1, 2]})
+    snap = ds.merge_commit([], {"f1.parquet": [0]}, author="tester", operation=operation)
+    assert snap.operation_type == operation
+    assert snap.commit_message.startswith(f"{operation}:")
+
+
+def test_an_unknown_operation_is_refused():
+    """A closed vocabulary: other tools read operation_type, so a caller must
+    not be able to coin a word in it."""
+    ds, _ = _seed_dataset({"f1.parquet": [1, 2]})
+    with pytest.raises(ValueError, match="operation must be one of"):
+        ds.merge_commit([], {"f1.parquet": [0]}, author="tester", operation="upsert")

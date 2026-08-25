@@ -56,7 +56,7 @@ def strategies():
         "brute": {
             "description": "Simple file combining",
             "best_for": "General-purpose, unordered data",
-            "algorithm": "Combine small files until reaching 512MB target",
+            "algorithm": "Combine sub-floor files toward TARGET_SIZE_MB (uncompressed)",
             "auto_used": "When dataset has no sort order",
         },
         "performance": {

@@ -82,7 +82,7 @@ class _FakeCatalog:
     def save_snapshot(self, identifier, snapshot):
         self.saved_snapshots.append((identifier, snapshot))
 
-    def save_dataset_metadata(self, identifier, metadata):
+    def save_dataset_metadata(self, identifier, metadata, **kwargs):
         self.saved_metadata.append((identifier, copy.deepcopy(metadata)))
 
 
@@ -211,7 +211,11 @@ def test_sidecar_rejects_empty_vector():
 
 
 def test_is_delete_vector_path():
+    # Both shapes must be recognised: the nonce form written now, and the bare
+    # form written before the nonce existed. A sweep that stopped matching the
+    # legacy names would leak every one of those files forever.
     assert is_delete_vector_path(f"{LOCATION}/metadata/deletes-1755000000000.parquet")
+    assert is_delete_vector_path(f"{LOCATION}/metadata/deletes-1755000000000-a1b2c3d4e5f6.parquet")
     assert not is_delete_vector_path(f"{LOCATION}/metadata/manifest-1755000000000.parquet")
     assert not is_delete_vector_path(f"{LOCATION}/data/deletes.parquet")
 
@@ -248,7 +252,11 @@ def test_delete_rows_commits_sidecar_and_manifest():
     entries = {e["file_path"]: e for e in _current_entries(ds)}
     f1, f2 = entries["mem://f1.parquet"], entries["mem://f2.parquet"]
     assert f1["deleted_record_count"] == 2
-    assert f1["delete_file_path"] == f"{LOCATION}/metadata/deletes-{snap.snapshot_id}.parquet"
+    # The name carries a per-write nonce (see delete_vector_path), so this
+    # asserts the entry points at THIS snapshot's sidecar rather than at an
+    # exact byte string the naming scheme is free to extend.
+    assert f1["delete_file_path"].startswith(f"{LOCATION}/metadata/deletes-{snap.snapshot_id}-")
+    assert is_delete_vector_path(f1["delete_file_path"])
     assert f1["record_count"] == 4  # physical rows untouched
     assert not f2["deleted_record_count"]
     assert f2["delete_file_path"] is None
@@ -271,7 +279,8 @@ def test_delete_rows_merges_into_existing_vector():
     entries = _current_entries(ds)
     assert entries[0]["deleted_record_count"] == 2
     # The merged state lives in the NEW snapshot's own sidecar.
-    assert entries[0]["delete_file_path"].endswith(f"deletes-{snap2.snapshot_id}.parquet")
+    assert f"deletes-{snap2.snapshot_id}-" in entries[0]["delete_file_path"]
+    assert is_delete_vector_path(entries[0]["delete_file_path"])
     # deleted-records counts only the NEWLY deleted row.
     assert snap2.summary["deleted-records"] == 1
 
@@ -317,7 +326,8 @@ def test_append_carries_delete_columns_forward():
     # The append copied the parent rows forward verbatim: f1 still points at
     # the delete snapshot's sidecar and the read side still resolves it.
     assert f1["deleted_record_count"] == 1
-    assert f1["delete_file_path"].endswith(f"deletes-{del_snap.snapshot_id}.parquet")
+    assert f"deletes-{del_snap.snapshot_id}-" in f1["delete_file_path"]
+    assert is_delete_vector_path(f1["delete_file_path"])
     assert ds.delete_vectors() == {"mem://f1.parquet": [1]}
 
 
@@ -345,7 +355,8 @@ def test_delete_files_carries_survivor_vectors_forward():
     entries = _current_entries(ds)
     assert [e["file_path"] for e in entries] == ["mem://f2.parquet"]
     assert entries[0]["deleted_record_count"] == 1
-    assert entries[0]["delete_file_path"].endswith(f"deletes-{snap.snapshot_id}.parquet")
+    assert f"deletes-{snap.snapshot_id}-" in entries[0]["delete_file_path"]
+    assert is_delete_vector_path(entries[0]["delete_file_path"])
     assert ds.delete_vectors() == {"mem://f2.parquet": [0]}
 
 
