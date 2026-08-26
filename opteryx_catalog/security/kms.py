@@ -128,9 +128,7 @@ def decrypt_secret(ciphertext: str, kms_key: str) -> bytes:
     try:
         envelope = json.loads(base64.b64decode(ciphertext))
         if envelope.get("v") != _ENVELOPE_VERSION:
-            raise SecretDecryptionError(
-                f"unsupported envelope version {envelope.get('v')!r}"
-            )
+            raise SecretDecryptionError(f"unsupported envelope version {envelope.get('v')!r}")
         wrapped = base64.b64decode(envelope["dek"])
         iv = base64.b64decode(envelope["iv"])
         ct = base64.b64decode(envelope["ct"])

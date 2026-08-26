@@ -145,9 +145,7 @@ def _validate(kind: str, config: dict, auth_mode: str, ciphertext, kms_key, inje
             )
     else:  # ambient
         carried = [
-            name
-            for name, value in (("ciphertext", ciphertext), ("kms_key", kms_key))
-            if value
+            name for name, value in (("ciphertext", ciphertext), ("kms_key", kms_key)) if value
         ]
         if carried:
             raise InvalidCatalogBinding(

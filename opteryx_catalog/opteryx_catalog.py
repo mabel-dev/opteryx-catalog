@@ -1526,9 +1526,7 @@ class OpteryxCatalog(Metastore):
 
         from .catalog.dropped_sweep import DroppedDatasetSweep
 
-        sweep_result = DroppedDatasetSweep(self, author=author, min_age_ms=0).sweep(
-            dry_run=False
-        )
+        sweep_result = DroppedDatasetSweep(self, author=author, min_age_ms=0).sweep(dry_run=False)
         if sweep_result.get("errors"):
             # Must not proceed to delete $properties: once it's gone there is
             # no way to construct a normal handle on this workspace again to
@@ -3495,9 +3493,7 @@ class OpteryxCatalog(Metastore):
         data = doc.to_dict() or {}
         current_schema_id = data.get("current-schema-id")
         if not current_schema_id:
-            raise ValueError(
-                f"{collection}.{dataset_name} has no current schema to alter"
-            )
+            raise ValueError(f"{collection}.{dataset_name} has no current schema to alter")
         schema_doc = doc_ref.collection("schemas").document(str(current_schema_id)).get()
         if not schema_doc.exists:
             raise ValueError(
@@ -3512,9 +3508,7 @@ class OpteryxCatalog(Metastore):
         # dataset would be pointing at a schema nobody asked for.
         for name in list(drop) + list(rename) + list(retype):
             if name not in by_name:
-                raise ValueError(
-                    f"{collection}.{dataset_name} has no column named '{name}'"
-                )
+                raise ValueError(f"{collection}.{dataset_name} has no column named '{name}'")
 
         surviving = {c["name"] for c in columns if c.get("name") not in drop}
         for old, new in rename.items():
@@ -3534,8 +3528,7 @@ class OpteryxCatalog(Metastore):
             surviving.add(name)
         if not surviving:
             raise ValueError(
-                f"dropping every column of {collection}.{dataset_name} would leave "
-                "no relation"
+                f"dropping every column of {collection}.{dataset_name} would leave no relation"
             )
 
         next_field_id = data.get("next-field-id") or (
@@ -3617,8 +3610,7 @@ class OpteryxCatalog(Metastore):
         # reaches the commit that detects the race. With a nonce the loser only
         # leaves an orphan, which the reclamation sweeps collect.
         parquet_path = (
-            f"{dataset_location}/metadata/"
-            f"manifest-{snapshot_id}-{secrets.token_hex(6)}.parquet"
+            f"{dataset_location}/metadata/manifest-{snapshot_id}-{secrets.token_hex(6)}.parquet"
         )
 
         # Use provided FileIO if it supports writing; otherwise write to GCS.
@@ -3793,12 +3785,14 @@ class OpteryxCatalog(Metastore):
             # then couldn't read its parent. Let it raise.
             out.close()
 
-        # A manifest rewritten at the same path (e.g. two commits allocating
-        # the same millisecond snapshot id) must not be served stale from the
-        # parsed-manifest LRU.
-        from .catalog.manifest import invalidate_parsed_manifest
+        # Seed the parsed-manifest cache with the bytes just written: the next
+        # commit reads this manifest back as its parent, and the cache hit
+        # saves that download + parse. Seeding also replaces any stale entry
+        # at the same path (two commits allocating the same millisecond
+        # snapshot id), which is the invalidation this used to do.
+        from .catalog.manifest import seed_parsed_manifest
 
-        invalidate_parsed_manifest(parquet_path)
+        seed_parsed_manifest(parquet_path, data)
 
         return parquet_path
 
@@ -3819,7 +3813,6 @@ class OpteryxCatalog(Metastore):
         from google.cloud import firestore
 
         from .exceptions import SnapshotRaceError
-
 
         @firestore.transactional
         def _check(transaction) -> None:
@@ -3861,9 +3854,7 @@ class OpteryxCatalog(Metastore):
         doc_ref = self._dataset_doc_ref(collection, dataset_name)
 
         if expected_current_snapshot_id is not _NO_SNAPSHOT_EXPECTATION:
-            self._refuse_if_pointer_moved(
-                doc_ref, identifier, expected_current_snapshot_id
-            )
+            self._refuse_if_pointer_moved(doc_ref, identifier, expected_current_snapshot_id)
 
         doc_ref.set(
             {

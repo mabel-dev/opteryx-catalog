@@ -10,7 +10,6 @@ import os
 import random
 import time
 import urllib.parse
-from collections import OrderedDict
 from collections.abc import Callable
 
 import requests
@@ -24,9 +23,7 @@ from .base import FETCH_404
 from .base import FileIO
 from .base import InputFile
 from .base import OutputFile
-
-# we keep a local cache of recently read files
-MAX_CACHE_SIZE: int = 32
+from .base import _ByteBudgetLRU
 
 # Statuses where trying again is the right move: the request was rejected for a
 # reason that has nothing to do with the request itself. Everything else - 401,
@@ -215,34 +212,43 @@ class _GcsOutputStream(io.BytesIO):
 
 
 class _GcsInputFile(InputFile):
+    """An InputFile whose bytes are fetched LAZILY, on first ``open()``.
+
+    Construction used to perform the download, which made ``new_input`` itself
+    a full-object transfer - so code paths that constructed an input and never
+    read it (or only wanted existence) paid for the whole object. Every caller
+    that splits construction from open wraps both in one try block, so read
+    errors surfacing at ``open()`` instead of ``new_input()`` reach the same
+    handlers.
+    """
+
     def __init__(
         self,
         location: str,
         session: requests.Session,
         access_token_getter: Callable[[], str],
-        cache: OrderedDict | None = None,
+        cache: _ByteBudgetLRU | None = None,
     ):
-        # Check cache first
-        if cache is not None and location in cache:
-            # Move to end (most recently used)
-            cache.move_to_end(location)
-            data = cache[location]
-            super().__init__(location, data)
+        super().__init__(location, None)
+        self._session = session
+        self._access_token_getter = access_token_getter
+        self._cache = cache
+        self._fetched = False
+
+    def _fetch(self) -> None:
+        if self._fetched:
             return
+        self._fetched = True
 
-        # read entire bytes via optimized session
+        if self._cache is not None:
+            data = self._cache.get(self.location)
+            if data is not None:
+                self._content = data
+                return
+
         try:
-            stream = _GcsInputStream(location, session, access_token_getter)
+            stream = _GcsInputStream(self.location, self._session, self._access_token_getter)
             data = stream.read()
-
-            # Add to cache
-            if cache is not None:
-                cache[location] = data
-                # Evict oldest if cache exceeds MAX_CACHE_SIZE entries
-                if len(cache) > MAX_CACHE_SIZE:
-                    cache.popitem(last=False)
-
-            super().__init__(location, data)
         except FileNotFoundError:
             # A genuinely absent object is represented as content-less, which is
             # what `InputFile.open()` turns back into a `FileNotFoundError` at
@@ -250,7 +256,18 @@ class _GcsInputFile(InputFile):
             # here: swallowing it produced a content-less InputFile whose later
             # `open()` reported the object missing, discarding the status code
             # and body that said why the read actually failed.
-            super().__init__(location, None, absent_reason=FETCH_404)
+            self.absent_reason = FETCH_404
+            return
+
+        # Add to cache (the cache itself declines oversized objects and
+        # evicts to stay inside its entry and byte budgets)
+        if self._cache is not None:
+            self._cache.put(self.location, data)
+        self._content = data
+
+    def open(self):
+        self._fetch()
+        return super().open()
 
 
 class _GcsOutputFile(OutputFile):
@@ -278,8 +295,8 @@ class GcsFileIO(FileIO):
         self.manifest_paths: list[str] = []
         self.captured_manifests: list[tuple[str, bytes]] = []
 
-        # LRU cache for read operations (MAX_CACHE_SIZE files max)
-        self._read_cache: OrderedDict = OrderedDict()
+        # LRU cache for read operations, bounded by entries AND bytes
+        self._read_cache = _ByteBudgetLRU()
 
         # Prepare requests session and set up credential refresh helper (token may expire)
         self._credentials = _get_storage_credentials()
@@ -291,7 +308,7 @@ class GcsFileIO(FileIO):
                     req = Request()
                     self._credentials.refresh(req)
                 self._access_token = self._credentials.token
-            except Exception as e:  # noqa: BLE001 - google-auth boundary
+            except Exception as e:
                 # Raised, not warned-and-nulled. A None token does not stop the
                 # request: it goes out with no Authorization header, and a
                 # private bucket answers 403 - which reads as a permissions
@@ -301,9 +318,7 @@ class GcsFileIO(FileIO):
                 # instead of disguising it as a different failure on every
                 # subsequent read.
                 self._access_token = None
-                raise CredentialsUnavailable(
-                    f"Could not obtain GCS credentials: {e}"
-                ) from e
+                raise CredentialsUnavailable(f"Could not obtain GCS credentials: {e}") from e
 
         self._refresh_credentials = _refresh_credentials
 

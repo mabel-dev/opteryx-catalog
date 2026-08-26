@@ -5,16 +5,15 @@ S3 (and S3-compatible) FileIO for opteryx_catalog.iops
 from __future__ import annotations
 
 import logging
-from collections import OrderedDict
 
 from opteryx_catalog.exceptions import StorageReadError
 
 from .base import FileIO
 from .base import InputFile
 from .base import OutputFile
+from .base import _ByteBudgetLRU
 
 # we keep a local cache of recently read files
-MAX_CACHE_SIZE: int = 32
 
 logger = logging.getLogger(__name__)
 
@@ -38,30 +37,43 @@ def _split_bucket_prefix(location: str) -> tuple[str, str]:
 
 
 class _S3InputFile(InputFile):
-    def __init__(self, location: str, client, cache: OrderedDict | None = None):
-        if cache is not None and location in cache:
-            cache.move_to_end(location)
-            super().__init__(location, cache[location])
+    def __init__(self, location: str, client, cache: _ByteBudgetLRU | None = None):
+        # Fetch is LAZY (first open()), mirroring iops.gcs._GcsInputFile:
+        # constructing an input must not itself transfer the whole object.
+        super().__init__(location, None)
+        self._client = client
+        self._cache = cache
+        self._fetched = False
+
+    def _fetch(self) -> None:
+        if self._fetched:
             return
+        self._fetched = True
+
+        if self._cache is not None:
+            data = self._cache.get(self.location)
+            if data is not None:
+                self._content = data
+                return
 
         from botocore.exceptions import ClientError
 
         try:
-            bucket, key = _split_bucket_key(location)
-            data = client.get_object(Bucket=bucket, Key=key)["Body"].read()
+            bucket, key = _split_bucket_key(self.location)
+            data = self._client.get_object(Bucket=bucket, Key=key)["Body"].read()
         except ClientError as err:
             code = err.response.get("Error", {}).get("Code")
             if code in ("NoSuchKey", "404"):
-                super().__init__(location, None)
                 return
-            raise StorageReadError(f"Unable to read '{location}': {err}") from err
+            raise StorageReadError(f"Unable to read '{self.location}': {err}") from err
 
-        if cache is not None:
-            cache[location] = data
-            if len(cache) > MAX_CACHE_SIZE:
-                cache.popitem(last=False)
+        if self._cache is not None:
+            self._cache.put(self.location, data)
+        self._content = data
 
-        super().__init__(location, data)
+    def open(self):
+        self._fetch()
+        return super().open()
 
 
 class _S3OutputStream:
@@ -73,7 +85,7 @@ class _S3OutputStream:
     backend.
     """
 
-    def __init__(self, location: str, client, cache: OrderedDict | None = None):
+    def __init__(self, location: str, client, cache: _ByteBudgetLRU | None = None):
         self._location = location
         self._client = client
         self._cache = cache
@@ -98,7 +110,7 @@ class _S3OutputStream:
 
 
 class _S3OutputFile(OutputFile):
-    def __init__(self, location: str, client, cache: OrderedDict | None = None):
+    def __init__(self, location: str, client, cache: _ByteBudgetLRU | None = None):
         super().__init__(location)
         self._client = client
         self._cache = cache
@@ -128,7 +140,7 @@ class S3FileIO(FileIO):
         import boto3
 
         self._client = boto3.client("s3", **client_kwargs)
-        self._read_cache: OrderedDict = OrderedDict()
+        self._read_cache = _ByteBudgetLRU()
 
     def new_input(self, location: str) -> InputFile:
         return _S3InputFile(location, self._client, self._read_cache)

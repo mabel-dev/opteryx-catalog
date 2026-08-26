@@ -82,10 +82,7 @@ def delete_vector_path(dataset_location: str, snapshot_id: int) -> str:
     reconstructs an existing one. Written paths are stored on the manifest
     entries that reference them (DELETE_FILE_PATH_KEY), never recomputed.
     """
-    return (
-        f"{dataset_location}/metadata/"
-        f"deletes-{snapshot_id}-{secrets.token_hex(6)}.parquet"
-    )
+    return f"{dataset_location}/metadata/deletes-{snapshot_id}-{secrets.token_hex(6)}.parquet"
 
 
 def is_delete_vector_path(path: str) -> bool:
@@ -107,9 +104,7 @@ def encode_positions(positions: Iterable[int], record_count: int) -> bytes:
     ordered = sorted(set(int(p) for p in positions))
     if ordered and (ordered[0] < 0 or ordered[-1] >= record_count):
         bad = ordered[0] if ordered[0] < 0 else ordered[-1]
-        raise ValueError(
-            f"delete position {bad} out of range for a file of {record_count} rows"
-        )
+        raise ValueError(f"delete position {bad} out of range for a file of {record_count} rows")
 
     # Varint deltas
     out = bytearray([_ENC_VARINT_DELTAS])

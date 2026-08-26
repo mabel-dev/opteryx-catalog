@@ -750,12 +750,15 @@ class SimpleDataset(Dataset):
         """
         manifest_path = snapshot.manifest_list
         try:
-            from .manifest import read_manifest_rows
+            # Cache-aware: on a steady append stream the parent manifest is the
+            # one this process wrote (and seeded) a commit ago, so this is a
+            # hit and the download + parse disappear. Rows come back FROZEN
+            # (inner lists as tuples) and shared - callers must copy an entry
+            # (`dict(entry)`) before mutating it, which every current caller
+            # already does.
+            from .manifest import get_parsed_manifest
 
-            inp = self.io.new_input(manifest_path)
-            with inp.open() as f:
-                data = f.read()
-            return read_manifest_rows(data)
+            return get_parsed_manifest(self.io, manifest_path)
         except Exception as err:
             raise ManifestReadError(
                 f"Cannot read parent manifest {manifest_path} for {self.identifier}: {err}. "
@@ -1072,8 +1075,7 @@ class SimpleDataset(Dataset):
             for column in add:
                 if column.get("name") in surviving:
                     raise ValueError(
-                        f"{self.identifier} already has a column called "
-                        f"'{column.get('name')}'"
+                        f"{self.identifier} already has a column called '{column.get('name')}'"
                     )
                 surviving.add(column.get("name"))
             if not surviving:
@@ -1698,9 +1700,7 @@ class SimpleDataset(Dataset):
         removed_data_size = sum(
             int(e.get("uncompressed_size_in_bytes") or 0) for e in removed_entries
         )
-        total_deleted_records = sum(
-            int(e.get("deleted_record_count") or 0) for e in new_entries
-        )
+        total_deleted_records = sum(int(e.get("deleted_record_count") or 0) for e in new_entries)
 
         added_entries = list(added_entries)
         summary = {
@@ -1834,9 +1834,7 @@ class SimpleDataset(Dataset):
         removed_entries = []
         for file_path in list(vectors):
             entry = by_path.get(file_path)
-            if entry is not None and len(vectors[file_path]) >= int(
-                entry.get("record_count") or 0
-            ):
+            if entry is not None and len(vectors[file_path]) >= int(entry.get("record_count") or 0):
                 removed_entries.append(entry)
                 del vectors[file_path]
         removed_paths = {e.get("file_path") for e in removed_entries}
@@ -1936,8 +1934,7 @@ class SimpleDataset(Dataset):
         """
         if operation not in self.MERGE_OPERATIONS:
             raise ValueError(
-                f"merge_commit: operation must be one of {self.MERGE_OPERATIONS}, "
-                f"got {operation!r}"
+                f"merge_commit: operation must be one of {self.MERGE_OPERATIONS}, got {operation!r}"
             )
         from .deletes import DELETE_FILE_PATH_KEY
         from .deletes import DELETED_RECORD_COUNT_KEY
@@ -1996,9 +1993,7 @@ class SimpleDataset(Dataset):
         removed_entries = []
         for file_path in list(vectors):
             entry = by_path.get(file_path)
-            if entry is not None and len(vectors[file_path]) >= int(
-                entry.get("record_count") or 0
-            ):
+            if entry is not None and len(vectors[file_path]) >= int(entry.get("record_count") or 0):
                 removed_entries.append(entry)
                 del vectors[file_path]
         removed_paths = {e.get("file_path") for e in removed_entries}
@@ -2027,9 +2022,7 @@ class SimpleDataset(Dataset):
 
         # New files carry no delete debt: nothing can have marked a row of a
         # file that did not exist until this commit.
-        added_entries = self._build_entries_for_files(
-            files, set(by_path), footer_only=footer_only
-        )
+        added_entries = self._build_entries_for_files(files, set(by_path), footer_only=footer_only)
 
         if not added_entries and newly_deleted == 0 and not removed_entries:
             raise ValueError(
@@ -2565,11 +2558,14 @@ class SimpleDataset(Dataset):
         # Rebuild manifest entries by re-reading each data file
         entries = []
         try:
-            # Read previous manifest entries using Arrow-native retrieval
-            from .manifest_arrow import get_arrow_manifest
+            # Read the manifest bytes UNCACHED, on purpose: this is a repair
+            # path, and the write path seeds the manifest caches - so a cached
+            # read can succeed for a manifest storage has lost, and the whole
+            # point of refresh is to verify what storage actually holds.
+            from .manifest import read_manifest_rows
 
-            prev_manifest = get_arrow_manifest(self.io, prev.manifest_list)
-            prev_rows = prev_manifest.to_pylist()
+            with self.io.new_input(prev.manifest_list).open() as f:
+                prev_rows = read_manifest_rows(f.read())
         except Exception as exc:
             # An unreadable manifest previously degraded to `prev_rows = []`,
             # which then "refreshed" zero files and committed a snapshot that

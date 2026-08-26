@@ -139,15 +139,13 @@ class GcsFileIO(FileIO):
         return self._impl.delete(location)
 
     def exists(self, location: str) -> bool:
+        # Delegate to the impl's own exists() - a HEAD request. The previous
+        # version probed for `exists` on the *InputFile* (which never has one)
+        # and fell through to open(), i.e. it DOWNLOADED THE WHOLE OBJECT to
+        # answer a boolean - per file, at data-file sizes, on exactly the GC
+        # paths that ask this question most.
         try:
-            impl_in = self._impl.new_input(location)
-            # Some implementations provide `exists()`
-            if hasattr(impl_in, "exists"):
-                return impl_in.exists()
-            # Fallback: try to open. Closed immediately - this answers a
-            # question about existence and must not leak the handle.
-            with impl_in.open():
-                return True
+            return bool(self._impl.exists(location))
         except FileNotFoundError:
             return False
         except StorageReadError:

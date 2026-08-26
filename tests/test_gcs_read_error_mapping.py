@@ -144,8 +144,11 @@ def test_input_file_propagates_a_403_instead_of_yielding_empty_content():
     """
     session = _Session(_Response(403, b"forbidden"))
 
+    # The fetch is lazy (construction is free; new_input no longer downloads),
+    # so the failure surfaces at open() - with its status and body intact.
+    handle = gcs._GcsInputFile("gs://bucket/object", session, lambda: "token", None)
     with pytest.raises(StorageReadError):
-        gcs._GcsInputFile("gs://bucket/object", session, lambda: "token", None)
+        handle.open()
 
 
 def test_input_file_still_represents_a_real_404_as_absent():
@@ -159,13 +162,16 @@ def test_input_file_still_represents_a_real_404_as_absent():
 
 def test_a_failed_read_is_not_cached():
     """A cached failure would outlive the permission change that caused it."""
-    cache = {}
+    from opteryx_catalog.iops.base import _ByteBudgetLRU
+
+    cache = _ByteBudgetLRU()
     session = _Session(_Response(403, b"forbidden"))
 
+    handle = gcs._GcsInputFile("gs://bucket/object", session, lambda: "token", cache)
     with pytest.raises(StorageReadError):
-        gcs._GcsInputFile("gs://bucket/object", session, lambda: "token", cache)
+        handle.open()
 
-    assert cache == {}
+    assert len(cache) == 0
 
 
 class _Credentials:

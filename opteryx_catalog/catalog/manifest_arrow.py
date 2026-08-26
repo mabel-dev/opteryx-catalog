@@ -158,6 +158,21 @@ def get_arrow_manifest(io: Any, manifest_path: str) -> ArrowManifest:
     return ArrowManifest(columns, row_count, sketch_vectors)
 
 
+def seed_arrow_manifest(manifest_path: str, data: bytes) -> ArrowManifest:
+    """Populate the columnar cache from manifest bytes already in hand (the
+    write path holds them at upload time). One decode serves the planner's
+    columnar reads AND, via ``manifest.seed_parsed_manifest``, the commit
+    path's row dicts. Replaces any stale entry at the same path."""
+    columns, row_count, sketch_vectors = read_manifest_columns(
+        data, keep_native=_SKETCH_VECTOR_COLUMNS
+    )
+    _arrow_manifest_cache[manifest_path] = (columns, row_count, sketch_vectors)
+    _arrow_manifest_cache.move_to_end(manifest_path)
+    if len(_arrow_manifest_cache) > ARROW_MANIFEST_CACHE_SIZE:
+        _arrow_manifest_cache.popitem(last=False)
+    return ArrowManifest(columns, row_count, sketch_vectors)
+
+
 def get_parsed_manifest(io: Any, manifest_path: str) -> list:
     """Compatibility wrapper: returns list of row dicts."""
     start_time = time.perf_counter()
