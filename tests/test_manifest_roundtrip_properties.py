@@ -31,6 +31,17 @@ UINT64_MASK = 0xFFFFFFFFFFFFFFFF
 INT64_MAX = (1 << 63) - 1
 INT64_MIN = -(1 << 63)
 
+
+def _thaw(value):
+    """Recursively convert tuples back to lists, so equality checks compare
+    values rather than the (deliberately frozen) sequence type."""
+    if isinstance(value, tuple):
+        return [_thaw(v) for v in value]
+    if isinstance(value, list):
+        return [_thaw(v) for v in value]
+    return value
+
+
 # Per-column statistics arrays, all indexed in lock-step with field_ids.
 _FLAT_INT_ARRAY_COLUMNS = (
     "column_uncompressed_sizes_in_bytes",
@@ -187,7 +198,12 @@ def test_manifest_entries_survive_the_round_trip(entries):
     for row, entry in zip(rows, entries):
         expected = _expected(entry)
         for key, want in expected.items():
-            assert row[key] == want, f"{key}: wrote {want!r}, read back {row[key]!r}"
+            # Cells read back FROZEN (tuples, possibly nested): they are shared
+            # between the columnar manifest cache and its row views, and
+            # immutability is what makes that sharing safe. The round-trip
+            # contract is the VALUES, not the sequence type.
+            got = _thaw(row[key])
+            assert got == want, f"{key}: wrote {want!r}, read back {got!r}"
 
 
 @settings(max_examples=25, deadline=None, suppress_health_check=[HealthCheck.too_slow])
@@ -202,7 +218,7 @@ def test_min_k_hashes_keep_their_unsigned_value_and_order(hashes):
     entry = {"file_path": "mem://data/f.parquet", "min_k_hashes": [hashes]}
 
     (row,) = _round_trip([entry])
-    read_back = row["min_k_hashes"][0]
+    read_back = _thaw(row["min_k_hashes"][0])
     unsigned = [h & UINT64_MASK for h in hashes]
 
     assert read_back == unsigned

@@ -166,33 +166,29 @@ def get_parsed_manifest(io, manifest_path: str) -> list:
         _manifest_metrics["parsed_cache_hits"] += 1
         return _parsed_manifest_cache[manifest_path]
 
-    # Miss: read bytes -> parse -> freeze -> cache
+    # Miss: read through the COLUMNAR cache (manifest_arrow) rather than
+    # decoding independently. A worker that both commits (row dicts) and
+    # plans (columns + sketch vectors) used to hold every manifest twice,
+    # fully materialized in each shape; the columnar cache is now the single
+    # decode, and the row dicts here share its (immutable) cells - this cache
+    # adds only per-row dict overhead on top.
+    #
     # A missing manifest propagates as FileNotFoundError: callers distinguish
     # "no manifest" from "empty manifest", and caching a [] for a path that
     # merely failed to read would serve that emptiness to every later caller.
-    inp = io.new_input(manifest_path)
-    with inp.open() as f:
-        data = f.read()
+    from .manifest_arrow import get_arrow_manifest
 
-    if not data:
-        _manifest_metrics["parsed_cache_misses"] += 1
-        _parsed_manifest_cache[manifest_path] = []
-        # Evict oldest if needed
-        if len(_parsed_manifest_cache) > PARSED_MANIFEST_CACHE_SIZE:
-            _parsed_manifest_cache.popitem(last=False)
-        return []
+    manifest = get_arrow_manifest(io, manifest_path)
+    rows = _rows_from_columns(manifest._columns, len(manifest))
 
-    # Optimized: try selective column reading first
-    frozen_rows = _parse_manifest_optimized(data)
-
-    _parsed_manifest_cache[manifest_path] = frozen_rows
+    _parsed_manifest_cache[manifest_path] = rows
     _manifest_metrics["parsed_cache_misses"] += 1
 
     # Evict oldest if cache exceeds size
     if len(_parsed_manifest_cache) > PARSED_MANIFEST_CACHE_SIZE:
         _parsed_manifest_cache.popitem(last=False)
 
-    return _parsed_manifest_cache[manifest_path]
+    return rows
 
 
 # Columns that write_parquet_manifest() comma-encodes into ARRAY<VARCHAR>
@@ -204,12 +200,18 @@ _NESTED_INT_LIST_COLUMNS = ("min_k_hashes", "histogram_counts")
 
 
 def _decode_nested_int_list_column(rows: list) -> list:
-    def _decode_cell(s):
-        if not isinstance(s, str):
-            return s
-        return [int(h) for h in s.split(",")] if s else []
+    """Decode to TUPLES of tuples, not lists: cells are shared between the
+    columnar cache and the row-dict cache (see ``get_parsed_manifest``), and
+    immutability is what makes that sharing safe."""
 
-    return [None if row is None else [_decode_cell(s) for s in row] for row in rows]
+    def _decode_cell(s):
+        if isinstance(s, str):
+            return tuple(int(h) for h in s.split(",")) if s else ()
+        if isinstance(s, list):  # native nested read: list[int] per column
+            return tuple(s)
+        return s
+
+    return [None if row is None else tuple(_decode_cell(s) for s in row) for row in rows]
 
 
 def read_manifest_columns(data: bytes, keep_native: tuple = ()) -> tuple:
@@ -250,6 +252,14 @@ def read_manifest_columns(data: bytes, keep_native: tuple = ()) -> tuple:
         if name in column_data:
             column_data[name] = _decode_nested_int_list_column(column_data[name])
 
+    # Freeze every remaining list cell (the generic ARRAY columns) to a tuple.
+    # Cells are shared between the columnar cache, its row views, and the
+    # row-dict cache built over it - immutable cells are what make one decoded
+    # copy safe to hand to all of them.
+    for name, col in column_data.items():
+        if any(isinstance(c, list) for c in col):
+            column_data[name] = [tuple(c) if isinstance(c, list) else c for c in col]
+
     native: dict = {}
     if kept_morsels:
         combined = (
@@ -263,25 +273,57 @@ def read_manifest_columns(data: bytes, keep_native: tuple = ()) -> tuple:
     return column_data, row_count, native
 
 
-def read_manifest_rows(data: bytes) -> list:
-    """Decode manifest parquet bytes into a list of row dicts using rugo."""
-    column_data, row_count, _native = read_manifest_columns(data)
+def _rows_from_columns(column_data: dict, row_count: int) -> list:
+    """Row dicts over already-decoded columns. Cells are shared, not copied -
+    they are immutable by construction (see ``read_manifest_columns``)."""
     if not column_data:
         return []
     names = list(column_data.keys())
     return [{name: column_data[name][i] for name in names} for i in range(row_count)]
 
 
-def _parse_manifest_optimized(data: bytes) -> list:
-    """Parse manifest parquet bytes into frozen row dicts for caching."""
-    rows = read_manifest_rows(data)
-    _manifest_metrics["full_column_reads"] += 1
-    return [{k: _freeze_for_cache(v) for k, v in r.items()} for r in rows]
+def read_manifest_rows(data: bytes) -> list:
+    """Decode manifest parquet bytes into a list of row dicts using rugo."""
+    column_data, row_count, _native = read_manifest_columns(data)
+    return _rows_from_columns(column_data, row_count)
+
+
+def seed_parsed_manifest(manifest_path: str, data: bytes) -> None:
+    """Populate the parsed-manifest cache from manifest bytes just WRITTEN.
+
+    The write path holds the manifest's exact bytes at the moment it uploads
+    them; parsing those into the cache means the next commit's
+    ``_parent_manifest_entries`` is a cache hit instead of a re-download and
+    re-parse of a file this process created moments ago. For a steady append
+    stream that read was the dominant recurring cost of every commit.
+
+    Parsing the written bytes rather than caching the caller's entry dicts is
+    deliberate: the cache's contract is "exactly what a read of this path
+    returns", and only the parquet round trip (numeric NULL handling, nested
+    list decode, freezing) guarantees that.
+
+    Replaces any stale entry at the same path, so it also subsumes the
+    invalidation the write path used to do.
+    """
+    from .manifest_arrow import seed_arrow_manifest
+
+    manifest = seed_arrow_manifest(manifest_path, data)
+    rows = _rows_from_columns(manifest._columns, len(manifest))
+    _parsed_manifest_cache[manifest_path] = rows
+    _parsed_manifest_cache.move_to_end(manifest_path)
+    if len(_parsed_manifest_cache) > PARSED_MANIFEST_CACHE_SIZE:
+        _parsed_manifest_cache.popitem(last=False)
 
 
 def invalidate_parsed_manifest(manifest_path: str) -> None:
-    """Remove a manifest from the parsed-manifest cache (if present)."""
+    """Remove a manifest from the parsed-manifest cache (if present).
+
+    Also drops the columnar entry: the two caches are views over one decode,
+    and invalidating one while the other keeps serving is a staleness bug."""
     _parsed_manifest_cache.pop(manifest_path, None)
+    from .manifest_arrow import invalidate_arrow_manifest
+
+    invalidate_arrow_manifest(manifest_path)
 
 
 def clear_parsed_manifest_cache() -> None:
@@ -831,6 +873,7 @@ def build_parquet_manifest_entry_from_bytes(
         return entry
 
     from rugo.parquet import read_parquet
+
     # name -> category from Parquet's own logical-type annotations, since a
     # re-read Vector's own .type is the flattened physical storage type (e.g.
     # a DATE column reads back as plain INT64).
@@ -992,9 +1035,7 @@ def build_parquet_manifest_entry_from_bytes(
         col_element_min = NULL_FLAG
         col_element_max = NULL_FLAG
         element_pairs = [
-            p
-            for p in (v.ordinal_min_max() for v in acc["element_ordinal_vecs"])
-            if p is not None
+            p for p in (v.ordinal_min_max() for v in acc["element_ordinal_vecs"]) if p is not None
         ]
         if element_pairs:
             col_element_min = int(min(p[0] for p in element_pairs))
