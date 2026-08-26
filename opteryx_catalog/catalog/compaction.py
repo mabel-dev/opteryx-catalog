@@ -393,16 +393,75 @@ KEY_SCAN_CHUNK_ROWS = 1_000_000
 # Where the source cache spills. None = the system default temp directory. Set
 # this when that default is not backed by real disk. See
 # ``_execute_compaction_streaming``.
+# --- Spill-to-disk switch ------------------------------------------------------
+#
+# Whether the source cache may spend LOCAL DISK instead of RAM. It is only a
+# saving where the temp directory is backed by a real ephemeral disk billed
+# separately from the memory limit; where that directory is an in-memory
+# filesystem (the default on several serverless runtimes) a "spill" is heap by
+# another name, and silently charging the memory limit for it is worse than not
+# caching at all. So it is an explicit opt-in per deployment rather than a
+# default that is right on some platforms and a trap on others.
+#
+# An environment setting and not a table property on purpose: whether spilling
+# pays is a fact about the machine the compactor runs on, not about the dataset
+# being compacted.
+#
+# ON:  candidates are cached on disk and served to rugo BY PATH, so a window
+#      holds one row group rather than every candidate's whole compressed bytes.
+# OFF: candidates are held on the heap up to SOURCE_CACHE_RAM_BYTES and
+#      re-fetched from object storage beyond it - bounded heap, paid in network.
+SPILL_TO_DISK = os.environ.get("OPTERYX_COMPACTION_SPILL_TO_DISK", "0").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+
 COMPACTION_TMPDIR = os.environ.get("OPTERYX_COMPACTION_TMPDIR") or None
 
+# --- Disk budget ---------------------------------------------------------------
+#
+# The ephemeral disk is 10 GB and, like the memory limit, belongs to the whole
+# CONTAINER, not to one compaction: the worker runs several uvicorn workers, so
+# two compactions can be spilling at once, and anything else on the box wants
+# temp space too. The cache budget is therefore a per-compaction SHARE of the
+# device, not its size - the same mistake CONTAINER_RAM_MB warns about, made
+# against disk. Override the device size for a deployment with a different disk
+# via OPTERYX_COMPACTION_DISK_MB, or set the share directly with
+# OPTERYX_COMPACTION_SOURCE_CACHE_DISK_MB.
+#
+# What has to fit is the COMPRESSED bytes of one pass's candidate files, which
+# the selection caps bound: a decluster group is at most
+# DECLUSTER_MAX_COMBINED_BYTES (12 GB uncompressed) and a combine-split at most
+# MAX_SELECTED_BUDGET_BYTES, so at the ~8.6x zstd ratio measured on
+# github.events a pass caches well under 2 GB. The default share leaves room for
+# data that compresses far worse than that; a pass that does overrun simply
+# stops caching and re-fetches the remainder, which costs network, not
+# correctness.
+COMPACTION_DISK_MB = int(os.environ.get("OPTERYX_COMPACTION_DISK_MB") or 10 * 1024)
+# Concurrent compactions the device must accommodate (uvicorn --workers).
+COMPACTION_DISK_SHARES = int(os.environ.get("OPTERYX_COMPACTION_DISK_SHARES") or 2)
+DISK_SAFETY_FRACTION = 0.8  # headroom for everything else using the same device
+_share_override = os.environ.get("OPTERYX_COMPACTION_SOURCE_CACHE_DISK_MB")
 SOURCE_CACHE_DISK_BYTES = (
-    int(os.environ.get("OPTERYX_COMPACTION_SOURCE_CACHE_DISK_MB") or 32 * 1024) * 1024 * 1024
+    int(_share_override) * 1024 * 1024
+    if _share_override is not None
+    else int(
+        COMPACTION_DISK_MB * 1024 * 1024 * DISK_SAFETY_FRACTION / max(1, COMPACTION_DISK_SHARES)
+    )
+)
+
+# How much of the candidate files' COMPRESSED bytes the cache may hold on the
+# heap when SPILL_TO_DISK is off.
+SOURCE_CACHE_RAM_BYTES = (
+    int(os.environ.get("OPTERYX_COMPACTION_SOURCE_CACHE_MB") or 2048) * 1024 * 1024
 )
 
 
 class _SourceFileCache:
     """Fetch each candidate file from object storage AT MOST ONCE per compaction,
-    then serve it from LOCAL DISK for every window that needs it.
+    then serve it for every window that needs it.
 
     Streaming execution reads each candidate file once per chunk group it
     contributes to. Reading straight from ``io`` meant re-DOWNLOADING the whole
@@ -412,9 +471,10 @@ class _SourceFileCache:
     bounded memory and avoids write amplification), but it should be paid
     against local storage, not the network.
 
-    ``source()`` returns a local FILENAME rather than bytes. Both are valid
-    ``rugo.parquet.read_parquet`` sources, but the filename form is what keeps
-    this cheap:
+    Which resource that is paid against is the ``spill`` switch (see
+    ``SPILL_TO_DISK``). With spilling on, ``source()`` returns a local FILENAME.
+    Both a filename and bytes are valid ``rugo.parquet.read_parquet`` sources,
+    but the filename form is what keeps this cheap:
 
       * bytes meant every window re-materialised the whole compressed file
         (~470 MB at target size) on the heap, per candidate file, defeating the
@@ -423,23 +483,27 @@ class _SourceFileCache:
       * bloom-filter row-group pruning is only available on FILE sources, so the
         "hot value" ``= value`` predicate gets pruning it could not use before.
 
-    Only when a file cannot be cached locally (no space, or the write failed)
-    does ``source()`` fall back to returning bytes, so a full disk degrades to
-    the old behaviour rather than failing the compaction.
+    With spilling off - or when a file cannot be cached locally (no space, or
+    the write failed) - it returns bytes, so neither a full disk nor a
+    memory-backed temp directory can fail a compaction outright.
     """
 
     def __init__(
         self,
         io,
-        tmpdir: str,
+        tmpdir: str | None,
         disk_budget: int = SOURCE_CACHE_DISK_BYTES,
         delete_vectors: dict | None = None,
+        spill: bool = SPILL_TO_DISK,
+        ram_budget: int = SOURCE_CACHE_RAM_BYTES,
     ):
         self._io = io
         self._tmpdir = tmpdir
-        self._disk_budget = disk_budget
-        self._disk_used = 0
-        self._local: dict = {}
+        # No temp directory means nowhere to spill, whatever the setting says.
+        self._spill = spill and tmpdir is not None
+        self._budget = disk_budget if self._spill else ram_budget
+        self._used = 0
+        self._cached: dict = {}
         # Merge-on-read delete vectors for the pass's input files
         # ({file_path: sorted ordinals}). Applied in _fetch, so every
         # consumer of this cache — predicate reads, sort-column projection,
@@ -451,19 +515,24 @@ class _SourceFileCache:
     def source(self, file_path: str):
         """A ``read_parquet`` source for ``file_path``: a local filename when the
         file is (or can be) cached on disk, else its raw bytes."""
-        cached = self._local.get(file_path)
+        cached = self._cached.get(file_path)
         if cached is not None:
             return cached
 
         data = self._fetch(file_path)
-        if self._disk_used + len(data) > self._disk_budget:
-            # Budget exhausted - serve this one from RAM and keep going. Nothing
+        if self._used + len(data) > self._budget:
+            # Budget exhausted - serve this one uncached and keep going. Nothing
             # is evicted: the files already cached are the ones being re-read
             # every window, so dropping one to admit another just trades a hit
             # for a miss.
             return data
 
-        local = os.path.join(self._tmpdir, f"src-{len(self._local):x}.parquet")
+        if not self._spill:
+            self._cached[file_path] = data
+            self._used += len(data)
+            return data
+
+        local = os.path.join(self._tmpdir, f"src-{len(self._cached):x}.parquet")
         try:
             with open(local, "wb") as fh:
                 fh.write(data)
@@ -472,8 +541,8 @@ class _SourceFileCache:
             logger.debug("compaction: could not spill %s locally (%s)", file_path, exc)
             return data
 
-        self._local[file_path] = local
-        self._disk_used += len(data)
+        self._cached[file_path] = local
+        self._used += len(data)
         return local
 
     def _fetch(self, file_path: str) -> bytes:
@@ -643,9 +712,7 @@ class DatasetCompactor:
         elif rule == "sort_aware":
             compaction_plan = self._select_sort_aware_merge(entries)
         elif rule is not None:
-            raise ValueError(
-                f"rule must be 'brute', 'sort_aware', 'debt', or None; got {rule!r}"
-            )
+            raise ValueError(f"rule must be 'brute', 'sort_aware', 'debt', or None; got {rule!r}")
         else:
             compaction_plan = (
                 self._select_brute_merge(entries)
@@ -1316,9 +1383,7 @@ class DatasetCompactor:
                 if positions:
                     from .deletes import drop_deleted_rows_from_morsels
 
-                    row_group_morsels = drop_deleted_rows_from_morsels(
-                        row_group_morsels, positions
-                    )
+                    row_group_morsels = drop_deleted_rows_from_morsels(row_group_morsels, positions)
                     if not row_group_morsels:
                         # An all-deleted file is dropped from the manifest at
                         # delete-commit time, so this means the vector and the
@@ -2137,13 +2202,18 @@ class DatasetCompactor:
         # temp directory is an in-memory filesystem, point
         # OPTERYX_COMPACTION_TMPDIR at the mounted disk or the cache is just
         # heap by another name. None = the system default.
+        delete_vectors = getattr(self, "_pass_delete_vectors", None)
+        if not SPILL_TO_DISK:
+            source_cache = _SourceFileCache(self.dataset.io, None, delete_vectors=delete_vectors)
+            return self._execute_compaction_streaming_inner(all_entries, plan, source_cache)
+
         with tempfile.TemporaryDirectory(
             prefix="opteryx-compact-", dir=COMPACTION_TMPDIR
         ) as tmpdir:
             source_cache = _SourceFileCache(
                 self.dataset.io,
                 tmpdir,
-                delete_vectors=getattr(self, "_pass_delete_vectors", None),
+                delete_vectors=delete_vectors,
             )
             return self._execute_compaction_streaming_inner(all_entries, plan, source_cache)
 
