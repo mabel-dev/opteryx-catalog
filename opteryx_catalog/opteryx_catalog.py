@@ -59,11 +59,6 @@ from .webhooks.events import workspace_unlocked_payload
 
 logger = logging.getLogger(__name__)
 
-# Workspace-level document holding drop tombstones. The `$` prefix keeps it out of
-# `list_collections()`, which filters `$`-prefixed documents, so tombstones are
-# invisible to normal catalog enumeration.
-DROPPED_DOC = "$dropped"
-
 # Subcollection under a dataset document holding that dataset's triggers - one
 # document per trigger, keyed by trigger name. A subcollection rather than a
 # doc field for the same reason as `maintenance`: `load_dataset` reads the
@@ -591,10 +586,6 @@ class OpteryxCatalog(Metastore):
     def _view_doc_ref(self, collection: str, view_name: str):
         return self._views_collection(collection).document(view_name)
 
-    def _tombstones_collection(self):
-        """Subcollection of drop tombstones for this workspace."""
-        return self._catalog_ref.document(DROPPED_DOC).collection("datasets")
-
     @staticmethod
     def _delete_subcollection(coll_ref) -> None:
         """Delete every document in a subcollection.
@@ -1020,13 +1011,18 @@ class OpteryxCatalog(Metastore):
         return SimpleDataset(identifier=identifier, _metadata=metadata, io=self.io, catalog=self)
 
     def drop_dataset(self, identifier: str, author: str | None = None) -> None:
-        """Drop a dataset, leaving a tombstone so its files can be reclaimed.
+        """Drop a dataset. Its storage is reclaimed later, by reconciliation.
 
-        Dropping removes the dataset from the catalog immediately, which also
-        removes it from `list_datasets()` - and the expiration job only visits
-        datasets it can still list. Without a record of the location, the files
-        under it would be unreachable by any later sweep. The tombstone is that
-        record; see `list_dropped_datasets()`.
+        Dropping removes the dataset from the catalog immediately; the files
+        under its location are left in place and become unreferenced storage.
+        Nothing records where they were, deliberately. A dropped dataset's
+        location is derived from its name, so any persisted note of it is a
+        claim about a prefix that `create_dataset` can silently re-bind to a
+        new dataset - which is exactly how a stale note once pointed at live
+        data. Reclamation instead re-derives the answer from ground truth:
+        storage that no live dataset claims is orphaned, found by comparing
+        what is physically in the bucket against the locations the catalog
+        currently holds.
 
         Raises `DatasetLocked` if the dataset's `locked-by` field is set -
         the two-person deniability lock takes precedence over the drop.
@@ -1070,15 +1066,6 @@ class OpteryxCatalog(Metastore):
             )
 
         location = data.get("location")
-
-        # Tombstone FIRST: a failure between here and the final delete leaves a
-        # reclaimable record, whereas the reverse order would leak the location.
-        self._write_tombstone(
-            collection=collection,
-            dataset_name=dataset_name,
-            location=location,
-            author=author,
-        )
 
         # A dropped dataset takes its own triggers with it. If it is itself a
         # materialized view, its refresh triggers live on *other* datasets and
@@ -1178,12 +1165,13 @@ class OpteryxCatalog(Metastore):
 
         Ordering, since Firestore and GCS share no transaction:
         copy files -> rewrite manifests -> write new catalog entry -> delete old
-        entry -> tombstone the old location. A failure before the new entry is
-        written leaves the dataset untouched and some orphan copies at the new
-        location (a re-run overwrites them). A failure after it leaves the old
-        entry present alongside the new one, both readable, until re-run. No
-        ordering here loses data; the old files are handed to the existing 24h
-        reclamation sweep rather than deleted inline.
+        entry -> delete the files the copy superseded. A failure before the new
+        entry is written leaves the dataset untouched and some orphan copies at
+        the new location (a re-run overwrites them). A failure after it leaves
+        the old entry present alongside the new one, both readable, until
+        re-run. No ordering here loses data; the superseded files are deleted
+        by exact path, never by clearing the old prefix, so a re-run that
+        already moved them simply finds nothing left to delete.
 
         Files the dataset references from *outside* its own location are left
         exactly where they are and referenced unchanged - they were never this
@@ -1256,6 +1244,11 @@ class OpteryxCatalog(Metastore):
         # 1. Copy data files, and 2. rewrite manifests. One pass per snapshot;
         # a file referenced by several snapshots is copied once (copied_paths).
         copied_paths = set()
+        # Paths left behind under `old_location` once the copies land. Collected
+        # as they are copied, rather than by listing the old prefix afterwards:
+        # these exact paths are known to be superseded, whereas a listing would
+        # also sweep up anything written under that prefix concurrently.
+        vacated_paths = set()
         rewritten_manifests = {}
         for snapshot_doc in snapshot_docs:
             snapshot_data = snapshot_doc.to_dict() or {}
@@ -1265,6 +1258,8 @@ class OpteryxCatalog(Metastore):
 
             manifest_bytes = self._read_bytes(manifest_path)
             rows = read_manifest_rows(manifest_bytes)
+            if old_location and manifest_path.startswith(old_location + "/"):
+                vacated_paths.add(manifest_path)
 
             for row in rows:
                 source_path = row.get("file_path")
@@ -1275,6 +1270,7 @@ class OpteryxCatalog(Metastore):
                     continue
                 self._copy_object(source_path, target_path)
                 copied_paths.add(target_path)
+                vacated_paths.add(source_path)
                 row["file_path"] = target_path
 
             snapshot_id = snapshot_data.get("snapshot-id")
@@ -1327,15 +1323,16 @@ class OpteryxCatalog(Metastore):
         self._delete_subcollection(doc_ref.collection(MAINTENANCE_SUBCOLLECTION))
         doc_ref.delete()
 
-        # 5. Hand the vacated prefix to the existing reclamation sweep rather
-        # than deleting inline - same mechanism drop_dataset uses, so the files
-        # are removed on the established 24h grace period instead of instantly.
-        self._write_tombstone(
-            collection=collection,
-            dataset_name=dataset_name,
-            location=old_location,
-            author=author,
-        )
+        # 5. Delete what the copy vacated. Done inline, and by exact path:
+        # every one of these was copied to `new_location` moments ago and is
+        # now a duplicate, so there is nothing to defer and no grace period to
+        # wait out. Deleting the old *prefix* instead would be the unsafe
+        # version - it can be re-bound to a new dataset of the same name - and
+        # is precisely what this no longer does. Failures are left alone rather
+        # than raised: the rename itself has fully succeeded by this point, and
+        # anything not deleted here is unreferenced storage that reconciliation
+        # finds later.
+        self._reclaim_paths(vacated_paths)
 
         send_webhook(
             action="rename",
@@ -1367,37 +1364,25 @@ class OpteryxCatalog(Metastore):
             snapshots_moved=len(snapshot_docs),
         )
 
-    def _write_tombstone(
-        self, collection: str, dataset_name: str, location: str | None, author: str | None
-    ) -> None:
-        """Record a dropped dataset's storage location for later reclamation."""
-        self._tombstones_collection().document(f"{collection}.{dataset_name}").set(
-            {
-                "name": dataset_name,
-                "collection": collection,
-                "workspace": self.workspace,
-                "location": location,
-                "dropped-at-ms": int(time.time() * 1000),
-                "dropped-by": author,
-            }
-        )
+    def _reclaim_paths(self, paths) -> dict:
+        """Delete an explicit set of storage paths, reporting rather than raising.
 
-    def list_dropped_datasets(self) -> list[dict]:
-        """Tombstones for datasets dropped from this workspace.
-
-        Each entry carries `location` (the storage prefix whose files are now
-        unreferenced), `dropped-at-ms` and `dropped-by`. Consumed by the
-        expiration job, which reclaims the files and then calls
-        `delete_tombstone()`.
+        Takes the paths themselves, never a prefix to expand. Callers know
+        exactly which objects they have superseded; re-deriving that set from a
+        listing would also catch anything written under the same prefix in the
+        meantime, which is the failure mode this codebase is deliberately out
+        of the business of.
         """
-        return [
-            {**(doc.to_dict() or {}), "id": doc.id}
-            for doc in self._tombstones_collection().stream()
-        ]
-
-    def delete_tombstone(self, tombstone_id: str) -> None:
-        """Remove a tombstone once its storage location has been reclaimed."""
-        self._tombstones_collection().document(tombstone_id).delete()
+        deleted = 0
+        failed = 0
+        for path in sorted(paths):
+            try:
+                self.io.delete(path)
+                deleted += 1
+            except (AttributeError, ValueError, OSError) as exc:
+                logger.error("Could not delete %s: %s", path, exc)
+                failed += 1
+        return {"files_deleted": deleted, "files_failed": failed}
 
     # --- Workspace lifecycle (drop / lock) ------------------------------
     #
@@ -1423,8 +1408,8 @@ class OpteryxCatalog(Metastore):
         reclaimed; policy.opteryx's access grants for this workspace
         (`$policies/access` - a different service's data, sharing this same
         Firestore database, with no webhook consumer of its own to clean it
-        up); then the workspace's own `$properties` document. No tombstone,
-        no grace period, no restore - turning off `deletion_protection`
+        up); then the workspace's own `$properties` document. No grace
+        period, no restore - turning off `deletion_protection`
         (checked here, via `_assert_not_deletion_protected`) is the
         deliberate signal of intent; there is nothing left to undo, and
         nothing left in Firestore or on disk, after this returns.
@@ -1447,33 +1432,32 @@ class OpteryxCatalog(Metastore):
         that is a real, external dependency this operation cannot and must
         not silently override, not a bug in the ordering.
 
-        Reuses `drop_dataset`/`drop_view`/`drop_materialized_view` per item
-        rather than deleting storage directly - each tombstones its own
-        location the same way a standalone `DROP TABLE` does - but then
-        sweeps those tombstones itself, synchronously, with `min_age_ms=0`
-        rather than `DroppedDatasetSweep`'s normal wait: that grace period
-        exists to protect a write still in flight in a *live* workspace,
-        which doesn't apply here, deletion_protection having just been
-        cleared is the caller's own attestation that this workspace is not
-        "live" in that sense, and nothing else in this codebase runs that
-        sweep on a schedule - reclaiming inline is the only way this
-        doesn't leave every dropped dataset's files stranded indefinitely,
-        which used to be exactly what happened.
+        Reuses `drop_dataset`/`drop_view`/`drop_materialized_view` per item,
+        none of which touch storage, and then reclaims that storage itself,
+        inline. Every dataset's location is read BEFORE the drops begin, while
+        the dataset documents still exist to be read - the one moment those
+        locations are known to be correct. Nothing is persisted and nothing is
+        deferred, so there is no window in which a recorded location could come
+        to mean something else. Leaving this to the reconciliation pass instead
+        would strand a dropped workspace's files in the bucket until that pass
+        next ran, breaking this method's promise that nothing is left on disk
+        after it returns.
 
         A dataset held by its own per-asset `locked-by` lock raises
         `DatasetLocked` out of `drop_dataset` and stops this partway
         through, the same as it would dropping that one dataset directly -
         clear the lock and re-run, rather than this silently skipping it.
 
-        A sweep failure on any one location (e.g. a storage listing error)
+        A reclaim failure on any one location (e.g. a storage listing error)
         raises `WorkspaceStorageReclaimFailed` rather than letting the drop
         finish anyway - `$properties` is deliberately NOT deleted in that
         case, because deleting it removes the only way to construct a
         normal handle on this workspace again to retry the leftover
-        tombstone(s). Every dataset/view/collection has still been dropped
+        location(s). Every dataset/view/collection has still been dropped
         by that point; only the storage confirmation and the final
         `$properties` delete are held back. Re-run `drop_workspace` once
-        the underlying storage issue is resolved.
+        the underlying storage issue is resolved - it re-reads what is
+        physically there rather than replaying a record.
 
         Raises `WorkspaceDeletionProtected` if the workspace is
         deletion-protected. This is the only thing that flag ever guarded -
@@ -1495,6 +1479,19 @@ class OpteryxCatalog(Metastore):
             return
 
         collections = list(self.list_collections())
+
+        # Read every dataset's location up front, straight off the dataset
+        # documents, while they still exist. Streaming the subcollection rather
+        # than going through `list_datasets()` catches materialized views'
+        # backing datasets too, whatever their `dataset-type`. This is the only
+        # point at which these locations are known-correct, and they are used
+        # before this call returns - never written down.
+        doomed_locations = []
+        for collection in collections:
+            for dataset_doc in self._datasets_collection(collection).stream():
+                location = (dataset_doc.to_dict() or {}).get("location")
+                if location:
+                    doomed_locations.append(location)
 
         for collection in collections:
             for mv in list(self.list_materialized_views(collection)):
@@ -1524,18 +1521,40 @@ class OpteryxCatalog(Metastore):
             except CollectionNotFound:
                 pass
 
-        from .catalog.dropped_sweep import DroppedDatasetSweep
+        from .catalog.deep_clean import DatasetDeepClean
 
-        sweep_result = DroppedDatasetSweep(self, author=author, min_age_ms=0).sweep(dry_run=False)
-        if sweep_result.get("errors"):
+        # Listing each doomed location is safe in a way that listing a dropped
+        # *dataset's* prefix would not be: every dataset in this workspace has
+        # just been dropped, so nothing can still be writing here, and the
+        # workspace itself ceases to exist a few lines below.
+        lister = DatasetDeepClean(self, author=author, agent="drop-workspace")
+        failed = []
+        for location in doomed_locations:
+            try:
+                files = lister.get_all_physical_files(location)
+            except Exception as exc:  # noqa: BLE001 - storage listing boundary
+                logger.error("Could not list files under %s: %s", location, exc)
+                failed.append({"location": location, "reason": "list-failed", "error": str(exc)})
+                continue
+
+            result = self._reclaim_paths(files)
+            if result["files_failed"]:
+                failed.append(
+                    {
+                        "location": location,
+                        "reason": "partial-delete",
+                        "files_failed": result["files_failed"],
+                    }
+                )
+
+        if failed:
             # Must not proceed to delete $properties: once it's gone there is
             # no way to construct a normal handle on this workspace again to
-            # retry whatever tombstone(s) this left behind - see
+            # retry whatever storage this left behind - see
             # WorkspaceStorageReclaimFailed's docstring.
-            failed = [d for d in sweep_result.get("details", []) if d.get("action") == "error"]
             raise WorkspaceStorageReclaimFailed(
                 f"Dropped every dataset/view in {self.workspace!r}, but "
-                f"{sweep_result['errors']} of {sweep_result['tombstones']} "
+                f"{len(failed)} of {len(doomed_locations)} "
                 f"storage location(s) could not be confirmed reclaimed: "
                 f"{failed}. The workspace's $properties document was NOT "
                 f"deleted - re-run the drop once the underlying storage "
@@ -1588,13 +1607,12 @@ class OpteryxCatalog(Metastore):
         unlinked and re-bound with its tables entirely unaware.
 
         Deliberately NOT built out of `drop_dataset`, the way `drop_workspace`
-        is. That path tombstones each dataset's storage location and then
-        sweeps the tombstones to reclaim the files behind them, which is right
-        for datasets this catalog domiciles and meaningless for a stub, which
-        has no location and no files. Running it here would ask the storage
-        layer to reclaim addresses that were never ours, and there is no
-        reclaim step at all in what follows because there is nothing to
-        reclaim.
+        is. That path reads each dataset's storage location and deletes the
+        files behind it, which is right for datasets this catalog domiciles and
+        meaningless for a stub, which has no location and no files. Running it
+        here would ask the storage layer to reclaim addresses that were never
+        ours, and there is no reclaim step at all in what follows because there
+        is nothing to reclaim.
 
         `deletion_protection` has already been checked by the caller: unlinking
         is not a lesser act needing a lesser gate. It destroys the binding and
@@ -2020,11 +2038,11 @@ class OpteryxCatalog(Metastore):
         """Drop a collection.
 
         A collection owns no storage of its own - only its datasets and views
-        do - so unlike `drop_dataset` this needs no tombstone/sweep; deleting
-        the catalog document is the whole operation. Raises CollectionNotEmpty
-        if any datasets or views remain, since deleting a non-empty collection
-        would otherwise silently orphan them (still tombstoned/reclaimed
-        individually, but no longer reachable through `list_collections()`).
+        do - so this reclaims nothing; deleting the catalog document is the
+        whole operation. Raises CollectionNotEmpty if any datasets or views
+        remain, since deleting a non-empty collection would otherwise silently
+        orphan them - their storage still reachable by reconciliation, but the
+        datasets themselves no longer reachable through `list_collections()`.
         Raises `CollectionLocked` if the collection's `locked-by` field is
         set - the two-person deniability lock takes precedence over the drop.
         The workspace's `deletion_protection` does not apply; it protects the
@@ -2249,8 +2267,8 @@ class OpteryxCatalog(Metastore):
     def drop_view(self, identifier: str | tuple, author: str | None = None) -> None:
         """Drop a view.
 
-        No tombstone: a view owns no storage, so dropping it leaves nothing to
-        reclaim - unlike `drop_dataset`.
+        A view owns no storage, so dropping it leaves nothing to reclaim -
+        unlike `drop_dataset`.
 
         The workspace's `deletion_protection` does not apply; it protects the
         workspace itself, not the assets inside it.

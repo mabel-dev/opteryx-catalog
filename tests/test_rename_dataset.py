@@ -101,6 +101,9 @@ class _FakeIO:
 
         return _Out()
 
+    def delete(self, location):
+        self.objects.pop(location, None)
+
 
 _OLD_LOC = "gs://bucket/ws/coll/tbl"
 _NEW_LOC = "gs://bucket/ws/newcoll/newtbl"
@@ -126,7 +129,6 @@ def _catalog(
         doc_id="tbl",
     )
     target_ref = _DocRef(exists=target_exists, doc_id="newtbl")
-    tombstones = _Collection()
 
     refs = {("coll", "tbl"): source_ref, ("newcoll", "newtbl"): target_ref}
 
@@ -137,7 +139,6 @@ def _catalog(
     catalog.io = _FakeIO()
     catalog._dataset_doc_ref = lambda c, n: refs[(c, n)]
     catalog._snapshots_collection = lambda c, n: refs[(c, n)].collection("snapshots")
-    catalog._tombstones_collection = lambda: tombstones
 
     # Manifests are read as parquet bytes; stub the decode so these tests stay
     # about the move, not about rugo's parquet round-trip.
@@ -148,7 +149,7 @@ def _catalog(
     for row in manifest_rows or []:
         catalog.io.objects[row["file_path"]] = b"data"
 
-    return catalog, source_ref, target_ref, tombstones
+    return catalog, source_ref, target_ref
 
 
 def _patch_manifest_io(catalog, monkeypatch, rows_by_manifest):
@@ -177,13 +178,13 @@ def _single_snapshot_catalog(monkeypatch, extra_rows=()):
     rows = [{"file_path": f"{_OLD_LOC}/data/a.parquet", "record_count": 1}]
     rows.extend(extra_rows)
     snapshots = {1: {"snapshot-id": 1, "manifest": f"{_OLD_LOC}/metadata/manifest-1.parquet"}}
-    catalog, source, target, tombstones = _catalog(snapshots=snapshots, manifest_rows=rows)
+    catalog, source, target = _catalog(snapshots=snapshots, manifest_rows=rows)
     _patch_manifest_io(catalog, monkeypatch, {"manifest-1": rows})
-    return catalog, source, target, tombstones
+    return catalog, source, target
 
 
 def test_copies_data_files_to_the_new_location(monkeypatch, capsys):
-    catalog, _source, _target, _tomb = _single_snapshot_catalog(monkeypatch)
+    catalog, _source, _target = _single_snapshot_catalog(monkeypatch)
 
     catalog.rename_dataset("coll.tbl", "newcoll.newtbl", author="alice")
 
@@ -192,7 +193,7 @@ def test_copies_data_files_to_the_new_location(monkeypatch, capsys):
 
 
 def test_manifest_is_rewritten_with_remapped_paths(monkeypatch, capsys):
-    catalog, _source, _target, _tomb = _single_snapshot_catalog(monkeypatch)
+    catalog, _source, _target = _single_snapshot_catalog(monkeypatch)
 
     catalog.rename_dataset("coll.tbl", "newcoll.newtbl", author="alice")
 
@@ -202,7 +203,7 @@ def test_manifest_is_rewritten_with_remapped_paths(monkeypatch, capsys):
 
 
 def test_catalog_entry_moves_with_new_name_collection_and_location(monkeypatch, capsys):
-    catalog, source, target, _tomb = _single_snapshot_catalog(monkeypatch)
+    catalog, source, target = _single_snapshot_catalog(monkeypatch)
 
     catalog.rename_dataset("coll.tbl", "newcoll.newtbl", author="alice")
 
@@ -213,7 +214,7 @@ def test_catalog_entry_moves_with_new_name_collection_and_location(monkeypatch, 
 
 
 def test_snapshot_docs_move_and_point_at_the_new_manifest(monkeypatch, capsys):
-    catalog, _source, target, _tomb = _single_snapshot_catalog(monkeypatch)
+    catalog, _source, target = _single_snapshot_catalog(monkeypatch)
 
     catalog.rename_dataset("coll.tbl", "newcoll.newtbl", author="alice")
 
@@ -229,7 +230,7 @@ def test_all_snapshots_move_not_just_the_current_one(monkeypatch, capsys):
         1: {"snapshot-id": 1, "manifest": f"{_OLD_LOC}/metadata/manifest-1.parquet"},
         2: {"snapshot-id": 2, "manifest": f"{_OLD_LOC}/metadata/manifest-2.parquet"},
     }
-    catalog, _source, target, _tomb = _catalog(snapshots=snapshots, manifest_rows=rows_1 + rows_2)
+    catalog, _source, target = _catalog(snapshots=snapshots, manifest_rows=rows_1 + rows_2)
     _patch_manifest_io(catalog, monkeypatch, {"manifest-1": rows_1, "manifest-2": rows_2})
 
     catalog.rename_dataset("coll.tbl", "newcoll.newtbl", author="alice")
@@ -251,7 +252,7 @@ def test_file_shared_by_two_snapshots_is_copied_once(monkeypatch, capsys):
         1: {"snapshot-id": 1, "manifest": f"{_OLD_LOC}/metadata/manifest-1.parquet"},
         2: {"snapshot-id": 2, "manifest": f"{_OLD_LOC}/metadata/manifest-2.parquet"},
     }
-    catalog, _source, _target, _tomb = _catalog(snapshots=snapshots, manifest_rows=shared)
+    catalog, _source, _target = _catalog(snapshots=snapshots, manifest_rows=shared)
     _patch_manifest_io(catalog, monkeypatch, {"manifest-1": shared, "manifest-2": shared})
 
     copies = []
@@ -271,7 +272,7 @@ def test_file_shared_by_two_snapshots_is_copied_once(monkeypatch, capsys):
 def test_externally_referenced_files_are_left_where_they_are(monkeypatch, capsys):
     """A file outside the dataset's own location was never ours to move."""
     external = {"file_path": "gs://bucket/elsewhere/shared.parquet"}
-    catalog, _source, _target, _tomb = _single_snapshot_catalog(monkeypatch, extra_rows=[external])
+    catalog, _source, _target = _single_snapshot_catalog(monkeypatch, extra_rows=[external])
 
     catalog.rename_dataset("coll.tbl", "newcoll.newtbl", author="alice")
 
@@ -281,21 +282,52 @@ def test_externally_referenced_files_are_left_where_they_are(monkeypatch, capsys
     assert f"{_NEW_LOC}/elsewhere/shared.parquet" not in catalog.io.objects
 
 
-def test_old_location_is_tombstoned_not_deleted_inline(monkeypatch, capsys):
-    """The vacated prefix goes to the existing 24h reclamation sweep."""
-    catalog, _source, _target, tombstones = _single_snapshot_catalog(monkeypatch)
+def test_vacated_files_are_deleted_by_exact_path(monkeypatch, capsys):
+    """The superseded originals go; nothing else under the old prefix does.
+
+    The distinction is the whole point: an unrelated object under the old
+    prefix survives, because this deletes the paths the copy actually
+    superseded rather than clearing the prefix. A prefix is re-bindable - a
+    later dataset of the same name lands on it - so clearing one is how a
+    reclamation pass ends up deleting live data.
+    """
+    catalog, _source, _target = _single_snapshot_catalog(monkeypatch)
+    bystander = f"{_OLD_LOC}/data/not-ours.parquet"
+    catalog.io.objects[bystander] = b"data"
 
     catalog.rename_dataset("coll.tbl", "newcoll.newtbl", author="alice")
 
-    tombstone = tombstones.document("coll.tbl").get().to_dict()
-    assert tombstone["location"] == _OLD_LOC
-    assert tombstone["dropped-by"] == "alice"
-    # the original files are still there - the sweep removes them later
+    # the copies are in place at the new location
+    assert f"{_NEW_LOC}/data/a.parquet" in catalog.io.objects
+    # and the originals they superseded - data file and manifest alike - are gone
+    assert f"{_OLD_LOC}/data/a.parquet" not in catalog.io.objects
+    assert f"{_OLD_LOC}/metadata/manifest-1.parquet" not in catalog.io.objects
+    # but the bystander is untouched
+    assert bystander in catalog.io.objects
+
+
+def test_rename_survives_undeletable_old_files(monkeypatch, capsys):
+    """A delete that fails leaves the rename standing.
+
+    The rename has fully succeeded by the time anything is deleted, so a
+    storage failure here must not raise - it just leaves unreferenced files
+    for reconciliation to find.
+    """
+    catalog, _source, _target = _single_snapshot_catalog(monkeypatch)
+
+    def _refuse(location):
+        raise OSError("storage unavailable")
+
+    catalog.io.delete = _refuse
+
+    catalog.rename_dataset("coll.tbl", "newcoll.newtbl", author="alice")
+
+    assert f"{_NEW_LOC}/data/a.parquet" in catalog.io.objects
     assert f"{_OLD_LOC}/data/a.parquet" in catalog.io.objects
 
 
 def test_missing_source_raises(monkeypatch):
-    catalog, source, _target, _tomb = _single_snapshot_catalog(monkeypatch)
+    catalog, source, _target = _single_snapshot_catalog(monkeypatch)
     source._doc.exists = False
 
     with pytest.raises(DatasetNotFound):
@@ -304,7 +336,7 @@ def test_missing_source_raises(monkeypatch):
 
 def test_existing_target_raises(monkeypatch):
     snapshots = {1: {"snapshot-id": 1, "manifest": f"{_OLD_LOC}/metadata/manifest-1.parquet"}}
-    catalog, _source, _target, _tomb = _catalog(snapshots=snapshots, target_exists=True)
+    catalog, _source, _target = _catalog(snapshots=snapshots, target_exists=True)
     _patch_manifest_io(catalog, monkeypatch, {"manifest-1": []})
 
     with pytest.raises(DatasetAlreadyExists):
@@ -313,7 +345,7 @@ def test_existing_target_raises(monkeypatch):
 
 def test_locked_dataset_cannot_be_renamed(monkeypatch):
     """The two-person deniability lock outranks a rename, as it does a drop."""
-    catalog, source, _target, _tomb = _single_snapshot_catalog(monkeypatch)
+    catalog, source, _target = _single_snapshot_catalog(monkeypatch)
     source._doc._data["locked-by"] = "bob"
 
     with pytest.raises(DatasetLocked):
@@ -321,7 +353,7 @@ def test_locked_dataset_cannot_be_renamed(monkeypatch):
 
 
 def test_same_name_rejected(monkeypatch):
-    catalog, _source, _target, _tomb = _single_snapshot_catalog(monkeypatch)
+    catalog, _source, _target = _single_snapshot_catalog(monkeypatch)
 
     with pytest.raises(ValueError, match="same"):
         catalog.rename_dataset("coll.tbl", "coll.tbl", author="alice")
@@ -332,7 +364,7 @@ def test_nothing_is_copied_when_the_target_already_exists(monkeypatch):
     not leave orphan copies behind."""
     rows = [{"file_path": f"{_OLD_LOC}/data/a.parquet"}]
     snapshots = {1: {"snapshot-id": 1, "manifest": f"{_OLD_LOC}/metadata/manifest-1.parquet"}}
-    catalog, _source, _target, _tomb = _catalog(
+    catalog, _source, _target = _catalog(
         snapshots=snapshots, manifest_rows=rows, target_exists=True
     )
     _patch_manifest_io(catalog, monkeypatch, {"manifest-1": rows})
@@ -344,7 +376,7 @@ def test_nothing_is_copied_when_the_target_already_exists(monkeypatch):
 
 
 def test_emits_audit_record(monkeypatch, capsys):
-    catalog, _source, _target, _tomb = _single_snapshot_catalog(monkeypatch)
+    catalog, _source, _target = _single_snapshot_catalog(monkeypatch)
 
     catalog.rename_dataset("coll.tbl", "newcoll.newtbl", author="alice")
 
@@ -361,7 +393,7 @@ def test_emits_audit_record(monkeypatch, capsys):
 
 
 def test_unauthenticated_records_no_author(monkeypatch, capsys):
-    catalog, _source, _target, _tomb = _single_snapshot_catalog(monkeypatch)
+    catalog, _source, _target = _single_snapshot_catalog(monkeypatch)
 
     catalog.rename_dataset("coll.tbl", "newcoll.newtbl")
 

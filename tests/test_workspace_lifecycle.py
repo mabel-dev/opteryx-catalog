@@ -400,65 +400,112 @@ def test_drop_workspace_tolerates_a_collection_with_no_document_of_its_own():
     assert not any(entry[0] == "collection" and entry[1] == "implicit_coll" for entry in dropped)
 
 
-def test_drop_workspace_reclaims_storage_synchronously_not_on_a_grace_period():
-    """The datasets/views are tombstoned (via the mocked drop_dataset/
-    drop_view above), but nothing in this codebase runs the sweep that
-    reclaims a tombstone's storage on a schedule - so drop_workspace has to
-    do it inline, immediately (min_age_ms=0), or the files are stranded
-    forever. This is the difference between "the workspace is gone" and
-    "the workspace is gone AND the storage is reclaimed" - see the
-    workspace-delete-billing-coupling incident for why that distinction
-    matters."""
-    catalog, _cc, _dropped, _log = _catalog_with_contents(
-        props_data={"deletion_protection": False},
-        collections={"coll1": {"datasets": ["tbl1"], "views": []}},
+class _RecordingIO:
+    """Records every delete, so a test can assert on exact paths."""
+
+    def __init__(self):
+        self.deleted = []
+
+    def delete(self, path):
+        self.deleted.append(path)
+
+
+def _with_dataset_locations(catalog, locations_by_collection):
+    """Give the catalog a `_datasets_collection` that streams dataset docs.
+
+    drop_workspace reads locations straight off these documents, before any
+    drop runs - so a fixture that only stubs `list_datasets` cannot exercise
+    it. Streaming the subcollection is also what picks up materialized views'
+    backing datasets, which `list_datasets` filters out.
+    """
+
+    class _Doc:
+        def __init__(self, data):
+            self._data = data
+
+        def to_dict(self):
+            return dict(self._data)
+
+    class _Coll:
+        def __init__(self, docs):
+            self._docs = docs
+
+        def stream(self):
+            return iter(self._docs)
+
+    catalog._datasets_collection = lambda c: _Coll(
+        [_Doc({"location": loc}) for loc in locations_by_collection.get(c, [])]
     )
 
-    calls = []
 
-    class _FakeSweep:
-        def __init__(self, cat, author=None, min_age_ms=None):
-            calls.append({"catalog": cat, "author": author, "min_age_ms": min_age_ms})
+def test_drop_workspace_deletes_storage_inline_by_exact_path():
+    """drop_workspace reclaims storage itself, immediately.
 
-        def sweep(self, dry_run=True):
-            calls.append({"dry_run": dry_run})
-            return {"tombstones": 0, "reclaimed": 0, "skipped": 0, "errors": 0, "details": []}
+    Nothing else deletes a dropped dataset's files on a schedule with any
+    urgency - reconciliation gets to them eventually - so a workspace drop
+    that returned without reclaiming would leave the files sitting in the
+    bucket, still billed, against a workspace the caller believes is gone.
+    That is the difference between "the workspace is gone" and "the workspace
+    is gone AND the storage is reclaimed" - see the
+    workspace-delete-billing-coupling incident for why it matters.
+
+    The locations come off the dataset documents before any drop runs, which
+    is also how the materialized view's backing dataset gets included.
+    """
+    catalog, _cc, _dropped, _log = _catalog_with_contents(
+        props_data={"deletion_protection": False},
+        collections={"coll1": {"datasets": ["tbl1"], "materialized_views": ["mv1"]}},
+    )
+    _with_dataset_locations(
+        catalog, {"coll1": ["gs://b/ws/coll1/tbl1", "gs://b/ws/coll1/mv1"]}
+    )
+    catalog.io = _RecordingIO()
+
+    files = {
+        "gs://b/ws/coll1/tbl1": {"gs://b/ws/coll1/tbl1/data/a.parquet"},
+        "gs://b/ws/coll1/mv1": {"gs://b/ws/coll1/mv1/data/b.parquet"},
+    }
+
+    class _FakeClean:
+        def __init__(self, cat, author=None, agent=None):
+            pass
+
+        def get_all_physical_files(self, location):
+            return files[location]
 
     with (
-        patch("opteryx_catalog.catalog.dropped_sweep.DroppedDatasetSweep", _FakeSweep),
+        patch("opteryx_catalog.catalog.deep_clean.DatasetDeepClean", _FakeClean),
         patch("opteryx_catalog.opteryx_catalog.send_webhook"),
     ):
         catalog.drop_workspace(author="alice")
 
-    assert calls[0] == {"catalog": catalog, "author": "alice", "min_age_ms": 0}
-    assert calls[1] == {"dry_run": False}
+    assert sorted(catalog.io.deleted) == [
+        "gs://b/ws/coll1/mv1/data/b.parquet",
+        "gs://b/ws/coll1/tbl1/data/a.parquet",
+    ]
 
 
 def test_drop_workspace_raises_and_keeps_properties_doc_when_reclaim_fails():
-    """If the sweep can't confirm every location was reclaimed, drop_workspace
-    must not delete $properties anyway - doing so would orphan the failed
-    file(s) and their tombstone(s) permanently, since nothing could ever
-    construct a normal handle on this workspace again to retry them."""
+    """If any location can't be confirmed reclaimed, drop_workspace must not
+    delete $properties anyway - doing so would orphan the failed file(s)
+    permanently, since nothing could ever construct a normal handle on this
+    workspace again to retry them."""
     catalog, catalog_collection, _dropped, _log = _catalog_with_contents(
         props_data={"deletion_protection": False},
         collections={"coll1": {"datasets": ["tbl1"]}},
     )
+    _with_dataset_locations(catalog, {"coll1": ["gs://b/ws/coll1/tbl1"]})
+    catalog.io = _RecordingIO()
 
-    class _FailingSweep:
-        def __init__(self, cat, author=None, min_age_ms=None):
+    class _FailingClean:
+        def __init__(self, cat, author=None, agent=None):
             pass
 
-        def sweep(self, dry_run=True):
-            return {
-                "tombstones": 1,
-                "reclaimed": 0,
-                "skipped": 0,
-                "errors": 1,
-                "details": [{"id": "tbl1", "action": "error", "reason": "list-failed"}],
-            }
+        def get_all_physical_files(self, location):
+            raise OSError("storage unavailable")
 
     with (
-        patch("opteryx_catalog.catalog.dropped_sweep.DroppedDatasetSweep", _FailingSweep),
+        patch("opteryx_catalog.catalog.deep_clean.DatasetDeepClean", _FailingClean),
         patch("opteryx_catalog.opteryx_catalog.send_webhook") as hook,
         pytest.raises(WorkspaceStorageReclaimFailed),
     ):
@@ -533,11 +580,9 @@ def _catalog_with_dataset(locked=False):
         data["locked-by"] = "alice"
         data["locked-at-ms"] = 123
     dataset_ref = _DocRef("tbl", data=data, exists=True, log=log)
-    tombstones = _Collection("datasets", log=log)
 
     catalog._dataset_doc_ref = lambda c, n: dataset_ref
     catalog._snapshots_collection = lambda c, n: dataset_ref.collection("snapshots")
-    catalog._tombstones_collection = lambda: tombstones
 
     return catalog, dataset_ref, log
 

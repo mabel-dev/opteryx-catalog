@@ -166,7 +166,6 @@ def test_catalog_drop_dataset_emits_audit(capsys):
     catalog.workspace = "opteryx"
     catalog._dataset_doc_ref = lambda c, n: _Ref()
     catalog._snapshots_collection = lambda c, n: _Coll()
-    catalog._tombstones_collection = lambda: _Coll()
 
     with patch("opteryx_catalog.opteryx_catalog.send_webhook"):
         catalog.drop_dataset("coll.tbl", author="alice")

@@ -113,8 +113,6 @@ def _catalog():
     catalog._snapshots_collection = lambda c, n: catalog._dataset_doc_ref(c, n).collection(
         "snapshots"
     )
-    tombstones = _Collection()
-    catalog._tombstones_collection = lambda: tombstones
     catalog.firestore_client = _FirestoreClient()
     catalog._catalog_ref = catalog.firestore_client.collection("ws")
     return catalog
