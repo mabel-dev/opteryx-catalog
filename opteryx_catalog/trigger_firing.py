@@ -134,21 +134,21 @@ def policies_for(catalog, principal: str | None) -> list[dict] | None:
 # several places with nothing able to see, meter or refuse it in one spot. jobs
 # is the control point; a refresh is a query; so a refresh goes through jobs.
 #
-# The credential is the catalog's OWN, not `federator`'s. federator is
-# compaction's identity and its secret stays in xb500: this library runs inside
-# upload, worker and worker-lo, so handing it federator's secret would put
-# compaction's identity in three more places. What is NOT avoided is
-# distribution - the catalog's own secret does ship to all three, because that
-# is where the code runs. What is contained is WHICH identity a compromise
-# there yields.
+# The submission authenticates as `federator`, the platform's service-to-service
+# identity. That is ALL it does: jobs resolves a refresh's acting identity,
+# payer, policies and dedup window from the statement and the view's own
+# definition, so this credential carries no authority over any of them - it
+# proves "a platform service, not the open internet", nothing more. That is
+# what makes it safe to ship FEDERATOR_CLIENT_SECRET into every committing
+# service: holding it unlocks nothing that any authenticated caller lacks.
 #
-# Read from the environment only, with no Secret Manager path here. Cloud Run's
-# `--set-secrets` resolves the secret at instance start, which keeps this
-# library free of a Secret Manager dependency it would otherwise carry into
-# every host. The consequence is stated rather than hidden: a rotated secret is
-# picked up when instances restart, not on the next call.
-CLIENT_ID_ENV = "CATALOG_CLIENT_ID"
-CLIENT_SECRET_ENV = "CATALOG_CLIENT_SECRET"
+# The secret's home mirrors xb500's `app/federator.py`, which owns rotation:
+# same Secret Manager entry, same ENVVAR, same name for both - one name to
+# grep for when the credential is the thing that broke. The same caveat
+# travels with it: Cloud Run resolves `--set-secrets` at instance start, so a
+# rotated secret is picked up on restart, not on the next call.
+FEDERATOR_CLIENT_ID_ENV = "FEDERATOR_CLIENT_ID"
+FEDERATOR_CLIENT_SECRET_ENV = "FEDERATOR_CLIENT_SECRET"
 
 # Re-minting per refresh would be one auth round trip per fired trigger, and a
 # commit can fire several. Margin so a token is never spent in its last seconds.
@@ -160,12 +160,8 @@ def _auth_url() -> str:
     return os.environ.get("AUTH_URL", "https://authenticate.opteryx.app")
 
 
-def _jobs_url() -> str:
-    return os.environ.get("JOBS_URL", "https://jobs.opteryx.app")
-
-
-def _catalog_token() -> str:
-    """A platform bearer token for this library, minted and cached.
+def _federator_token() -> str:
+    """A `federator` bearer token, minted via client_credentials and cached.
 
     Raises rather than returning None: a refresh that cannot authenticate has
     not happened, and `fire_triggers` turns that into an alert and a recorded
@@ -177,14 +173,14 @@ def _catalog_token() -> str:
     if cached and _token_cache.get("expires_at", 0) > now:
         return cached
 
-    secret = os.environ.get(CLIENT_SECRET_ENV)
+    secret = os.environ.get(FEDERATOR_CLIENT_SECRET_ENV)
     if not secret:
         raise MaterializedViewError(
-            f"cannot submit a materialized view refresh: {CLIENT_SECRET_ENV} is not set. "
-            "It is injected by the deployment (Cloud Run --set-secrets); without it this "
-            "service cannot authenticate to the jobs API."
+            f"cannot submit a materialized view refresh: {FEDERATOR_CLIENT_SECRET_ENV} "
+            "is not set. It is injected by the deployment (Cloud Run --set-secrets); "
+            "without it this service cannot authenticate to the jobs API."
         )
-    client_id = os.environ.get(CLIENT_ID_ENV, "catalog")
+    client_id = os.environ.get(FEDERATOR_CLIENT_ID_ENV, "federator")
 
     payload = urllib.parse.urlencode(
         {
@@ -208,8 +204,14 @@ def _catalog_token() -> str:
     if not access_token:
         raise MaterializedViewError(f"auth service returned no access_token for {client_id}")
     _token_cache["access_token"] = access_token
-    _token_cache["expires_at"] = now + max(0, int(body.get("expires_in") or 0)) - _TOKEN_EXPIRY_MARGIN_SECONDS
+    _token_cache["expires_at"] = (
+        now + max(0, int(body.get("expires_in") or 0)) - _TOKEN_EXPIRY_MARGIN_SECONDS
+    )
     return access_token
+
+
+def _jobs_url() -> str:
+    return os.environ.get("JOBS_URL", "https://jobs.opteryx.app")
 
 
 def _submit_refresh_job(
@@ -253,13 +255,20 @@ def _submit_refresh_job(
         f"{_jobs_url()}/api/v1/jobs",
         data=json.dumps(payload).encode("utf-8"),
         headers={
-            "Authorization": f"Bearer {_catalog_token()}",
+            "Authorization": f"Bearer {_federator_token()}",
             "Content-Type": "application/json",
         },
         method="POST",
     )
     with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
         body = json.loads(response.read().decode("utf-8"))
+
+    # jobs may decline the refresh outright: its read gate skips a view nobody
+    # has read since the last refresh. That is a decision, not a failure - the
+    # trigger records it (SHOW TRIGGERS shows "skipped-unread"), no job exists,
+    # and the view's next reader triggers the catch-up.
+    if body.get("status") == "SKIPPED":
+        return None, "skipped-unread"
 
     execution_id = body.get("execution_id")
     if not execution_id:

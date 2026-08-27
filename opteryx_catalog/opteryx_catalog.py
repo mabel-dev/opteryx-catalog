@@ -3107,7 +3107,43 @@ class OpteryxCatalog(Metastore):
             "last-refreshed-at-ms": data.get("last-refreshed-at-ms"),
             "last-refresh-status": data.get("last-refresh-status"),
             "last-refresh-execution-id": data.get("last-refresh-execution-id"),
+            "last-read-at-ms": data.get("last-read-at-ms"),
+            "last-refresh-skipped-at-ms": data.get("last-refresh-skipped-at-ms"),
         }
+
+    def mark_materialized_view_read(self, identifier: str) -> None:
+        """Stamp that somebody read this view - the signal read-gated refresh runs on.
+
+        Written by jobs.opteryx when a submitted statement reads the view. The
+        caller debounces: only the FIRST read after a refresh changes the
+        gate's answer ("was this view read since it was last refreshed?"), so
+        this is written at most once per view per refresh cycle - not per query.
+
+        A targeted `update()`, never `set()`: the MV record carries fields this
+        stamp must not destroy.
+        """
+        collection, dataset_name = self._local_parts(identifier)
+        self._dataset_doc_ref(collection, dataset_name).update(
+            {"last-read-at-ms": int(time.time() * 1000)}
+        )
+
+    def mark_materialized_view_refresh_skipped(self, identifier: str) -> None:
+        """Stamp that a refresh was declined because nobody had read the view.
+
+        Written by jobs.opteryx when the read gate skips a refresh. The stamp is
+        what lets the NEXT reader trigger a catch-up: a view whose skip stamp is
+        newer than its refresh stamp is stale-by-choice, and the read path turns
+        that into a refresh submission. Without it, a skipped view being read
+        again would stay stale until its sources happened to commit.
+
+        Deliberately not a status on `last-refresh-status`: nothing was
+        attempted, and overwriting the last real refresh outcome with "skipped"
+        would erase the answer to "did the last refresh WORK".
+        """
+        collection, dataset_name = self._local_parts(identifier)
+        self._dataset_doc_ref(collection, dataset_name).update(
+            {"last-refresh-skipped-at-ms": int(time.time() * 1000)}
+        )
 
     def set_materialized_view_suspended(
         self, identifier: str, suspended: bool, author: str | None = None

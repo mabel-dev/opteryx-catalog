@@ -232,19 +232,20 @@ def _metadata_response(status=200, text="svc@project.iam.gserviceaccount.com"):
     return response
 
 
-def test_refuses_to_submit_without_a_credential(monkeypatch):
+def test_refuses_to_submit_without_a_secret(monkeypatch):
     """No identity is a loud failure, not a request jobs will 401.
 
     Same guarantee as when this library minted its own OIDC token for Cloud
-    Tasks - only the credential changed. A missing secret must stop the refresh
-    here, where `fire_triggers` turns it into an alert and a recorded fire
-    failure, rather than produce an unauthenticated call with a much dimmer trail.
+    Tasks - only who it authenticates as changed. A missing secret must stop
+    the refresh here, where `fire_triggers` turns it into an alert and a
+    recorded fire failure, rather than produce an unauthenticated call with a
+    much dimmer trail.
     """
-    monkeypatch.delenv(trigger_firing.CLIENT_SECRET_ENV, raising=False)
+    monkeypatch.delenv(trigger_firing.FEDERATOR_CLIENT_SECRET_ENV, raising=False)
     trigger_firing._token_cache["access_token"] = None
 
-    with pytest.raises(MaterializedViewError, match=trigger_firing.CLIENT_SECRET_ENV):
-        trigger_firing._catalog_token()
+    with pytest.raises(MaterializedViewError, match=trigger_firing.FEDERATOR_CLIENT_SECRET_ENV):
+        trigger_firing._federator_token()
 
 
 def test_a_failed_submission_audits_instead_of_breaking_the_commit():
