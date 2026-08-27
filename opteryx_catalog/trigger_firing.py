@@ -53,6 +53,9 @@ from datetime import datetime
 from datetime import timedelta
 from typing import Any
 
+import urllib.parse
+import urllib.request
+
 import requests
 
 from .alerts import report as _alert
@@ -64,6 +67,10 @@ from .exceptions import MaterializedViewOwnerMissing
 # Refreshes fired inside one window share a task name, and Cloud Tasks
 # rejects a name it has already seen - that rejection IS the debounce.
 DEDUP_WINDOW_SECONDS = 60
+
+# Bounds one HTTP call - minting a token, or submitting one refresh - not the
+# refresh itself, which jobs runs asynchronously long after this returns.
+HTTP_TIMEOUT_SECONDS = 30
 
 # Mirrors jobs.opteryx's JOB_TTL_DAYS: how long a refresh job document
 # lingers before the purge sweep may remove it.
@@ -85,56 +92,6 @@ _METADATA_TIMEOUT_SECONDS = 1.0
 
 _sa_lock = threading.Lock()
 _sa_cache: str | None = None
-
-
-def _runtime_service_account() -> str | None:
-    """This process's own service account, or None when not on GCP.
-
-    Only successful lookups are cached: a failure here is fatal to the fire
-    (see `_enqueue_refresh_task`), so caching a None would turn one slow
-    metadata response into permanently stale views for the process lifetime.
-    """
-    global _sa_cache
-
-    with _sa_lock:
-        if _sa_cache is not None:
-            return _sa_cache
-
-    try:
-        response = requests.get(
-            _METADATA_SA_URL,
-            headers={"Metadata-Flavor": "Google"},
-            timeout=_METADATA_TIMEOUT_SECONDS,
-        )
-    except requests.RequestException:
-        # Not on GCP, or the metadata server did not answer in time.
-        return None
-    if response.status_code != 200:
-        return None
-    email = response.text.strip()
-    if not email:
-        return None
-
-    with _sa_lock:
-        _sa_cache = email
-    return email
-
-
-def _oidc_service_account() -> str | None:
-    """The service account the refresh task is minted for.
-
-    worker.opteryx pins one OIDC subject (`WORKER_OIDC_SUBJECT`, defaulting to
-    the numeric id of the project's Cloud Run runtime identity), so the answer
-    is always "whoever this process already is" - every Opteryx service runs as
-    that same account, which is why jobs.opteryx's enqueue is accepted today.
-    Asking the metadata server is therefore both correct and self-configuring;
-    there is nothing for an operator to set, and nothing to keep in step with
-    the worker when the platform identity changes.
-
-    TASKS_OIDC_SA remains as an escape hatch for the case the runtime identity
-    and the enqueuing identity are deliberately split.
-    """
-    return os.environ.get("TASKS_OIDC_SA") or _runtime_service_account()
 
 
 def firing_enabled() -> bool:
@@ -216,20 +173,6 @@ def _billing_account_for_workspace(catalog, workspace: str) -> str:
     return account
 
 
-def _make_job_id(now: datetime | None = None) -> str:
-    """Job id of the form YYYYMMDDHHMMSS-{16 lowercase alphanums}.
-
-    Same shape `jobs.opteryx._make_job_id` mints, so refresh jobs are
-    indistinguishable infrastructure-wise from user submissions.
-    """
-    if now is None:
-        now = datetime.now(UTC)
-    prefix = now.strftime("%Y%m%d%H%M%S")
-    chars = string.ascii_lowercase + string.digits
-    rand = "".join(secrets.choice(chars) for _ in range(16))
-    return f"{prefix}-{rand}"
-
-
 def _policies_for(catalog, principal: str | None) -> list[dict] | None:
     """The principal's current access policies, in job-document shape.
 
@@ -273,120 +216,162 @@ def _task_id(workspace: str, trigger_name: str, now_s: float | None = None) -> s
     return _TASK_ID_UNSAFE.sub("-", raw)[:500]
 
 
-def _enqueue_refresh_task(catalog, execution_id: str, task_id: str) -> str:
-    """Enqueue the Cloud Task push to worker.opteryx. Returns the outcome.
+# --- Submitting through jobs.opteryx -------------------------------------------
+#
+# This module used to write the `jobs/{execution_id}` document itself and enqueue
+# its own Cloud Task straight at worker.opteryx. That made it a second
+# implementation of jobs' contract, and - because this is a LIBRARY, embedded in
+# every service that commits a dataset - it meant work reached the workers from
+# several places with nothing able to see, meter or refuse it in one spot. jobs
+# is the control point; a refresh is a query; so a refresh goes through jobs.
+#
+# The credential is the catalog's OWN, not `federator`'s. federator is
+# compaction's identity and its secret stays in xb500: this library runs inside
+# upload, worker and worker-lo, so handing it federator's secret would put
+# compaction's identity in three more places. What is NOT avoided is
+# distribution - the catalog's own secret does ship to all three, because that
+# is where the code runs. What is contained is WHICH identity a compromise
+# there yields.
+#
+# Read from the environment only, with no Secret Manager path here. Cloud Run's
+# `--set-secrets` resolves the secret at instance start, which keeps this
+# library free of a Secret Manager dependency it would otherwise carry into
+# every host. The consequence is stated rather than hidden: a rotated secret is
+# picked up when instances restart, not on the next call.
+CLIENT_ID_ENV = "CATALOG_CLIENT_ID"
+CLIENT_SECRET_ENV = "CATALOG_CLIENT_SECRET"
 
-    Same wiring as jobs.opteryx's enqueue (`interface.py`, create_job): plain
-    dict task, OIDC token for the worker's pinned service account, audience
-    defaulting to the target URL. The worker reads only `execution_id` from
-    the body.
+# Re-minting per refresh would be one auth round trip per fired trigger, and a
+# commit can fire several. Margin so a token is never spent in its last seconds.
+_TOKEN_EXPIRY_MARGIN_SECONDS = 60
+_token_cache: dict = {"access_token": None, "expires_at": 0.0}
+
+
+def _auth_url() -> str:
+    return os.environ.get("AUTH_URL", "https://authenticate.opteryx.app")
+
+
+def _jobs_url() -> str:
+    return os.environ.get("JOBS_URL", "https://jobs.opteryx.app")
+
+
+def _catalog_token() -> str:
+    """A platform bearer token for this library, minted and cached.
+
+    Raises rather than returning None: a refresh that cannot authenticate has
+    not happened, and `fire_triggers` turns that into an alert and a recorded
+    fire failure. Returning a falsy token would instead produce a 401 at jobs
+    and a much less obvious trail.
     """
-    from google.api_core.exceptions import AlreadyExists
-    from google.cloud import tasks_v2
+    now = time.time()
+    cached = _token_cache.get("access_token")
+    if cached and _token_cache.get("expires_at", 0) > now:
+        return cached
 
-    project = _project_id(catalog)
-    location = os.environ.get("TASKS_LOCATION", "us-east1")
-    queue = os.environ.get("TASKS_QUEUE", "worker-dispatch")
-    target_url = os.environ.get("TASKS_TARGET_URL", "https://worker.opteryx.app/api/v1/submit")
-
-    client = tasks_v2.CloudTasksClient()
-    parent = client.queue_path(project, location, queue)
-
-    http_request: dict = {
-        "http_method": tasks_v2.HttpMethod.POST,
-        "url": target_url,
-        "headers": {"Content-Type": "application/json"},
-        "body": json.dumps({"execution_id": execution_id}).encode("utf-8"),
-    }
-    # worker.opteryx pins one OIDC subject; the SA here must be the same one
-    # jobs.opteryx enqueues as (decision 4 - no worker-side auth changes).
-    # No token means a task the worker answers with 401, which Cloud Tasks
-    # then retries until it expires - a stale view whose only evidence is in
-    # the queue's logs. Failing here instead puts it in the audit log.
-    oidc_sa = _oidc_service_account()
-    if not oidc_sa:
+    secret = os.environ.get(CLIENT_SECRET_ENV)
+    if not secret:
         raise MaterializedViewError(
-            "cannot mint an OIDC token for the refresh task: no TASKS_OIDC_SA "
-            "and no runtime service account from the metadata server. Set "
-            "OPTERYX_TRIGGER_FIRING=0 where commits happen off-platform."
+            f"cannot submit a materialized view refresh: {CLIENT_SECRET_ENV} is not set. "
+            "It is injected by the deployment (Cloud Run --set-secrets); without it this "
+            "service cannot authenticate to the jobs API."
         )
-    http_request["oidc_token"] = tasks_v2.OidcToken(
-        service_account_email=oidc_sa,
-        audience=os.environ.get("TASKS_OIDC_AUDIENCE", target_url),
+    client_id = os.environ.get(CLIENT_ID_ENV, "catalog")
+
+    payload = urllib.parse.urlencode(
+        {
+            "grant_type": "client_credentials",
+            "client_id": client_id,
+            "client_secret": secret,
+        }
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        f"{_auth_url()}/token",
+        data=payload,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
     )
+    # The secret is in the request body, so nothing from the request is echoed
+    # into an error - only what came back.
+    with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
+        body = json.loads(response.read().decode("utf-8"))
 
-    task = {"name": f"{parent}/tasks/{task_id}", "http_request": http_request}
-    try:
-        client.create_task(parent=parent, task=task)
-    except AlreadyExists:
-        return "deduplicated"
-    return "enqueued"
+    access_token = body.get("access_token")
+    if not access_token:
+        raise MaterializedViewError(f"auth service returned no access_token for {client_id}")
+    _token_cache["access_token"] = access_token
+    _token_cache["expires_at"] = now + max(0, int(body.get("expires_in") or 0)) - _TOKEN_EXPIRY_MARGIN_SECONDS
+    return access_token
 
 
-def _write_refresh_job(
+def _submit_refresh_job(
     catalog,
-    execution_id: str,
+    *,
     sql_text: str,
-    author: str | None,
-    policies: list[dict] | None,
+    runs_as: str,
+    policies: list | None,
     source_dataset: str,
     trigger_name: str,
     target_view: str,
     snapshot_id: Any | None,
     billing_account: str,
-    fired_by: str | None = None,
-) -> None:
-    """Write the jobs/{execution_id} document the worker will execute from."""
-    from google.cloud import firestore
+    fired_by: str | None,
+    task_id: str,
+) -> tuple[str, str]:
+    """Submit the refresh to jobs. Returns `(execution_id, outcome)`.
 
-    now = datetime.now(UTC)
-    job_doc = {
-        "execution_id": execution_id,
+    Everything that used to be written into the job document by hand travels in
+    the `platform` block, which jobs refuses from callers not on its
+    submitter allowlist. Two of those fields are the reason the block is gated:
+    a refresh ACTS as the view's pinned owner and BILLS the workspace holding
+    the view - two parties, and neither of them is this library.
+
+    `task_id` becomes jobs' idempotency key, which is what carries the dedup
+    window across the move. It used to be a Cloud Tasks task NAME chosen here,
+    and Cloud Tasks refusing a name it had seen was the debounce. Submitting
+    through jobs without passing it would have silently turned one refresh per
+    window back into one refresh per commit.
+    """
+    payload = {
         "sql_text": sql_text,
-        "status": "SUBMITTED",
-        "created_at": firestore.SERVER_TIMESTAMP,
-        "updated_at": firestore.SERVER_TIMESTAMP,
-        # The view's pinned owner (`runs-as`), not the commit's author. This is
-        # the identity the worker hands the engine and the one the binder
-        # authorizes. `trigger.fired_by` below keeps the link to that commit.
-        "submitted_by": author,
-        # Who PAYS, which is a different question from who ACTS and is no longer
-        # answered with the same value. `runs-as` is a service identity - for
-        # every platform-owned view, `federator` - and billing it made the
-        # platform's own automation the largest account on the meter. The
-        # workspace holding the view is the party that benefits from it.
-        "billing_account": billing_account,
-        # The one workspace this job is on behalf of. Recorded because the
-        # billing account above is derived from it: without it the derivation
-        # is unauditable after the fact.
-        "workspace": catalog.workspace,
-        "entitlements": [],
-        "purge_at": now + timedelta(days=JOB_TTL_DAYS),
-        # `origin` keeps this off /jobs/recent and tells the worker to stamp
-        # the MV's refresh state when the job finishes.
-        "origin": "trigger",
-        "trigger": {
-            # workspace travels too: the worker builds a catalog handle from it
-            # to stamp refresh state on the right MV.
+        "platform": {
+            "submitted_by": runs_as,
+            "billing_account": billing_account,
             "workspace": catalog.workspace,
-            "source_dataset": source_dataset,
-            "trigger_name": trigger_name,
-            "target_view": target_view,
-            "snapshot_id": snapshot_id,
-            # Which commit caused this refresh. `submitted_by` used to carry it
-            # and now carries the owner instead, so without this the audit trail
-            # from a refresh back to the write that triggered it is lost.
-            "fired_by": fired_by,
+            "origin": "trigger",
+            "policies": policies or None,
+            "trigger": {
+                "workspace": catalog.workspace,
+                "source_dataset": source_dataset,
+                "trigger_name": trigger_name,
+                "target_view": target_view,
+                "snapshot_id": snapshot_id,
+                "fired_by": fired_by,
+            },
+            "idempotency_key": task_id,
         },
-        "description": (
-            f"materialized view refresh of {target_view} "
-            f"(trigger {trigger_name} on {source_dataset})"
-        ),
-        "describer": "trigger",
     }
-    if policies:
-        job_doc["policies"] = policies
-    _jobs_client(catalog).collection("jobs").document(execution_id).set(job_doc)
+    request = urllib.request.Request(
+        f"{_jobs_url()}/api/v1/jobs",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {_catalog_token()}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
+        body = json.loads(response.read().decode("utf-8"))
+
+    execution_id = body.get("execution_id")
+    if not execution_id:
+        raise MaterializedViewError(
+            f"jobs accepted the refresh of {target_view} but returned no execution_id"
+        )
+    # "enqueued", not "submitted": this string is recorded on the trigger and
+    # shown by SHOW TRIGGERS. The work still ends up on a queue; only which
+    # service puts it there changed, and the operator vocabulary should not
+    # shift underneath them for that.
+    return execution_id, "enqueued"
 
 
 def _fire_refresh(
@@ -467,13 +452,11 @@ def _fire_refresh(
             f"VIEW {target_view} OWNER TO <principal>."
         )
 
-    execution_id = _make_job_id()
     billing_account = _billing_account_for_workspace(catalog, catalog.workspace)
-    _write_refresh_job(
+    execution_id, outcome = _submit_refresh_job(
         catalog,
-        execution_id=execution_id,
         sql_text=sql_text,
-        author=runs_as,
+        runs_as=runs_as,
         policies=_policies_for(catalog, runs_as),
         source_dataset=dataset_identifier,
         trigger_name=trigger["name"],
@@ -481,9 +464,7 @@ def _fire_refresh(
         snapshot_id=snapshot_id,
         billing_account=billing_account,
         fired_by=author,
-    )
-    outcome = _enqueue_refresh_task(
-        catalog, execution_id, _task_id(catalog.workspace, trigger["name"])
+        task_id=_task_id(catalog.workspace, trigger["name"]),
     )
     catalog.mark_trigger_fired(dataset_identifier, trigger["name"], status=outcome)
 
