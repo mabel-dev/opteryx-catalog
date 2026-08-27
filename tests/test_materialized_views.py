@@ -771,7 +771,7 @@ def test_egress_lock_turned_on_after_registration_blocks_refresh():
 
     with (
         patch.object(trigger_firing, "_jobs_client"),
-        patch.object(trigger_firing, "_enqueue_refresh_task", return_value="enqueued") as enqueue,
+        patch.object(trigger_firing, "_submit_refresh_job", return_value=("exec-1", "enqueued")) as enqueue,
         patch.object(trigger_firing, "_policies_for", return_value=None),
     ):
         fire_triggers(catalog, "src.a", author="alice")
@@ -786,7 +786,7 @@ def test_egress_lock_turned_on_after_registration_blocks_refresh():
         patch.object(trigger_firing, "_alert") as alert,
         patch.object(trigger_firing, "write_audit_record") as audit,
         patch.object(trigger_firing, "_jobs_client") as jobs_client,
-        patch.object(trigger_firing, "_enqueue_refresh_task") as enqueue,
+        patch.object(trigger_firing, "_submit_refresh_job", return_value=("exec-1", "enqueued")) as enqueue,
     ):
         fire_triggers(catalog, "src.a", author="alice")  # must not raise
 
@@ -814,7 +814,7 @@ def test_a_suspended_view_does_not_refresh():
 
     with (
         patch.object(trigger_firing, "_jobs_client") as jobs,
-        patch.object(trigger_firing, "_enqueue_refresh_task") as enq,
+        patch.object(trigger_firing, "_submit_refresh_job", return_value=("exec-1", "enqueued")) as enq,
         patch.object(trigger_firing, "_alert") as alert,
     ):
         fire_triggers(catalog, "src.a", author="alice", snapshot_id=1)
@@ -842,7 +842,7 @@ def test_resume_lets_it_refresh_again():
 
     with (
         patch.object(trigger_firing, "_jobs_client", return_value=MagicMock()),
-        patch.object(trigger_firing, "_enqueue_refresh_task", return_value="enqueued") as enq,
+        patch.object(trigger_firing, "_submit_refresh_job", return_value=("exec-1", "enqueued")) as enq,
         patch.object(trigger_firing, "_policies_for", return_value=None),
     ):
         fire_triggers(catalog, "src.a", author="alice", snapshot_id=1)
