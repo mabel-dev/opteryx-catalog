@@ -770,9 +770,7 @@ def test_egress_lock_turned_on_after_registration_blocks_refresh():
     _set_egress_restriction(catalog, "ichnos", False)
 
     with (
-        patch.object(trigger_firing, "_jobs_client"),
         patch.object(trigger_firing, "_submit_refresh_job", return_value=("exec-1", "enqueued")) as enqueue,
-        patch.object(trigger_firing, "_policies_for", return_value=None),
     ):
         fire_triggers(catalog, "src.a", author="alice")
 
@@ -785,12 +783,10 @@ def test_egress_lock_turned_on_after_registration_blocks_refresh():
     with (
         patch.object(trigger_firing, "_alert") as alert,
         patch.object(trigger_firing, "write_audit_record") as audit,
-        patch.object(trigger_firing, "_jobs_client") as jobs_client,
         patch.object(trigger_firing, "_submit_refresh_job", return_value=("exec-1", "enqueued")) as enqueue,
     ):
         fire_triggers(catalog, "src.a", author="alice")  # must not raise
 
-    jobs_client.assert_not_called()
     enqueue.assert_not_called()
     assert isinstance(alert.call_args.args[0], EgressRestricted)
     assert audit.call_args.args[0]["event"] == "trigger.fire_failed"
@@ -813,13 +809,11 @@ def test_a_suspended_view_does_not_refresh():
     catalog.set_materialized_view_suspended("mart.daily", True, author="admin")
 
     with (
-        patch.object(trigger_firing, "_jobs_client") as jobs,
         patch.object(trigger_firing, "_submit_refresh_job", return_value=("exec-1", "enqueued")) as enq,
         patch.object(trigger_firing, "_alert") as alert,
     ):
         fire_triggers(catalog, "src.a", author="alice", snapshot_id=1)
 
-    jobs.assert_not_called()
     enq.assert_not_called()
     alert.assert_not_called()  # suspension is the setting working, not a failure
     assert catalog.list_triggers("src.a")[0]["last-fired-status"] == "suspended"
@@ -841,9 +835,7 @@ def test_resume_lets_it_refresh_again():
     assert record["suspended-by"] is None
 
     with (
-        patch.object(trigger_firing, "_jobs_client", return_value=MagicMock()),
         patch.object(trigger_firing, "_submit_refresh_job", return_value=("exec-1", "enqueued")) as enq,
-        patch.object(trigger_firing, "_policies_for", return_value=None),
     ):
         fire_triggers(catalog, "src.a", author="alice", snapshot_id=1)
     enq.assert_called_once()

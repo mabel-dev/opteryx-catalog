@@ -18,7 +18,6 @@ from opteryx_catalog import trigger_firing
 from opteryx_catalog.catalog.dataset import SimpleDataset
 from opteryx_catalog.catalog.metadata import Snapshot
 from opteryx_catalog.exceptions import MaterializedViewError
-from opteryx_catalog.trigger_firing import _task_id
 from opteryx_catalog.trigger_firing import fire_triggers
 
 
@@ -56,19 +55,6 @@ def _refresh_trigger(name="refresh__mart__daily", target="ws.mart.daily"):
 # --- pure helpers --------------------------------------------------------
 
 
-def test_task_id_is_stable_within_window_and_rolls_over():
-    a = _task_id("ws", "refresh__mart__daily", now_s=960.0)
-    b = _task_id("ws", "refresh__mart__daily", now_s=1019.9)
-    c = _task_id("ws", "refresh__mart__daily", now_s=1020.0)
-    assert a == b
-    assert a != c
-
-
-def test_task_id_sanitized():
-    task_id = _task_id("w s", "trig.ger/name", now_s=0)
-    assert all(ch.isalnum() or ch in "-_" for ch in task_id)
-
-
 # --- fire_triggers flow --------------------------------------------------
 
 
@@ -89,9 +75,7 @@ def test_a_view_with_no_owner_refuses_to_fire():
 
     with (
         patch.object(trigger_firing, "_alert") as alert,
-        patch.object(trigger_firing, "_jobs_client", return_value=jobs_client),
         patch.object(trigger_firing, "_submit_refresh_job", return_value=("exec-1", "enqueued")) as enq,
-        patch.object(trigger_firing, "_policies_for", return_value=None),
     ):
         # Never raises into the commit path, whatever it finds.
         fire_triggers(catalog, "src.a", author="alice", snapshot_id=123)
@@ -129,30 +113,23 @@ def test_fire_submits_the_refresh_through_jobs():
         patch.object(
             trigger_firing, "_submit_refresh_job", return_value=("exec-1", "enqueued")
         ) as submit,
-        patch.object(
-            trigger_firing, "_policies_for", return_value=[{"role": "owner", "pattern": "*"}]
-        ),
-        patch.object(trigger_firing, "_billing_account_for_workspace", return_value="acme"),
     ):
         fire_triggers(catalog, "src.a", author="alice", snapshot_id=123)
 
     kwargs = submit.call_args.kwargs
     assert kwargs["sql_text"] == "REFRESH MATERIALIZED VIEW ws.mart.daily"
     assert "SELECT" not in kwargs["sql_text"]
-    # ACTS as the view's pinned owner, not the committer...
-    assert kwargs["runs_as"] == "olive"
-    # ...and the committer survives only as provenance.
+    # Provenance only. The acting identity, policies, billing account and dedup
+    # window are deliberately ABSENT: jobs resolves all four from the statement
+    # and the view's own definition, so this library cannot be wrong about them.
     assert kwargs["fired_by"] == "alice"
-    # ...while the workspace holding the view PAYS.
-    assert kwargs["billing_account"] == "acme"
-    assert kwargs["policies"] == [{"role": "owner", "pattern": "*"}]
     assert kwargs["source_dataset"] == "src.a"
     assert kwargs["snapshot_id"] == 123
     assert kwargs["target_view"] == "ws.mart.daily"
-    # The dedup window travels as the idempotency key, which is what keeps a
-    # burst of commits collapsing into one refresh now that Cloud Tasks is no
-    # longer being handed a name chosen here.
-    assert kwargs["task_id"] == _task_id("ws", "refresh__mart__daily")
+    assert "runs_as" not in kwargs
+    assert "billing_account" not in kwargs
+    assert "policies" not in kwargs
+    assert "task_id" not in kwargs
 
     catalog.mark_trigger_fired.assert_called_once_with(
         "src.a", "refresh__mart__daily", status="enqueued"
@@ -169,38 +146,6 @@ def _workspace_doc(data):
     return client
 
 
-def test_refresh_bills_the_target_workspaces_account():
-    client = _workspace_doc({"billing_account": "acme"})
-    with patch.object(trigger_firing, "_jobs_client", return_value=client):
-        assert trigger_firing._billing_account_for_workspace(MagicMock(), "ws") == "acme"
-    # Read from the DEFAULT database's `workspaces` collection, which is where
-    # billing.opteryx writes it - not the catalog's own `catalogs` database.
-    client.collection.assert_called_once_with("workspaces")
-    client.collection.return_value.document.assert_called_once_with("ws")
-
-
-def test_a_workspace_with_no_billing_record_falls_back_to_the_house():
-    """Not to `runs-as`. Billing a service identity is the failure being removed;
-    the house absorbing it is wrong in a bounded, findable way instead."""
-    for data in ({}, {"billing_account": None}, {"billing_account": ""}, None):
-        with patch.object(trigger_firing, "_jobs_client", return_value=_workspace_doc(data)):
-            assert (
-                trigger_firing._billing_account_for_workspace(MagicMock(), "ws")
-                == trigger_firing.HOUSE_BILLING_ACCOUNT
-            )
-
-
-def test_a_billing_lookup_failure_never_blocks_the_refresh():
-    """A stale materialized view is a worse outcome than a misattributed charge."""
-    client = MagicMock()
-    client.collection.side_effect = RuntimeError("firestore is unreachable")
-    with patch.object(trigger_firing, "_jobs_client", return_value=client):
-        assert (
-            trigger_firing._billing_account_for_workspace(MagicMock(), "ws")
-            == trigger_firing.HOUSE_BILLING_ACCOUNT
-        )
-
-
 def test_duplicate_targets_fire_once():
     catalog = _catalog_stub(
         triggers=[
@@ -210,9 +155,7 @@ def test_duplicate_targets_fire_once():
         ]
     )
     with (
-        patch.object(trigger_firing, "_jobs_client", return_value=MagicMock()),
         patch.object(trigger_firing, "_submit_refresh_job", return_value=("exec-1", "enqueued")) as enq,
-        patch.object(trigger_firing, "_policies_for", return_value=None),
     ):
         fire_triggers(catalog, "src.a", author="alice")
 
@@ -223,9 +166,7 @@ def test_duplicate_targets_fire_once():
 def test_dedup_outcome_recorded():
     catalog = _catalog_stub(triggers=[_refresh_trigger()])
     with (
-        patch.object(trigger_firing, "_jobs_client", return_value=MagicMock()),
         patch.object(trigger_firing, "_submit_refresh_job", return_value=("exec-1", "deduplicated")),
-        patch.object(trigger_firing, "_policies_for", return_value=None),
     ):
         fire_triggers(catalog, "src.a", author="alice")
 
@@ -267,9 +208,7 @@ def test_one_bad_trigger_does_not_stop_the_rest():
     catalog.get_materialized_view.side_effect = mv_lookup
     with (
         patch.object(trigger_firing, "_alert"),
-        patch.object(trigger_firing, "_jobs_client", return_value=MagicMock()),
         patch.object(trigger_firing, "_submit_refresh_job", return_value=("exec-1", "enqueued")) as enq,
-        patch.object(trigger_firing, "_policies_for", return_value=None),
     ):
         fire_triggers(catalog, "src.a", author="alice")
 
@@ -315,8 +254,6 @@ def test_a_failed_submission_audits_instead_of_breaking_the_commit():
     the submission itself failing, which is the same class of fault."""
     catalog = _catalog_stub(triggers=[_refresh_trigger()])
     with (
-        patch.object(trigger_firing, "_jobs_client", return_value=MagicMock()),
-        patch.object(trigger_firing, "_policies_for", return_value=None),
         patch.object(
             trigger_firing,
             "_submit_refresh_job",

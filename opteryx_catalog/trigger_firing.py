@@ -2,16 +2,13 @@
 
 The commit path calls `fire_triggers()`, which reads the committed dataset's
 `triggers` subcollection and, for each materialized-view refresh trigger,
-does what jobs.opteryx does when a user submits a query - because the refresh
-IS a query, executed by the same worker:
-
-1. Write a `jobs/{execution_id}` document. worker.opteryx ignores the Cloud
-   Tasks payload beyond `execution_id` and re-reads everything (sql_text,
-   submitted_by, policies, ...) from this document, so the document is the
-   whole contract.
-2. Enqueue a Cloud Task targeting worker.opteryx's `/api/v1/submit`, OIDC-
-   authenticated, with a *named* task so rapid commits within the dedup
-   window collapse into one refresh.
+submits `REFRESH MATERIALIZED VIEW <name>` to jobs.opteryx - because the
+refresh IS a query, and jobs is the one control point through which work
+reaches the workers. This library used to write the `jobs/{execution_id}`
+document and enqueue the Cloud Task itself; both moved into jobs, which
+recognises the statement by its query class and resolves the acting identity,
+policies, billing and dedup window there. What travels from here is the
+statement and provenance, nothing a submitter could be wrong about.
 
 Invoker semantics (settled 2026-08-06): the job runs as the commit's `author`.
 Their current policies are read from the workspace's `$policies/access`
@@ -64,20 +61,9 @@ from .exceptions import EgressRestricted
 from .exceptions import MaterializedViewError
 from .exceptions import MaterializedViewOwnerMissing
 
-# Refreshes fired inside one window share a task name, and Cloud Tasks
-# rejects a name it has already seen - that rejection IS the debounce.
-DEDUP_WINDOW_SECONDS = 60
-
 # Bounds one HTTP call - minting a token, or submitting one refresh - not the
 # refresh itself, which jobs runs asynchronously long after this returns.
 HTTP_TIMEOUT_SECONDS = 30
-
-# Mirrors jobs.opteryx's JOB_TTL_DAYS: how long a refresh job document
-# lingers before the purge sweep may remove it.
-JOB_TTL_DAYS = int(os.environ.get("JOB_TTL_DAYS", "14"))
-
-# Cloud Tasks task ids allow letters, digits, hyphens and underscores.
-_TASK_ID_UNSAFE = re.compile(r"[^A-Za-z0-9_-]+")
 
 _KILL_SWITCH_ENV = "OPTERYX_TRIGGER_FIRING"
 
@@ -104,83 +90,21 @@ def firing_enabled() -> bool:
     return value not in ("0", "false", "no", "off")
 
 
-def _project_id(catalog) -> str | None:
-    """The GCP project for the jobs collection and task queue.
-
-    Env wins (the deployed convention, same names jobs.opteryx reads);
-    the catalog's own Firestore project is the fallback.
-    """
-    for env in ("GCP_PROJECT_ID", "GCP_PROJECT", "GOOGLE_CLOUD_PROJECT"):
-        value = os.environ.get(env)
-        if value:
-            return value
-    return getattr(getattr(catalog, "firestore_client", None), "project", None)
-
-
-def _jobs_client(catalog):
-    """Firestore client for the `jobs` collection.
-
-    jobs.opteryx and worker.opteryx use the project's *default* database
-    (`db.collection("jobs")`), not the catalog's `catalogs` database, so the
-    catalog's own client cannot be reused. OPTERYX_JOBS_DATABASE overrides
-    for tests/emulators.
-    """
-    from google.cloud import firestore
-
-    database = os.environ.get("OPTERYX_JOBS_DATABASE")
-    kwargs = {"project": _project_id(catalog)}
-    if database:
-        kwargs["database"] = database
-    return firestore.Client(**kwargs)
-
-
 HOUSE_BILLING_ACCOUNT = "opteryx"
 
 
-def _billing_account_for_workspace(catalog, workspace: str) -> str:
-    """The account that pays for work done on behalf of `workspace`.
-
-    A refresh used to bill the view's `runs-as` identity, which for every
-    platform-owned view is `federator` - an identity, not an account, and by
-    volume the largest single thing on the meter. The party that benefits from
-    a materialized view is the workspace holding it, so that is who pays.
-
-    `workspaces/{name}` lives in the project's DEFAULT database - the one
-    `_jobs_client` already talks to. The catalog's own `catalogs` database does
-    not hold it.
-
-    A workspace with no billing record falls back to the house account rather
-    than to `runs-as`. Neither answer is knowably right, but this one is wrong
-    in a bounded way: the house absorbs it, and the event carries `workspace`,
-    so the gap is findable by name. Billing `runs-as` instead invents a payer
-    out of a service identity, which is the failure this replaces.
-
-    Never raises. A refresh must not fail because a billing lookup did.
-    """
-    try:
-        snapshot = _jobs_client(catalog).collection("workspaces").document(workspace).get()
-        account = (snapshot.to_dict() or {}).get("billing_account") if snapshot.exists else None
-    except Exception as exc:  # noqa: BLE001 - see docstring
-        logger.warning(f"could not read the billing account for workspace {workspace!r}: {exc}")
-        account = None
-
-    if not account:
-        logger.warning(
-            f"workspace {workspace!r} has no billing account; billing this refresh to "
-            f"{HOUSE_BILLING_ACCOUNT!r}"
-        )
-        return HOUSE_BILLING_ACCOUNT
-    return account
-
-
-def _policies_for(catalog, principal: str | None) -> list[dict] | None:
+def policies_for(catalog, principal: str | None) -> list[dict] | None:
     """The principal's current access policies, in job-document shape.
 
     Read from `{workspace}/$policies/access` - policy.opteryx's storage,
     which lives in the same Firestore database as the catalog - and shaped
     exactly as `normalize_policies_for_storage` writes them onto job docs:
-    `[{"role", "pattern", "policy"}]`. Read at fire time deliberately: a
-    revoked role stops the very next refresh.
+    `[{"role", "pattern", "policy"}]`.
+
+    Public because jobs.opteryx is the caller now: the control point resolves
+    the refresh's acting identity and policies itself rather than trusting a
+    submission to carry them, and this is the data-access half of that. Read at
+    submission time deliberately: a revoked role stops the very next refresh.
     """
     if not principal:
         return None
@@ -199,21 +123,6 @@ def _policies_for(catalog, principal: str | None) -> list[dict] | None:
         if role and pattern:
             policies.append({"role": role, "pattern": pattern, "policy": doc.id})
     return policies or None
-
-
-def _task_id(workspace: str, trigger_name: str, now_s: float | None = None) -> str:
-    """Deterministic per-window task id - the dedup key.
-
-    Two commits inside the same window produce the same id; Cloud Tasks
-    rejects the second create with AlreadyExists, which callers treat as a
-    successful (deduplicated) fire. Window rollover changes the id, so the
-    ~1h task-name tombstone never suppresses a later refresh.
-    """
-    if now_s is None:
-        now_s = time.time()
-    bucket = int(now_s // DEDUP_WINDOW_SECONDS)
-    raw = f"mvrefresh--{workspace}--{trigger_name}--{bucket}"
-    return _TASK_ID_UNSAFE.sub("-", raw)[:500]
 
 
 # --- Submitting through jobs.opteryx -------------------------------------------
@@ -307,47 +216,37 @@ def _submit_refresh_job(
     catalog,
     *,
     sql_text: str,
-    runs_as: str,
-    policies: list | None,
     source_dataset: str,
     trigger_name: str,
     target_view: str,
     snapshot_id: Any | None,
-    billing_account: str,
     fired_by: str | None,
-    task_id: str,
 ) -> tuple[str, str]:
     """Submit the refresh to jobs. Returns `(execution_id, outcome)`.
 
-    Everything that used to be written into the job document by hand travels in
-    the `platform` block, which jobs refuses from callers not on its
-    submitter allowlist. Two of those fields are the reason the block is gated:
-    a refresh ACTS as the view's pinned owner and BILLS the workspace holding
-    the view - two parties, and neither of them is this library.
+    The payload is the REFRESH statement plus provenance, nothing more. The
+    statement is self-identifying - `REFRESH MATERIALIZED VIEW <name>` parses
+    as its own query class - so jobs recognises it, resolves the view's
+    pinned `runs-as`, that principal's policies and billing account, routes it
+    to the background worker, and derives the dedup window. None of those are
+    this library's to assert: a submission that could name the actor or the
+    payer is a submission that could name them WRONGLY, and the control point
+    exists so that nothing below it has to be trusted about either.
 
-    `task_id` becomes jobs' idempotency key, which is what carries the dedup
-    window across the move. It used to be a Cloud Tasks task NAME chosen here,
-    and Cloud Tasks refusing a name it had seen was the debounce. Submitting
-    through jobs without passing it would have silently turned one refresh per
-    window back into one refresh per commit.
+    `client_info.trigger` is provenance for the audit trail - which commit
+    fired this - not instructions. jobs derives the authoritative workspace
+    and target view from the statement itself.
     """
     payload = {
         "sql_text": sql_text,
-        "platform": {
-            "submitted_by": runs_as,
-            "billing_account": billing_account,
-            "workspace": catalog.workspace,
-            "origin": "trigger",
-            "policies": policies or None,
+        "client_info": {
             "trigger": {
-                "workspace": catalog.workspace,
                 "source_dataset": source_dataset,
                 "trigger_name": trigger_name,
                 "target_view": target_view,
                 "snapshot_id": snapshot_id,
                 "fired_by": fired_by,
-            },
-            "idempotency_key": task_id,
+            }
         },
     }
     request = urllib.request.Request(
@@ -452,19 +351,14 @@ def _fire_refresh(
             f"VIEW {target_view} OWNER TO <principal>."
         )
 
-    billing_account = _billing_account_for_workspace(catalog, catalog.workspace)
     execution_id, outcome = _submit_refresh_job(
         catalog,
         sql_text=sql_text,
-        runs_as=runs_as,
-        policies=_policies_for(catalog, runs_as),
         source_dataset=dataset_identifier,
         trigger_name=trigger["name"],
         target_view=target_view,
         snapshot_id=snapshot_id,
-        billing_account=billing_account,
         fired_by=author,
-        task_id=_task_id(catalog.workspace, trigger["name"]),
     )
     catalog.mark_trigger_fired(dataset_identifier, trigger["name"], status=outcome)
 
@@ -478,7 +372,6 @@ def _fire_refresh(
             "execution_id": execution_id,
             "outcome": outcome,
             "author": author,
-            "billing_account": billing_account,
         }
     )
 
