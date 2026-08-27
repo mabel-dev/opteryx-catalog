@@ -192,9 +192,9 @@ class WorkspaceStorageReclaimFailed(Alertable, CatalogError):
 
     Raised instead of silently deleting the workspace's `$properties` doc
     anyway: once that doc is gone, nothing can construct a normal handle on
-    this workspace again to retry a leftover tombstone, so a file that
+    this workspace again to retry a leftover location, so a file that
     failed to delete here would be orphaned with no path back to it short
-    of a manual, out-of-band fix. The message names every tombstone that
+    of a manual, out-of-band fix. The message names every location that
     did not fully reclaim.
 
     Alertable because this means storage is now permanently unreachable

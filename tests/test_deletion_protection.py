@@ -69,7 +69,6 @@ def _catalog(protected: bool):
     catalog._catalog_ref = catalog_ref
     catalog._dataset_doc_ref = lambda c, n: dataset_ref
     catalog._snapshots_collection = lambda c, n: dataset_ref.collection("snapshots")
-    catalog._tombstones_collection = lambda: _Collection()
     catalog._collection_ref = lambda c: collection_ref
     catalog._datasets_collection = lambda c: _Collection()
     catalog._views_collection = lambda c: _Collection()
