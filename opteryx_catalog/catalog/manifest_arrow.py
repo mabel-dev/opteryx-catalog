@@ -15,6 +15,7 @@ held as an Arrow table.
 from __future__ import annotations
 
 import logging
+import os
 import time
 from collections import OrderedDict
 from collections.abc import Iterable
@@ -35,8 +36,56 @@ _SKETCH_VECTOR_COLUMNS = ("min_k_hashes", "histogram_counts", "char_class_counts
 # Note: entries now also pin the native sketch vectors (min_k_hashes /
 # histogram_counts / char_class_counts) per manifest, so a cached entry holds
 # that manifest's sketch buffers alongside the boxed columns until evicted.
+#
+# The cache is bounded by BYTES as well as by entry count. The count bound
+# alone let 32 whole parsed manifests pin memory: a ~1MB manifest parquet
+# inflates to ~90MB resident once boxed to Python lists and its sketch
+# vectors are pinned (measured against public.geopolitics.gdelt_events,
+# 2026-08-27), so 32 entries exceeded a 1GiB container on their own and the
+# platform-wide expiration sweep OOMed. The native sketch Vectors expose no
+# byte-size API, so an entry's cost is ESTIMATED as the raw manifest size
+# times the measured inflation factor. Entries whose estimated cost exceeds
+# the whole budget are served but never cached.
 ARROW_MANIFEST_CACHE_SIZE: int = 32
+# Measured resident-set inflation of a parsed+pinned manifest over its raw
+# parquet bytes (~92x for gdelt_events). Deliberately rounded up.
+MANIFEST_CACHE_INFLATION: int = 100
+MANIFEST_CACHE_BYTES: int = int(os.environ.get("OPTERYX_MANIFEST_CACHE_MB") or 128) * 1024 * 1024
 _arrow_manifest_cache: OrderedDict[str, tuple] = OrderedDict()
+# path -> estimated resident bytes for that entry; total tracked alongside.
+_arrow_manifest_cache_costs: dict[str, int] = {}
+_arrow_manifest_cache_total: int = 0
+
+
+def _cache_store(manifest_path: str, entry: tuple, raw_byte_len: int) -> None:
+    """Insert a parsed entry, evicting LRU entries to hold the byte budget.
+
+    ``raw_byte_len`` is the size of the manifest's raw parquet bytes; the
+    resident cost is estimated from it (see MANIFEST_CACHE_INFLATION).
+    """
+    global _arrow_manifest_cache_total
+
+    cost = raw_byte_len * MANIFEST_CACHE_INFLATION
+    if cost > MANIFEST_CACHE_BYTES:
+        # Too large to ever fit: serve it, but don't let one entry own the
+        # budget. Drop any stale entry at the same path.
+        invalidate_arrow_manifest(manifest_path)
+        return
+
+    if manifest_path in _arrow_manifest_cache:
+        _arrow_manifest_cache_total -= _arrow_manifest_cache_costs.get(manifest_path, 0)
+    _arrow_manifest_cache[manifest_path] = entry
+    _arrow_manifest_cache.move_to_end(manifest_path)
+    _arrow_manifest_cache_costs[manifest_path] = cost
+    _arrow_manifest_cache_total += cost
+
+    while _arrow_manifest_cache and (
+        _arrow_manifest_cache_total > MANIFEST_CACHE_BYTES
+        or len(_arrow_manifest_cache) > ARROW_MANIFEST_CACHE_SIZE
+    ):
+        evicted_path, _ = _arrow_manifest_cache.popitem(last=False)
+        _arrow_manifest_cache_total -= _arrow_manifest_cache_costs.pop(evicted_path, 0)
+
 
 # Metrics
 _manifest_retrieval_metrics = {
@@ -149,9 +198,7 @@ def get_arrow_manifest(io: Any, manifest_path: str) -> ArrowManifest:
     elapsed_ms = (time.perf_counter() - start_time) * 1000
     _manifest_retrieval_metrics["total_retrieval_time_ms"] += elapsed_ms
 
-    _arrow_manifest_cache[manifest_path] = (columns, row_count, sketch_vectors)
-    if len(_arrow_manifest_cache) > ARROW_MANIFEST_CACHE_SIZE:
-        _arrow_manifest_cache.popitem(last=False)
+    _cache_store(manifest_path, (columns, row_count, sketch_vectors), len(data))
 
     logger.debug(f"Loaded manifest {manifest_path} in {elapsed_ms:.1f}ms ({row_count} rows)")
 
@@ -166,10 +213,7 @@ def seed_arrow_manifest(manifest_path: str, data: bytes) -> ArrowManifest:
     columns, row_count, sketch_vectors = read_manifest_columns(
         data, keep_native=_SKETCH_VECTOR_COLUMNS
     )
-    _arrow_manifest_cache[manifest_path] = (columns, row_count, sketch_vectors)
-    _arrow_manifest_cache.move_to_end(manifest_path)
-    if len(_arrow_manifest_cache) > ARROW_MANIFEST_CACHE_SIZE:
-        _arrow_manifest_cache.popitem(last=False)
+    _cache_store(manifest_path, (columns, row_count, sketch_vectors), len(data))
     return ArrowManifest(columns, row_count, sketch_vectors)
 
 
@@ -190,17 +234,25 @@ def get_arrow_manifest_rows(io: Any, manifest_path: str) -> Iterator[ArrowManife
 
 def invalidate_arrow_manifest(manifest_path: str) -> None:
     """Remove manifest from cache."""
-    _arrow_manifest_cache.pop(manifest_path, None)
+    global _arrow_manifest_cache_total
+    if _arrow_manifest_cache.pop(manifest_path, None) is not None:
+        _arrow_manifest_cache_total -= _arrow_manifest_cache_costs.pop(manifest_path, 0)
 
 
 def clear_arrow_manifest_cache() -> None:
     """Clear entire manifest cache."""
+    global _arrow_manifest_cache_total
     _arrow_manifest_cache.clear()
+    _arrow_manifest_cache_costs.clear()
+    _arrow_manifest_cache_total = 0
 
 
 def get_retrieval_metrics() -> dict:
     """Get manifest retrieval performance metrics."""
-    return dict(_manifest_retrieval_metrics)
+    metrics = dict(_manifest_retrieval_metrics)
+    metrics["manifest_cache_entries"] = len(_arrow_manifest_cache)
+    metrics["manifest_cache_estimated_bytes"] = _arrow_manifest_cache_total
+    return metrics
 
 
 def reset_retrieval_metrics() -> None:

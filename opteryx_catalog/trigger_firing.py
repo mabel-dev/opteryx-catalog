@@ -143,10 +143,14 @@ def policies_for(catalog, principal: str | None) -> list[dict] | None:
 # service: holding it unlocks nothing that any authenticated caller lacks.
 #
 # The secret's home mirrors xb500's `app/federator.py`, which owns rotation:
-# same Secret Manager entry, same ENVVAR, same name for both - one name to
-# grep for when the credential is the thing that broke. The same caveat
-# travels with it: Cloud Run resolves `--set-secrets` at instance start, so a
-# rotated secret is picked up on restart, not on the next call.
+# ENVVAR first (local runs), then Secret Manager - same entry, same name for
+# both, one name to grep for when the credential is the thing that broke.
+# Deployed services leave the ENVVAR unset on purpose, exactly as federator.py
+# documents: an env-injected secret is resolved at instance start and never
+# sees a rotation, while the Secret Manager read happens at every MINT - so a
+# rotated secret lands on the next token, not the next restart. The mint is
+# already throttled by the token cache below, so this is not a per-refresh
+# Secret Manager call.
 FEDERATOR_CLIENT_ID_ENV = "FEDERATOR_CLIENT_ID"
 FEDERATOR_CLIENT_SECRET_ENV = "FEDERATOR_CLIENT_SECRET"
 
@@ -175,10 +179,15 @@ def _federator_token() -> str:
 
     secret = os.environ.get(FEDERATOR_CLIENT_SECRET_ENV)
     if not secret:
+        from .alerts._secrets import access_secret
+
+        secret = access_secret(FEDERATOR_CLIENT_SECRET_ENV)
+    if not secret:
         raise MaterializedViewError(
             f"cannot submit a materialized view refresh: {FEDERATOR_CLIENT_SECRET_ENV} "
-            "is not set. It is injected by the deployment (Cloud Run --set-secrets); "
-            "without it this service cannot authenticate to the jobs API."
+            "is neither in the environment nor readable from Secret Manager. Without "
+            "it this service cannot authenticate to the jobs API - check the runtime "
+            "service account's secretAccessor grant on that secret."
         )
     client_id = os.environ.get(FEDERATOR_CLIENT_ID_ENV, "federator")
 
