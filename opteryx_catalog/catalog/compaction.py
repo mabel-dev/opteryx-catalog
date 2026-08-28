@@ -1739,6 +1739,19 @@ class DatasetCompactor:
                 f"Failed to persist compaction snapshot {snapshot_id} to metastore"
             ) from e
 
+        self.dataset._emit_audit(
+            "compact",
+            author=self.author,
+            snapshot_id=snapshot_id,
+            strategy=self.strategy,
+            files_added=added_files,
+            files_removed=deleted_files,
+            bytes_added=added_size,
+            bytes_removed=deleted_size,
+            records_added=added_records,
+            records_removed=deleted_records,
+        )
+
         return snapshot
 
     def _dataset_moved_under_us(self) -> bool:

@@ -310,6 +310,60 @@ def test_update_mv_reconciles_triggers_and_bumps_sequence():
     assert statement["sequence-number"] == 2
 
 
+def test_two_registrations_in_one_millisecond_keep_both_statements():
+    """The statement id is the millisecond it was written, so a redefinition
+    inside the same millisecond must not overwrite the version the sequence
+    number still claims is there."""
+    catalog = _catalog()
+    _add_dataset(catalog, "src.a")
+    _add_dataset(catalog, "src.b")
+    mv_ref = _add_dataset(catalog, "mart.daily")
+
+    with patch("opteryx_catalog.opteryx_catalog.time.time", return_value=1_700_000_000.0):
+        catalog.create_materialized_view(
+            "mart.daily", "SELECT * FROM src.a", ["src.a"], author="alice"
+        )
+        first = mv_ref.get().to_dict()["statement-id"]
+        catalog.create_materialized_view(
+            "mart.daily",
+            "SELECT * FROM src.b",
+            ["src.b"],
+            author="alice",
+            update_if_exists=True,
+        )
+
+    second = mv_ref.get().to_dict()["statement-id"]
+    assert second != first
+
+    statements = {doc.id: doc.to_dict() for doc in mv_ref.collection("statement").stream()}
+    assert set(statements) == {first, second}
+    assert statements[first]["sql"] == "SELECT * FROM src.a"
+    assert statements[second]["sql"] == "SELECT * FROM src.b"
+    assert statements[first]["sequence-number"] == 1
+    assert statements[second]["sequence-number"] == 2
+
+
+def test_two_view_registrations_in_one_millisecond_keep_both_statements():
+    """`create_view` shares the millisecond-as-document-id convention."""
+    catalog = _catalog()
+    view_ref = catalog._view_doc_ref("mart", "daily")
+
+    with patch("opteryx_catalog.opteryx_catalog.time.time", return_value=1_700_000_000.0):
+        catalog.create_view("mart.daily", "SELECT 1", author="alice")
+        first = view_ref.get().to_dict()["statement-id"]
+        catalog.create_view("mart.daily", "SELECT 2", author="alice", update_if_exists=True)
+
+    second = view_ref.get().to_dict()["statement-id"]
+    assert second != first
+
+    statements = {doc.id: doc.to_dict() for doc in view_ref.collection("statement").stream()}
+    assert set(statements) == {first, second}
+    assert statements[first]["sql"] == "SELECT 1"
+    assert statements[second]["sql"] == "SELECT 2"
+    assert statements[first]["sequence-number"] == 1
+    assert statements[second]["sequence-number"] == 2
+
+
 def test_mv_cannot_read_another_mv():
     """Policy: a view's sources are plain datasets. No stacking, upward."""
     catalog = _catalog()

@@ -39,6 +39,8 @@ from .exceptions import SnapshotMissingError
 from .exceptions import TagAlreadyExists
 from .exceptions import TagLimitExceeded
 from .exceptions import TagNotFound
+from .exceptions import TaskAlreadyExists
+from .exceptions import TaskNotFound
 from .exceptions import TriggerNotFound
 from .exceptions import ViewAlreadyExists
 from .exceptions import ViewNotFound
@@ -79,6 +81,13 @@ TRIGGERS_SUBCOLLECTION = "triggers"
 # stale. Tags here are never in that blast radius, and a tag write never
 # contends with a commit.
 TAGS_SUBCOLLECTION = "tags"
+
+# Tasks sit beside `datasets` and `views` under a collection, not inside a
+# dataset: a task is a named catalog object addressed as
+# `<workspace>.<collection>.<task>` by EXECUTE, exactly as a view is addressed
+# by a SELECT. Which dataset's commits FIRE a task is a separate fact, and it
+# lives where it always has - a trigger document on that dataset.
+TASKS_SUBCOLLECTION = "tasks"
 
 # Most tags one dataset may hold. A tag pins its snapshot from expiry until it
 # is dropped - nothing ages one out - so this is the only bound on how much
@@ -585,6 +594,12 @@ class OpteryxCatalog(Metastore):
 
     def _view_doc_ref(self, collection: str, view_name: str):
         return self._views_collection(collection).document(view_name)
+
+    def _tasks_collection(self, collection: str):
+        return self._collection_ref(collection).collection(TASKS_SUBCOLLECTION)
+
+    def _task_doc_ref(self, collection: str, task_name: str):
+        return self._tasks_collection(collection).document(task_name)
 
     @staticmethod
     def _delete_subcollection(coll_ref) -> None:
@@ -2152,8 +2167,16 @@ class OpteryxCatalog(Metastore):
             raise ValueError("author must be provided when creating a view")
 
         # Write statement version
-        statement_id = str(now_ms)
+        # The statement id is the millisecond it was written, so two
+        # redefinitions inside one millisecond would collide on the document id
+        # and the earlier statement would be overwritten - losing a version the
+        # sequence number still claims is there. Step forward to the first free
+        # id instead.
         stmt_coll = doc_ref.collection("statement")
+        statement_id = str(now_ms)
+        while stmt_coll.document(statement_id).get().exists:
+            now_ms += 1
+            statement_id = str(now_ms)
         stmt_coll.document(statement_id).set(
             {
                 "sql": sql,
@@ -2311,6 +2334,224 @@ class OpteryxCatalog(Metastore):
     def list_views(self, collection: str) -> Iterable[str]:
         coll = self._views_collection(collection)
         return [doc.id for doc in coll.stream()]
+
+    # ------------------------------------------------------------------
+    # Tasks
+    # ------------------------------------------------------------------
+
+    def create_task(
+        self,
+        identifier: str | tuple,
+        sql: str,
+        author: str | None = None,
+        runs_as: str | None = None,
+        description: str | None = None,
+        update_if_exists: bool = False,
+    ) -> None:
+        """Register a task: a statement the platform runs on its own.
+
+        The statement is versioned in a `statement` subcollection, the same way
+        a view's and a materialized view's are, so redefining a task keeps its
+        history rather than overwriting it.
+
+        `runs-as` is pinned on first registration and survives re-registration,
+        for the reason a view's does: the identity a task executes as is the one
+        that chose to create the standing cost, not whoever happened to edit it
+        last. `set_task_owner` is the only way to move it.
+        """
+        if author is None:
+            raise ValueError("author must be provided when creating a task")
+        if not sql or not sql.strip():
+            raise ValueError("a task requires a statement")
+
+        if isinstance(identifier, (tuple, list)):
+            collection, task_name = identifier[0], identifier[1]
+        else:
+            collection, task_name = identifier.split(".")
+
+        doc_ref = self._task_doc_ref(collection, task_name)
+        existing = doc_ref.get()
+        data = existing.to_dict() or {} if existing.exists else {}
+        if existing.exists and not update_if_exists:
+            raise TaskAlreadyExists(f"Task already exists: {collection}.{task_name}")
+
+        now_ms = int(time.time() * 1000)
+        sequence_number = 1
+        current_statement_id = data.get("statement-id")
+        if current_statement_id:
+            stmt_doc = doc_ref.collection("statement").document(str(current_statement_id)).get()
+            if stmt_doc.exists:
+                sequence_number = (stmt_doc.to_dict() or {}).get("sequence-number", 0) + 1
+
+        # The statement id is the millisecond it was written, so two
+        # redefinitions inside one millisecond would collide on the document id
+        # and the earlier statement would be overwritten - losing a version the
+        # sequence number still claims is there. Step forward to the first free
+        # id instead: the id is an identifier, not a clock reading, and a
+        # statement history that quietly drops entries is worse than one whose
+        # timestamps are a millisecond optimistic.
+        statements = doc_ref.collection("statement")
+        statement_id = str(now_ms)
+        while statements.document(statement_id).get().exists:
+            now_ms += 1
+            statement_id = str(now_ms)
+
+        statements.document(statement_id).set(
+            {
+                "sql": sql,
+                "timestamp-ms": now_ms,
+                "author": author,
+                "sequence-number": sequence_number,
+            }
+        )
+
+        doc_ref.set(
+            {
+                "name": task_name,
+                "statement-id": statement_id,
+                # Pinned, as a materialized view's is.
+                "runs-as": data.get("runs-as") or runs_as or author,
+                "description": description if description is not None else data.get("description"),
+                "created-by": data.get("created-by") or author,
+                "created-at-ms": data.get("created-at-ms") or now_ms,
+                "suspended-at-ms": data.get("suspended-at-ms"),
+                "suspended-by": data.get("suspended-by"),
+                "last-fired-at-ms": data.get("last-fired-at-ms"),
+                "last-fired-status": data.get("last-fired-status"),
+                # The `current_version` of the last run that succeeded. Not a
+                # consumer offset - nothing reads it to decide a window - but the
+                # breadcrumb that makes a MISSED window detectable: a firing whose
+                # parent_version does not meet this has a gap behind it.
+                "last-window-to": data.get("last-window-to"),
+            }
+        )
+
+        emit_audit(
+            "update_task" if existing.exists else "create_task",
+            resource_type=ResourceType.DATASET,
+            workspace=self.workspace,
+            collection=collection,
+            resource=task_name,
+            author=author,
+            statement_id=statement_id,
+            runs_as=data.get("runs-as") or runs_as or author,
+        )
+
+    def get_task(self, identifier: str | tuple) -> dict:
+        """The task's registration record, including its current statement.
+
+        `runs-as` is the pinned identity the task executes as;
+        `last-updated-by`/`last-updated-at-ms` describe who last changed the
+        statement, which is a different question and often a different person.
+        """
+        if isinstance(identifier, (tuple, list)):
+            collection, task_name = identifier[0], identifier[1]
+        else:
+            parts = identifier.split(".")
+            if len(parts) != 2:
+                raise TaskNotFound(f"Task not found: {identifier}")
+            collection, task_name = parts
+
+        doc_ref = self._task_doc_ref(collection, task_name)
+        doc = doc_ref.get()
+        if not doc.exists:
+            raise TaskNotFound(f"Task not found: {collection}.{task_name}")
+        data = doc.to_dict() or {}
+
+        statement_id = data.get("statement-id")
+        sql = None
+        last_updated_by = None
+        last_updated_at_ms = None
+        if statement_id:
+            statement = (
+                doc_ref.collection("statement").document(str(statement_id)).get().to_dict() or {}
+            )
+            sql = statement.get("sql")
+            last_updated_by = statement.get("author")
+            last_updated_at_ms = statement.get("timestamp-ms")
+
+        return {
+            "identifier": f"{self.workspace}.{collection}.{task_name}",
+            "name": task_name,
+            "collection": collection,
+            "workspace": self.workspace,
+            "sql": sql,
+            "statement-id": statement_id,
+            "runs-as": data.get("runs-as"),
+            "description": data.get("description"),
+            "created-by": data.get("created-by"),
+            "created-at-ms": data.get("created-at-ms"),
+            # Who last changed the STATEMENT, which is a different question from
+            # who created the task and often a different person.
+            "last-updated-by": last_updated_by,
+            "last-updated-at-ms": last_updated_at_ms,
+            "suspended-at-ms": data.get("suspended-at-ms"),
+            "suspended-by": data.get("suspended-by"),
+            "last-fired-at-ms": data.get("last-fired-at-ms"),
+            "last-fired-status": data.get("last-fired-status"),
+            "last-window-to": data.get("last-window-to"),
+        }
+
+    def list_tasks(self, collection: str) -> list:
+        return [doc.id for doc in self._tasks_collection(collection).stream()]
+
+    def drop_task(self, identifier: str | tuple, author: str | None = None) -> None:
+        """Drop a task. A task owns no storage, so nothing is reclaimed.
+
+        Triggers that fire it are NOT swept here: a trigger lives on the dataset
+        that fires it, and reaching across to delete other datasets' documents
+        from a drop is how a partial failure leaves a dataset with a trigger
+        nobody can see. `fire_tasks` treats a trigger whose task is gone as a
+        failure it reports, which is recoverable; a silently half-dropped
+        trigger is not.
+        """
+        if not author:
+            raise ValueError("author must be provided when dropping a task")
+        if isinstance(identifier, (tuple, list)):
+            collection, task_name = identifier[0], identifier[1]
+        else:
+            collection, task_name = identifier.split(".")
+
+        doc_ref = self._task_doc_ref(collection, task_name)
+        if not doc_ref.get().exists:
+            return
+
+        self._delete_subcollection(doc_ref.collection("statement"))
+        doc_ref.delete()
+
+        emit_audit(
+            "drop_task",
+            resource_type=ResourceType.DATASET,
+            workspace=self.workspace,
+            collection=collection,
+            resource=task_name,
+            author=author,
+        )
+
+    def mark_task_fired(
+        self,
+        identifier: str | tuple,
+        status: str,
+        window_to: int | None = None,
+    ) -> None:
+        """Stamp a task's last-fired fields, and its window breadcrumb on success.
+
+        `window_to` is recorded ONLY when the run succeeded: a failed run
+        consumed nothing, and advancing the breadcrumb past it would hide the
+        very gap the breadcrumb exists to expose.
+        """
+        if isinstance(identifier, (tuple, list)):
+            collection, task_name = identifier[0], identifier[1]
+        else:
+            collection, task_name = identifier.split(".")
+
+        update = {
+            "last-fired-at-ms": int(time.time() * 1000),
+            "last-fired-status": status,
+        }
+        if window_to is not None:
+            update["last-window-to"] = window_to
+        self._task_doc_ref(collection, task_name).update(update)
 
     def view_exists(
         self, identifier_or_collection: str | tuple, view_name: str | None = None
@@ -2476,10 +2717,11 @@ class OpteryxCatalog(Metastore):
         self,
         dataset_identifier: str,
         name: str,
-        target_view: str,
+        target_view: str | None = None,
         statement_id: str | None = None,
         author: str | None = None,
         kind: str = MV_REFRESH_TRIGGER_KIND,
+        target_task: str | None = None,
     ) -> None:
         """Attach a trigger to a dataset.
 
@@ -2504,15 +2746,28 @@ class OpteryxCatalog(Metastore):
         if not self._dataset_doc_ref(collection, dataset_name).get().exists:
             raise DatasetNotFound(f"Dataset not found: {collection}.{dataset_name}")
 
-        target_view = self._qualify(target_view)
+        # Which field names the target depends on what the trigger runs. Both are
+        # written - one of them None - so a reader never has to know the kind to
+        # find the field, and a trigger can never carry two targets at once.
+        if target_task is not None:
+            if target_view is not None:
+                raise ValueError("a trigger targets a view or a task, never both")
+            target_task = self._qualify(target_task)
+            target, target_field = target_task, "target-task"
+        else:
+            if target_view is None:
+                raise ValueError("a trigger requires a target")
+            target_view = self._qualify(target_view)
+            target, target_field = target_view, "target-view"
+
         trigger_ref = self._triggers_collection(collection, dataset_name).document(name)
         existing = trigger_ref.get()
         if existing.exists:
-            claimed = (existing.to_dict() or {}).get("target-view")
-            if claimed and claimed != target_view:
+            claimed = (existing.to_dict() or {}).get(target_field)
+            if claimed and claimed != target:
                 raise MaterializedViewError(
                     f"trigger {name} on {collection}.{dataset_name} already refreshes "
-                    f"{claimed}; refusing to repoint it at {target_view}"
+                    f"{claimed}; refusing to repoint it at {target}"
                 )
 
         trigger_ref.set(
@@ -2520,6 +2775,7 @@ class OpteryxCatalog(Metastore):
                 "name": name,
                 "kind": kind,
                 "target-view": target_view,
+                "target-task": target_task,
                 "statement-id": statement_id,
                 "created-by": author,
                 "created-at-ms": int(time.time() * 1000),
@@ -2537,7 +2793,7 @@ class OpteryxCatalog(Metastore):
             author=author,
             trigger=name,
             kind=kind,
-            target_view=target_view,
+            target=target,
         )
 
     def drop_trigger(
@@ -3008,8 +3264,17 @@ class OpteryxCatalog(Metastore):
             stmt_doc = doc_ref.collection("statement").document(str(current_statement_id)).get()
             if stmt_doc.exists:
                 sequence_number = (stmt_doc.to_dict() or {}).get("sequence-number", 0) + 1
+        # The statement id is the millisecond it was written, so two
+        # redefinitions inside one millisecond would collide on the document id
+        # and the earlier statement would be overwritten - losing a version the
+        # sequence number still claims is there. Step forward to the first free
+        # id instead.
+        statements = doc_ref.collection("statement")
         statement_id = str(now_ms)
-        doc_ref.collection("statement").document(statement_id).set(
+        while statements.document(statement_id).get().exists:
+            now_ms += 1
+            statement_id = str(now_ms)
+        statements.document(statement_id).set(
             {
                 "sql": sql,
                 "timestamp-ms": now_ms,

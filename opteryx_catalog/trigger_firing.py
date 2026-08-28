@@ -60,6 +60,29 @@ from .audit import write_audit_record
 from .exceptions import EgressRestricted
 from .exceptions import MaterializedViewError
 from .exceptions import MaterializedViewOwnerMissing
+from .exceptions import TaskError
+from .exceptions import TaskOwnerMissing
+
+# Trigger kind for a task run. The MV refresh kind is still spelled inline where
+# it is matched; it becomes a task in the next phase, at which point one kind is
+# left and this constant is the only one.
+TASK_TRIGGER_KIND = "task"
+
+# The `parent_version` bound for a dataset's FIRST commit, which has no parent.
+# The window is then everything up to and including that commit, so this only
+# has to sit below every real snapshot id - those are millisecond timestamps,
+# so 1 is comfortably beneath all of them.
+#
+# NOT 0, which the engine reserves: `VERSION AS OF 0` is the rewriter's sentinel
+# for `VERSION AS OF PREVIOUS`, resolved against the chain as it stands WHEN THE
+# QUERY RUNS. Binding 0 into a task that time-travels on `:parent_version` would
+# quietly restore the very race this design exists to remove - and quietly is
+# the operative word, because the rewriter's refusal of a literal 0 happens on
+# the SQL text, before parsing, while binding happens after it. 1 is not a
+# sentinel: in a predicate it admits everything, and in a time-travel clause it
+# names a snapshot that does not exist and fails loudly, which is the truth -
+# a first commit has no predecessor to travel to.
+NO_PARENT_VERSION_FLOOR = 1
 
 # Bounds one HTTP call - minting a token, or submitting one refresh - not the
 # refresh itself, which jobs runs asynchronously long after this returns.
@@ -223,6 +246,65 @@ def _jobs_url() -> str:
     return os.environ.get("JOBS_URL", "https://jobs.opteryx.app")
 
 
+def _post_job(payload: dict) -> dict:
+    """POST one job submission to jobs as federator, and return its body.
+
+    The transport only. What is submitted, and what a given response means, stay
+    with each caller: a refresh reads `SKIPPED` as the read gate declining it,
+    which is a decision particular to views and not something a task shares.
+    """
+    request = urllib.request.Request(
+        f"{_jobs_url()}/api/v1/jobs",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {_federator_token()}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _submit_task_job(
+    catalog,
+    *,
+    sql_text: str,
+    source_dataset: str,
+    trigger_name: str,
+    target_task: str,
+    snapshot_id: Any | None,
+    fired_by: str | None,
+) -> tuple[str, str]:
+    """Submit one task run to jobs. Returns `(execution_id, outcome)`.
+
+    Like the refresh path, the payload is the statement plus provenance and
+    nothing more. `EXECUTE <task> USING ...` is self-identifying - it names a
+    catalog object - so jobs resolves the task's pinned `runs-as`, that
+    principal's policies and billing account, and routes the work, none of which
+    this library asserts. A submission that could name the actor or the payer
+    is one that could name them wrongly.
+    """
+    payload = {
+        "sql_text": sql_text,
+        "client_info": {
+            "trigger": {
+                "source_dataset": source_dataset,
+                "trigger_name": trigger_name,
+                "target_task": target_task,
+                "snapshot_id": snapshot_id,
+                "fired_by": fired_by,
+            }
+        },
+    }
+    body = _post_job(payload)
+
+    execution_id = body.get("execution_id")
+    if not execution_id:
+        raise TaskError(f"jobs accepted the run of {target_task} but returned no execution_id")
+    return execution_id, "enqueued"
+
+
 def _submit_refresh_job(
     catalog,
     *,
@@ -260,17 +342,7 @@ def _submit_refresh_job(
             }
         },
     }
-    request = urllib.request.Request(
-        f"{_jobs_url()}/api/v1/jobs",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {_federator_token()}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
-    with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
-        body = json.loads(response.read().decode("utf-8"))
+    body = _post_job(payload)
 
     # jobs may decline the refresh outright: its read gate skips a view nobody
     # has read since the last refresh. That is a decision, not a failure - the
@@ -394,11 +466,104 @@ def _fire_refresh(
     )
 
 
+def _fire_task(
+    catalog,
+    dataset_identifier: str,
+    trigger: dict,
+    author: str | None,
+    snapshot_id: Any | None,
+    parent_snapshot_id: Any | None,
+) -> None:
+    """Enqueue one task run for the commit that just landed.
+
+    The window is bound HERE, at fire time, as the committing snapshot and its
+    parent - not left to resolve when a worker picks the job up. Execution is
+    asynchronous, so a relative window (`VERSION AS OF PREVIOUS`) would mean
+    whatever the snapshot chain looked like minutes later: with two commits in
+    flight, one window is processed twice and another never, silently. Bound
+    boundaries make a run's window exactly the commit that fired it, however
+    late it runs, and replayable afterwards by naming the same two versions.
+
+    Because the window is a snapshot and its own parent it spans exactly one
+    commit, so a compaction can only ever be one of its endpoints - never
+    something inside it whose rewritten files would read as new rows.
+    """
+    target_task = trigger["target-task"]
+    task = catalog.get_task(target_task)
+
+    # A task with no statement can never run; found here so it lands in the
+    # audit log beside the commit that tried, rather than as a job failure
+    # nobody is watching.
+    if not task.get("sql"):
+        raise TaskError(f"task has no statement recorded: {target_task}")
+
+    # Suspended by an operator. Not an error and not alerted - the trigger still
+    # records that it fired and why nothing came of it, so the suppression is
+    # visible where someone looks for the task's staleness.
+    if task.get("suspended-at-ms"):
+        catalog.mark_trigger_fired(dataset_identifier, trigger["name"], status="suspended")
+        return
+
+    # The identity the task runs as, never the committer's - see `_fire_refresh`
+    # for why a missing one is refused rather than defaulted.
+    runs_as = task.get("runs-as")
+    if not runs_as:
+        catalog.mark_trigger_fired(dataset_identifier, trigger["name"], status="owner-missing")
+        raise TaskOwnerMissing(
+            f"task {target_task} has no runs-as identity; refusing to run it as the "
+            "committing user."
+        )
+
+    # A dataset's first commit has no parent; the window is then everything up
+    # to and including it. Skipping instead would silently drop the rows of the
+    # very first commit - and provisioning a task before any data lands is the
+    # normal order, so that case is reached in practice, not in theory.
+    # See NO_PARENT_VERSION_FLOOR for why this is emphatically not 0.
+    parent_version = (
+        NO_PARENT_VERSION_FLOOR if parent_snapshot_id is None else int(parent_snapshot_id)
+    )
+
+    # Both versions are integers off the catalog's own records, coerced here so
+    # nothing but a number can reach the statement text.
+    sql_text = (
+        f"EXECUTE {task['identifier']} "
+        f"USING {parent_version} AS parent_version, "
+        f"{int(snapshot_id)} AS current_version"
+    )
+
+    execution_id, outcome = _submit_task_job(
+        catalog,
+        sql_text=sql_text,
+        source_dataset=dataset_identifier,
+        trigger_name=trigger["name"],
+        target_task=target_task,
+        snapshot_id=snapshot_id,
+        fired_by=author,
+    )
+    catalog.mark_trigger_fired(dataset_identifier, trigger["name"], status=outcome)
+
+    write_audit_record(
+        {
+            "event": "task.fired",
+            "workspace": getattr(catalog, "workspace", None),
+            "dataset": dataset_identifier,
+            "trigger": trigger["name"],
+            "target_task": target_task,
+            "parent_version": parent_version,
+            "current_version": snapshot_id,
+            "execution_id": execution_id,
+            "outcome": outcome,
+            "author": author,
+        }
+    )
+
+
 def fire_triggers(
     catalog,
     dataset_identifier: str,
     author: str | None,
     snapshot_id: Any | None = None,
+    parent_snapshot_id: Any | None = None,
 ) -> None:
     """Fire every refresh trigger on a dataset that just took a user commit.
 
@@ -422,18 +587,30 @@ def fire_triggers(
 
     seen_targets = set()
     for trigger in triggers:
-        if trigger.get("kind") != "materialized_view_refresh":
+        kind = trigger.get("kind")
+        if kind == "materialized_view_refresh":
+            target_view = trigger.get("target-view")
+            fire = lambda: _fire_refresh(  # noqa: E731
+                catalog, dataset_identifier, trigger, author, snapshot_id
+            )
+            note = "materialized view refresh NOT enqueued - the view is going stale"
+        elif kind == TASK_TRIGGER_KIND:
+            target_view = trigger.get("target-task")
+            fire = lambda: _fire_task(  # noqa: E731
+                catalog, dataset_identifier, trigger, author, snapshot_id, parent_snapshot_id
+            )
+            note = "task NOT enqueued - its output is going stale"
+        else:
             continue
-        target_view = trigger.get("target-view")
         if not target_view or target_view in seen_targets:
             continue
         seen_targets.add(target_view)
         try:
-            _fire_refresh(catalog, dataset_identifier, trigger, author, snapshot_id)
+            fire()
         except Exception as exc:  # noqa: BLE001 - commit path must survive
             _alert(
                 exc,
-                note="materialized view refresh NOT enqueued - the view is going stale",
+                note=note,
                 fingerprint=("trigger-fire-failed", dataset_identifier, trigger.get("name")),
                 context={
                     "dataset": dataset_identifier,

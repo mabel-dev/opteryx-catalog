@@ -112,6 +112,29 @@ class TriggerNotFound(KeyError, CatalogError):
     pass
 
 
+class TaskError(KeyError, CatalogError):
+    """A task registration or lookup that cannot proceed."""
+
+
+class TaskAlreadyExists(TaskError):
+    pass
+
+
+class TaskNotFound(TaskError):
+    pass
+
+
+class TaskOwnerMissing(TaskError):
+    """The task has no `runs-as` identity recorded.
+
+    Refused rather than defaulted to whoever fired it: defaulting silently
+    reinstates invoker semantics, so a field lost by some unrelated write
+    reappears later as a baffling permission denial - or, if the committer
+    happens to be privileged, as a task running with authority it never had.
+    Mirrors `MaterializedViewOwnerMissing`.
+    """
+
+
 class TagError(CatalogError):
     """Base for snapshot-tag failures."""
 
