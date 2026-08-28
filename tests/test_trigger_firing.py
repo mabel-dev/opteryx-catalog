@@ -284,7 +284,15 @@ def test_after_commit_fires_for_user_snapshots():
     dataset = _dataset_with_catalog()
     with patch.object(trigger_firing, "fire_triggers") as fire:
         dataset._after_commit("alice", _snapshot(user_created=True))
-    fire.assert_called_once_with(dataset.catalog, "src.a", author="alice", snapshot_id=123)
+    # The parent is threaded through as well: a task's window is this commit and
+    # the one before it, bound now rather than resolved when the job runs.
+    fire.assert_called_once_with(
+        dataset.catalog,
+        "src.a",
+        author="alice",
+        snapshot_id=123,
+        parent_snapshot_id=None,
+    )
 
 
 def test_after_commit_skips_housekeeping_snapshots():

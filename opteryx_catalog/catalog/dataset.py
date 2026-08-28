@@ -864,6 +864,9 @@ class SimpleDataset(Dataset):
                 self.identifier,
                 author=author,
                 snapshot_id=snapshot.snapshot_id,
+                # A task's window is this commit and the one before it, bound at
+                # fire time rather than resolved when the job runs.
+                parent_snapshot_id=snapshot.parent_snapshot_id,
             )
         except Exception as exc:  # noqa: BLE001 - the commit already landed
             _alert(
