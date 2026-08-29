@@ -12,6 +12,8 @@ dataset takes its relationships with it for free.
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from opteryx_catalog.exceptions import ConstraintNotFound
@@ -75,6 +77,14 @@ class _Collection:
         return [ref.get() for ref in self._docs.values() if ref._exists]
 
 
+# An unquoted Firestore property path must match this; anything else has to be
+# backtick-quoted. Every field this catalog stores is hyphenated, so a query
+# against one is rejected unless it is quoted -- which real Firestore enforces
+# and a fake that just does dict lookups does not. Reproduced here because it
+# was found in production, by a write, after the tests were green.
+_UNQUOTED_PROPERTY_PATH = re.compile(r"^[a-zA-Z_][a-zA-Z_0-9]*$")
+
+
 class _Query:
     """A collection group query: every document in every collection of that
     name, narrowed by equality filters."""
@@ -84,13 +94,22 @@ class _Query:
         self._filters = list(filters)
 
     def where(self, filter=None):
+        path = filter.field_path
+        if path.startswith("`"):
+            if not path.endswith("`") or len(path) < 3:
+                raise ValueError(f"Invalid quoted property path {path!r}")
+        elif not _UNQUOTED_PROPERTY_PATH.match(path):
+            raise ValueError(
+                f'Invalid property path "{path}". Unquoted property paths must match '
+                "regex ([a-zA-Z_][a-zA-Z_0-9]*)"
+            )
         return _Query(self._docs, self._filters + [filter])
 
     def stream(self):
         out = []
         for doc in self._docs:
             data = doc.to_dict()
-            if all(data.get(f.field_path) == f.value for f in self._filters):
+            if all(data.get(f.field_path.strip("`")) == f.value for f in self._filters):
                 out.append(doc)
         return out
 
