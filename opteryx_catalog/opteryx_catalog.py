@@ -3107,15 +3107,22 @@ class OpteryxCatalog(Metastore):
         (references-workspace, references-collection, references-dataset).
         Collection-group scope is not automatic; until the index exists Firestore
         refuses the query outright rather than answering it slowly.
+
+        THE BACKTICKS ARE LOAD-BEARING. Every field this catalog stores is
+        hyphenated (`created-by`, `target-view`, and these), which is fine until
+        one is used in a QUERY: an unquoted Firestore property path must match
+        `[a-zA-Z_][a-zA-Z_0-9]*`, so a bare "references-workspace" is rejected
+        outright with InvalidArgument. Quoting is the documented escape and
+        changes nothing about how the field is stored.
         """
         from google.cloud.firestore_v1 import FieldFilter
 
         collection, dataset_name = self._local_parts(dataset_identifier)
         query = (
             self.firestore_client.collection_group(RELATIONSHIPS_SUBCOLLECTION)
-            .where(filter=FieldFilter("references-workspace", "==", self.workspace))
-            .where(filter=FieldFilter("references-collection", "==", collection))
-            .where(filter=FieldFilter("references-dataset", "==", dataset_name))
+            .where(filter=FieldFilter("`references-workspace`", "==", self.workspace))
+            .where(filter=FieldFilter("`references-collection`", "==", collection))
+            .where(filter=FieldFilter("`references-dataset`", "==", dataset_name))
         )
         results = []
         for doc in query.stream():
