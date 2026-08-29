@@ -35,6 +35,7 @@ from .exceptions import DatasetLocked
 from .exceptions import DatasetNotFound
 from .exceptions import EgressRestricted
 from .exceptions import MaterializedViewError
+from .exceptions import SnapshotAncestryTooDeep
 from .exceptions import SnapshotMissingError
 from .exceptions import TagAlreadyExists
 from .exceptions import TagLimitExceeded
@@ -93,6 +94,36 @@ TASKS_SUBCOLLECTION = "tasks"
 # is dropped - nothing ages one out - so this is the only bound on how much
 # history a single dataset can hold alive, and every byte of it is charged.
 MAX_TAGS_PER_DATASET = 100
+
+# Tag names nobody may take, because they name the head or the version behind
+# it. A tag is IMMUTABLE, so `current` as a real tag would stop meaning "the
+# head" from the moment it was created and would keep the word working while
+# quietly returning a frozen snapshot - the one failure mode a time-travel read
+# must not have. Compared against the NORMALIZED (lowercase) name.
+#
+# `current` and `previous` are answered by the read path and surfaced as virtual
+# tags (see `virtual_tags`). `last` and `head` are not answered by anything: they
+# are reserved because they are what a person reaches for when they mean the
+# pointer, and a real tag holding one of those words would answer a
+# pointer-shaped question with a snapshot frozen at the moment it was created.
+# Reserving a word costs nothing; taking it back after someone has scripted
+# against it costs a migration.
+RESERVED_TAG_NAMES = frozenset({"current", "previous", "last", "head"})
+
+# Names the read path USED to answer and no longer does. `latest` was renamed to
+# `current`; the rename is a hard cutover, so `VERSION AS OF latest` must fail.
+#
+# Retired is not the same as free. If `latest` were merely dropped from the
+# reserved set, the first person to create a tag by that name would make the old
+# spelling resolve again - to one frozen snapshot, forever. That is a silent
+# wrong answer where the cutover promised a loud failure, so the word stays
+# unavailable and the error says why.
+RETIRED_TAG_NAMES = frozenset({"latest"})
+
+# Reserved names the read path resolves to a real snapshot, and which are shown
+# alongside real tags in a snapshot listing. Both are RESERVED, so no stored tag
+# can ever collide with one.
+VIRTUAL_TAG_NAMES = ("current", "previous")
 
 # A tag name is a SQL identifier: a letter, then letters, digits or
 # underscores. No dots (they are the catalog's own separator) and no hyphens.
@@ -382,6 +413,28 @@ _SNAPSHOT_SUMMARY_KEYS = (
     "total-files-size",
     "total-records",
 )
+
+
+def _virtual_tag_row(name: str, snapshot_id: int, comment: str) -> dict:
+    """A computed tag in the same shape `list_tags` returns for a stored one.
+
+    Carries the keys a consumer reads off a real tag, so a listing can hold both
+    kinds without special-casing every field access, plus `virtual: True` for the
+    one thing that must never be confused: these are not stored, cannot be
+    dropped, and pin nothing against expiry.
+
+    `created-by` and `created-at-ms` are explicitly None rather than absent -
+    nobody created these, and the honest answer to "who made this tag?" is
+    nobody, not a missing key that reads as a lost value.
+    """
+    return {
+        "name": name,
+        "snapshot-id": int(snapshot_id),
+        "virtual": True,
+        "created-by": None,
+        "created-at-ms": None,
+        "comment": comment,
+    }
 
 
 def _snapshot_to_document(snapshot: Snapshot) -> dict:
@@ -894,7 +947,7 @@ class OpteryxCatalog(Metastore):
         # sort-orders above: save_dataset_metadata writes 'maintenance-policy'
         # but nothing read it back, so every dataset presented the class
         # default of {'retained-snapshot-age-days': None} - which SnapshotExpiry
-        # reads as "keep only the latest snapshot". Retention was therefore
+        # reads as "keep only the current snapshot". Retention was therefore
         # ignored everywhere, and every expiration run condemned the entire
         # history regardless of what was configured.
         stored_maintenance_policy = data.get("maintenance-policy")
@@ -932,8 +985,25 @@ class OpteryxCatalog(Metastore):
                 if snapshot_is_tombstoned(snap_data):
                     continue
                 snaps.append(self._snapshot_from_dict(snap_data))
-            if snaps:
-                metadata.current_snapshot_id = snaps[-1].snapshot_id
+            # The HEAD comes from the dataset document's pointer (stored as
+            # `current-snapshot-id` - see
+            # DatasetMetadata.current_snapshot_id), NOT from the tail of this
+            # list. The stream arrives in Firestore document-id order, which is
+            # LEXICOGRAPHIC on the id string and only accidentally chronological;
+            # and after a `rollback` the head is deliberately not the newest
+            # snapshot at all. Taking `snaps[-1]` would silently roll a rolled-
+            # back dataset forward again the first time anything loaded its
+            # history - expiration does, on every run.
+            stored_head = data.get("current-snapshot-id")
+            if stored_head is not None and any(s.snapshot_id == stored_head for s in snaps):
+                metadata.current_snapshot_id = stored_head
+            elif snaps:
+                # No pointer recorded (a dataset older than the pointer), or one
+                # naming a snapshot that has expired out of this list. Fall back
+                # to the newest by sequence number, which IS chronological.
+                metadata.current_snapshot_id = max(
+                    snaps, key=lambda s: (s.sequence_number or 0, s.snapshot_id or 0)
+                ).snapshot_id
             metadata.snapshots = snaps
             metadata.schemas = [self._schema_entry_from_doc(s) for s in schemas_coll.stream()]
             metadata.current_schema_id = data.get("current-schema-id")
@@ -947,6 +1017,8 @@ class OpteryxCatalog(Metastore):
         # default, which is what makes a caller that needs the pins go and read
         # them rather than conclude from an empty map that nothing is pinned.
 
+        # `current-snapshot-id` is the stored key for the head pointer, and it
+        # matches the field name. See DatasetMetadata.current_snapshot_id.
         current_snap_id = data.get("current-snapshot-id")
         current_schema_id = data.get("current-schema-id")
 
@@ -2881,7 +2953,24 @@ class OpteryxCatalog(Metastore):
                 f"'{name}' is not a valid tag name. A tag name starts with a letter and "
                 "contains only letters, digits and underscores - no dots, no hyphens."
             )
-        return name.lower()
+        normalized = name.lower()
+        if normalized in RETIRED_TAG_NAMES:
+            raise ValueError(
+                f"'{normalized}' is a retired name and cannot be used for a tag. "
+                "The snapshot pointer once spelled `latest` is now `current`; use "
+                "that. The old spelling is not accepted as a tag either, because a "
+                "tag of that name would make `VERSION AS OF latest` resolve again - "
+                "to one frozen snapshot - instead of failing."
+            )
+        if normalized in RESERVED_TAG_NAMES:
+            raise ValueError(
+                f"'{normalized}' is a reserved name and cannot be used for a tag. "
+                "It names the snapshot the dataset points at now, or the version "
+                "behind it, and a tag is immutable - one holding that word would "
+                "take it over and then never move again. Reserved: "
+                f"{', '.join(sorted(RESERVED_TAG_NAMES))}."
+            )
+        return normalized
 
     def create_tag(
         self,
@@ -3032,11 +3121,16 @@ class OpteryxCatalog(Metastore):
         )
 
     def list_tags(self, dataset_identifier: str) -> list[dict]:
-        """Every tag on a dataset, as plain dicts, ordered by name.
+        """Every STORED tag on a dataset, as plain dicts, ordered by name.
 
-        One subcollection read. `SHOW SNAPSHOTS` groups these by `snapshot-id`
-        to show which snapshots are held; expiration reads the same rows to
-        know which snapshots it may not retire.
+        One subcollection read. Expiration reads these rows to know which
+        snapshots it may not retire, which makes this a protected input: every
+        row here pins its snapshot.
+
+        Stored tags only. The virtual `current` and `previous` pin nothing and
+        are not returned - see `virtual_tags`. A display listing (what
+        `SHOW SNAPSHOTS` groups by `snapshot-id`) wants both, and gets them from
+        `list_tags_for_display`.
         """
         collection, dataset_name = self._local_parts(dataset_identifier)
         tags = []
@@ -3045,6 +3139,93 @@ class OpteryxCatalog(Metastore):
             data.setdefault("name", doc.id)
             tags.append(data)
         return sorted(tags, key=lambda tag: tag["name"])
+
+    def virtual_tags(
+        self, dataset_identifier: str, dataset: SimpleDataset | None = None
+    ) -> list[dict]:
+        """`current` and `previous` as tag-shaped rows, for display beside real tags.
+
+        These are computed on every call, never stored. That is the whole point:
+        a stored tag is immutable and pins its snapshot from expiry, and both of
+        these words must instead MOVE as the dataset moves. Writing them down
+        would freeze them at the moment of writing and pin two snapshots nobody
+        asked to keep.
+
+        `previous` is the previous VERSION OF THE DATA, not the previous
+        snapshot. Compaction and statistics refresh write a new snapshot without
+        changing a single row, so the snapshot immediately behind the head is
+        very often the same data the unqualified read already returns - the
+        worst possible answer, because it looks like a successful time-travel
+        read. `SimpleDataset.previous_user_snapshot` does the skipping, and the
+        reasoning lives there.
+
+        A row is emitted only when the word resolves to a snapshot that exists.
+        `previous` is absent for a dataset with one version, and absent when the
+        version behind the current one has expired: there is no row in the
+        listing to attach it to either way, and inventing one would name a
+        snapshot the caller cannot read.
+
+        Deliberately NOT part of `list_tags`. That method is a protected input to
+        expiration - it decides what may not be deleted - and a virtual tag is
+        not a pin. Keeping them in separate methods means the retention path
+        cannot pick one up by accident.
+        """
+        if dataset is None:
+            dataset = self.load_dataset(dataset_identifier)
+
+        rows: list[dict] = []
+
+        head = dataset.metadata.current_snapshot()
+        if head is not None and head.snapshot_id is not None:
+            rows.append(
+                _virtual_tag_row(
+                    "current",
+                    head.snapshot_id,
+                    "The snapshot every unqualified read of this dataset sees.",
+                )
+            )
+
+        try:
+            previous = dataset.previous_user_snapshot()
+        except (SnapshotMissingError, SnapshotAncestryTooDeep) as exc:
+            # Neither is fatal to a listing. The first means the previous
+            # version has expired, the second that the walk gave up; in both
+            # cases there is no snapshot in this listing to label, so the row
+            # is omitted rather than the whole listing failing.
+            logger.debug(
+                "No `previous` virtual tag for %s (%s)", dataset_identifier, exc
+            )
+            previous = None
+
+        if previous is not None and previous.snapshot_id is not None:
+            rows.append(
+                _virtual_tag_row(
+                    "previous",
+                    previous.snapshot_id,
+                    "The version of the data before the current one. Compaction and "
+                    "statistics refresh are skipped - they rewrite files without "
+                    "changing rows.",
+                )
+            )
+
+        return rows
+
+    def list_tags_for_display(
+        self, dataset_identifier: str, dataset: SimpleDataset | None = None
+    ) -> list[dict]:
+        """Every tag on a dataset as a viewer should see it: virtual, then real.
+
+        What `SHOW SNAPSHOTS` groups by `snapshot-id`. Virtual tags lead because
+        they are the two rows a reader is looking for - where the dataset is now
+        and what it was before - and real tags follow by name, as `list_tags`
+        orders them.
+
+        Nothing here may be passed to expiration: `virtual` rows are not pins.
+        Use `list_tags` for that.
+        """
+        return self.virtual_tags(dataset_identifier, dataset=dataset) + self.list_tags(
+            dataset_identifier
+        )
 
     def resolve_tag(self, dataset_identifier: str, name: str) -> int:
         """The snapshot id a tag names.
@@ -3067,6 +3248,139 @@ class OpteryxCatalog(Metastore):
                 f"Tag {tag_name} on {collection}.{dataset_name} names no snapshot."
             )
         return int(snapshot_id)
+
+    # ------------------------------------------------------------------
+    # Rollback
+    # ------------------------------------------------------------------
+
+    def rollback_dataset(
+        self,
+        dataset_identifier: str,
+        snapshot_id: int,
+        author: str | None = None,
+    ) -> dict:
+        """Move the head to an existing snapshot - what a rollback is.
+
+        Every unqualified read of a dataset sees the snapshot the head points
+        at, so pointing it at an older one restores that version of the data for
+        everybody, at once, without moving a single byte.
+
+        Nothing is deleted and nothing is rewritten. The snapshots this moves
+        OFF stay live: they keep their documents, their manifests and their data
+        files, they still appear in `SHOW SNAPSHOTS`, and they can still be read
+        by id - so a rollback is itself reversible, by rolling forward to the id
+        it moved off. That id is in the returned record, because it is the only
+        thing the caller needs to undo this and nothing else records it.
+
+        What it does NOT do is protect those snapshots. Ordinary retention still
+        applies to them, and once they age out they expire like any other
+        snapshot - after which the rollback can no longer be undone. A rollback
+        somebody may want to reverse later should be preceded by a tag, which is
+        the mechanism that pins a snapshot indefinitely.
+
+        The head moves with the schema pointer, not on its own: a dataset whose
+        data is at yesterday's snapshot but which still advertises today's
+        schema describes columns its files do not have, and the next append
+        would be built against that schema.
+
+        The check and the move are ONE transaction, conditional on the head
+        still being where it was read. A rollback that raced a commit would
+        otherwise discard that commit silently, which is exactly the failure
+        `SnapshotRaceError` exists to prevent on the write path.
+        """
+        if not author:
+            raise ValueError("author must be provided when rolling back a dataset")
+
+        collection, dataset_name = self._local_parts(dataset_identifier)
+        doc_ref = self._dataset_doc_ref(collection, dataset_name)
+        snapshot_ref = self._snapshots_collection(collection, dataset_name).document(
+            str(int(snapshot_id))
+        )
+        qualified = f"{collection}.{dataset_name}"
+        snapshot_id = int(snapshot_id)
+
+        @firestore.transactional
+        def _rollback(transaction) -> dict:
+            # Reads before writes - Firestore refuses the other order.
+            doc = doc_ref.get(transaction=transaction)
+            snapshot_doc = snapshot_ref.get(transaction=transaction)
+
+            if not doc.exists:
+                raise DatasetNotFound(f"Dataset not found: {qualified}")
+            data = doc.to_dict() or {}
+
+            # The same per-asset guard `drop_dataset` honours: a locked dataset
+            # is one two people agreed not to change, and replacing every row in
+            # it is a change.
+            if data.get("locked-by") is not None:
+                raise DatasetLocked(f"Dataset is locked: {qualified}")
+
+            if not snapshot_doc.exists:
+                raise SnapshotMissingError(
+                    f"No snapshot {snapshot_id} for {qualified} - it may not exist, "
+                    "or may have expired."
+                )
+            snapshot_data = snapshot_doc.to_dict() or {}
+            if snapshot_is_tombstoned(snapshot_data):
+                raise SnapshotMissingError(
+                    f"Snapshot {snapshot_id} of {qualified} has expired; there is no "
+                    "longer a guarantee its data files exist, so it cannot be made "
+                    "the current snapshot."
+                )
+            if not snapshot_data.get("manifest"):
+                # A snapshot with no manifest cannot be scanned. Pointing the
+                # head at one would present the dataset as empty rather than
+                # rolled back.
+                raise SnapshotMissingError(
+                    f"Snapshot {snapshot_id} of {qualified} has no manifest and cannot "
+                    "be read; it cannot be made the current snapshot."
+                )
+
+            previous_head = data.get("current-snapshot-id")
+            if previous_head == snapshot_id:
+                # Already there. Not an error - a rollback that has to be
+                # retried should be safe to retry - but reported honestly so
+                # the caller does not tell someone data moved when it did not.
+                return {
+                    "dataset": qualified,
+                    "snapshot-id": snapshot_id,
+                    "previous-snapshot-id": previous_head,
+                    "moved": False,
+                }
+
+            update = {
+                # The head pointer - see DatasetMetadata.current_snapshot_id.
+                "current-snapshot-id": snapshot_id,
+            }
+            schema_id = snapshot_data.get("schema-id")
+            if schema_id is not None:
+                update["current-schema-id"] = schema_id
+            transaction.update(doc_ref, update)
+
+            return {
+                "dataset": qualified,
+                "snapshot-id": snapshot_id,
+                "previous-snapshot-id": previous_head,
+                "moved": True,
+            }
+
+        record = _rollback(self.firestore_client.transaction())
+
+        # The id-keyed snapshot cache is safe across this (snapshot documents
+        # are write-once), but a dataset object already held by this process has
+        # the OLD pointer in memory, and nothing here can reach it.
+        emit_audit(
+            "rollback_dataset",
+            resource_type=ResourceType.DATASET,
+            workspace=self.workspace,
+            collection=collection,
+            resource=dataset_name,
+            author=author,
+            snapshot_id=snapshot_id,
+            previous_snapshot_id=record["previous-snapshot-id"],
+            moved=record["moved"],
+        )
+        return record
 
     # ------------------------------------------------------------------
     # Materialized views
@@ -4184,6 +4498,7 @@ class OpteryxCatalog(Metastore):
                 "properties": metadata.properties,
                 "format-version": metadata.format_version,
                 "annotations": metadata.annotations,
+                # The head pointer - see DatasetMetadata.current_snapshot_id.
                 "current-snapshot-id": metadata.current_snapshot_id,
                 "current-schema-id": metadata.current_schema_id,
                 "timestamp-ms": metadata.timestamp_ms,

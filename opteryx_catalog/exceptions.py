@@ -486,6 +486,22 @@ class InvalidCatalogBinding(ValueError, CatalogError):
     """
 
 
+class SnapshotAncestryTooDeep(CatalogError):
+    """A walk back through a snapshot's ancestors ran past its bound.
+
+    `previous_user_snapshot` answers "the previous version of the DATA" by
+    walking the parent chain past the maintenance commits (compaction,
+    statistics refresh) that sit between two things a user did. That walk is
+    bounded: each hop can be a document read, and an unbounded one on a dataset
+    with a pathological chain would turn a single interactive query into
+    thousands of reads.
+
+    Raised rather than answered with None, because None means "there is no
+    previous version" - a different fact, and one that would send a reader
+    looking for data that is actually there.
+    """
+
+
 class SnapshotRaceError(CatalogError):
     """Raised when a commit's parent snapshot is no longer the dataset's current one.
 

@@ -526,3 +526,48 @@ def test_an_unreadable_tag_list_stops_expiration_rather_than_deleting():
         expirer.expire_dataset("reports.monthly", dry_run=False)
 
     assert "ran" not in captured, "expiration proceeded without knowing what was tagged"
+
+
+# --- reserved names ------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "current",
+        "CURRENT",
+        "Current",
+        "previous",
+        "PREVIOUS",
+        "last",
+        "LAST",
+        "head",
+        "HEAD",
+    ],
+)
+def test_reserved_names_cannot_be_taken_by_a_tag(name):
+    """Words that name the head, or the version behind it, are not tag names.
+
+    A tag is immutable. One named `current` would stop meaning "the head" the
+    instant it was created, while `VERSION AS OF current` kept resolving - and
+    would then return the same frozen snapshot forever.
+
+    `last` and `head` resolve to nothing today. They are reserved because they
+    are what a person reaches for when they mean the pointer, and a word is
+    cheap to hold and expensive to take back once someone has scripted with it.
+    """
+    with pytest.raises(ValueError):
+        OpteryxCatalog.normalize_tag_name(name)
+
+
+@pytest.mark.parametrize("name", ["latest", "LATEST", "Latest"])
+def test_retired_name_latest_cannot_be_taken_by_a_tag(name):
+    """`latest` was renamed to `current`, and the old spelling stays unavailable.
+
+    The rename is a hard cutover: `VERSION AS OF latest` must fail rather than
+    resolve. Letting a real tag claim the word would make it resolve again - to
+    one frozen snapshot, forever - which is the silent fall-through the cutover
+    exists to prevent.
+    """
+    with pytest.raises(ValueError, match="retired"):
+        OpteryxCatalog.normalize_tag_name(name)

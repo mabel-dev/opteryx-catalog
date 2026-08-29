@@ -247,7 +247,8 @@ than fail — reapply the positions against the new manifest, and abort only if 
 file is gone. Compaction gets the reciprocal check: if any input file gained deletes
 since the pass started, abort the pass (it is a scheduled job; the next pass picks it
 up). Doing this properly argues for a real CAS on the dataset document — a Firestore
-transaction asserting `current-snapshot-id` — which is worth doing regardless of MOR.
+transaction asserting `current-snapshot-id` (the stored key for the head) — which
+is worth doing regardless of MOR.
 
 ## 5. Read path (opteryx-core)
 
