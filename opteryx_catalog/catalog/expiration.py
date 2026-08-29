@@ -40,6 +40,7 @@ import time
 from ..alerts import report as _alert
 from ..exceptions import ManifestProtectionError
 from .dataset import select_last_user_snapshot
+from .dataset import visible_history
 from .metadata import SNAPSHOT_EXPIRED_AT_KEY
 from .metadata import Snapshot
 from .metadata import snapshot_is_tombstoned
@@ -166,7 +167,7 @@ class SnapshotExpiration:
         Apply retention policy to a single dataset.
 
         Keeps snapshots based on age. Null or missing value means keep only
-        the current (latest) snapshot - data is unversioned.
+        the current snapshot - data is unversioned.
 
         `dry_run` is required and keyword-only. It used to default to False, so
         the destructive behaviour was what you got by omitting it; a caller had
@@ -270,10 +271,18 @@ class SnapshotExpiration:
             if not snapshots:
                 return None
 
+            # The HEAD, from the dataset's pointer - NOT `snapshots[-1]`. That
+            # list arrives in Firestore document-id order, which is lexicographic
+            # on the id string and only accidentally chronological; and after a
+            # `rollback` the head is deliberately not the newest snapshot at all.
+            # Expiring the head is expiring the data every reader sees, so this
+            # is the one snapshot that must be identified exactly.
+            current = dataset.metadata.current_snapshot() or snapshots[-1]
+
             # Determine which snapshots to keep
             if retention_days is None or retention_days == 0:
-                # Keep only current (latest) snapshot - unversioned
-                snapshots_to_keep = [snapshots[-1]]  # Last snapshot only
+                # Keep only the current snapshot - unversioned
+                snapshots_to_keep = [current]
             elif retention_days < 0:
                 # Negative means unlimited retention
                 return None
@@ -287,11 +296,11 @@ class SnapshotExpiration:
                 ]
 
                 # Always keep at least the current snapshot
-                if snapshots[-1] not in snapshots_to_keep:
-                    snapshots_to_keep.append(snapshots[-1])
+                if current not in snapshots_to_keep:
+                    snapshots_to_keep.append(current)
 
             # A tagged snapshot is never an expiry candidate, in EITHER branch
-            # above - including the "keep only the latest" one, where a tag is
+            # above - including the "keep only the current" one, where a tag is
             # the only thing standing between a snapshot and immediate
             # condemnation. The pin does not weaken with age and no retention
             # setting reaches past it: a tag is held until it is dropped.
@@ -332,10 +341,16 @@ class SnapshotExpiration:
             # automatically forever would otherwise pin its very first
             # snapshot, and everything it references, in storage for good. A
             # user commit buried deeper than that window is allowed to
-            # expire, leaving the latest snapshot (already retained above) as
+            # expire, leaving the current snapshot (already retained above) as
             # what the UI shows. An imperfect trade, chosen deliberately.
+            # Ranked over the HEAD's own line of descent only. A rollback
+            # leaves the snapshots it moved off live, and protecting one of
+            # those would pin the version the dataset's owner has just retired -
+            # while leaving the user commit the head actually rests on
+            # unprotected, which is the one this exists to keep.
             protected_user_snapshot = select_last_user_snapshot(
-                snapshots, lookback=USER_SNAPSHOT_LOOKBACK
+                visible_history(current, snapshots),
+                lookback=USER_SNAPSHOT_LOOKBACK,
             )
             if (
                 protected_user_snapshot is not None

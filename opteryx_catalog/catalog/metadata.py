@@ -80,6 +80,20 @@ class DatasetMetadata:
     )
     # Compaction policy lives under maintenance_policy as 'compaction-policy'
     snapshots: list[Snapshot] = field(default_factory=list)
+    # The HEAD: the snapshot an unqualified read sees. Called "current"
+    # everywhere the word is written by hand - in code, in SQL, in messages -
+    # and stored under the matching key, `current-snapshot-id`.
+    #
+    # "current" rather than "latest" because the pointer makes no claim about
+    # recency, and "latest" asserted one it cannot keep. It is the same word
+    # the rest of the field uses for this pointer: Iceberg's
+    # `current-snapshot-id`, Delta and Hudi's current version, `is_current` in
+    # SCD Type 2.
+    #
+    # It is NOT necessarily the newest snapshot: `rollback` moves it BACKWARDS,
+    # and the snapshots it was moved off stay live and readable by id. Anything
+    # asking "what is the current state of the data?" must read this pointer,
+    # never `max(snapshots)` or `snapshots[-1]`.
     current_snapshot_id: int | None = None
     # Tags: normalized (lowercase) tag name -> the snapshot id it is bound to.
     # Stored in a `tags` subcollection beside `snapshots` and `schemas`, NOT on
@@ -156,6 +170,14 @@ class DatasetMetadata:
         return {sid for sid in self.tags.values() if sid is not None}
 
     def current_snapshot(self) -> Snapshot | None:
+        """The snapshot the head points at - what an unqualified read sees.
+
+        The `snapshots[-1]` fallback applies only when NO pointer is recorded,
+        which is a dataset written before the pointer existed. It is not a
+        general "newest wins" rule: once a pointer is set it is authoritative,
+        including when a rollback has moved it behind snapshots that are still
+        in the list.
+        """
         if self.current_snapshot_id is None:
             return self.snapshots[-1] if self.snapshots else None
         for s in self.snapshots:

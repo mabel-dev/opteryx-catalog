@@ -41,12 +41,14 @@ def _snap(sid, seq, user_created, age_days):
 
 
 class _FakeDataset:
-    def __init__(self, snapshots):
+    def __init__(self, snapshots, head=None):
         self.metadata = DatasetMetadata(
             dataset_identifier="ops.test", location="mem://", schema=None, properties={}
         )
         self.metadata.snapshots = list(snapshots)
-        self.metadata.current_snapshot_id = snapshots[-1].snapshot_id
+        self.metadata.current_snapshot_id = (
+            head if head is not None else snapshots[-1].snapshot_id
+        )
         self.metadata.maintenance_policy = {"retained-snapshot-age-days": 7}
 
 
@@ -63,11 +65,11 @@ class _FakeCatalog:
         return []
 
 
-def _run(snapshots):
+def _run(snapshots, head=None):
     """Return (kept_ids, deleted_ids) for a dry-run expiration."""
     captured = {}
 
-    expirer = SnapshotExpiration(_FakeCatalog(_FakeDataset(snapshots)))
+    expirer = SnapshotExpiration(_FakeCatalog(_FakeDataset(snapshots, head=head)))
 
     def _capture(identifier, dataset, snapshots_to_delete, snapshots_to_keep, **kwargs):
         captured["keep"] = {s.snapshot_id for s in snapshots_to_keep}
@@ -90,7 +92,7 @@ def test_last_user_snapshot_is_retained_when_it_falls_outside_the_window():
     assert 1 not in delete
 
 
-def test_latest_snapshot_is_still_retained():
+def test_current_snapshot_is_still_retained():
     snapshots = [_snap(1, 1, True, age_days=30)] + [
         _snap(i, i, False, age_days=30 - i) for i in range(2, 6)
     ]
@@ -110,7 +112,7 @@ def test_user_snapshot_beyond_the_lookback_is_not_protected():
 
     assert 1 not in keep
     assert 1 in delete
-    # ...and the latest is still kept, so the UI always has something.
+    # ...and the current snapshot is still kept, so the UI always has something.
     assert snapshots[-1].snapshot_id in keep
 
 
@@ -132,9 +134,36 @@ def test_dataset_with_no_user_snapshots_at_all():
     snapshots = [_snap(i, i, False, age_days=30 - i) for i in range(1, 5)]
     keep, _delete = _run(snapshots)
 
-    # Nothing to protect; the latest is still retained.
+    # Nothing to protect; the current snapshot is still retained.
     assert snapshots[-1].snapshot_id in keep
 
 
 if __name__ == "__main__":  # pragma: no cover
     pytest.main([__file__, "-v"])
+
+
+# --- after a rollback -----------------------------------------------------
+
+
+def test_the_head_is_retained_even_when_it_is_not_the_newest_snapshot():
+    """A rollback moves the head backwards. Expiring it would delete the data
+    every reader of the dataset currently sees."""
+    snapshots = [_snap(i, i, True, age_days=30 - i) for i in range(1, 6)]
+    keep, delete = _run(snapshots, head=2)
+
+    assert 2 in keep
+    assert 2 not in delete
+
+
+def test_the_protected_user_commit_is_the_one_the_head_rests_on():
+    """Not the newest user commit in the list - after a rollback that one is
+    the version the owner has just retired, and protecting it would pin the
+    wrong data while leaving the live version unprotected."""
+    snapshots = [
+        _snap(1, 1, True, age_days=30),
+        _snap(2, 2, False, age_days=29),
+        _snap(3, 3, True, age_days=28),
+    ]
+    keep, _delete = _run(snapshots, head=2)
+
+    assert 1 in keep, "the user commit behind the head was not protected"

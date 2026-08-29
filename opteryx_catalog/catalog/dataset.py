@@ -13,6 +13,8 @@ from ..alerts import report as _alert
 from ..audit import emit_audit
 from ..exceptions import AddFilesReadError
 from ..exceptions import ManifestReadError
+from ..exceptions import SnapshotAncestryTooDeep
+from ..exceptions import SnapshotMissingError
 from ..exceptions import SummaryInconsistencyError
 from ..resource_types import ResourceType
 from .manifest import ParquetManifestEntry
@@ -24,6 +26,13 @@ from .metastore import Dataset
 
 # Stable node identifier for this process (hex-mac-hex-pid)
 _NODE = f"{uuid.getnode():x}-{os.getpid():x}"
+
+# How far `previous_user_snapshot` will walk back through maintenance commits
+# looking for a user one. Each hop past the head can be a document read, so the
+# bound is what stops one interactive query becoming thousands of them. Sized
+# for the real gap between two user commits (compaction and statistics refresh,
+# so single digits) with several orders of magnitude of headroom.
+MAX_ANCESTOR_WALK = 200
 
 logger = logging.getLogger(__name__)
 
@@ -138,6 +147,81 @@ def _as_int(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def snapshot_ancestry(head: Snapshot | None, snapshots: list[Snapshot]) -> list[Snapshot]:
+    """`head` and every ancestor of it that is present in `snapshots`.
+
+    The history a read at the head can see. A `rollback` moves the head
+    backwards and leaves the snapshots it moved off LIVE - they keep their
+    documents, they are still listed, and they are still readable by id - but
+    they are not part of the current line of descent, and anything asking "what
+    does this dataset's history look like from here" must not include them.
+
+    Follows `parent_snapshot_id` rather than ordering by recency. Ordering
+    cannot answer this: after a rollback the next commit's sequence number is
+    allocated from what the writer had in memory, so a rolled-off snapshot can
+    share a sequence number with a live one and no ordering separates them.
+    Ancestry is the only thing that does.
+
+    Purely in-memory, over a list the caller already holds - it never reads.
+    A parent that is not in `snapshots` (expired, or a partial load) ends the
+    walk, so the result is always "what can be seen from here", never a claim
+    that nothing came before.
+    """
+    if head is None:
+        return []
+
+    by_id = {s.snapshot_id: s for s in snapshots}
+    line: list[Snapshot] = []
+    seen: set[int] = set()
+    node: Snapshot | None = by_id.get(head.snapshot_id, head)
+    while node is not None and node.snapshot_id not in seen:
+        seen.add(node.snapshot_id)
+        line.append(node)
+        parent_id = node.parent_snapshot_id
+        node = by_id.get(parent_id) if parent_id is not None else None
+    return line
+
+
+def visible_history(head: Snapshot | None, snapshots: list[Snapshot]) -> list[Snapshot]:
+    """The snapshots that are part of the history a read at `head` sees.
+
+    `rollback` moves the head backwards and leaves the snapshots it moved off
+    LIVE - they keep their documents, they are still listed by `SHOW SNAPSHOTS`,
+    and they are still readable by id. They are not part of the current history,
+    though, and anything answering a question about "this dataset" as it stands
+    must exclude them: "when did a human last change this?", "what may
+    expiration delete?", "which snapshot was live at 3pm?".
+
+    Ancestry is the answer where the chain is recorded, and it is EXACT. It is
+    also the only thing that works: after a rollback the next commit's sequence
+    number is allocated from what its writer had in memory, so a rolled-off
+    snapshot can share a sequence number with a live one and no ordering
+    separates the two.
+
+    Where the chain is NOT recorded - snapshots written before
+    `parent_snapshot_id` existed - there is nothing to walk, and ancestry would
+    collapse the whole history to the head alone. Those datasets fall back to
+    ordering, which is what they have always been read by and which is correct
+    for them: a dataset with no parent links has never been rolled back, because
+    rollback is newer than parent links are.
+
+    Purely in-memory over a list the caller already holds; it never reads.
+    """
+    if head is None:
+        return []
+
+    if not any(s.parent_snapshot_id is not None for s in snapshots):
+        # No chain recorded anywhere. Order is all there is - and nothing after
+        # the head, which for such a dataset means nothing at all unless its
+        # snapshots were loaded from somewhere that has more than the head.
+        ceiling = (head.sequence_number or 0, head.snapshot_id or 0)
+        return [
+            s for s in snapshots if (s.sequence_number or 0, s.snapshot_id or 0) <= ceiling
+        ]
+
+    return snapshot_ancestry(head, snapshots)
 
 
 def select_last_user_snapshot(
@@ -493,9 +577,9 @@ class SimpleDataset(Dataset):
         query-plan hot path. When the current snapshot IS user-created, which
         is the common case, it returns immediately with no extra read.
         """
-        current = self.metadata.current_snapshot()
-        if current is not None and current.user_created is True:
-            return current
+        head = self.metadata.current_snapshot()
+        if head is not None and head.user_created is True:
+            return head
 
         candidates: list = []
         if self.catalog:
@@ -520,7 +604,82 @@ class SimpleDataset(Dataset):
         if not candidates:
             candidates = list(self.metadata.snapshots)
 
+        # Only the head's own line of descent counts. A rollback moves the head
+        # backwards and leaves the snapshots it moved off live and readable, so
+        # ranking the whole set would answer "when did a human last change
+        # this?" with a commit that is no longer part of the data anyone can
+        # see. Those snapshots are history that was undone, not history.
+        if head is not None:
+            candidates = visible_history(head, candidates)
+
         return select_last_user_snapshot(candidates, lookback=lookback)
+
+    def previous_user_snapshot(self) -> Snapshot | None:
+        """The version of the data BEFORE the one a read sees now, or None.
+
+        This is what `VERSION AS OF PREVIOUS` means. Someone asking for the
+        previous version is asking about their data, not about the commit log:
+        compaction and statistics refresh rewrite files without changing a
+        single row, and a `parent_snapshot_id` hop that lands on one of those
+        answers the question with the SAME DATA the unqualified read returns.
+        That is the worst possible answer - it looks like a successful
+        time-travel read and is indistinguishable from one.
+
+        So the walk skips every snapshot that is not `user_created`, twice: once
+        to find the user commit the head currently rests on (which IS the
+        current version of the data, and may be the head itself), and again from
+        that commit's parent to find the one before it.
+
+        The walk follows `parent_snapshot_id` rather than ranking snapshots by
+        recency, because after a `rollback` the newest snapshots are not
+        ancestors of the head at all - they are the version that was undone.
+
+        Cost is one document read per hop that is not already in memory, and
+        the gap between two user commits is normally zero to a few maintenance
+        commits. `SnapshotAncestryTooDeep` bounds the pathological case.
+        """
+        head = self.metadata.current_snapshot()
+        if head is None:
+            return None
+
+        current_version = self._walk_to_user_snapshot(head)
+        if current_version is None or current_version.parent_snapshot_id is None:
+            return None
+
+        parent = self.snapshot(current_version.parent_snapshot_id)
+        if parent is None:
+            # The chain runs into a snapshot that has expired out of the
+            # history. There IS a previous version, we just cannot read it, and
+            # saying "there is none" would be a different and wrong answer.
+            raise SnapshotMissingError(
+                f"The version before snapshot {current_version.snapshot_id} of "
+                f"{self.identifier} has expired and can no longer be read."
+            )
+        return self._walk_to_user_snapshot(parent)
+
+    def _walk_to_user_snapshot(self, start: Snapshot) -> Snapshot | None:
+        """`start`, or the nearest user-created snapshot behind it; None if none.
+
+        `user_created` must be explicitly True, for the reason
+        `select_last_user_snapshot` gives: a missing value means "not known to
+        be a user commit", and counting it as one puts a maintenance commit in
+        front of somebody asking what they changed.
+        """
+        node: Snapshot | None = start
+        for _ in range(MAX_ANCESTOR_WALK):
+            if node is None:
+                return None
+            if node.user_created is True:
+                return node
+            if node.parent_snapshot_id is None:
+                return None
+            node = self.snapshot(node.parent_snapshot_id)
+
+        raise SnapshotAncestryTooDeep(
+            f"Gave up walking the ancestors of snapshot {start.snapshot_id} on "
+            f"{self.identifier} after {MAX_ANCESTOR_WALK} hops without finding a "
+            "user commit. Name the snapshot id you want instead of PREVIOUS."
+        )
 
     def _get_node(self) -> str:
         """Return the stable node identifier for this process.
@@ -1914,6 +2073,11 @@ class SimpleDataset(Dataset):
         Neither existing primitive can express that — `add_files` marks nothing
         deleted, and a `delete_rows` snapshot adds no files.
 
+        A target with no snapshots at all is a valid destination: there is
+        nothing to carry forward and the merge writes the dataset's FIRST
+        snapshot, which is how an insert-only MERGE bootstraps a relation that
+        was created but never written to.
+
         `files` are paths already written to storage, as `add_files` takes
         them. `positions` maps data-file paths in the CURRENT manifest to
         file-local, zero-based ordinals in physical row order, as `delete_rows`
@@ -1952,12 +2116,30 @@ class SimpleDataset(Dataset):
         if not files and not positions:
             raise ValueError("merge_commit requires files to add, positions to delete, or both")
 
+        # A relation that exists but has never been committed to has NO parent
+        # snapshot and therefore nothing to carry forward. That is the state
+        # `add_files` already commits into (see its `prev_entries = []`), and an
+        # insert-only MERGE - a statement whose only reachable arm is WHEN NOT
+        # MATCHED THEN INSERT - is exactly how such a target is bootstrapped.
+        # Refusing it was an asymmetry rather than a rule: the same MERGE
+        # against a TRUNCATEd relation already commits, because truncate leaves
+        # a snapshot whose manifest is empty rather than absent, and the two
+        # states are identical in data.
+        #
+        # Nothing is relaxed for the delete half. With no entries, `by_path` is
+        # empty and every named position falls into the `missing` check below,
+        # so a merge that claims to retire a row of a relation holding no files
+        # still fails, loudly, naming the files it could not find.
+        #
+        # A snapshot that exists but names no manifest is NOT this case - that
+        # is a broken commit, not a fresh relation - and keeps refusing.
         prev_snap = self.snapshot(None)
-        if prev_snap is None or not getattr(prev_snap, "manifest_list", None):
-            raise ValueError(f"{self.identifier} has no current manifest to merge into")
-
-        entries = self._parent_manifest_entries(prev_snap)
-        self._warn_if_summary_disagrees(prev_snap, entries)
+        entries: list[dict] = []
+        if prev_snap is not None:
+            if not getattr(prev_snap, "manifest_list", None):
+                raise ValueError(f"{self.identifier} has no current manifest to merge into")
+            entries = self._parent_manifest_entries(prev_snap)
+            self._warn_if_summary_disagrees(prev_snap, entries)
         by_path = {e.get("file_path"): e for e in entries}
 
         missing = [p for p in positions if p not in by_path]

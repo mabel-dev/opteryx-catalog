@@ -175,7 +175,7 @@ if __name__ == "__main__":  # pragma: no cover
 # and maintained automatically forever would otherwise pin its very first
 # snapshot — and every data file that snapshot references — in storage
 # permanently. A user commit buried deeper than the window is allowed to
-# expire, leaving the latest snapshot (always retained) as what the UI shows.
+# expire, leaving the current snapshot (always retained) as what the UI shows.
 
 from opteryx_catalog.catalog.dataset import select_last_user_snapshot
 

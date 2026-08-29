@@ -248,3 +248,94 @@ def test_an_unknown_operation_is_refused():
     ds, _ = _seed_dataset({"f1.parquet": [1, 2]})
     with pytest.raises(ValueError, match="operation must be one of"):
         ds.merge_commit([], {"f1.parquet": [0]}, author="tester", operation="upsert")
+
+
+# ---------------------------------------------------------------------------
+# A relation created but never committed to. It has a schema and zero
+# snapshots, so there is no parent manifest to carry forward - the state
+# `add_files` already commits into, and the one an insert-only MERGE must be
+# able to bootstrap.
+
+
+def _uncommitted_dataset():
+    """A dataset with a location and NO snapshots - what CREATE TABLE leaves."""
+    from opteryx_catalog.catalog.dataset import SimpleDataset
+    from opteryx_catalog.catalog.manifest import clear_parsed_manifest_cache
+    from opteryx_catalog.catalog.metadata import DatasetMetadata
+    from test_mor_deletes import LOCATION
+    from test_mor_deletes import _FakeCatalog
+    from test_mor_deletes import _MemIO
+
+    clear_parsed_manifest_cache()
+    storage: dict[str, bytes] = {}
+    mem_io = _MemIO(storage)
+    meta = DatasetMetadata(
+        dataset_identifier="col.fresh",
+        location=LOCATION,
+        schema=None,
+        properties={},
+    )
+    ds = SimpleDataset(identifier="col.fresh", _metadata=meta)
+    ds.io = mem_io
+    ds.catalog = _FakeCatalog(mem_io)
+    return ds, storage
+
+
+def test_insert_only_merge_bootstraps_a_never_committed_relation():
+    """The FIRST snapshot of a relation can be written by a MERGE.
+
+    A MERGE whose only reachable arm is WHEN NOT MATCHED THEN INSERT has no
+    target rows to retire, so there is nothing a parent manifest would have
+    told it. Refusing it stopped a SQL-driven pipeline from creating its own
+    tables through the same statement that keeps them up to date.
+    """
+    ds, storage = _uncommitted_dataset()
+    new = _stage(ds, storage, "f1.parquet", [1, 2, 3])
+
+    snap = ds.merge_commit([new], {}, author="tester")
+
+    assert snap.parent_snapshot_id is None
+    assert snap.operation_type == "merge"
+    assert snap.summary["added-data-files"] == 1
+    assert snap.summary["added-records"] == 3
+    assert snap.summary["deleted-records"] == 0
+    assert snap.summary["total-records"] == 3
+    assert _paths(_current_entries(ds)) == {"f1.parquet"}
+
+
+def test_a_delete_against_a_never_committed_relation_still_refuses():
+    """The tolerance is for the APPEND half only.
+
+    With no entries, every named position addresses a file that is not in the
+    manifest - which is the existing check, reached rather than bypassed, so a
+    caller that computed positions against something else is told so.
+    """
+    ds, _ = _uncommitted_dataset()
+
+    with pytest.raises(ValueError, match="not in the current manifest"):
+        ds.merge_commit([], {"f1.parquet": [0]}, author="tester")
+
+
+def test_a_snapshot_without_a_manifest_still_refuses():
+    """A commit that named no manifest is a BROKEN snapshot, not a fresh
+    relation, and proceeding would write a snapshot claiming its predecessor
+    held nothing."""
+    ds, storage = _uncommitted_dataset()
+    from opteryx_catalog.catalog.metadata import Snapshot
+
+    ds.metadata.snapshots.append(
+        Snapshot(
+            snapshot_id=1000,
+            timestamp_ms=1000,
+            author="seed",
+            sequence_number=1,
+            user_created=True,
+            operation_type="append",
+            manifest_list=None,
+        )
+    )
+    ds.metadata.current_snapshot_id = 1000
+    new = _stage(ds, storage, "f1.parquet", [1])
+
+    with pytest.raises(ValueError, match="no current manifest to merge into"):
+        ds.merge_commit([new], {}, author="tester")

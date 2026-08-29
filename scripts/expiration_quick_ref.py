@@ -53,7 +53,7 @@ def api_methods():
 def retention_policy_examples():
     """Common retention policies."""
     return {
-        "Keep only latest": {
+        "Keep only current": {
             "config": {"retained-snapshot-age-days": None},
             "use_case": "Dev/test datasets, unversioned data",
             "example": "Only current snapshot kept",
