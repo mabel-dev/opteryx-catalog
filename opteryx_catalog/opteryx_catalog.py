@@ -27,6 +27,7 @@ from .catalog.metastore import Metastore
 from .catalog.orphan_quarantine import MAINTENANCE_SUBCOLLECTION
 from .catalog.view import View as CatalogView
 from .exceptions import CollectionAlreadyExists
+from .exceptions import ConstraintNotFound
 from .exceptions import CollectionLocked
 from .exceptions import CollectionNotEmpty
 from .exceptions import CollectionNotFound
@@ -68,6 +69,23 @@ logger = logging.getLogger(__name__)
 # dataset document on every call and must not pay for opt-in state. The commit
 # path reads this subcollection to decide what to fire.
 TRIGGERS_SUBCOLLECTION = "triggers"
+
+# Subcollection under a dataset document holding the relationships DECLARED ON
+# that dataset - one document per relationship, keyed by the constraint name,
+# which is the handle `ALTER TABLE ... DROP CONSTRAINT` removes it by.
+#
+# Keyed under the dataset for the same reason the relationship graph's design
+# wanted a `(workspace, collection, dataset)` cluster key: the dominant read by
+# a wide margin is "what relates to THIS dataset", behind every `$metadata`
+# build. As a subcollection that is not a cluster key to maintain, it is the
+# parent - one keyed read, and a dropped dataset takes its relationships with
+# it exactly as it takes its triggers.
+#
+# Nothing here is enforced, ever. A declared relationship records that two
+# columns hold corresponding values; a write that breaks it succeeds. This is
+# metadata for tooling and discovery, and the engine never reads it back to
+# plan or rewrite a query.
+RELATIONSHIPS_SUBCOLLECTION = "relationships"
 
 # Subcollection under a dataset document holding that dataset's snapshot tags -
 # one document per tag, keyed by the NORMALIZED tag name. The document id doing
@@ -648,6 +666,23 @@ class OpteryxCatalog(Metastore):
     def _view_doc_ref(self, collection: str, view_name: str):
         return self._views_collection(collection).document(view_name)
 
+    def _task_parts(self, identifier: str | tuple) -> tuple[str, str]:
+        """(collection, task) for a task name, qualified or not.
+
+        Accepts `<collection>.<task>` and `<workspace>.<collection>.<task>`
+        alike, because both spellings genuinely occur: a trigger records its
+        target FULLY qualified, so the firing path hands one in with the
+        workspace still attached, while a caller registering a task writes the
+        short form. Both must resolve to the same document.
+
+        Hand-rolling `identifier.split(".")` here instead is what made every
+        trigger-fired run raise `TaskNotFound: opteryx.ops.compaction_log_ingest`
+        in production - the name was right, the parser was not.
+        """
+        if isinstance(identifier, (tuple, list)):
+            return identifier[0], identifier[1]
+        return self._local_parts(identifier)
+
     def _tasks_collection(self, collection: str):
         return self._collection_ref(collection).collection(TASKS_SUBCOLLECTION)
 
@@ -1169,6 +1204,7 @@ class OpteryxCatalog(Metastore):
         self._delete_subcollection(doc_ref.collection(MAINTENANCE_SUBCOLLECTION))
         self._delete_subcollection(doc_ref.collection("statement"))
         self._delete_subcollection(doc_ref.collection(TRIGGERS_SUBCOLLECTION))
+        self._delete_subcollection(doc_ref.collection(RELATIONSHIPS_SUBCOLLECTION))
         doc_ref.delete()
 
         send_webhook(
@@ -1390,6 +1426,18 @@ class OpteryxCatalog(Metastore):
         for tag_doc in self._tags_collection(collection, dataset_name).stream():
             new_tags.document(tag_doc.id).set(tag_doc.to_dict() or {})
 
+        # Relationships travel with the dataset for the same reason tags do:
+        # they are its own metadata, keyed under it, and a rename that left them
+        # behind would delete every relationship declared on it with nothing
+        # saying so. What does NOT travel is a relationship declared on some
+        # OTHER dataset that points AT this one - its stored reference is now
+        # stale. That is deliberate: chasing inbound references would mean
+        # scanning every dataset in the workspace, and a stale reference is
+        # exactly what `status = 'broken'` is for.
+        new_relationships = self._relationships_collection(new_collection, new_dataset_name)
+        for relationship_doc in self._relationships_collection(collection, dataset_name).stream():
+            new_relationships.document(relationship_doc.id).set(relationship_doc.to_dict() or {})
+
         new_snapshots = self._snapshots_collection(new_collection, new_dataset_name)
         for snapshot_doc in snapshot_docs:
             snapshot_data, new_manifest_path = rewritten_manifests.get(
@@ -1408,6 +1456,7 @@ class OpteryxCatalog(Metastore):
         self._delete_subcollection(self._tags_collection(collection, dataset_name))
         self._delete_subcollection(doc_ref.collection("schemas"))
         self._delete_subcollection(doc_ref.collection(MAINTENANCE_SUBCOLLECTION))
+        self._delete_subcollection(doc_ref.collection(RELATIONSHIPS_SUBCOLLECTION))
         doc_ref.delete()
 
         # 5. Delete what the copy vacated. Done inline, and by exact path:
@@ -2436,10 +2485,7 @@ class OpteryxCatalog(Metastore):
         if not sql or not sql.strip():
             raise ValueError("a task requires a statement")
 
-        if isinstance(identifier, (tuple, list)):
-            collection, task_name = identifier[0], identifier[1]
-        else:
-            collection, task_name = identifier.split(".")
+        collection, task_name = self._task_parts(identifier)
 
         doc_ref = self._task_doc_ref(collection, task_name)
         existing = doc_ref.get()
@@ -2516,13 +2562,7 @@ class OpteryxCatalog(Metastore):
         `last-updated-by`/`last-updated-at-ms` describe who last changed the
         statement, which is a different question and often a different person.
         """
-        if isinstance(identifier, (tuple, list)):
-            collection, task_name = identifier[0], identifier[1]
-        else:
-            parts = identifier.split(".")
-            if len(parts) != 2:
-                raise TaskNotFound(f"Task not found: {identifier}")
-            collection, task_name = parts
+        collection, task_name = self._task_parts(identifier)
 
         doc_ref = self._task_doc_ref(collection, task_name)
         doc = doc_ref.get()
@@ -2579,10 +2619,7 @@ class OpteryxCatalog(Metastore):
         """
         if not author:
             raise ValueError("author must be provided when dropping a task")
-        if isinstance(identifier, (tuple, list)):
-            collection, task_name = identifier[0], identifier[1]
-        else:
-            collection, task_name = identifier.split(".")
+        collection, task_name = self._task_parts(identifier)
 
         doc_ref = self._task_doc_ref(collection, task_name)
         if not doc_ref.get().exists:
@@ -2612,10 +2649,7 @@ class OpteryxCatalog(Metastore):
         consumed nothing, and advancing the breadcrumb past it would hide the
         very gap the breadcrumb exists to expose.
         """
-        if isinstance(identifier, (tuple, list)):
-            collection, task_name = identifier[0], identifier[1]
-        else:
-            collection, task_name = identifier.split(".")
+        collection, task_name = self._task_parts(identifier)
 
         update = {
             "last-fired-at-ms": int(time.time() * 1000),
@@ -2661,6 +2695,11 @@ class OpteryxCatalog(Metastore):
 
     def _triggers_collection(self, collection: str, dataset_name: str):
         return self._dataset_doc_ref(collection, dataset_name).collection(TRIGGERS_SUBCOLLECTION)
+
+    def _relationships_collection(self, collection: str, dataset_name: str):
+        return self._dataset_doc_ref(collection, dataset_name).collection(
+            RELATIONSHIPS_SUBCOLLECTION
+        )
 
     def _materialized_views_reading(self, dataset_identifier: str) -> set[str]:
         """Qualified names of the materialized views that read this dataset.
@@ -2909,6 +2948,192 @@ class OpteryxCatalog(Metastore):
         collection, dataset_name = self._local_parts(dataset_identifier)
         results = []
         for doc in self._triggers_collection(collection, dataset_name).stream():
+            data = doc.to_dict() or {}
+            data.setdefault("name", doc.id)
+            results.append(data)
+        return results
+
+    # ------------------------------------------------------------------
+    # Declared relationships
+    # ------------------------------------------------------------------
+
+    def declare_relationship(
+        self,
+        dataset_identifier: str,
+        constraint_name: str,
+        column: str,
+        references_dataset: str,
+        references_column: str,
+        cardinality: str,
+        author: str | None = None,
+    ) -> None:
+        """Declare, without enforcing, that `column` corresponds to
+        `references_column` on another dataset in this workspace.
+
+        `ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY ... NOT ENFORCED`.
+        Nothing validates it now or later: a write that breaks the relationship
+        succeeds, and no query plan consults it. It exists so tools and people
+        can see how datasets relate.
+
+        Both ends are in this workspace - `_local_parts` refuses anything else,
+        the same boundary a trigger's target has - which is what lets one
+        dataset's subcollection hold the whole relationship.
+
+        The constraint name is the document id rather than a field, so
+        uniqueness is Firestore's rather than ours: a create-if-absent write
+        with no read-then-write race to lose, the same reason snapshot tags key
+        on the tag name.
+        """
+        if not author:
+            raise ValueError("author must be provided when declaring a relationship")
+
+        collection, dataset_name = self._local_parts(dataset_identifier)
+        if not self._dataset_doc_ref(collection, dataset_name).get().exists:
+            raise DatasetNotFound(f"Dataset not found: {collection}.{dataset_name}")
+
+        references = self._qualify(references_dataset)
+        # Refuses a far end in another workspace, and does it before writing.
+        far_collection, far_dataset = self._local_parts(references)
+        if not self._dataset_doc_ref(far_collection, far_dataset).get().exists:
+            raise DatasetNotFound(f"Dataset not found: {far_collection}.{far_dataset}")
+
+        doc_ref = self._relationships_collection(collection, dataset_name).document(constraint_name)
+        if doc_ref.get().exists:
+            raise ValueError(
+                f"constraint {constraint_name} already exists on {collection}.{dataset_name}"
+            )
+
+        doc_ref.set(
+            {
+                "name": constraint_name,
+                "kind": "maps",
+                # The NEAR end, denormalised from the path this document already
+                # lives at. Redundant for the forward read, where the parent
+                # says it - and required for the reverse one, which arrives via
+                # a collection group query holding a document and no context
+                # about whose child it is. This is not a mirrored row: it is one
+                # row carrying its own address, so there is nothing to drift.
+                "workspace": self.workspace,
+                "collection": collection,
+                "dataset": dataset_name,
+                "column": column,
+                # Stored SPLIT, never as a dotted string: a dataset name may
+                # contain dots and every consumer that re-parsed one would have
+                # to agree where the boundaries are.
+                "references-workspace": self.workspace,
+                "references-collection": far_collection,
+                "references-dataset": far_dataset,
+                "references-column": references_column,
+                # Declared, never derived - nothing samples the data to check.
+                "cardinality": cardinality,
+                "origin": "asserted",
+                "status": "active",
+                "asserted-by": author,
+                "asserted-at-ms": int(time.time() * 1000),
+                "verified-at-ms": None,
+            }
+        )
+
+        emit_audit(
+            "declare_relationship",
+            resource_type=ResourceType.DATASET,
+            workspace=self.workspace,
+            collection=collection,
+            resource=dataset_name,
+            author=author,
+            constraint=constraint_name,
+            references=f"{far_collection}.{far_dataset}",
+        )
+
+    def drop_relationship(
+        self,
+        dataset_identifier: str,
+        constraint_name: str,
+        author: str | None = None,
+        missing_ok: bool = False,
+    ) -> bool:
+        """Remove one declared relationship by name.
+
+        Returns True if one was removed, False if there was none and
+        `missing_ok` allowed that - a drop that silently matched nothing would
+        let a typo read as success.
+        """
+        if not author:
+            raise ValueError("author must be provided when dropping a relationship")
+
+        collection, dataset_name = self._local_parts(dataset_identifier)
+        doc_ref = self._relationships_collection(collection, dataset_name).document(constraint_name)
+        if not doc_ref.get().exists:
+            if missing_ok:
+                return False
+            raise ConstraintNotFound(
+                f"Constraint not found: {constraint_name} on {collection}.{dataset_name}"
+            )
+        doc_ref.delete()
+
+        emit_audit(
+            "drop_relationship",
+            resource_type=ResourceType.DATASET,
+            workspace=self.workspace,
+            collection=collection,
+            resource=dataset_name,
+            author=author,
+            constraint=constraint_name,
+        )
+        return True
+
+    def find_relationships_to(self, dataset_identifier: str) -> list[dict]:
+        """Every relationship pointing AT this dataset, from anywhere in this
+        workspace - the reverse of `list_relationships`.
+
+        A collection group query, which matches every `relationships`
+        subcollection in the database whatever its parent, so this is one
+        indexed read rather than a walk over every dataset in the workspace.
+        That is what makes it affordable to store one row per relationship
+        instead of a mirrored copy keyed the other way.
+
+        THE WORKSPACE FILTER IS LOAD-BEARING. Workspaces are root collections in
+        a single database, so a collection group query crosses all of them: this
+        would return other workspaces' relationships if the filter were dropped
+        or mistyped. It is sound because a relationship cannot cross a workspace
+        - refused at plan time - so `references-workspace` always equals the
+        workspace whose datasets are being asked about. That makes the filter an
+        invariant rather than a hope, but it is still the one place in this
+        feature where visibility depends on a predicate being right, and a
+        caller must not treat these rows as already authorized: whoever renders
+        them still owes a read check on each near end.
+
+        REQUIRES A COLLECTION GROUP INDEX on `relationships` over
+        (references-workspace, references-collection, references-dataset).
+        Collection-group scope is not automatic; until the index exists Firestore
+        refuses the query outright rather than answering it slowly.
+        """
+        from google.cloud.firestore_v1 import FieldFilter
+
+        collection, dataset_name = self._local_parts(dataset_identifier)
+        query = (
+            self.firestore_client.collection_group(RELATIONSHIPS_SUBCOLLECTION)
+            .where(filter=FieldFilter("references-workspace", "==", self.workspace))
+            .where(filter=FieldFilter("references-collection", "==", collection))
+            .where(filter=FieldFilter("references-dataset", "==", dataset_name))
+        )
+        results = []
+        for doc in query.stream():
+            data = doc.to_dict() or {}
+            data.setdefault("name", doc.id)
+            results.append(data)
+        return results
+
+    def list_relationships(self, dataset_identifier: str) -> list[dict]:
+        """Every relationship declared ON this dataset, as plain dicts.
+
+        Only the near side - what this dataset points at. The reverse question
+        is `find_relationships_to`, which is a collection group query rather
+        than the mirrored row an earlier draft of the design proposed.
+        """
+        collection, dataset_name = self._local_parts(dataset_identifier)
+        results = []
+        for doc in self._relationships_collection(collection, dataset_name).stream():
             data = doc.to_dict() or {}
             data.setdefault("name", doc.id)
             results.append(data)

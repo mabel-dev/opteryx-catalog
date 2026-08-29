@@ -91,6 +91,43 @@ def test_missing_task_is_not_found():
         catalog.get_task("ops.absent")
 
 
+def test_a_fully_qualified_name_resolves_to_the_same_task():
+    """The name a TRIGGER records is fully qualified, so the firing path hands
+    `<workspace>.<collection>.<task>` in. Rejecting that spelling made every
+    trigger-fired run raise TaskNotFound in production while the task existed."""
+    catalog = _catalog()
+    catalog.create_task("ops.ingest", sql="SELECT 1", author="xb500")
+
+    short = catalog.get_task("ops.ingest")
+    qualified = catalog.get_task("ws.ops.ingest")
+
+    assert qualified["identifier"] == short["identifier"]
+    assert qualified["sql"] == "SELECT 1"
+
+
+def test_another_workspaces_task_is_refused():
+    """A handle bound to one workspace must not silently read another's."""
+    catalog = _catalog()
+    catalog.create_task("ops.ingest", sql="SELECT 1", author="xb500")
+
+    with pytest.raises(Exception, match="belongs to workspace"):
+        catalog.get_task("elsewhere.ops.ingest")
+
+
+def test_fully_qualified_names_work_across_the_task_api():
+    """create/mark/drop must all accept the spelling a trigger records."""
+    catalog = _catalog()
+    catalog.create_task("ws.ops.ingest", sql="SELECT 1", author="xb500")
+    assert catalog.list_tasks("ops") == ["ingest"]
+
+    catalog.mark_task_fired("ws.ops.ingest", status="enqueued", window_to=42)
+    assert catalog.get_task("ops.ingest")["last-window-to"] == 42
+
+    catalog.drop_task("ws.ops.ingest", author="xb500")
+    with pytest.raises(TaskNotFound):
+        catalog.get_task("ops.ingest")
+
+
 def test_drop_removes_the_task():
     catalog = _catalog()
     catalog.create_task("ops.ingest", sql="SELECT 1", author="xb500")

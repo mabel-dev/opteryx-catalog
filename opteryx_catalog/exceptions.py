@@ -112,6 +112,12 @@ class TriggerNotFound(KeyError, CatalogError):
     pass
 
 
+class ConstraintNotFound(KeyError, CatalogError):
+    """A named relationship declaration is not on the dataset it was sought on."""
+
+    pass
+
+
 class TaskError(KeyError, CatalogError):
     """A task registration or lookup that cannot proceed."""
 
