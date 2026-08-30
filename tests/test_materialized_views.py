@@ -364,52 +364,144 @@ def test_two_view_registrations_in_one_millisecond_keep_both_statements():
     assert statements[second]["sequence-number"] == 2
 
 
-def test_mv_cannot_read_another_mv():
-    """Policy: a view's sources are plain datasets. No stacking, upward."""
+def test_mv_can_read_another_mv():
+    """Chains are allowed: mv2 reads mv1, and picks up a trigger on it."""
     catalog = _catalog()
     _add_dataset(catalog, "src.a")
     _register_mv(catalog, "mart.mv1", sources=("src.a",))
     _add_dataset(catalog, "mart.mv2")
 
-    with pytest.raises(MaterializedViewError, match="cannot read another materialized view"):
-        catalog.create_materialized_view(
-            "mart.mv2", "SELECT * FROM mart.mv1", ["mart.mv1"], author="alice"
-        )
-    # Rejected before anything was written: no trigger landed on mv1.
-    assert catalog.list_triggers("mart.mv1") == []
-    assert catalog._dataset_doc_ref("mart", "mv2").get().to_dict().get("dataset-type") is None
+    catalog.create_materialized_view(
+        "mart.mv2", "SELECT * FROM mart.mv1", ["mart.mv1"], author="alice"
+    )
+
+    assert catalog.get_materialized_view("mart.mv2")["source-tables"] == ["ws.mart.mv1"]
+    # The refresh of mv1 is what fires mv2, so mv2's trigger lives on mv1.
+    triggers = catalog.list_triggers("mart.mv1")
+    assert [t["target-view"] for t in triggers] == ["ws.mart.mv2"]
 
 
-def test_mv_cannot_read_another_mv_via_workspace_qualified_name():
-    """The same rejection, with the engine's fully-qualified source name."""
-    catalog = _catalog()
-    _add_dataset(catalog, "src.a")
-    _register_mv(catalog, "mart.mv1", sources=("src.a",))
-    _add_dataset(catalog, "mart.mv2")
-
-    with pytest.raises(MaterializedViewError, match="cannot read another materialized view"):
-        catalog.create_materialized_view(
-            "mart.mv2", "SELECT * FROM mart.mv1", ["ws.mart.mv1"], author="alice"
-        )
-
-
-def test_cannot_register_an_mv_over_a_dataset_a_view_reads():
-    """The same policy from the other end: src.a already feeds mv1, so turning
-    src.a into a view would stack mv1 on top of it after the fact."""
+def test_mv_can_be_registered_over_a_dataset_a_view_already_reads():
+    """The same chain built from the other end: src.a already feeds mv1, and
+    turning src.a into a view now simply puts mv1 on top of it."""
     catalog = _catalog()
     _add_dataset(catalog, "src.a")
     _add_dataset(catalog, "src.b")
     _register_mv(catalog, "mart.mv1", sources=("src.a",))
 
-    with pytest.raises(MaterializedViewError, match="it is a source of materialized view ws.mart.mv1"):
-        catalog.create_materialized_view("src.a", "SELECT * FROM src.b", ["src.b"], author="alice")
-    # src.b picked up no trigger from the rejected registration.
-    assert catalog.list_triggers("src.b") == []
+    catalog.create_materialized_view("src.a", "SELECT * FROM src.b", ["src.b"], author="alice")
+
+    assert catalog.get_materialized_view("src.a")["source-tables"] == ["ws.src.b"]
+    # src.a keeps mv1's trigger and gains one of its own on src.b.
+    assert [t["target-view"] for t in catalog.list_triggers("src.a")] == ["ws.mart.mv1"]
+    assert [t["target-view"] for t in catalog.list_triggers("src.b")] == ["ws.src.a"]
+
+
+def test_mv_cannot_read_itself_through_a_chain():
+    """The loop is what registration refuses, at any depth."""
+    catalog = _catalog()
+    _add_dataset(catalog, "src.a")
+    _register_mv(catalog, "mart.mv1", sources=("src.a",))
+    _add_dataset(catalog, "mart.mv2")
+    _register_mv(catalog, "mart.mv2", sources=("mart.mv1",))
+
+    # Repointing mv1 at mv2 would close mv1 -> mv2 -> mv1.
+    with pytest.raises(MaterializedViewError, match="cycle"):
+        catalog.create_materialized_view(
+            "mart.mv1",
+            "SELECT * FROM mart.mv2",
+            ["mart.mv2"],
+            author="alice",
+            update_if_exists=True,
+        )
+    # Rejected before anything was written: mv1 still reads src.a.
+    assert catalog.get_materialized_view("mart.mv1")["source-tables"] == ["ws.src.a"]
+    assert catalog.list_triggers("mart.mv2") == []
+
+
+def test_mv_cycle_rejected_via_workspace_qualified_name():
+    """The same rejection, with the engine's fully-qualified source name."""
+    catalog = _catalog()
+    _add_dataset(catalog, "src.a")
+    _register_mv(catalog, "mart.mv1", sources=("src.a",))
+    _add_dataset(catalog, "mart.mv2")
+    _register_mv(catalog, "mart.mv2", sources=("mart.mv1",))
+
+    with pytest.raises(MaterializedViewError, match="cycle"):
+        catalog.create_materialized_view(
+            "mart.mv1",
+            "SELECT * FROM mart.mv2",
+            ["ws.mart.mv2"],
+            author="alice",
+            update_if_exists=True,
+        )
+
+
+def test_create_trigger_refuses_to_close_a_loop():
+    """The enforcing check, on the graph that fires. src.a -> mv1 -> mv2
+    already exists; a trigger on mv2 aimed back at mv1 would close it."""
+    catalog = _catalog()
+    _add_dataset(catalog, "src.a")
+    _register_mv(catalog, "mart.mv1", sources=("src.a",))
+    _add_dataset(catalog, "mart.mv2")
+    _register_mv(catalog, "mart.mv2", sources=("mart.mv1",))
+
+    with pytest.raises(MaterializedViewError, match="trigger cycle"):
+        catalog.create_trigger("mart.mv2", "hand_made", target_view="mart.mv1", author="alice")
+    # Nothing was written: mv2 still carries no triggers.
+    assert catalog.list_triggers("mart.mv2") == []
+
+
+def test_create_trigger_refuses_a_self_loop():
+    catalog = _catalog()
+    _add_dataset(catalog, "src.a")
+
+    with pytest.raises(MaterializedViewError, match="trigger cycle"):
+        catalog.create_trigger("src.a", "self", target_view="src.a", author="alice")
+
+
+def test_create_trigger_allows_an_edge_that_extends_a_chain():
+    """The DAG check refuses cycles, not depth."""
+    catalog = _catalog()
+    _add_dataset(catalog, "src.a")
+    _register_mv(catalog, "mart.mv1", sources=("src.a",))
+    _add_dataset(catalog, "mart.mv2")
+    _register_mv(catalog, "mart.mv2", sources=("mart.mv1",))
+    _add_dataset(catalog, "mart.mv3")
+
+    # A second, independent edge INTO mv3 from the top of the chain is fine -
+    # a DAG may have two paths to the same node, it just may not have a loop.
+    catalog.create_trigger("src.a", "extra", target_view="mart.mv3", author="alice")
+    catalog.create_trigger("mart.mv2", "extra", target_view="mart.mv3", author="alice")
+
+    assert [t["target-view"] for t in catalog.list_triggers("mart.mv2")] == ["ws.mart.mv3"]
+
+
+def test_create_trigger_cycle_check_ignores_task_triggers():
+    """A task is not a node: it declares SQL, never what the SQL writes, so a
+    task trigger on the path must neither be followed nor block an edge."""
+    catalog = _catalog()
+    _add_dataset(catalog, "src.a")
+    _add_dataset(catalog, "mart.mv1")
+    catalog.create_task("ops.roll", "INSERT INTO src.a SELECT 1", author="alice")
+    catalog.create_trigger(
+        "mart.mv1",
+        "run_task",
+        target_view=None,
+        target_task="ops.roll",
+        kind="task",
+        author="alice",
+    )
+
+    # Walking from mv1 finds only the task trigger, which is not an edge.
+    catalog.create_trigger("src.a", "refresh", target_view="mart.mv1", author="alice")
+
+    assert len(catalog.list_triggers("mart.mv1")) == 1
 
 
 def test_re_registering_an_mv_is_unaffected_by_its_own_triggers():
-    """An MV's refresh triggers live on its sources, never on itself, so the
-    no-stacking check must not trip on a plain CoRTAS re-registration."""
+    """An MV's refresh triggers live on its sources, never on itself, so a
+    plain CoRTAS re-registration must not read as a loop."""
     catalog = _catalog()
     _add_dataset(catalog, "src.a")
     _add_dataset(catalog, "src.b")
@@ -426,12 +518,9 @@ def test_re_registering_an_mv_is_unaffected_by_its_own_triggers():
 
 
 def test_mv_cycle_rejected():
-    """The backstop behind the no-stacking policy.
-
-    A stacked graph cannot be built through `create_materialized_view` any more,
-    so the transitive walk is driven directly against documents seeded the way a
-    pre-policy catalog (or an out-of-band edit) would leave them: mv2 reads mv3,
-    mv3 reads mv1, so pointing mv1 at mv2 closes the loop.
+    """The transitive walk, driven directly, at a depth registration reaches
+    only through a chain: mv2 reads mv3, mv3 reads mv1, so pointing mv1 at mv2
+    closes the loop.
     """
     catalog = _catalog()
     _add_dataset(catalog, "src.a")

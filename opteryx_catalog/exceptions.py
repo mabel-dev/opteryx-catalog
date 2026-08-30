@@ -118,6 +118,17 @@ class ConstraintNotFound(KeyError, CatalogError):
     pass
 
 
+class NameInUse(CatalogError):
+    """The name is already held by an object of a different kind.
+
+    `workspace.collection.<object>` is ONE namespace: a table, a view, a
+    materialized view and a task all live in it, and a name identifies exactly
+    one of them. Without this, the same name could be a dataset and a task at
+    once - they are stored in different subcollections, so nothing would notice -
+    and which one a statement got would depend on which statement it was.
+    """
+
+
 class TaskError(KeyError, CatalogError):
     """A task registration or lookup that cannot proceed."""
 
@@ -168,8 +179,7 @@ class TagLimitExceeded(TagError):
 class MaterializedViewError(CatalogError):
     """A materialized-view registration or drop that cannot proceed:
     the named dataset is not a materialized view, a source is invalid,
-    a view would be stacked on another view, or the source graph would
-    contain a cycle."""
+    or the source graph would contain a cycle."""
 
 
 class CollectionAlreadyExists(KeyError, CatalogError):

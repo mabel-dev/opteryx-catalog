@@ -309,14 +309,27 @@ Behavior worth knowing:
   fired it, with policies re-read at fire time. A committer without rights on
   the view gets a denied refresh — recorded in `last-refresh-status`, never
   silent.
-- **Materialized views do not stack.** A view's sources must all be plain
-  datasets: registration is rejected if a source is itself a materialized view,
-  and equally if the dataset being registered is one some other view already
-  reads. Stacking would leave the outer view permanently a refresh behind the
-  inner one, and a failed inner refresh would silently pin everything above it.
-- **Cycles are rejected at registration** too — the transitive walk over
-  `source-tables` is the backstop behind the no-stacking rule, for registrations
-  that predate it or documents edited out of band.
+- **Materialized views may stack.** A view's source can itself be a
+  materialized view, and the chain refreshes a hop at a time: an inner
+  refresh lands a user-created commit, which fires the triggers of the views
+  above it. The cost is inherent to the shape — an outer view is always at
+  least one refresh behind the inner one, and a failed inner refresh pins
+  everything above it at the last good data (visible in each view's
+  `last-refresh-status`).
+- **The trigger graph is a DAG.** A node is a dataset, an edge `D -> V` a
+  refresh trigger on `D` targeting view `V`. `create_trigger` walks forward
+  from the target and refuses an edge that reaches back to the dataset the
+  trigger sits on; `create_materialized_view` additionally rejects a cyclic
+  `source-tables` graph up front, so a bad registration writes nothing at all.
+  Enforcement is on the trigger graph rather than only on `source-tables`
+  because that is the graph that fires — a trigger created directly, or left
+  behind by a reconciliation that failed partway, is an edge no source list
+  mentions. Two concurrent writes can each see an acyclic graph, so `fsck`
+  re-walks it and reports `trigger-cycle` as the backstop.
+- **Task triggers are outside all of this.** A task records its SQL and never
+  what that SQL writes, so a task is not a node in the trigger graph and a loop
+  that runs through one — a task fired by a commit on `a` whose statement
+  writes `a` — is neither rejected nor detectable here.
 - `drop_materialized_view` removes the triggers from every source before
   dropping the dataset; `drop_dataset` on a materialized view does the same
   cleanup, so a raw drop cannot strand triggers.
