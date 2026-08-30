@@ -36,6 +36,7 @@ from .exceptions import DatasetLocked
 from .exceptions import DatasetNotFound
 from .exceptions import EgressRestricted
 from .exceptions import MaterializedViewError
+from .exceptions import NameInUse
 from .exceptions import SnapshotAncestryTooDeep
 from .exceptions import SnapshotMissingError
 from .exceptions import TagAlreadyExists
@@ -757,6 +758,37 @@ class OpteryxCatalog(Metastore):
     def _view_doc_ref(self, collection: str, view_name: str):
         return self._views_collection(collection).document(view_name)
 
+    def name_holder(self, collection: str, name: str) -> str | None:
+        """Which kind of object holds `collection.name`, or None if it is free.
+
+        `workspace.collection.<object>` is one namespace. Datasets, views and
+        tasks are stored in three separate subcollections, so nothing about the
+        storage prevents the same name existing in all three - this is what
+        prevents it. A materialized view is a dataset carrying a type marker, so
+        the dataset check covers it.
+        """
+        if self._dataset_doc_ref(collection, name).get().exists:
+            return "dataset"
+        if self._view_doc_ref(collection, name).get().exists:
+            return "view"
+        if self._task_doc_ref(collection, name).get().exists:
+            return "task"
+        return None
+
+    def assert_name_free(self, collection: str, name: str, kind: str) -> None:
+        """Refuse `collection.name` if another KIND of object already holds it.
+
+        The same-kind case is left to each creator, which knows whether it is a
+        replace: this answers only "is this name someone else's".
+        """
+        holder = self.name_holder(collection, name)
+        if holder is not None and holder != kind:
+            raise NameInUse(
+                f"{collection}.{name} already exists as a {holder}. A table, a view "
+                "and a task share one namespace, so a name identifies exactly one of "
+                "them - drop the existing object or choose another name."
+            )
+
     def _task_parts(self, identifier: str | tuple) -> tuple[str, str]:
         """(collection, task) for a task name, qualified or not.
 
@@ -804,6 +836,8 @@ class OpteryxCatalog(Metastore):
         # Check primary `datasets` location
         if doc_ref.get().exists:
             raise DatasetAlreadyExists(f"Dataset already exists: {identifier}")
+        # ... and the rest of the namespace, which is shared with views and tasks.
+        self.assert_name_free(collection, dataset_name, "dataset")
 
         # Build default dataset metadata
         location = f"gs://{self.gcs_bucket}/{self.workspace}/{collection}/{dataset_name}"
@@ -1289,6 +1323,44 @@ class OpteryxCatalog(Metastore):
             for source in data.get("source-tables") or []:
                 self.drop_trigger(source, trigger_name, author=author, missing_ok=True)
 
+        # A dropped dataset takes its OWN relationships with it - they are its
+        # metadata and they go with the subcollection below. What does not go,
+        # because Firestore cascades nothing, is a relationship declared on some
+        # OTHER dataset that points AT this one. Those are now references to
+        # something that does not exist, and they are marked broken rather than
+        # deleted: the row is the only remaining record that this dataset was
+        # ever depended on, and whoever asserted it is entitled to find out
+        # from their own catalog rather than from a query that returns nothing.
+        #
+        # One collection group query, the same one the projection makes. The
+        # design's reason for punting this - that it would mean scanning every
+        # dataset in the workspace - has been superseded by that query existing.
+        # Non-fatal, and deliberately so. The drop has been decided by this
+        # point; failing it because a METADATA sweep could not run would leave
+        # the caller unable to drop a dataset at all whenever the collection
+        # group index is unavailable. What the sweep misses is an inbound row
+        # pointing at something that no longer exists - which is precisely the
+        # shape `integrity.py` already sweeps for, and a far smaller problem
+        # than an undroppable dataset. Same reasoning as `_reclaim_paths` in
+        # `rename_dataset`, and it is logged rather than swallowed.
+        try:
+            self._break_inbound_relationships(
+                collection,
+                dataset_name,
+                reason="dataset-dropped",
+                detail=f"dataset {collection}.{dataset_name} was dropped",
+                author=author,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "could not break inbound relationships for %s.%s: %s: %s - they now "
+                "reference a dropped dataset and will be found by fsck",
+                collection,
+                dataset_name,
+                type(exc).__name__,
+                exc,
+            )
+
         self._delete_subcollection(self._snapshots_collection(collection, dataset_name))
         self._delete_subcollection(self._tags_collection(collection, dataset_name))
         self._delete_subcollection(doc_ref.collection("schemas"))
@@ -1523,11 +1595,16 @@ class OpteryxCatalog(Metastore):
         # Relationships travel with the dataset for the same reason tags do:
         # they are its own metadata, keyed under it, and a rename that left them
         # behind would delete every relationship declared on it with nothing
-        # saying so. What does NOT travel is a relationship declared on some
-        # OTHER dataset that points AT this one - its stored reference is now
-        # stale. That is deliberate: chasing inbound references would mean
-        # scanning every dataset in the workspace, and a stale reference is
-        # exactly what `status = 'broken'` is for.
+        # saying so.
+        #
+        # A relationship declared on some OTHER dataset that points AT this one
+        # is FOLLOWED, below. It used to be left stale on purpose, on the
+        # grounds that chasing inbound references would mean scanning every
+        # dataset in the workspace and that a stale reference is what
+        # `status = 'broken'` is for. THAT REASONING IS SUPERSEDED:
+        # `find_relationships_to` answers "what points at this dataset" in one
+        # collection group query - the same read `information_schema` already
+        # makes - so the punt now costs more than the fix.
         new_relationships = self._relationships_collection(new_collection, new_dataset_name)
         for relationship_doc in self._relationships_collection(collection, dataset_name).stream():
             payload = relationship_doc.to_dict() or {}
@@ -1555,6 +1632,39 @@ class OpteryxCatalog(Metastore):
             payload["collection"] = new_collection
             payload["dataset"] = new_dataset_name
             new_suppressions.document(suppression_doc.id).set(payload)
+
+        # Inbound references follow the rename rather than breaking. A renamed
+        # dataset is the SAME dataset - its snapshots, tags and relationships
+        # all travelled above - so a reference to it still names the data it
+        # meant. Breaking these would report a data problem where there is
+        # none, and an owner who "fixed" it by dropping the constraint would
+        # lose a true relationship to a bookkeeping event. A drop is the
+        # opposite case and is handled as one.
+        # Non-fatal, for a sharper reason than in `drop_dataset`: by this point
+        # the rename has already copied every byte to the new location, and
+        # raising here would abort it halfway - files at the new prefix, the
+        # catalog entry still at the old one. An inbound row left pointing at
+        # the old name is a stale reference, which is the state this whole
+        # sweep is an improvement on, and `fsck` finds it.
+        try:
+            self._repoint_inbound_relationships(
+                collection,
+                dataset_name,
+                new_collection,
+                new_dataset_name,
+                author=author,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "could not repoint inbound relationships from %s.%s to %s.%s: %s: %s - "
+                "they still name the old dataset and will be found by fsck",
+                collection,
+                dataset_name,
+                new_collection,
+                new_dataset_name,
+                type(exc).__name__,
+                exc,
+            )
 
         new_snapshots = self._snapshots_collection(new_collection, new_dataset_name)
         for snapshot_doc in snapshot_docs:
@@ -2386,6 +2496,7 @@ class OpteryxCatalog(Metastore):
             collection, view_name = identifier.split(".")
 
         doc_ref = self._view_doc_ref(collection, view_name)
+        self.assert_name_free(collection, view_name, "view")
         if doc_ref.get().exists:
             if not update_if_exists:
                 raise ViewAlreadyExists(f"View already exists: {collection}.{view_name}")
@@ -2586,7 +2697,6 @@ class OpteryxCatalog(Metastore):
         identifier: str | tuple,
         sql: str,
         author: str | None = None,
-        runs_as: str | None = None,
         description: str | None = None,
         update_if_exists: bool = False,
     ) -> None:
@@ -2596,10 +2706,10 @@ class OpteryxCatalog(Metastore):
         a view's and a materialized view's are, so redefining a task keeps its
         history rather than overwriting it.
 
-        `runs-as` is pinned on first registration and survives re-registration,
-        for the reason a view's does: the identity a task executes as is the one
-        that chose to create the standing cost, not whoever happened to edit it
-        last. `set_task_owner` is the only way to move it.
+        A task carries NO identity of its own. A person running it with EXECUTE
+        runs it as themselves; an unattended run carries the identity of the
+        TRIGGER that fired it (`create_trigger`'s `runs-as`). Storing an owner
+        here would be a second answer to the same question.
         """
         if author is None:
             raise ValueError("author must be provided when creating a task")
@@ -2608,6 +2718,7 @@ class OpteryxCatalog(Metastore):
 
         collection, task_name = self._task_parts(identifier)
 
+        self.assert_name_free(collection, task_name, "task")
         doc_ref = self._task_doc_ref(collection, task_name)
         existing = doc_ref.get()
         data = existing.to_dict() or {} if existing.exists else {}
@@ -2648,8 +2759,6 @@ class OpteryxCatalog(Metastore):
             {
                 "name": task_name,
                 "statement-id": statement_id,
-                # Pinned, as a materialized view's is.
-                "runs-as": data.get("runs-as") or runs_as or author,
                 "description": description if description is not None else data.get("description"),
                 "created-by": data.get("created-by") or author,
                 "created-at-ms": data.get("created-at-ms") or now_ms,
@@ -2673,15 +2782,15 @@ class OpteryxCatalog(Metastore):
             resource=task_name,
             author=author,
             statement_id=statement_id,
-            runs_as=data.get("runs-as") or runs_as or author,
         )
 
     def get_task(self, identifier: str | tuple) -> dict:
         """The task's registration record, including its current statement.
 
-        `runs-as` is the pinned identity the task executes as;
         `last-updated-by`/`last-updated-at-ms` describe who last changed the
-        statement, which is a different question and often a different person.
+        statement, which is a different question - and often a different person -
+        from who created the task. There is no `runs-as`: the identity of an
+        unattended run belongs to the trigger that fires it.
         """
         collection, task_name = self._task_parts(identifier)
 
@@ -2710,7 +2819,6 @@ class OpteryxCatalog(Metastore):
             "workspace": self.workspace,
             "sql": sql,
             "statement-id": statement_id,
-            "runs-as": data.get("runs-as"),
             "description": data.get("description"),
             "created-by": data.get("created-by"),
             "created-at-ms": data.get("created-at-ms"),
@@ -2950,6 +3058,63 @@ class OpteryxCatalog(Metastore):
             f"{operation} materialized view {identifier}",
         )
 
+    def _assert_no_trigger_cycle(self, dataset_identifier: str, target_view: str) -> None:
+        """Refuse a refresh trigger that would close a loop in the trigger graph.
+
+        The trigger graph is the one that actually fires: a node is a dataset,
+        and an edge D -> V is a refresh trigger on D targeting view V, meaning
+        a user commit on D enqueues a refresh that commits on V. It must stay a
+        DAG. A cycle in it refreshes forever - every refresh lands a
+        user-created commit, `_after_commit` fires that dataset's triggers
+        afresh, and nothing carries a hop count or lineage that could notice
+        the loop at run time.
+
+        Checked here rather than only over `source-tables` because the two
+        graphs are not the same graph. `create_materialized_view` keeps them
+        consistent by reconciling triggers against the source list, but a
+        trigger written through this method directly - or one left behind by a
+        reconciliation that failed partway - is a firing edge that appears in
+        no source list, and a source-based walk cannot see it.
+
+        The edge being added is `dataset_identifier -> target_view`, so it
+        closes a cycle exactly when `dataset_identifier` is already reachable
+        FROM `target_view`. Walks forward from the target, one subcollection
+        read per node, terminating at datasets with no refresh triggers - which
+        is every leaf of a chain, and the common case at depth one.
+        """
+        source = self._qualify(dataset_identifier)
+        target = self._qualify(target_view)
+        stack: list[tuple[str, list[str]]] = [(target, [source])]
+        seen: set[str] = set()
+        while stack:
+            current, path = stack.pop()
+            if current == source:
+                raise MaterializedViewError(
+                    "trigger cycle: a refresh trigger on "
+                    f"{dataset_identifier} targeting {target_view} would make "
+                    f"{source} refresh itself ({' -> '.join([*path, current])})"
+                )
+            if current in seen:
+                continue
+            seen.add(current)
+            if self._split_qualified(current)[0] != self.workspace:
+                # Another workspace's dataset - its triggers are unreadable from
+                # this handle, so the walk cannot continue through it. It also
+                # cannot close a cycle back to us without a trigger on a foreign
+                # dataset targeting one of ours, which is not representable.
+                continue
+            coll, name = self._local_parts(current)
+            for doc in self._triggers_collection(coll, name).stream():
+                trigger = doc.to_dict() or {}
+                if trigger.get("kind") != MV_REFRESH_TRIGGER_KIND:
+                    continue
+                downstream = trigger.get("target-view")
+                # A target too short to name a dataset is a broken trigger, not
+                # an edge; leave it to whoever fires it to complain.
+                if not downstream or "." not in downstream:
+                    continue
+                stack.append((self._qualify(downstream), [*path, current]))
+
     def create_trigger(
         self,
         dataset_identifier: str,
@@ -2959,6 +3124,7 @@ class OpteryxCatalog(Metastore):
         author: str | None = None,
         kind: str = MV_REFRESH_TRIGGER_KIND,
         target_task: str | None = None,
+        runs_as: str | None = None,
     ) -> None:
         """Attach a trigger to a dataset.
 
@@ -2969,8 +3135,9 @@ class OpteryxCatalog(Metastore):
         caller-side permission model demands writer on that dataset, not on the
         target view.
 
-        Refuses to overwrite a trigger of the same name aimed at a DIFFERENT
-        view. Trigger names are derived from the target's collection and
+        Refuses to close a cycle in the trigger graph - see
+        `_assert_no_trigger_cycle` - and refuses to overwrite a trigger of the
+        same name aimed at a DIFFERENT view. Trigger names are derived from the target's collection and
         dataset (`_mv_trigger_name`), so two views can in principle want the
         same document; a blind write would leave the first view with no trigger
         and nothing to report it - it would simply never refresh again. The
@@ -2997,6 +3164,13 @@ class OpteryxCatalog(Metastore):
             target_view = self._qualify(target_view)
             target, target_field = target_view, "target-view"
 
+        # Before any write: the trigger graph must stay a DAG. Task targets are
+        # not nodes in it - a task declares only its SQL, never what that SQL
+        # writes, so there is no edge to draw and no walk that could find a loop
+        # through one.
+        if target_view is not None:
+            self._assert_no_trigger_cycle(dataset_identifier, target_view)
+
         trigger_ref = self._triggers_collection(collection, dataset_name).document(name)
         existing = trigger_ref.get()
         if existing.exists:
@@ -3022,6 +3196,22 @@ class OpteryxCatalog(Metastore):
                 "suspended-by": (existing.to_dict() or {}).get("suspended-by")
                 if existing.exists
                 else None,
+                # The identity an UNATTENDED run executes as. On the trigger and
+                # not the task, because that is what separates unattended from
+                # attended: a person running EXECUTE runs the task as themselves
+                # and answers for it, so there is nothing to pin - a trigger
+                # fires with nobody present. Pinned on first registration
+                # (explicit runs_as is for trusted platform callers; the SQL
+                # surface always pins the author) and preserved across
+                # re-registration so an edit never silently transfers whose
+                # authority the work runs with. Moved only by
+                # `set_trigger_owner`. MV refresh triggers ignore this - a
+                # refresh resolves its identity from the view's own record.
+                "runs-as": (
+                    ((existing.to_dict() or {}).get("runs-as") if existing.exists else None)
+                    or runs_as
+                    or author
+                ),
                 "created-by": author,
                 "created-at-ms": int(time.time() * 1000),
                 "last-fired-at-ms": None,
@@ -3578,6 +3768,356 @@ class OpteryxCatalog(Metastore):
         )
         return True
 
+    # -- Verification and decay (design §9) -----------------------------
+    #
+    # SPLIT INTO TWO MECHANISMS, deliberately, and the design's single periodic
+    # checker was wrong for half of it.
+    #
+    # EXISTENCE is checked WHEN THE THING STOPS EXISTING - here, on the write
+    # that removes it. A rename, a drop or a dropped column is the moment the
+    # fact is known for certain and for nothing: the write is already holding
+    # the identifiers, and the reverse lookup answers "what points at this" in
+    # one query. Scanning for missing endpoints later would re-derive, at a
+    # cost and after a delay, something a write path had in hand.
+    #
+    # VALUES are re-checked by the inference job, which builds the sketches a
+    # re-score needs anyway - see `opteryx_catalog.inference.relationships`.
+    #
+    # A BROKEN EDGE IS KEPT. "These used to correspond and no longer do" is
+    # information; deleting it hides a data problem instead of surfacing one.
+
+    def _mark_relationship_broken(
+        self,
+        collection: str,
+        dataset_name: str,
+        constraint_name: str,
+        *,
+        reason: str,
+        detail: str,
+        author: str | None,
+    ) -> None:
+        """Flip one relationship to `broken`, keeping everything it recorded.
+
+        A MERGE, never a set. The row's `evidence` is the last thing anyone
+        measured about this pair, and it is what makes a break readable as
+        "these used to correspond" rather than as a bare flag - so this adds
+        fields and overwrites `status`, and touches nothing else.
+
+        `verified-at-ms` is stamped because an existence check IS a check, and
+        the strongest kind: it did not sample, it observed. A reader comparing
+        that stamp against today is entitled to know this was settled now.
+        """
+        self._relationships_collection(collection, dataset_name).document(constraint_name).set(
+            {
+                "status": "broken",
+                # Why, in two registers. `broken-reason` is a token a consumer
+                # can branch on; `broken-detail` is the sentence a person
+                # reads, and it names what went missing - which is the only
+                # part that makes the row actionable rather than alarming.
+                "broken-reason": reason,
+                "broken-detail": detail,
+                "broken-at-ms": int(time.time() * 1000),
+                "verified-at-ms": int(time.time() * 1000),
+            },
+            merge=True,
+        )
+
+        emit_audit(
+            "break_relationship",
+            resource_type=ResourceType.DATASET,
+            workspace=self.workspace,
+            collection=collection,
+            resource=dataset_name,
+            author=author,
+            constraint=constraint_name,
+            reason=reason,
+            detail=detail,
+        )
+
+    def _break_inbound_relationships(
+        self,
+        collection: str,
+        dataset_name: str,
+        *,
+        reason: str,
+        detail: str,
+        author: str | None,
+        column: str | None = None,
+    ) -> list[dict]:
+        """Break every relationship elsewhere that points at this dataset.
+
+        THE DESIGN SAID NOT TO DO THIS, and the reasoning has been superseded.
+        `rename_dataset` used to leave inbound references stale on purpose,
+        because "chasing inbound references would mean scanning every dataset
+        in the workspace". That was true when it was written and is not now:
+        `find_relationships_to` is a collection group query - ONE indexed read,
+        the same one `information_schema.column_relationships` already makes on
+        every `$metadata` build. The punt now costs more than the fix.
+
+        `column` narrows it to references at one column, which is what
+        `ALTER TABLE ... DROP COLUMN` needs; without it the whole dataset went.
+
+        Returns the rows it broke, so the caller can say who to tell. Each one
+        was ASSERTED BY SOMEONE ELSE, on a dataset this author may not own -
+        which is exactly why the return value matters and a status column
+        alone would not be enough.
+        """
+        broken = []
+        for row in self.find_relationships_to(f"{collection}.{dataset_name}"):
+            if column is not None:
+                if (row.get("references-column") or "").casefold() != column.casefold():
+                    continue
+            near_collection = row.get("collection")
+            near_dataset = row.get("dataset")
+            name = row.get("name")
+            if not (near_collection and near_dataset and name):
+                # A row with no near address cannot be located to be updated.
+                # It also cannot be rendered, since the projection reads these
+                # same fields, so this is an integrity problem rather than a
+                # verification one - `integrity.py` is where it belongs.
+                logger.warning(
+                    "inbound relationship with no near address on %s.%s: %r",
+                    collection,
+                    dataset_name,
+                    name,
+                )
+                continue
+            if row.get("status") == "broken":
+                continue
+            self._mark_relationship_broken(
+                near_collection,
+                near_dataset,
+                name,
+                reason=reason,
+                detail=detail,
+                author=author,
+            )
+            broken.append(row)
+        return broken
+
+    def _repoint_inbound_relationships(
+        self,
+        old_collection: str,
+        old_dataset: str,
+        new_collection: str,
+        new_dataset: str,
+        *,
+        author: str | None,
+    ) -> list[dict]:
+        """Follow every inbound reference across a rename.
+
+        REPOINTED, NOT BROKEN, and the distinction is the whole reason rename
+        and drop are handled separately. A renamed dataset is the same dataset:
+        its snapshots, tags and relationships all travel, so a reference to it
+        is still a reference to the data it names. Marking those broken would
+        report a data problem where there is none, and an owner who "fixed" it
+        by dropping the constraint would lose a true relationship to a
+        bookkeeping event.
+
+        A drop is the opposite - the referenced thing is gone - and that is
+        what `_break_inbound_relationships` is for.
+
+        This writes to relationship documents under OTHER datasets, which the
+        renamer may not own. That is repair, not escalation: the reference
+        already named this dataset, and the alternative is leaving a row that
+        points at nothing. Nothing new is disclosed - the rows are not returned
+        to a caller, only to the audit trail.
+        """
+        repointed = []
+        for row in self.find_relationships_to(f"{old_collection}.{old_dataset}"):
+            near_collection = row.get("collection")
+            near_dataset = row.get("dataset")
+            name = row.get("name")
+            if not (near_collection and near_dataset and name):
+                logger.warning(
+                    "inbound relationship with no near address on %s.%s: %r",
+                    old_collection,
+                    old_dataset,
+                    name,
+                )
+                continue
+            self._relationships_collection(near_collection, near_dataset).document(name).set(
+                {
+                    "references-collection": new_collection,
+                    "references-dataset": new_dataset,
+                },
+                merge=True,
+            )
+            emit_audit(
+                "repoint_relationship",
+                resource_type=ResourceType.DATASET,
+                workspace=self.workspace,
+                collection=near_collection,
+                resource=near_dataset,
+                author=author,
+                constraint=name,
+                references=f"{new_collection}.{new_dataset}",
+                previous_references=f"{old_collection}.{old_dataset}",
+            )
+            repointed.append(row)
+        return repointed
+
+    def relationships_through_column(self, dataset_identifier: str, column: str) -> list[dict]:
+        """Every relationship that would point at nothing if `column` went.
+
+        BOTH DIRECTIONS, and they are not equivalent to the caller:
+
+          * outbound - declared ON this dataset, at this column. Its author is
+            this dataset's owner, so naming it back to them discloses nothing.
+          * inbound - declared elsewhere, referencing this column. Its far end
+            is a dataset the asker may hold no grant on, so these rows are
+            marked `"inbound": True` and a caller that renders a message MUST
+            NOT name them (§8.2). They are here to be broken and to be
+            notified about, not to be shown to whoever dropped the column.
+
+        Read at plan time by `ALTER TABLE ... DROP COLUMN`, which is the whole
+        point: telling someone before the damage beats recording it after.
+        """
+        collection, dataset_name = self._local_parts(dataset_identifier)
+        target = (column or "").casefold()
+
+        through = []
+        for row in self.list_relationships(dataset_identifier):
+            if (row.get("column") or "").casefold() == target:
+                through.append({**row, "inbound": False})
+        for row in self.find_relationships_to(f"{collection}.{dataset_name}"):
+            if (row.get("references-column") or "").casefold() == target:
+                through.append({**row, "inbound": True})
+        return through
+
+    def break_relationships_through_column(
+        self,
+        dataset_identifier: str,
+        column: str,
+        *,
+        author: str | None = None,
+    ) -> list[dict]:
+        """Mark broken every relationship that ran through a dropped column.
+
+        Called AFTER the column is gone, by whoever executed the drop. The
+        plan-time check refuses the case worth refusing (an asserted outbound
+        relationship, §6.1); what reaches here is what was allowed through -
+        proposals, and inbound references the dropper was deliberately not
+        told about because naming them would disclose a dataset they cannot
+        read.
+
+        Returns what it broke, including inbound rows, so the caller can notify
+        the people who asserted them. That notification is the point: an
+        inbound reference nobody is told about is a status field nobody reads.
+        """
+        collection, dataset_name = self._local_parts(dataset_identifier)
+        detail = f"column {collection}.{dataset_name}.{column} was dropped"
+
+        broken = []
+        for row in self.list_relationships(dataset_identifier):
+            if (row.get("column") or "").casefold() != (column or "").casefold():
+                continue
+            if row.get("status") == "broken":
+                continue
+            self._mark_relationship_broken(
+                collection,
+                dataset_name,
+                row.get("name"),
+                reason="column-dropped",
+                detail=detail,
+                author=author,
+            )
+            broken.append({**row, "inbound": False})
+
+        broken.extend(
+            {**row, "inbound": True}
+            for row in self._break_inbound_relationships(
+                collection,
+                dataset_name,
+                reason="column-dropped",
+                detail=detail,
+                author=author,
+                column=column,
+            )
+        )
+        return broken
+
+    def record_relationship_verification(
+        self,
+        dataset_identifier: str,
+        constraint_name: str,
+        *,
+        status: str,
+        evidence: dict | None = None,
+        confidence: float | None = None,
+        cardinality_observed: str | None = None,
+        verifier: str | None = None,
+    ) -> None:
+        """Write back what a re-score of a declared pair observed.
+
+        A NARROW MERGE over a row the job already located, which is the one
+        bulk write the cluster key does nothing for - and the reason this takes
+        a constraint name rather than re-deriving one.
+
+        `status=None` records the MEASUREMENT and leaves the status alone,
+        which is the honest outcome more often than it looks. A score that is
+        neither good enough to confirm nor bad enough to condemn should move
+        `verified-at-ms` and the evidence and nothing else - and a proposal
+        stays 'unverified' whatever it scores, because a machine re-measuring
+        its own guess does not turn it into a claim; only a person's
+        confirmation does (§7.4).
+
+        `cardinality_observed` is recorded BESIDE the declared cardinality and
+        never over it. The person who wrote `many_to_one` is the authority on
+        what the relationship means; a fan-out read off statistics is a
+        measurement of what the data currently is. Where they disagree, both
+        belong on the row - overwriting would destroy the disagreement, which
+        is the finding.
+        """
+        if status is not None and status not in {"active", "broken", "unverified"}:
+            raise ValueError(f"unknown verification status: {status!r}")
+
+        collection, dataset_name = self._local_parts(dataset_identifier)
+        now_ms = int(time.time() * 1000)
+        payload: dict = {
+            "verified-at-ms": now_ms,
+            "verified-by": verifier,
+            "cardinality-observed": cardinality_observed,
+        }
+        if status is not None:
+            payload["status"] = status
+        if evidence is not None:
+            payload["evidence"] = dict(evidence)
+        if confidence is not None:
+            payload["confidence"] = float(confidence)
+        if status == "broken":
+            payload["broken-reason"] = "values-diverged"
+            payload["broken-detail"] = (
+                "the values no longer correspond - see this row's evidence for "
+                "what was compared"
+            )
+            payload["broken-at-ms"] = now_ms
+        elif status == "active":
+            # A repair is as much a fact as a break. Clearing these stops a row
+            # that has come back from reading as broken forever, which is how a
+            # status column stops being believed. Only an explicit 'active'
+            # clears them: an inconclusive re-score (`status=None`) knows
+            # nothing about why the row broke and must not erase the answer.
+            payload["broken-reason"] = None
+            payload["broken-detail"] = None
+            payload["broken-at-ms"] = None
+
+        self._relationships_collection(collection, dataset_name).document(constraint_name).set(
+            payload, merge=True
+        )
+
+        emit_audit(
+            "verify_relationship",
+            resource_type=ResourceType.DATASET,
+            workspace=self.workspace,
+            collection=collection,
+            resource=dataset_name,
+            author=verifier,
+            constraint=constraint_name,
+            status=status,
+            cardinality_observed=cardinality_observed,
+        )
+
     def find_relationships_to(self, dataset_identifier: str) -> list[dict]:
         """Every relationship pointing AT this dataset, from anywhere in this
         workspace - the reverse of `list_relationships`.
@@ -3732,6 +4272,36 @@ class OpteryxCatalog(Metastore):
             resource=dataset_name,
             author=author,
             trigger=name,
+        )
+
+    def set_trigger_owner(
+        self,
+        dataset_identifier: str,
+        name: str,
+        new_owner: str,
+        author: str | None = None,
+    ) -> None:
+        """Repoint the identity a trigger's unattended runs execute as.
+
+        The caller (the engine's binder, for the SQL surface) has already
+        established the incoming owner is one who can be billed; this records
+        the transfer and audits who made it.
+        """
+        collection, dataset_name = self._local_parts(dataset_identifier)
+        ref = self._triggers_collection(collection, dataset_name).document(name)
+        if not ref.get().exists:
+            raise TriggerNotFound(f"Trigger not found: {name} on {collection}.{dataset_name}")
+        ref.update({"runs-as": new_owner})
+
+        emit_audit(
+            "alter_trigger_owner",
+            resource_type=ResourceType.DATASET,
+            workspace=self.workspace,
+            collection=collection,
+            resource=dataset_name,
+            author=author,
+            trigger=name,
+            new_owner=new_owner,
         )
 
     def mark_trigger_fired(self, dataset_identifier: str, name: str, status: str) -> None:
@@ -4221,63 +4791,20 @@ class OpteryxCatalog(Metastore):
         digest = hashlib.sha256(qualified_target.encode("utf-8")).hexdigest()[:8]
         return f"refresh__{collection}__{dataset_name}__{digest}"
 
-    def _assert_no_stacked_materialized_view(
-        self, identifier: str, source_tables: list[str]
-    ) -> None:
-        """Reject an MV that would sit on top of, or underneath, another MV.
-
-        Policy: a materialized view reads plain datasets only. Stacking them
-        makes staleness unreasonable - the outer view refreshes off the inner
-        view's refresh commit, so it is always at least one hop behind, and a
-        failed inner refresh silently pins everything above it. Both directions
-        are checked, because registration can create the stack from either end:
-
-        - a source that is already a materialized view (the obvious case), and
-        - registering a dataset that is already *read by* a materialized view,
-          which would turn that reader into an MV-over-MV after the fact.
-
-        The second check reads this dataset's own triggers: an MV's refresh
-        trigger lives on each of its sources, so a refresh trigger here that
-        targets some other view is exactly the evidence that a view reads it.
-        """
-        for source in source_tables:
-            coll, name = self._local_parts(source)
-            data = self._dataset_doc_ref(coll, name).get().to_dict() or {}
-            if data.get("dataset-type") == MATERIALIZED_VIEW_TYPE:
-                raise MaterializedViewError(
-                    f"a materialized view cannot read another materialized view: "
-                    f"{identifier} reads {source}"
-                )
-
-        collection, dataset_name = self._local_parts(identifier)
-        for doc in self._triggers_collection(collection, dataset_name).stream():
-            trigger = doc.to_dict() or {}
-            if trigger.get("kind") != MV_REFRESH_TRIGGER_KIND:
-                continue
-            target = trigger.get("target-view")
-            # A target too short to name a dataset is a broken trigger, not a
-            # stack; leave it to whoever fires it to complain.
-            if not target or "." not in target:
-                continue
-            target = self._qualify(target)
-            if target != identifier:
-                raise MaterializedViewError(
-                    f"cannot register {identifier} as a materialized view: it is a source "
-                    f"of materialized view {target}"
-                )
-
     def _assert_no_materialized_view_cycle(self, identifier: str, source_tables: list[str]) -> None:
         """Reject a source graph that reaches back to the MV being registered.
 
-        With the no-stacking policy above this is unreachable through the public
-        API - an MV's sources are all plain datasets, so the walk terminates at
-        depth one. It stays as a backstop for registrations that predate the
-        policy, for documents edited outside this class, and for the racing pair
-        of registrations that could each pass the depth-one check.
+        A view may read another view, so the walk is the only thing standing
+        between a chain and a loop: it follows `source-tables` transitively
+        through every source that is itself a materialized view, and refuses
+        the registration if it arrives back at `identifier`.
 
-        Checked at creation rather than fire time: a refresh commit is
-        user-created and fires downstream triggers, so a cycle would refresh
-        forever.
+        This is the early refusal, before the registration writes anything.
+        The enforcing check is `_assert_no_trigger_cycle`, on the graph that
+        actually fires; the two agree for any view registered through here,
+        because this method reconciles one trigger per source. Keeping this one
+        means a cyclic registration is rejected with nothing half-written,
+        rather than partway through creating its triggers.
         """
         stack = list(source_tables)
         seen = set()
@@ -4323,9 +4850,10 @@ class OpteryxCatalog(Metastore):
         writes a new statement version and reconciles triggers against the new
         source list.
 
-        Sources must be plain datasets: an MV may neither read another MV nor be
-        registered over a dataset some other MV already reads. See
-        `_assert_no_stacked_materialized_view`. A source in a workspace that
+        A source may itself be a materialized view: chains are allowed, and the
+        chain refreshes a hop at a time as each view's refresh commit fires the
+        triggers below it. What is not allowed is a loop - see
+        `_assert_no_materialized_view_cycle`. A source in a workspace that
         restricts egress is refused with `EgressRestricted`, at refresh time as
         well as here.
 
@@ -4387,7 +4915,6 @@ class OpteryxCatalog(Metastore):
             src_coll, src_name = self._local_parts(relative)
             if not self._dataset_doc_ref(src_coll, src_name).get().exists:
                 raise DatasetNotFound(f"Source dataset not found: {relative}")
-        self._assert_no_stacked_materialized_view(identifier, relative_sources)
         self._assert_no_materialized_view_cycle(identifier, relative_sources)
 
         # Statement version, following the view convention exactly.

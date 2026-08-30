@@ -24,6 +24,11 @@ Finding kinds:
 - ``missing-source-trigger``: a materialized view with a source that
   carries no refresh trigger pointing back at it - the MV silently never
   refreshes from that source.
+- ``trigger-cycle``: refresh triggers that close a loop. The trigger
+  graph is the one that fires, and it must be a DAG - a cycle in it
+  refreshes forever, since nothing at run time carries a hop count.
+  `create_trigger` refuses to close one, but two concurrent writes can
+  each read a graph that is still acyclic.
 """
 
 from __future__ import annotations
@@ -168,6 +173,61 @@ def _check_mv_sources(
     return findings
 
 
+def _check_trigger_cycles(edges: dict[str, list[str]]) -> list[dict[str, str]]:
+    """Findings for loops in the trigger graph.
+
+    The graph that fires: a node is a dataset, an edge D -> V a refresh trigger
+    on D targeting view V. `create_trigger` refuses to close a cycle, so this
+    is the backstop for what a single write cannot see - two triggers created
+    concurrently, each reading a graph that is still acyclic, and documents
+    edited out of band.
+
+    Built from trigger documents the sweep already reads, so it costs no extra
+    Firestore reads. Only edges whose target is a dataset in this workspace are
+    followed: a foreign target's triggers are not ours to read, and a loop
+    through another workspace would surface in that workspace's own audit.
+    Task triggers are not edges - a task records its SQL, never what the SQL
+    writes, so a loop through a task is not representable here.
+
+    One finding per cycle, keyed by its member set, so a loop is not reported
+    once per dataset on it.
+    """
+    findings: list[dict[str, str]] = []
+    reported: set[frozenset[str]] = set()
+    visiting: set[str] = set()
+    done: set[str] = set()
+
+    def walk(node: str, path: list[str]) -> None:
+        if node in done:
+            return
+        if node in visiting:
+            cycle = path[path.index(node) :]
+            key = frozenset(cycle)
+            if key not in reported:
+                reported.add(key)
+                workspace, collection, dataset = node.split(".", 2)
+                findings.append(
+                    _finding(
+                        "trigger-cycle",
+                        f"{workspace}/{collection}/datasets/{dataset}",
+                        "refresh triggers form a cycle: " + " -> ".join([*cycle, node]),
+                    )
+                )
+            return
+        visiting.add(node)
+        path.append(node)
+        for target in edges.get(node, ()):
+            if target in edges:
+                walk(target, path)
+        path.pop()
+        visiting.discard(node)
+        done.add(node)
+
+    for node in sorted(edges):
+        walk(node, [])
+    return findings
+
+
 def audit_workspace(client, workspace: str) -> list[dict[str, str]]:
     """Every integrity finding in one workspace, as `{kind, path, detail}` rows.
 
@@ -176,6 +236,11 @@ def audit_workspace(client, workspace: str) -> list[dict[str, str]]:
     do not exist, which is exactly what makes ghosts invisible everywhere else.
     """
     findings: list[dict[str, str]] = []
+    # The trigger graph, accumulated as the sweep reads each dataset's triggers,
+    # so the cycle walk at the end needs no further reads. Every live dataset is
+    # a node, including the ones with no triggers - a node with no outgoing edge
+    # is where a walk terminates.
+    trigger_edges: dict[str, list[str]] = {}
     for collection_ref in client.collection(workspace).list_documents():
         if collection_ref.id.startswith("$"):
             continue
@@ -194,12 +259,20 @@ def audit_workspace(client, workspace: str) -> list[dict[str, str]]:
                 )
                 continue
             data = snapshot.to_dict() or {}
+            qualified = f"{workspace}.{collection_ref.id}.{dataset_ref.id}"
+            trigger_edges.setdefault(qualified, [])
             for doc in dataset_ref.collection(TRIGGERS_SUBCOLLECTION).stream():
-                finding = _check_trigger(client, workspace, dataset_path, doc.to_dict() or {})
+                trigger = doc.to_dict() or {}
+                finding = _check_trigger(client, workspace, dataset_path, trigger)
                 if finding:
                     findings.append(finding)
+                if trigger.get("kind") == MV_REFRESH_TRIGGER_KIND:
+                    target = _split_target(trigger.get("target-view") or "", workspace)
+                    if target is not None:
+                        trigger_edges[qualified].append(".".join(target))
             if data.get("dataset-type") == MATERIALIZED_VIEW_TYPE:
                 findings.extend(
                     _check_mv_sources(client, workspace, collection_ref.id, dataset_ref.id, data)
                 )
+    findings.extend(_check_trigger_cycles(trigger_edges))
     return findings

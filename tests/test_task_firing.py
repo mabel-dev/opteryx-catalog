@@ -31,14 +31,13 @@ def _catalog_stub(triggers=None, task=None):
         "name": "compaction_log_ingest",
         "collection": "ops",
         "sql": "INSERT INTO ops.compaction_log SELECT 1",
-        "runs-as": "federator",
-        "suspended-at-ms": None,
     }
     return catalog
 
 
 def _task_trigger(name="task__ops__compaction_log_ingest", target="ws.ops.compaction_log_ingest"):
-    return {"name": name, "kind": "task", "target-task": target}
+    # `runs-as` on the TRIGGER: the identity an unattended run carries.
+    return {"name": name, "kind": "task", "target-task": target, "runs-as": "federator"}
 
 
 def _fire(catalog, snapshot_id=200, parent_snapshot_id=100):
@@ -95,8 +94,8 @@ def test_the_no_parent_floor_is_never_the_reserved_zero():
 
 
 def test_submission_names_the_task_never_the_principal():
-    """jobs resolves runs-as from the task; a payload that could name the actor
-    could name it wrongly."""
+    """jobs resolves the acting identity from the trigger's own record; a
+    payload that could name the actor could name it wrongly."""
     catalog = _catalog_stub()
     post, _ = _fire(catalog)
 
@@ -122,28 +121,13 @@ def test_fired_status_and_audit_are_recorded():
 # --- refusals and suppression
 
 
-def test_a_suspended_task_records_and_enqueues_nothing():
-    catalog = _catalog_stub(
-        task={
-            "identifier": "ws.ops.t",
-            "sql": "SELECT 1",
-            "runs-as": "federator",
-            "suspended-at-ms": 1700000000000,
-        }
-    )
-    post, _ = _fire(catalog)
-
-    post.assert_not_called()
-    catalog.mark_trigger_fired.assert_called_once_with(
-        "ops.catalog_changes", "task__ops__compaction_log_ingest", status="suspended"
-    )
-
-
-def test_a_task_with_no_owner_refuses_to_fire():
-    """Defaulting to the committer would silently reinstate invoker semantics."""
-    catalog = _catalog_stub(
-        task={"identifier": "ws.ops.t", "sql": "SELECT 1", "runs-as": None}
-    )
+def test_a_trigger_with_no_owner_refuses_to_fire():
+    """The trigger is what makes a run unattended, so the trigger must say whose
+    authority it carries. Defaulting to the committer would silently reinstate
+    invoker semantics."""
+    trigger = _task_trigger()
+    trigger["runs-as"] = None
+    catalog = _catalog_stub(triggers=[trigger])
     with (
         patch.object(trigger_firing, "_post_job") as post,
         patch.object(trigger_firing, "_alert") as alert,

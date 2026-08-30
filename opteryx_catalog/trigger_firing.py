@@ -495,20 +495,16 @@ def _fire_task(
     if not task.get("sql"):
         raise TaskError(f"task has no statement recorded: {target_task}")
 
-    # Suspended by an operator. Not an error and not alerted - the trigger still
-    # records that it fired and why nothing came of it, so the suppression is
-    # visible where someone looks for the task's staleness.
-    if task.get("suspended-at-ms"):
-        catalog.mark_trigger_fired(dataset_identifier, trigger["name"], status="suspended")
-        return
-
-    # The identity the task runs as, never the committer's - see `_fire_refresh`
-    # for why a missing one is refused rather than defaulted.
-    runs_as = task.get("runs-as")
+    # The identity this unattended run executes as - the TRIGGER's, never the
+    # committer's and never the task's. A task carries no identity: a person
+    # running EXECUTE runs it as themselves, and the trigger is what makes a run
+    # unattended, so the trigger is what must say whose authority it uses. See
+    # `_fire_refresh` for why a missing one is refused rather than defaulted.
+    runs_as = trigger.get("runs-as")
     if not runs_as:
         raise TaskOwnerMissing(
-            f"task {target_task} has no runs-as identity; refusing to run it as the "
-            "committing user."
+            f"trigger {trigger['name']} on {dataset_identifier} has no runs-as "
+            f"identity; refusing to run {target_task} as the committing user."
         )
 
     # A dataset's first commit has no parent; the window is then everything up

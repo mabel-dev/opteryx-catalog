@@ -23,12 +23,14 @@ from test_materialized_views import _catalog
 
 def test_create_and_read_a_task():
     catalog = _catalog()
-    catalog.create_task("ops.ingest", sql="SELECT 1", author="xb500", runs_as="federator")
+    catalog.create_task("ops.ingest", sql="SELECT 1", author="xb500")
 
     task = catalog.get_task("ops.ingest")
     assert task["identifier"] == "ws.ops.ingest"
     assert task["sql"] == "SELECT 1"
-    assert task["runs-as"] == "federator"
+    # A task carries no identity: EXECUTE runs as the invoker, and an unattended
+    # run carries the TRIGGER's owner. Storing one here would be a second answer.
+    assert "runs-as" not in task
     assert task["created-by"] == "xb500"
     assert task["last-window-to"] is None
 
@@ -65,16 +67,25 @@ def test_redefining_keeps_the_old_statement_as_a_version():
     assert task["created-by"] == "xb500"
 
 
-def test_runs_as_is_pinned_across_redefinition():
-    """Editing a task must never silently transfer whose authority it runs with."""
+def test_trigger_owner_is_pinned_across_re_registration():
+    """Editing or repointing a trigger must never silently transfer whose
+    authority its unattended runs carry - the confused-deputy hole."""
     catalog = _catalog()
-    catalog.create_task("ops.ingest", sql="SELECT 1", author="xb500", runs_as="federator")
-
-    catalog.create_task(
-        "ops.ingest", sql="SELECT 2", author="mallory", runs_as="mallory", update_if_exists=True
+    _add_dataset(catalog, "ops.src")
+    catalog.create_trigger(
+        "ops.src", name="t", target_task="ops.ingest", kind="task",
+        author="xb500", runs_as="federator",
     )
 
-    assert catalog.get_task("ops.ingest")["runs-as"] == "federator"
+    catalog.drop_trigger("ops.src", "t", author="mallory", missing_ok=True)
+    catalog.create_trigger(
+        "ops.src", name="t", target_task="ops.ingest", kind="task", author="mallory"
+    )
+    # A DROP genuinely clears it - that is a deliberate removal, not an edit.
+    assert catalog.list_triggers("ops.src")[0]["runs-as"] == "mallory"
+
+    catalog.set_trigger_owner("ops.src", "t", "federator", author="xb500")
+    assert catalog.list_triggers("ops.src")[0]["runs-as"] == "federator"
 
 
 def test_a_task_requires_a_statement_and_an_author():
@@ -230,3 +241,45 @@ def test_a_task_trigger_will_not_be_repointed():
             kind="task",
             author="xb500",
         )
+
+
+# --- the namespace is shared
+
+
+def test_a_task_cannot_take_a_dataset_name():
+    """`workspace.collection.<object>` is ONE namespace. Datasets, views and
+    tasks live in three separate subcollections, so nothing about the storage
+    prevents a collision — this check is what does."""
+    catalog = _catalog()
+    _add_dataset(catalog, "ops.thing")
+
+    with pytest.raises(Exception, match="already exists as a dataset"):
+        catalog.create_task("ops.thing", sql="SELECT 1", author="xb500")
+
+
+def test_a_dataset_cannot_take_a_task_name():
+    """The check runs in both directions, or it is not a namespace."""
+    catalog = _catalog()
+    catalog.create_task("ops.thing", sql="SELECT 1", author="xb500")
+
+    with pytest.raises(Exception, match="already exists as a task"):
+        catalog.create_dataset("ops.thing", schema=None, author="olive")
+
+
+def test_redefining_a_task_is_not_a_collision():
+    """The same-kind case belongs to the creator's own replace logic."""
+    catalog = _catalog()
+    catalog.create_task("ops.thing", sql="SELECT 1", author="xb500")
+
+    catalog.create_task("ops.thing", sql="SELECT 2", author="xb500", update_if_exists=True)
+
+    assert catalog.get_task("ops.thing")["sql"] == "SELECT 2"
+
+
+def test_name_holder_reports_the_kind():
+    catalog = _catalog()
+    assert catalog.name_holder("ops", "nothing") is None
+    catalog.create_task("ops.t", sql="SELECT 1", author="xb500")
+    assert catalog.name_holder("ops", "t") == "task"
+    _add_dataset(catalog, "ops.d")
+    assert catalog.name_holder("ops", "d") == "dataset"

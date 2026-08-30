@@ -226,13 +226,13 @@ per-dataset beats the old plan's workspace-wide `$hooks` query) and enqueues one
 trigger. Debounce within the call: a multi-trigger commit fires each distinct MV once.
 
 **MV-over-MV / loops**: a refresh commit on an MV's backing table is itself a user-created
-commit, so MVs stacking on MVs would work mechanically — but it is **rejected at creation**.
-The outer view can only ever be a refresh behind the inner one, and a failed inner refresh
-pins the whole tower without saying so. Registration rejects both an MV source and the
-registration of a dataset another MV already reads. Cycles are rejected at **creation** time
-as well (walk `source-tables` of any source that is itself an MV) — cheaper and more
-debuggable than runtime loop detection, and it still covers graphs written before the
-no-stacking rule.
+commit, so MVs stacking on MVs works mechanically, and it is **allowed**. The outer view is
+a refresh behind the inner one and a failed inner refresh pins the tower at its last good
+data — both visible in `last-refresh-status`, not silent. Loops are what is rejected, at
+**creation** time (walk `source-tables` of any source that is itself an MV) — cheaper and
+more debuggable than runtime loop detection. Creation-time checking cannot see two
+registrations racing to close a loop from opposite ends, so `fsck` re-walks the graph and
+reports `mv-source-cycle`.
 
 ### Enqueue mechanics — copy jobs.opteryx, not the webhook sender
 

@@ -217,3 +217,79 @@ def test_an_mv_source_trigger_is_matched_by_target_not_by_name():
     )
 
     assert audit_workspace(client, "ws") == []
+
+
+def _mv_with_trigger(client, workspace, collection, dataset, sources):
+    """An MV reading `sources`, with each source's refresh trigger in place -
+    so the only thing these fixtures can be reported for is the cycle."""
+    _add_dataset(
+        client,
+        workspace,
+        collection,
+        dataset,
+        **{"dataset-type": "materialized_view", "source-tables": list(sources)},
+    )
+    target = f"{workspace}.{collection}.{dataset}"
+    for source in sources:
+        src_ws, src_coll, src_name = source.split(".", 2)
+        ref = _dataset_ref(client, src_ws, src_coll, src_name)
+        ref.collection("triggers").document(f"refresh__{collection}__{dataset}").set(
+            {"kind": "materialized_view_refresh", "target-view": target}
+        )
+
+
+def test_a_trigger_cycle_is_reported():
+    # `create_trigger` refuses to close a loop, but two concurrent writes can
+    # each read a graph that is still acyclic. This is the backstop that sees
+    # the result: the trigger graph is what fires, and it must be a DAG.
+    client = _Client()
+    _mv_with_trigger(client, "ws", "mart", "a", ["ws.mart.b"])
+    _mv_with_trigger(client, "ws", "mart", "b", ["ws.mart.a"])
+
+    findings = [f for f in audit_workspace(client, "ws") if f["kind"] == "trigger-cycle"]
+
+    assert len(findings) == 1
+    assert findings[0]["path"] == "ws/mart/datasets/a"
+    assert "ws.mart.a" in findings[0]["detail"] and "ws.mart.b" in findings[0]["detail"]
+
+
+def test_a_trigger_chain_is_not_a_cycle():
+    # Stacking is allowed; only a loop is a finding.
+    client = _Client()
+    _add_dataset(client, "ws", "src", "raw")
+    _mv_with_trigger(client, "ws", "mart", "a", ["ws.src.raw"])
+    _mv_with_trigger(client, "ws", "mart", "b", ["ws.mart.a"])
+    _mv_with_trigger(client, "ws", "mart", "c", ["ws.mart.b"])
+
+    assert audit_workspace(client, "ws") == []
+
+
+def test_a_trigger_cycle_no_source_list_mentions_is_still_reported():
+    # The whole reason the walk is over triggers and not `source-tables`: an
+    # extra refresh trigger - written directly, or left behind by a
+    # reconciliation that failed partway - is a firing edge that appears in no
+    # source list. The source graph here is a clean chain.
+    client = _Client()
+    _add_dataset(client, "ws", "src", "raw")
+    _mv_with_trigger(client, "ws", "mart", "a", ["ws.src.raw"])
+    _mv_with_trigger(client, "ws", "mart", "b", ["ws.mart.a"])
+    # b refreshes a, though a does not list b as a source.
+    _dataset_ref(client, "ws", "mart", "b").collection("triggers").document("stale").set(
+        {"kind": "materialized_view_refresh", "target-view": "ws.mart.a"}
+    )
+
+    findings = [f for f in audit_workspace(client, "ws") if f["kind"] == "trigger-cycle"]
+
+    assert len(findings) == 1
+    assert "ws.mart.a -> ws.mart.b -> ws.mart.a" in findings[0]["detail"]
+
+
+def test_a_task_trigger_is_not_an_edge_in_the_trigger_graph():
+    # A task records its SQL, never what the SQL writes, so it cannot be a node
+    # and the walk must not try to make it one.
+    client = _Client()
+    src = _add_dataset(client, "ws", "src", "raw")
+    client.collection("ws").document("ops").collection("tasks").document("roll").set({})
+    src.collection("triggers").document("t").set({"kind": "task", "target-task": "ws.ops.roll"})
+
+    assert audit_workspace(client, "ws") == []
