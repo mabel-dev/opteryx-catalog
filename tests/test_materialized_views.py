@@ -910,3 +910,30 @@ def test_suspension_survives_a_commit():
     record = catalog.get_materialized_view("mart.daily")
     assert record["suspended-by"] == "admin"
     assert isinstance(record["suspended-at-ms"], int)
+
+
+def test_a_trigger_never_survives_a_concurrent_dataset_drop():
+    """The ghost-dataset race: `create_trigger` checks the dataset exists, then
+    writes the trigger - and a `drop_dataset` landing between the two sweeps
+    the triggers subcollection BEFORE this document arrives, then deletes the
+    dataset. The write path must notice and undo, or the trigger survives as
+    the only thing under a ghost path, invisible to every read but
+    `list_documents()`. This happened in production."""
+    catalog = _catalog()
+    _add_dataset(catalog, "src.a")
+    _add_dataset(catalog, "mart.daily")
+
+    dataset_ref = catalog._dataset_doc_ref("src", "a")
+    trigger_ref = catalog._triggers_collection("src", "a").document("t")
+    original_set = trigger_ref.set
+
+    def set_and_lose_the_race(data, merge=False):
+        original_set(data, merge=merge)
+        dataset_ref.delete()
+
+    trigger_ref.set = set_and_lose_the_race
+
+    with pytest.raises(DatasetNotFound):
+        catalog.create_trigger("src.a", "t", target_view="mart.daily", author="alice")
+
+    assert not any(True for _ in catalog._triggers_collection("src", "a").stream())
