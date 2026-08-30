@@ -400,7 +400,6 @@ def _fire_refresh(
     try:
         catalog.enforce_materialized_view_egress(target_view, mv.get("source-tables") or [])
     except EgressRestricted:
-        catalog.mark_trigger_fired(dataset_identifier, trigger["name"], status="egress-blocked")
         raise
 
     # REFRESH MATERIALIZED VIEW, not the CoRTAS it desugars to. The statement
@@ -434,7 +433,6 @@ def _fire_refresh(
     # privileged, as a refresh running with authority the view never had).
     runs_as = mv.get("runs-as")
     if not runs_as:
-        catalog.mark_trigger_fired(dataset_identifier, trigger["name"], status="owner-missing")
         raise MaterializedViewOwnerMissing(
             f"materialized view {target_view} has no runs-as identity; refusing to "
             "refresh it as the committing user. Set one with ALTER MATERIALIZED "
@@ -508,7 +506,6 @@ def _fire_task(
     # for why a missing one is refused rather than defaulted.
     runs_as = task.get("runs-as")
     if not runs_as:
-        catalog.mark_trigger_fired(dataset_identifier, trigger["name"], status="owner-missing")
         raise TaskOwnerMissing(
             f"task {target_task} has no runs-as identity; refusing to run it as the "
             "committing user."
@@ -558,6 +555,27 @@ def _fire_task(
     )
 
 
+# Statuses for the failures that RAISE. Recorded in one place - the handler in
+# `fire_triggers` - rather than at each raise site: stamping in both meant the
+# handler's generic status overwrote the specific one, turning "owner-missing"
+# into "error" and losing the only useful part. Arms that RETURN instead of
+# raising (a suspended trigger) still stamp themselves, because no handler sees
+# them.
+_FAILURE_STATUSES = (
+    (EgressRestricted, "egress-blocked"),
+    (MaterializedViewOwnerMissing, "owner-missing"),
+    (TaskOwnerMissing, "owner-missing"),
+)
+
+
+def _failure_status(exc: BaseException) -> str:
+    """What `last-fired-status` should say about a fire that raised."""
+    for kind, status in _FAILURE_STATUSES:
+        if isinstance(exc, kind):
+            return status
+    return "error"
+
+
 def fire_triggers(
     catalog,
     dataset_identifier: str,
@@ -604,10 +622,37 @@ def fire_triggers(
             continue
         if not target_view or target_view in seen_targets:
             continue
+
+        # Suspended by an operator. Not an error and not alerted - the trigger
+        # records that it was reached and why nothing came of it, so the
+        # suppression is visible where someone looks for the staleness rather
+        # than only in whatever they remember pausing.
+        if trigger.get("suspended-at-ms"):
+            catalog.mark_trigger_fired(dataset_identifier, trigger["name"], status="suspended")
+            continue
+
         seen_targets.add(target_view)
         try:
             fire()
         except Exception as exc:  # noqa: BLE001 - commit path must survive
+            # Stamp the trigger BEFORE alerting. Every expected outcome above
+            # records itself - suspended, egress-blocked, owner-missing - but an
+            # unexpected exception used to record nothing at all, so a trigger
+            # failing on every commit was indistinguishable from one that had
+            # never fired: `last-fired-at-ms` and `last-fired-status` both stayed
+            # null, and SHOW TRIGGERS / information_schema showed a healthy-looking
+            # row. That is how a TaskNotFound went unnoticed while it fired hourly.
+            #
+            # Guarded because this is the failure path of the failure path: if
+            # stamping also fails, the alert below is what must still happen.
+            try:
+                catalog.mark_trigger_fired(
+                    dataset_identifier, trigger["name"], status=_failure_status(exc)
+                )
+            except Exception:  # noqa: BLE001 - never displace the real failure
+                logger.warning(
+                    "could not record the fire failure on trigger %s", trigger.get("name")
+                )
             _alert(
                 exc,
                 note=note,

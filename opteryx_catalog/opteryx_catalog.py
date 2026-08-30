@@ -87,6 +87,29 @@ TRIGGERS_SUBCOLLECTION = "triggers"
 # plan or rewrite a query.
 RELATIONSHIPS_SUBCOLLECTION = "relationships"
 
+# Subcollection under a dataset document holding the COLUMN PAIRS inference has
+# been told not to propose again - one document per rejected pair, keyed by the
+# pair digest below.
+#
+# Keyed on the PAIR, never on the constraint name. An inference run generates
+# its own names, so a rejection recorded against a name would be re-proposed
+# under the next run's name and the owner would reject the same claim forever.
+# The pair is what was actually judged.
+#
+# Deliberately NOT a status on the relationship document itself. A rejected
+# proposal is not a relationship - it is a statement that no relationship is
+# there - and leaving it in `relationships` would put it in front of every
+# consumer that reads that subcollection, each of which would then need to know
+# to exclude it. The status enum stays `active | unverified | broken`.
+#
+# No expiry. A rejection says the values happen to overlap and the columns still
+# do not correspond, which is a fact about what the data MEANS; nothing a later
+# run observes changes it, because a later run observes the same kind of
+# evidence that was already rejected. Only a person can undo it, by dropping the
+# suppression - and `rejected-at-ms` is recorded so a future policy could revisit
+# that decision with the date in hand.
+RELATIONSHIP_SUPPRESSIONS_SUBCOLLECTION = "relationship-suppressions"
+
 # Subcollection under a dataset document holding that dataset's snapshot tags -
 # one document per tag, keyed by the NORMALIZED tag name. The document id doing
 # the naming is the point: uniqueness is then Firestore's (a create-if-absent
@@ -146,6 +169,74 @@ VIRTUAL_TAG_NAMES = ("current", "previous")
 # A tag name is a SQL identifier: a letter, then letters, digits or
 # underscores. No dots (they are the catalog's own separator) and no hyphens.
 _TAG_NAME_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
+
+# Prefix on every constraint name inference generates. Not decoration: it is
+# what tells a reader looking at a DROP CONSTRAINT statement that the name was
+# machine-made, and it keeps generated names in their own space so one can
+# never collide with a name a person chose.
+INFERRED_CONSTRAINT_PREFIX = "inferred_"
+
+
+def relationship_pair_digest(
+    column: str,
+    references_collection: str,
+    references_dataset: str,
+    references_column: str,
+) -> str:
+    """A stable 16-hex identity for one directed column pair.
+
+    THE PAIR, NOT THE NAME, is what inference and rejection both key on. A
+    constraint name is a handle a person or a generator chose; the pair is the
+    claim being made. Keying on the name would let the next run re-propose a
+    rejected pair under a new name, and would let a second run duplicate a
+    proposal the first already wrote.
+
+    The near dataset is NOT part of the digest - the digest is only ever used
+    inside that dataset's own subcollections, so including it would add a
+    constant. The workspace is absent for the same reason, and because a
+    relationship cannot cross one.
+
+    Case is normalised because column and dataset names are not case-sensitive
+    here, and the two sides of a comparison come from different places - the
+    parser's tokens on one, a stored document on the other.
+    """
+    payload = "\x00".join(
+        part.casefold()
+        for part in (column, references_collection, references_dataset, references_column)
+    )
+    return hashlib.blake2b(payload.encode("utf-8"), digest_size=8).hexdigest()
+
+
+def generated_constraint_name(
+    column: str,
+    references_collection: str,
+    references_dataset: str,
+    references_column: str,
+) -> str:
+    """The constraint name inference gives one proposed pair.
+
+    STABLE ACROSS RUNS, because the document id IS the constraint name and
+    uniqueness is Firestore's: a second run over unchanged data must land on
+    the same id and update that document, not write a second one beside it.
+    So the name is a pure function of the pair and carries no timestamp, no
+    score and no run id.
+
+    Readable head, unique tail. The near column name is carried in clear
+    because the name appears in the `DROP CONSTRAINT` an owner may type, and
+    `inferred_a3f19c2b04e7d518` tells them nothing about what they are
+    dropping; the digest is what actually makes it unique, since the column
+    name alone collides as soon as one column is proposed against two targets.
+
+    Sanitised to the identifier grammar the rest of this catalog uses - a
+    column name may contain characters a constraint name may not.
+    """
+    stem = re.sub(r"[^A-Za-z0-9_]", "_", column or "")[:48].strip("_")
+    digest = relationship_pair_digest(
+        column, references_collection, references_dataset, references_column
+    )
+    if not stem:
+        return f"{INFERRED_CONSTRAINT_PREFIX}{digest}"
+    return f"{INFERRED_CONSTRAINT_PREFIX}{stem}_{digest}"
 
 # Longest accepted tag name, in characters.
 MAX_TAG_NAME_LENGTH = 128
@@ -1205,6 +1296,9 @@ class OpteryxCatalog(Metastore):
         self._delete_subcollection(doc_ref.collection("statement"))
         self._delete_subcollection(doc_ref.collection(TRIGGERS_SUBCOLLECTION))
         self._delete_subcollection(doc_ref.collection(RELATIONSHIPS_SUBCOLLECTION))
+        self._delete_subcollection(
+            doc_ref.collection(RELATIONSHIP_SUPPRESSIONS_SUBCOLLECTION)
+        )
         doc_ref.delete()
 
         send_webhook(
@@ -1436,7 +1530,31 @@ class OpteryxCatalog(Metastore):
         # exactly what `status = 'broken'` is for.
         new_relationships = self._relationships_collection(new_collection, new_dataset_name)
         for relationship_doc in self._relationships_collection(collection, dataset_name).stream():
-            new_relationships.document(relationship_doc.id).set(relationship_doc.to_dict() or {})
+            payload = relationship_doc.to_dict() or {}
+            # The near address is denormalised onto every row, so a rename that
+            # copied the documents verbatim would leave each one claiming to
+            # belong to the dataset that no longer exists - and the reverse
+            # lookup and the workspace-wide query both read exactly these
+            # fields rather than the path.
+            payload["collection"] = new_collection
+            payload["dataset"] = new_dataset_name
+            new_relationships.document(relationship_doc.id).set(payload)
+
+        # Rejections travel too, and for a sharper reason than tags do: a
+        # rename that dropped them would have inference re-propose every pair
+        # this dataset's owner has already turned down. The digest keys on the
+        # near COLUMN and the far end, neither of which a rename changes, so the
+        # documents move under their own ids.
+        new_suppressions = self._relationship_suppressions_collection(
+            new_collection, new_dataset_name
+        )
+        for suppression_doc in self._relationship_suppressions_collection(
+            collection, dataset_name
+        ).stream():
+            payload = suppression_doc.to_dict() or {}
+            payload["collection"] = new_collection
+            payload["dataset"] = new_dataset_name
+            new_suppressions.document(suppression_doc.id).set(payload)
 
         new_snapshots = self._snapshots_collection(new_collection, new_dataset_name)
         for snapshot_doc in snapshot_docs:
@@ -1457,6 +1575,9 @@ class OpteryxCatalog(Metastore):
         self._delete_subcollection(doc_ref.collection("schemas"))
         self._delete_subcollection(doc_ref.collection(MAINTENANCE_SUBCOLLECTION))
         self._delete_subcollection(doc_ref.collection(RELATIONSHIPS_SUBCOLLECTION))
+        self._delete_subcollection(
+            doc_ref.collection(RELATIONSHIP_SUPPRESSIONS_SUBCOLLECTION)
+        )
         doc_ref.delete()
 
         # 5. Delete what the copy vacated. Done inline, and by exact path:
@@ -2701,6 +2822,11 @@ class OpteryxCatalog(Metastore):
             RELATIONSHIPS_SUBCOLLECTION
         )
 
+    def _relationship_suppressions_collection(self, collection: str, dataset_name: str):
+        return self._dataset_doc_ref(collection, dataset_name).collection(
+            RELATIONSHIP_SUPPRESSIONS_SUBCOLLECTION
+        )
+
     def _materialized_views_reading(self, dataset_identifier: str) -> set[str]:
         """Qualified names of the materialized views that read this dataset.
 
@@ -2888,12 +3014,31 @@ class OpteryxCatalog(Metastore):
                 "target-view": target_view,
                 "target-task": target_task,
                 "statement-id": statement_id,
+                # Preserved across re-registration: repointing or recreating a
+                # trigger must not quietly un-pause one an operator paused.
+                "suspended-at-ms": (existing.to_dict() or {}).get("suspended-at-ms")
+                if existing.exists
+                else None,
+                "suspended-by": (existing.to_dict() or {}).get("suspended-by")
+                if existing.exists
+                else None,
                 "created-by": author,
                 "created-at-ms": int(time.time() * 1000),
                 "last-fired-at-ms": None,
                 "last-fired-status": None,
             }
         )
+
+        # The existence check at the top and the write above are separate
+        # operations, so a concurrent `drop_dataset` can interleave: its sweep
+        # of the triggers subcollection runs before this document lands, then
+        # the dataset document is deleted - and this trigger survives as the
+        # only thing under a ghost path, invisible to every code path but
+        # `list_documents()`. Re-checking after the write turns that
+        # interleaving into a clean failure instead of an orphan.
+        if not self._dataset_doc_ref(collection, dataset_name).get().exists:
+            trigger_ref.delete()
+            raise DatasetNotFound(f"Dataset not found: {collection}.{dataset_name}")
 
         emit_audit(
             "create_trigger",
@@ -2983,6 +3128,29 @@ class OpteryxCatalog(Metastore):
         uniqueness is Firestore's rather than ours: a create-if-absent write
         with no read-then-write race to lose, the same reason snapshot tags key
         on the tag name.
+
+        THIS STATEMENT ALSO CONFIRMS A PROPOSAL, and that is why it is not a
+        plain create. Inference writes candidate rows that already exist in this
+        subcollection (`propose_relationship`), and the design's first answer -
+        that an owner confirms one "by issuing the DDL, which flips the row to
+        asserted" - could not work against a create-if-absent write: the
+        document is already there, so the statement raised "already exists" and
+        there was no way to confirm anything. So `ADD CONSTRAINT` means CREATE
+        OR UPGRADE:
+
+        - no row for this name and no proposal for this pair -> create, asserted
+        - an INFERRED row, by name or by pair -> upgrade it in place to asserted
+        - an ASSERTED row -> ValueError, unchanged
+
+        The duplicate-name error therefore still fires for the case it was
+        written for. What it no longer does is fire for a proposal, which was
+        never a duplicate declaration - it was the thing being confirmed.
+
+        Matching by PAIR as well as by name is what stops a confirmed proposal
+        coming back. An owner who types their own constraint name rather than
+        the generated one is making exactly the claim the proposal made; if that
+        wrote a second document, the proposal would sit beside the asserted row
+        and be re-proposed on every subsequent run.
         """
         if not author:
             raise ValueError("author must be provided when declaring a relationship")
@@ -2997,13 +3165,50 @@ class OpteryxCatalog(Metastore):
         if not self._dataset_doc_ref(far_collection, far_dataset).get().exists:
             raise DatasetNotFound(f"Dataset not found: {far_collection}.{far_dataset}")
 
-        doc_ref = self._relationships_collection(collection, dataset_name).document(constraint_name)
-        if doc_ref.get().exists:
-            raise ValueError(
-                f"constraint {constraint_name} already exists on {collection}.{dataset_name}"
-            )
+        relationships = self._relationships_collection(collection, dataset_name)
+        digest = relationship_pair_digest(
+            column, far_collection, far_dataset, references_column
+        )
 
-        doc_ref.set(
+        # The proposal this statement might be confirming, found either way it
+        # can be named: by the generated name the Studio's confirm button sends
+        # back, or by the pair, for an owner who typed a name of their own.
+        proposal = None
+        named = relationships.document(constraint_name).get()
+        if named.exists:
+            existing = named.to_dict() or {}
+            if existing.get("origin") == "inferred":
+                proposal = named
+            else:
+                # The case the original error was written for, and it still
+                # fires: a second declaration cannot share a handle with the
+                # first, because the handle is all `DROP CONSTRAINT` has.
+                raise ValueError(
+                    f"constraint {constraint_name} already exists on {collection}.{dataset_name}"
+                )
+        else:
+            # Streamed and filtered here rather than asked of Firestore. A
+            # `where` on `pair-digest` would need the field path backtick-quoted
+            # (every field this catalog stores is hyphenated, and an unquoted
+            # path must match `[a-zA-Z_][a-zA-Z_0-9]*`), and it would cost the
+            # same one read: this subcollection holds a dataset's own
+            # relationships, which number in the tens.
+            for candidate in relationships.stream():
+                data = candidate.to_dict() or {}
+                if data.get("origin") == "inferred" and data.get("pair-digest") == digest:
+                    proposal = candidate
+                    break
+
+        # An upgrade REPLACES the proposal's document rather than editing it,
+        # so a confirmation under a name of the owner's own choosing ends up
+        # under that name and the generated one is gone. Anything else leaves
+        # two handles for one relationship, only one of which drops it.
+        if proposal is not None and proposal.id != constraint_name:
+            relationships.document(proposal.id).delete()
+
+        proposed = (proposal.to_dict() or {}) if proposal is not None else {}
+
+        relationships.document(constraint_name).set(
             {
                 "name": constraint_name,
                 "kind": "maps",
@@ -3025,17 +3230,34 @@ class OpteryxCatalog(Metastore):
                 "references-dataset": far_dataset,
                 "references-column": references_column,
                 # Declared, never derived - nothing samples the data to check.
+                # A confirmation OVERWRITES whatever cardinality was inferred:
+                # the person saying many-to-one is the authority, and getting
+                # this wrong is how a fan-out join silently inflates a number.
                 "cardinality": cardinality,
                 "origin": "asserted",
                 "status": "active",
                 "asserted-by": author,
                 "asserted-at-ms": int(time.time() * 1000),
                 "verified-at-ms": None,
+                # Keyed on the pair so a later proposal of the same claim finds
+                # this row and does not write itself beside it.
+                "pair-digest": digest,
+                # What was proposed, kept after confirmation rather than
+                # cleared. `confidence` and `evidence` are how this row came to
+                # be looked at, and an owner reviewing the graph later is
+                # entitled to see that it began as a machine proposal and on
+                # what evidence. Both are absent on a relationship nobody
+                # proposed, which is the honest thing for a row that was typed
+                # from knowledge rather than measured.
+                "confidence": proposed.get("confidence"),
+                "evidence": proposed.get("evidence"),
+                "proposed-at-ms": proposed.get("proposed-at-ms"),
+                "proposed-by": proposed.get("proposed-by"),
             }
         )
 
         emit_audit(
-            "declare_relationship",
+            "confirm_relationship" if proposal is not None else "declare_relationship",
             resource_type=ResourceType.DATASET,
             workspace=self.workspace,
             collection=collection,
@@ -3044,6 +3266,260 @@ class OpteryxCatalog(Metastore):
             constraint=constraint_name,
             references=f"{far_collection}.{far_dataset}",
         )
+
+    def propose_relationship(
+        self,
+        dataset_identifier: str,
+        column: str,
+        references_dataset: str,
+        references_column: str,
+        cardinality: str,
+        confidence: float,
+        evidence: dict,
+        proposer: str,
+    ) -> str | None:
+        """Record a relationship inference SUGGESTS, for a person to judge.
+
+        Returns the constraint name written, or None if the pair was already
+        settled - suppressed by a rejection, or already asserted by someone.
+
+        NOT REACHABLE FROM DDL, and that is the point.
+        `ALTER TABLE ... ADD CONSTRAINT` means asserted by definition: someone
+        wrote the statement, so a person is standing behind the claim. A
+        proposal has nobody standing behind it, so it gets its own entrance and
+        the inference job calls this directly. There is no SQL for it, and there
+        should not be - a statement that wrote `origin='inferred'` would let a
+        person disclaim a claim they had in fact made.
+
+        `status='unverified'`, so the row is VISIBLE BUT INERT: it appears in
+        `information_schema.column_relationships` and in the Studio carrying its
+        evidence, and it is filtered out of every OData surface that a BI client
+        would act on. A `NavigationProperty` is a promise that joining two
+        entity sets returns rows, and that is not something a guess may say.
+
+        Idempotent on the pair. The constraint name is generated from the pair
+        alone, so a second run over unchanged data addresses the same document
+        and updates its score; it does not accumulate a proposal per run. What
+        does NOT survive a re-proposal is anything a person did to the row - an
+        asserted row is left alone, and a suppressed pair is not written at all.
+
+        Args:
+            column: the near end, on this dataset
+            references_dataset: the far end's dataset, in this workspace
+            confidence: 0..1, the job's own score
+            evidence: what was observed - overlap ratio, sample size, the
+                cardinalities compared. Stored as a map and shown to the owner
+                in full, because a bare score is not something anyone can judge.
+            proposer: the job identity, recorded where a person's name goes on
+                an assertion. It must be visibly not a person.
+        """
+        if not proposer:
+            raise ValueError("proposer must be provided when proposing a relationship")
+        if not 0.0 <= float(confidence) <= 1.0:
+            raise ValueError(f"confidence must be between 0 and 1, got {confidence!r}")
+
+        collection, dataset_name = self._local_parts(dataset_identifier)
+        if not self._dataset_doc_ref(collection, dataset_name).get().exists:
+            raise DatasetNotFound(f"Dataset not found: {collection}.{dataset_name}")
+
+        far_collection, far_dataset = self._local_parts(self._qualify(references_dataset))
+        if not self._dataset_doc_ref(far_collection, far_dataset).get().exists:
+            raise DatasetNotFound(f"Dataset not found: {far_collection}.{far_dataset}")
+
+        digest = relationship_pair_digest(column, far_collection, far_dataset, references_column)
+
+        # A rejected pair is not proposed again. Checked here rather than left
+        # to the job because the job is not the only caller that could exist,
+        # and a suppression that only holds when the caller remembers to look
+        # is not a suppression.
+        suppression = self._relationship_suppressions_collection(
+            collection, dataset_name
+        ).document(digest)
+        if suppression.get().exists:
+            return None
+
+        relationships = self._relationships_collection(collection, dataset_name)
+        constraint_name = generated_constraint_name(
+            column, far_collection, far_dataset, references_column
+        )
+
+        # Never overwrite a person. An asserted row for this pair - under the
+        # generated name or under one an owner chose - means the question is
+        # already answered, and a proposal beside it would ask it again.
+        # Streamed rather than queried for the reason `declare_relationship`
+        # gives: the field is hyphenated and the subcollection is tens of rows.
+        for existing_doc in relationships.stream():
+            data = existing_doc.to_dict() or {}
+            if data.get("origin") == "inferred":
+                continue
+            if existing_doc.id == constraint_name or data.get("pair-digest") == digest:
+                return None
+            if (
+                (data.get("column") or "").casefold() == (column or "").casefold()
+                and (data.get("references-collection") or "").casefold()
+                == far_collection.casefold()
+                and (data.get("references-dataset") or "").casefold() == far_dataset.casefold()
+                and (data.get("references-column") or "").casefold()
+                == (references_column or "").casefold()
+            ):
+                # An asserted row written before `pair-digest` existed. Matched
+                # on its parts so the first inference run against an existing
+                # catalog does not re-propose every relationship already
+                # declared by hand.
+                return None
+
+        relationships.document(constraint_name).set(
+            {
+                "name": constraint_name,
+                "kind": "maps",
+                "workspace": self.workspace,
+                "collection": collection,
+                "dataset": dataset_name,
+                "column": column,
+                "references-workspace": self.workspace,
+                "references-collection": far_collection,
+                "references-dataset": far_dataset,
+                "references-column": references_column,
+                # Inferred from the shape of the data, and the weakest part of
+                # the proposal: a cardinality read off statistics is a guess
+                # about a join's fan-out, which is why confirming overwrites it
+                # with what the person says.
+                "cardinality": cardinality,
+                "origin": "inferred",
+                "status": "unverified",
+                "confidence": float(confidence),
+                "evidence": dict(evidence or {}),
+                "pair-digest": digest,
+                "proposed-by": proposer,
+                "proposed-at-ms": int(time.time() * 1000),
+                # An assertion's fields, deliberately empty. A proposal has no
+                # author and has not been verified; filling either in with the
+                # job's name would make a guess look like a person's statement
+                # to every consumer that reads these fields.
+                "asserted-by": None,
+                "asserted-at-ms": None,
+                "verified-at-ms": None,
+            }
+        )
+
+        emit_audit(
+            "propose_relationship",
+            resource_type=ResourceType.DATASET,
+            workspace=self.workspace,
+            collection=collection,
+            resource=dataset_name,
+            author=proposer,
+            constraint=constraint_name,
+            references=f"{far_collection}.{far_dataset}",
+        )
+        return constraint_name
+
+    def reject_relationship(
+        self,
+        dataset_identifier: str,
+        constraint_name: str,
+        author: str | None = None,
+        reason: str | None = None,
+    ) -> bool:
+        """Reject one proposal, and record that the pair is not to be proposed again.
+
+        Returns True if a proposal was rejected.
+
+        Two writes, and the second is the one that matters. Deleting the
+        proposal without recording the rejection would leave the owner facing
+        the same claim after the next run, which is how a review queue stops
+        being reviewed.
+
+        THE SUPPRESSION KEYS ON THE PAIR, not on this constraint name - see
+        `RELATIONSHIP_SUPPRESSIONS_SUBCOLLECTION`. The name is generated, so a
+        record against it would be defeated by the next run generating another.
+
+        Only a proposal can be rejected. An asserted relationship is removed
+        with `DROP CONSTRAINT`, which says what it does and leaves no
+        suppression behind - dropping a relationship someone declared should not
+        quietly forbid inference from ever raising it again.
+        """
+        if not author:
+            raise ValueError("author must be provided when rejecting a relationship")
+
+        collection, dataset_name = self._local_parts(dataset_identifier)
+        doc_ref = self._relationships_collection(collection, dataset_name).document(constraint_name)
+        snapshot = doc_ref.get()
+        if not snapshot.exists:
+            raise ConstraintNotFound(
+                f"Constraint not found: {constraint_name} on {collection}.{dataset_name}"
+            )
+
+        data = snapshot.to_dict() or {}
+        if data.get("origin") != "inferred":
+            raise ValueError(
+                f"constraint {constraint_name} on {collection}.{dataset_name} was asserted, "
+                "not proposed - remove it with DROP CONSTRAINT"
+            )
+
+        digest = data.get("pair-digest") or relationship_pair_digest(
+            data.get("column") or "",
+            data.get("references-collection") or "",
+            data.get("references-dataset") or "",
+            data.get("references-column") or "",
+        )
+
+        # The suppression goes in FIRST. If the second write fails the owner
+        # sees the proposal again and can reject it again, which is a nuisance;
+        # the other order loses the rejection and re-proposes forever, which is
+        # the failure this method exists to prevent.
+        self._relationship_suppressions_collection(collection, dataset_name).document(digest).set(
+            {
+                "pair-digest": digest,
+                "workspace": self.workspace,
+                "collection": collection,
+                "dataset": dataset_name,
+                "column": data.get("column"),
+                "references-collection": data.get("references-collection"),
+                "references-dataset": data.get("references-dataset"),
+                "references-column": data.get("references-column"),
+                # What was rejected, kept so the record can be read back as a
+                # decision rather than as a bare prohibition: someone reviewing
+                # this later needs to know the claim was rejected at 0.94
+                # confidence, not merely that it was rejected.
+                "rejected-confidence": data.get("confidence"),
+                "rejected-evidence": data.get("evidence"),
+                "rejected-by": author,
+                "rejected-at-ms": int(time.time() * 1000),
+                "reason": reason,
+            }
+        )
+        doc_ref.delete()
+
+        emit_audit(
+            "reject_relationship",
+            resource_type=ResourceType.DATASET,
+            workspace=self.workspace,
+            collection=collection,
+            resource=dataset_name,
+            author=author,
+            constraint=constraint_name,
+            references=(
+                f"{data.get('references-collection')}.{data.get('references-dataset')}"
+            ),
+        )
+        return True
+
+    def list_relationship_suppressions(self, dataset_identifier: str) -> list[dict]:
+        """The column pairs this dataset's owner has rejected.
+
+        Read by the inference job before it proposes, and by nothing else -
+        a suppression is not part of the graph and does not appear in the
+        projection. It records the absence of a relationship, and
+        `information_schema.column_relationships` lists relationships.
+        """
+        collection, dataset_name = self._local_parts(dataset_identifier)
+        results = []
+        for doc in self._relationship_suppressions_collection(collection, dataset_name).stream():
+            data = doc.to_dict() or {}
+            data.setdefault("pair-digest", doc.id)
+            results.append(data)
+        return results
 
     def drop_relationship(
         self,
@@ -3057,18 +3533,38 @@ class OpteryxCatalog(Metastore):
         Returns True if one was removed, False if there was none and
         `missing_ok` allowed that - a drop that silently matched nothing would
         let a typo read as success.
+
+        DROPPING A PROPOSAL IS REJECTING IT, and that is why this branches. An
+        `origin='inferred'` row is a question nobody has answered; there is no
+        reason to remove one except to answer "no", and if the removal left no
+        record the next inference run would ask again. So a drop against a
+        proposal records the suppression `reject_relationship` writes.
+
+        This also gives the Studio a write path that needs no new grammar. The
+        confirm button emits `ADD CONSTRAINT` and the dismiss button emits
+        `DROP CONSTRAINT`, both of which the engine already parses, and both of
+        which are a person making a statement - which is the only kind of thing
+        DDL should carry (see `propose_relationship` for the other side of
+        that rule).
+
+        Dropping an ASSERTED relationship is unchanged and leaves nothing
+        behind. Removing something a person declared should not quietly forbid
+        inference from ever raising it again.
         """
         if not author:
             raise ValueError("author must be provided when dropping a relationship")
 
         collection, dataset_name = self._local_parts(dataset_identifier)
         doc_ref = self._relationships_collection(collection, dataset_name).document(constraint_name)
-        if not doc_ref.get().exists:
+        snapshot = doc_ref.get()
+        if not snapshot.exists:
             if missing_ok:
                 return False
             raise ConstraintNotFound(
                 f"Constraint not found: {constraint_name} on {collection}.{dataset_name}"
             )
+        if (snapshot.to_dict() or {}).get("origin") == "inferred":
+            return self.reject_relationship(dataset_identifier, constraint_name, author=author)
         doc_ref.delete()
 
         emit_audit(
@@ -3145,6 +3641,98 @@ class OpteryxCatalog(Metastore):
             data.setdefault("name", doc.id)
             results.append(data)
         return results
+
+    def list_workspace_relationships(self) -> list[dict]:
+        """Every relationship declared anywhere in this workspace, as plain dicts.
+
+        ONE collection group query, not a walk. The alternative - enumerate the
+        collections, enumerate each one's datasets, then read each dataset's
+        subcollection - costs `1 + collections + datasets` sequential round
+        trips to return a set of rows that numbers in the tens, and it grows
+        with the size of the workspace rather than with the number of
+        relationships in it. Measured on a 25-dataset workspace: 31 round trips
+        and 10.1s, against 150ms for this query, for an identical row set.
+
+        Every document carries its own near address (`workspace`, `collection`,
+        `dataset`), denormalised by `declare_relationship` from the path it
+        lives at, so a row that arrives here with no context about whose child
+        it is still says which dataset declared it. That is what makes the
+        walk redundant rather than merely slow.
+
+        THE WORKSPACE FILTER IS LOAD-BEARING, exactly as in
+        `find_relationships_to`. Workspaces are root collections in a single
+        database, so a collection group query crosses all of them and this
+        would return other tenants' relationships if the filter were dropped or
+        mistyped. It is sound because a relationship cannot cross a workspace -
+        refused at plan time - so `workspace` is an invariant rather than a
+        hope. The re-check below cannot fire against a correct query; it is
+        there so that an edit which breaks the filter fails loudly here instead
+        of quietly widening what the caller downstream is handed.
+
+        Unlike `find_relationships_to`'s three, this field needs NO backticks:
+        `workspace` already matches Firestore's bare property path grammar. It
+        needs no declared composite index either - the automatic single-field
+        index carries it, provided collection group scope has not been removed
+        by a field exemption.
+
+        The rows are NOT authorized. Both ends of every row still owe a read
+        check to whoever renders them - see
+        `information_schema.column_relationships`, which is this method's only
+        caller and makes both.
+        """
+        from google.cloud.firestore_v1 import FieldFilter
+
+        query = self.firestore_client.collection_group(RELATIONSHIPS_SUBCOLLECTION).where(
+            filter=FieldFilter("workspace", "==", self.workspace)
+        )
+        results = []
+        for doc in query.stream():
+            data = doc.to_dict() or {}
+            if data.get("workspace") != self.workspace:
+                raise ValueError(
+                    "collection group query returned a relationship from workspace "
+                    f"{data.get('workspace')!r} while reading {self.workspace!r} - "
+                    "the workspace filter is the only thing confining this query to "
+                    "one tenant and it is not holding"
+                )
+            data.setdefault("name", doc.id)
+            results.append(data)
+        return results
+
+    def set_trigger_suspended(
+        self,
+        dataset_identifier: str,
+        name: str,
+        suspended: bool,
+        author: str | None = None,
+    ) -> None:
+        """Suspend or resume one trigger.
+
+        A suspended trigger still exists and `fire_triggers` still reaches it;
+        it enqueues nothing and records why. Deliberately distinct from dropping
+        it - the suppression stays visible where an operator looks for the reason
+        a table stopped updating, rather than leaving no trace at all.
+        """
+        collection, dataset_name = self._local_parts(dataset_identifier)
+        ref = self._triggers_collection(collection, dataset_name).document(name)
+        if not ref.get().exists:
+            raise TriggerNotFound(f"Trigger not found: {name} on {collection}.{dataset_name}")
+        ref.update(
+            {
+                "suspended-at-ms": int(time.time() * 1000) if suspended else None,
+                "suspended-by": author if suspended else None,
+            }
+        )
+
+        emit_audit(
+            "suspend_trigger" if suspended else "resume_trigger",
+            resource_type=ResourceType.DATASET,
+            workspace=self.workspace,
+            collection=collection,
+            resource=dataset_name,
+            author=author,
+            trigger=name,
+        )
 
     def mark_trigger_fired(self, dataset_identifier: str, name: str, status: str) -> None:
         """Stamp a trigger's last-fired fields. Called by the enqueue path."""

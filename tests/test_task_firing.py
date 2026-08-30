@@ -220,3 +220,85 @@ def test_mv_and_task_triggers_coexist_on_one_dataset():
     submitted = [c[0][0]["sql_text"] for c in post.call_args_list]
     assert any(s.startswith("REFRESH MATERIALIZED VIEW") for s in submitted)
     assert any(s.startswith("EXECUTE ws.ops.compaction_log_ingest") for s in submitted)
+
+
+# --- suspension
+
+
+def test_a_suspended_trigger_enqueues_nothing():
+    """Suspension is on the TRIGGER, not the task: a task fired by several
+    datasets can be paused on one of them."""
+    trigger = _task_trigger()
+    trigger["suspended-at-ms"] = 1700000000000
+    catalog = _catalog_stub(triggers=[trigger])
+
+    post, _ = _fire(catalog)
+
+    post.assert_not_called()
+    catalog.mark_trigger_fired.assert_called_once_with(
+        "ops.catalog_changes", "task__ops__compaction_log_ingest", status="suspended"
+    )
+
+
+def test_a_suspended_trigger_is_still_reached_and_records_why():
+    """Distinct from dropping it — the suppression stays visible where an
+    operator looks for why a table stopped updating."""
+    trigger = _task_trigger()
+    trigger["suspended-at-ms"] = 1700000000000
+    catalog = _catalog_stub(triggers=[trigger])
+
+    with patch.object(trigger_firing, "_alert") as alert:
+        _fire(catalog)
+
+    # Not an error: a paused trigger is the setting working.
+    alert.assert_not_called()
+    assert catalog.mark_trigger_fired.called
+
+
+def test_resuming_lets_it_fire_again():
+    trigger = _task_trigger()
+    trigger["suspended-at-ms"] = None
+    catalog = _catalog_stub(triggers=[trigger])
+
+    post, _ = _fire(catalog)
+
+    assert post.called
+
+
+def test_an_unexpected_failure_is_recorded_on_the_trigger():
+    """A trigger failing every commit must not look like one that never fired.
+
+    Every expected outcome stamps itself; an unexpected exception used to stamp
+    nothing, so `last-fired-status` stayed null and information_schema showed a
+    healthy row. That is how a TaskNotFound fired hourly unnoticed.
+    """
+    catalog = _catalog_stub()
+    with (
+        patch.object(trigger_firing, "_post_job", side_effect=RuntimeError("jobs down")),
+        patch.object(trigger_firing, "_alert"),
+        patch.object(trigger_firing, "write_audit_record"),
+    ):
+        fire_triggers(
+            catalog, "ops.catalog_changes", author="alice", snapshot_id=200, parent_snapshot_id=100
+        )
+
+    catalog.mark_trigger_fired.assert_called_once_with(
+        "ops.catalog_changes", "task__ops__compaction_log_ingest", status="error"
+    )
+
+
+def test_a_failure_to_stamp_never_displaces_the_real_failure():
+    """The failure path of the failure path: the alert must still happen."""
+    catalog = _catalog_stub()
+    catalog.mark_trigger_fired.side_effect = RuntimeError("firestore down")
+    with (
+        patch.object(trigger_firing, "_post_job", side_effect=RuntimeError("jobs down")),
+        patch.object(trigger_firing, "_alert") as alert,
+        patch.object(trigger_firing, "write_audit_record"),
+    ):
+        fire_triggers(
+            catalog, "ops.catalog_changes", author="alice", snapshot_id=200, parent_snapshot_id=100
+        )
+
+    assert alert.called
+    assert "jobs down" in str(alert.call_args[0][0])
