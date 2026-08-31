@@ -63,10 +63,13 @@ from .exceptions import MaterializedViewOwnerMissing
 from .exceptions import TaskError
 from .exceptions import TaskOwnerMissing
 
-# Trigger kind for a task run. The MV refresh kind is still spelled inline where
-# it is matched; it becomes a task in the next phase, at which point one kind is
+# Trigger kind for a task run. Defined in `opteryx_catalog` beside the refresh
+# kind and re-exported here, so the creation gate that refuses a platform
+# identity as a task trigger's owner and the firing path that reads that owner
+# are keyed off one string. The MV refresh kind is still spelled inline where it
+# is matched; it becomes a task in the next phase, at which point one kind is
 # left and this constant is the only one.
-TASK_TRIGGER_KIND = "task"
+from .opteryx_catalog import TASK_TRIGGER_KIND  # noqa: F401
 
 # The `parent_version` bound for a dataset's FIRST commit, which has no parent.
 # The window is then everything up to and including that commit, so this only
