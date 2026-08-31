@@ -1,7 +1,8 @@
 # Webhooks + Materialized Views — Implementation Plan
 
-Status: draft, awaiting review
-Owners: catalog (this repo), webhooks.opteryx.app (new), subscriber.opteryx.app (new), web.opteryx
+Status: draft. **Phases 2, 4 and 6 are withdrawn — see "Revision: subscriptions are
+triggers" below.** Phases 1, 3 and 5 stand.
+Owners: catalog (this repo), subscriber.opteryx.app (new)
 Out of scope: C(R)TAS refresh mechanics — owned by another agent/workstream. This plan treats
 "run the defining query and (re)populate the target" as an external capability it calls, not
 something it designs.
@@ -95,35 +96,50 @@ Repo: `opteryx-catalog`.
    `resource_type` through untouched, so `materialized_view` flows through existing audit/log
    partitioning automatically.
 
-## Phase 2 — Catalog: webhook subscription storage
+## Phase 2 — WITHDRAWN: a subscription is a trigger
 
-Repo: `opteryx-catalog`.
+This phase proposed a `$hooks/subscriptions` collection mirroring `$policies/access`, with
+`pattern` / `resource_types` / `actions` / `target` fields. It is a re-implementation of
+machinery this repo already has.
 
-Mirror policy.opteryx's Firestore shape (`policy.opteryx/app/routes/v1/access.py:92-94`,
-`db.collection(workspace).document("$policies").collection("access")`) into a parallel `$hooks`
-collection:
+A trigger is already "when this dataset takes a commit, enqueue the reaction described by
+`kind`" (`create_trigger`, `opteryx_catalog.py:3129`), `kind` is already a discriminator with
+two values dispatched at `trigger_firing.py:604` (`materialized_view_refresh`, `task`), and the
+target field is already selected by kind — "one of them None — so a reader never has to know
+the kind to find the field" (`opteryx_catalog.py:3153`).
+
+Outbound delivery is a **third kind**, not a second subscription system:
 
 ```
-db.collection(workspace).document("$hooks").collection("subscriptions")
+kind: "http_endpoint"     target_secret: <workspace>.<secret name>
 ```
 
-Each subscription document:
+It inherits `CREATE TRIGGER` / `DROP TRIGGER` / `ALTER TRIGGER … OWNER TO`, the cycle check,
+the writer-on-the-dataset permission gate, and the existing firing path — all of it already
+reachable from SQL, which is where catalog objects are managed.
 
-```
-{
-  pattern: str,            # fnmatch pattern over collection.dataset, same semantics as policies
-  resource_types: [str],   # e.g. ["dataset"], or ["materialized_view"] for reflection-specific hooks
-  actions: [str],          # e.g. ["commit"], ["create", "delete"]
-  target: str,             # subscriber.opteryx.app URL (or, later, an arbitrary external URL)
-  created_by: str,
-  last_enqueued_at: timestamp | None,
-}
-```
+`last_enqueued_at` survives the withdrawal as a field on the trigger document; the reasoning
+was right. Cloud Tasks owns retry/delivery from the point of enqueue, so the catalog can only
+truthfully report "attempted," not "delivered." Delivery success/failure visibility, if wanted
+later, is a Cloud Tasks dashboard/DLQ concern, not something to fake here.
 
-`last_enqueued_at` is the honest field to track — Cloud Tasks owns retry/delivery from the point
-of enqueue, so the catalog can only truthfully report "attempted," not "delivered." (Delivery
-success/failure visibility, if wanted later, is a Cloud Tasks dashboard/DLQ concern, not something
-to fake here.)
+**The target is a secret name, never a URL.** For a Slack incoming webhook the URL *is* the
+credential, so a subscription document holding a plaintext `target` URL — served back by a list
+endpoint — is a stored credential in the clear. See `jobs.opteryx/docs/design/secrets.md`, which
+owns the storage, encryption and dispatch of the referenced secret. This also closes this plan's
+open item about arbitrary external URLs as targets: the question does not arise.
+
+**What is lost, and why that is acceptable:**
+
+- *Wildcard subscriptions.* `$hooks` patterns would have covered datasets that do not exist
+  yet. Triggers are per-dataset and explicit. For permissions a pattern is right; for
+  reactions it is the opposite — a wildcard that starts POSTing data to an external endpoint
+  because someone created a dataset matching a glob is a surprise nobody asked for.
+- *Metadata events.* Triggers fire on user-created data commits, not on `create_collection` or
+  `update_dataset_description`. Phase 1 still wires `send_webhook` into those paths for the
+  audit/event stream; what changes is that no subscription reacts to them yet. Phase 1 itself
+  says the commit event "is the one that actually matters for materialized views." If a
+  metadata reaction is wanted later, it is another trigger kind, not a parallel system.
 
 ## Phase 3 — Catalog: Cloud Tasks as the only delivery path
 
@@ -137,7 +153,16 @@ environment — `OPTERYX_WEBHOOK_DOMAIN` alone should no longer be sufficient to
 `OPTERYX_WEBHOOK_QUEUE` becomes required config wherever this runs for real. Keep `_send_direct`
 only if local dev needs a no-emulator fallback — otherwise delete it.
 
-## Phase 4 — webhooks.opteryx.app (new service)
+## Phase 4 — WITHDRAWN: webhooks.opteryx.app (new service)
+
+Withdrawn with Phase 2. Subscriptions are triggers, and triggers are created, listed and
+dropped in SQL; there is no CRUD surface left for this service to own. Audit entries for
+subscription mutations come from the catalog's existing trigger paths and
+`catalog_audit_log_contract`, as they already do for the other two kinds.
+
+The original text follows for reference.
+
+### (withdrawn) webhooks.opteryx.app
 
 New repo, following the existing service shape (Dockerfile/Makefile/pyproject.toml, FastAPI —
 same skeleton as `policy.opteryx` or `worker.opteryx`).
@@ -166,7 +191,14 @@ per the discussion, is a webhook **emitter** via its normal catalog CRUD, not a 
 it a second, unrelated responsibility (receiving pushes and executing arbitrary reactions) would
 blur that boundary rather than reuse it.
 
-## Phase 6 — web.opteryx UI
+## Phase 6 — WITHDRAWN: web.opteryx UI
+
+Withdrawn with Phase 4 — it was a page for that service's API. The Studio manages triggers the
+way it manages every other catalog object: by running SQL.
+
+The original text follows for reference.
+
+### (withdrawn) web.opteryx UI
 
 Repo: `web.opteryx`.
 
@@ -181,21 +213,33 @@ Wiring points:
 - Click-handler in `static/js/app.js:2431-2470`, copying the `permissions-btn` pattern exactly
   (owner-only visibility check via `window.opteryx_policies`, full-page nav fallback).
 
+## Revision: subscriptions are triggers
+
+Phases 2, 4 and 6 are withdrawn. What they proposed — a subscription store, a service to CRUD
+it, and a page to drive that service — is the trigger machinery this repo already has, reached
+through DDL that already exists. Outbound delivery becomes `kind: "http_endpoint"` on a trigger,
+with the destination held as a secret rather than as a plaintext URL.
+
+That removes one new service, one new Firestore convention, one web page, and the open question
+about external URLs as targets, and it leaves the plan as three phases of work in one repo plus
+one new consumer service.
+
 ## Dependency order
 
-Phase 1 and Phase 2 can proceed together (both catalog-side, no external dependents yet).
+Phase 1 (events) and the `http_endpoint` trigger kind can proceed together — both catalog-side,
+no external dependents.
 Phase 3 (Cloud Tasks mandatory) can land independently at any point.
-Phase 4 and Phase 5 (the two new services) can be scaffolded in parallel with Phase 1/2, but
-can't be exercised end-to-end until Phase 1's commit-event wiring exists and the refresh
-capability (external) is ready to be called.
-Phase 6 depends on Phase 4's API existing.
+Phase 5 (subscriber.opteryx.app) can be scaffolded in parallel, but can't be exercised
+end-to-end until Phase 1's commit-event wiring exists and the refresh capability (external) is
+ready to be called.
 
 ## Open items
 
 - Whether `_send_direct` is deleted outright or kept behind a dev-only flag (Phase 3).
-- Whether webhooks.opteryx.app subscriptions support arbitrary external URLs as `target`, or are
-  restricted to subscriber.opteryx.app only for v1 (recommend restricting to v1 — generalize only
-  if a real second consumer shows up).
 - Exact shape of the "look up which materialized view(s) match this event" step in
   subscriber.opteryx.app — depends on how source_pattern/materialized_view metadata ends up
   structured in Phase 1, point 2.
+- The SQL spelling for an outbound trigger. `CREATE TRIGGER <name> ON <dataset> CALL SECRET
+  <name>` reads closest to the existing forms, but it is not designed here.
+- Whether MV refresh subscriptions were ever going to need patterns. The withdrawal assumes not:
+  a materialized view names its source explicitly, so a per-dataset trigger is exactly right.
