@@ -293,3 +293,56 @@ def test_a_task_trigger_is_not_an_edge_in_the_trigger_graph():
     src.collection("triggers").document("t").set({"kind": "task", "target-task": "ws.ops.roll"})
 
     assert audit_workspace(client, "ws") == []
+
+
+def test_a_trigger_owned_by_a_platform_identity_is_reported():
+    """The grandfathered rows. `create_trigger` and `set_trigger_owner` refuse a
+    platform identity now, but only going forward - documents written before
+    that gate keep firing as whatever they hold, because the fire path reads
+    `runs-as` without re-judging it. The ones already there are the ones nobody
+    will notice, precisely because they work."""
+    client = _Client()
+    src = _add_dataset(client, "ws", "src", "a")
+    client.collection("ws").document("ops").collection("tasks").document("ingest").set(
+        {"name": "ingest"}
+    )
+    src.collection("triggers").document("t").set(
+        {"name": "t", "kind": "task", "target-task": "ws.ops.ingest", "runs-as": "federator"}
+    )
+
+    findings = audit_workspace(client, "ws")
+
+    assert [f["kind"] for f in findings] == ["platform-identity-owner"]
+    assert "federator" in findings[0]["detail"]
+
+
+def test_a_refresh_trigger_is_exempt_from_the_owner_check():
+    """A refresh ignores `runs-as` entirely and resolves its identity from the
+    view's own record, so a value sitting on the trigger decides nothing and
+    reporting it would be noise."""
+    client = _Client()
+    src = _add_dataset(client, "ws", "src", "a")
+    _add_dataset(client, "ws", "mart", "daily")
+    src.collection("triggers").document("t").set(
+        {
+            "name": "t",
+            "kind": "materialized_view_refresh",
+            "target-view": "ws.mart.daily",
+            "runs-as": "federator",
+        }
+    )
+
+    assert audit_workspace(client, "ws") == []
+
+
+def test_an_account_owned_trigger_is_fine():
+    client = _Client()
+    src = _add_dataset(client, "ws", "src", "a")
+    client.collection("ws").document("ops").collection("tasks").document("ingest").set(
+        {"name": "ingest"}
+    )
+    src.collection("triggers").document("t").set(
+        {"name": "t", "kind": "task", "target-task": "ws.ops.ingest", "runs-as": "olive"}
+    )
+
+    assert audit_workspace(client, "ws") == []

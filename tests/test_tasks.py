@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import pytest
 
+from opteryx_catalog.exceptions import PlatformIdentityOwnerRefused
 from opteryx_catalog.exceptions import TaskAlreadyExists
 from opteryx_catalog.exceptions import TaskNotFound
 from test_materialized_views import _add_dataset
@@ -73,9 +74,13 @@ def test_trigger_owner_is_pinned_across_re_registration():
     catalog = _catalog()
     _add_dataset(catalog, "ops.src")
     catalog.create_trigger(
-        "ops.src", name="t", target_task="ops.ingest", kind="task",
-        author="xb500", runs_as="federator",
+        "ops.src", name="t", target_task="ops.ingest", kind="task", author="olive"
     )
+    # Re-registering as somebody else does NOT move the owner.
+    catalog.create_trigger(
+        "ops.src", name="t", target_task="ops.ingest", kind="task", author="mallory"
+    )
+    assert catalog.list_triggers("ops.src")[0]["runs-as"] == "olive"
 
     catalog.drop_trigger("ops.src", "t", author="mallory", missing_ok=True)
     catalog.create_trigger(
@@ -84,8 +89,54 @@ def test_trigger_owner_is_pinned_across_re_registration():
     # A DROP genuinely clears it - that is a deliberate removal, not an edit.
     assert catalog.list_triggers("ops.src")[0]["runs-as"] == "mallory"
 
-    catalog.set_trigger_owner("ops.src", "t", "federator", author="xb500")
-    assert catalog.list_triggers("ops.src")[0]["runs-as"] == "federator"
+    catalog.set_trigger_owner("ops.src", "t", "olive", author="mallory")
+    assert catalog.list_triggers("ops.src")[0]["runs-as"] == "olive"
+
+
+def test_a_platform_identity_cannot_own_a_trigger():
+    """`federator` and `xb500` are identities, not accounts: nothing bills them,
+    and federator's credential is shipped to every service that commits a
+    dataset. Refused at BOTH the pinning points reachable from this library, not
+    only through the engine's binder - the two direct calls that pinned the ops
+    ingest triggers to federator never went near a binder."""
+    catalog = _catalog()
+    _add_dataset(catalog, "ops.src")
+
+    # At creation, because the author is what gets pinned.
+    with pytest.raises(PlatformIdentityOwnerRefused):
+        catalog.create_trigger(
+            "ops.src", name="t", target_task="ops.ingest", kind="task", author="federator"
+        )
+    with pytest.raises(PlatformIdentityOwnerRefused):
+        catalog.create_trigger(
+            "ops.src", name="t", target_task="ops.ingest", kind="task", author="XB500  "
+        )
+
+    # And on transfer.
+    catalog.create_trigger(
+        "ops.src", name="t", target_task="ops.ingest", kind="task", author="olive"
+    )
+    with pytest.raises(PlatformIdentityOwnerRefused):
+        catalog.set_trigger_owner("ops.src", "t", "federator", author="olive")
+    assert catalog.list_triggers("ops.src")[0]["runs-as"] == "olive"
+
+
+def test_the_ownership_gate_is_by_exemption_not_by_allowlist():
+    """Only the MV refresh kind is exempt - it resolves its identity from the
+    view's record and ignores `runs-as`. Any OTHER kind, including ones added
+    after this test was written, is gated: a new kind must not arrive
+    ungoverned because a list keyed on `task` was never extended."""
+    catalog = _catalog()
+    _add_dataset(catalog, "ops.src")
+
+    with pytest.raises(PlatformIdentityOwnerRefused):
+        catalog.create_trigger(
+            "ops.src",
+            name="t",
+            target_task="ops.ingest",
+            kind="http_endpoint",
+            author="federator",
+        )
 
 
 def test_a_task_requires_a_statement_and_an_author():
@@ -188,7 +239,7 @@ def test_a_trigger_can_target_a_task():
         name="task__ops__ingest",
         target_task="ops.ingest",
         kind="task",
-        author="xb500",
+        author="olive",
     )
 
     trigger = catalog.list_triggers("ops.catalog_changes")[0]
@@ -230,7 +281,7 @@ def test_a_task_trigger_will_not_be_repointed():
         name="task__ops__ingest",
         target_task="ops.ingest",
         kind="task",
-        author="xb500",
+        author="olive",
     )
 
     with pytest.raises(Exception, match="refusing to repoint"):
@@ -239,7 +290,7 @@ def test_a_task_trigger_will_not_be_repointed():
             name="task__ops__ingest",
             target_task="ops.other",
             kind="task",
-            author="xb500",
+            author="olive",
         )
 
 

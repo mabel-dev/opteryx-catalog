@@ -544,3 +544,23 @@ class SnapshotRaceError(CatalogError):
     between files, which invalidates any row addresses computed against the old
     manifest - the case MERGE cares about.
     """
+
+
+class PlatformIdentityOwnerRefused(CatalogError):
+    """Raised when a platform identity is offered as a trigger's or a
+    materialized view's `runs-as`.
+
+    A COSTING rule, not an access one, which is why it is not answerable from
+    grants: these identities hold broad grants precisely because the platform
+    maintains data with them, but they are identities rather than accounts.
+    Nothing bills them. Work pinned to one runs unattended, on every commit or
+    on a schedule, forever, at nobody's expense - and because the credential for
+    one is distributed to every service that commits a dataset, it is also the
+    widest authority available to pin work on.
+
+    Enforced HERE rather than only in the engine's binder. The binder gate
+    covers the SQL surface, but `runs-as` is a field on a document any holder of
+    this library can write, and the two paths that put federator on the ops
+    ingest triggers were both direct library calls. A rule that only one surface
+    applies is one the other surface silently exempts.
+    """
