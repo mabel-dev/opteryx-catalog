@@ -563,4 +563,10 @@ class PlatformIdentityOwnerRefused(CatalogError):
     this library can write, and the two paths that put federator on the ops
     ingest triggers were both direct library calls. A rule that only one surface
     applies is one the other surface silently exempts.
+
+    NOT raised for `xb500` owning a trigger in `public`, where both clauses of
+    the first paragraph fail: no billable account can hold WRITE over the
+    reserved workspace, so there is no owner to prefer, and jobs.opteryx already
+    resolves an owner with no billing membership to the house account, so the
+    work is billed to the party that chose to do it. See `_assert_can_own`.
     """
