@@ -37,6 +37,7 @@ from typing import Any
 
 from .opteryx_catalog import MATERIALIZED_VIEW_TYPE
 from .opteryx_catalog import MV_REFRESH_TRIGGER_KIND
+from .opteryx_catalog import PLATFORM_IDENTITIES
 from .opteryx_catalog import TASKS_SUBCOLLECTION
 from .opteryx_catalog import TRIGGERS_SUBCOLLECTION
 
@@ -116,6 +117,39 @@ def _check_trigger(
             "dangling-trigger",
             f"{dataset_path}/triggers/{name}",
             f"target {target} does not exist",
+        )
+    return None
+
+
+def _check_trigger_owner(
+    dataset_path: str, trigger: dict[str, Any]
+) -> dict[str, str] | None:
+    """A finding for a trigger pinned to an identity nothing can bill.
+
+    `create_trigger` and `set_trigger_owner` refuse a platform identity, but
+    they refuse it going FORWARD: documents written before that gate existed
+    keep whatever they were given, and they keep firing, because the fire path
+    reads `runs-as` without re-judging it. Deliberately so - a rule that
+    retroactively stopped live ingest the moment it shipped would take an
+    outage to enforce a billing question.
+
+    That leaves the grandfathered rows, which are exactly the ones nobody will
+    notice: they work. This is where they surface, alongside the dangling
+    targets, so "which triggers are running on an identity nobody pays for" is
+    a question the audit answers rather than one someone has to think to ask.
+
+    Refresh triggers are exempt: they ignore `runs-as` and resolve their
+    identity from the view's own record, which `_check_mv_sources` covers.
+    """
+    if trigger.get("kind") == MV_REFRESH_TRIGGER_KIND:
+        return None
+    owner = trigger.get("runs-as")
+    if owner and owner.strip().lower() in PLATFORM_IDENTITIES:
+        return _finding(
+            "platform-identity-owner",
+            f"{dataset_path}/triggers/{trigger.get('name') or '?'}",
+            f"unattended runs execute as {owner}, a platform identity that nothing "
+            "bills; transfer it to an account with ALTER TRIGGER ... OWNER TO",
         )
     return None
 
@@ -264,6 +298,9 @@ def audit_workspace(client, workspace: str) -> list[dict[str, str]]:
             for doc in dataset_ref.collection(TRIGGERS_SUBCOLLECTION).stream():
                 trigger = doc.to_dict() or {}
                 finding = _check_trigger(client, workspace, dataset_path, trigger)
+                if finding:
+                    findings.append(finding)
+                finding = _check_trigger_owner(dataset_path, trigger)
                 if finding:
                     findings.append(finding)
                 if trigger.get("kind") == MV_REFRESH_TRIGGER_KIND:
