@@ -98,7 +98,10 @@ def test_a_platform_identity_cannot_own_a_trigger():
     and federator's credential is shipped to every service that commits a
     dataset. Refused at BOTH the pinning points reachable from this library, not
     only through the engine's binder - the two direct calls that pinned the ops
-    ingest triggers to federator never went near a binder."""
+    ingest triggers to federator never went near a binder.
+
+    This catalog is workspace `ws`, which is the ordinary case. `public` is the
+    exception - see `test_xb500_may_own_a_trigger_in_public`."""
     catalog = _catalog()
     _add_dataset(catalog, "ops.src")
 
@@ -119,6 +122,70 @@ def test_a_platform_identity_cannot_own_a_trigger():
     with pytest.raises(PlatformIdentityOwnerRefused):
         catalog.set_trigger_owner("ops.src", "t", "federator", author="olive")
     assert catalog.list_triggers("ops.src")[0]["runs-as"] == "olive"
+
+
+def _public_catalog():
+    """A catalog handle on the reserved `public` workspace."""
+    catalog = _catalog()
+    catalog.workspace = "public"
+    return catalog
+
+
+def test_xb500_may_own_a_trigger_in_public():
+    """The one exemption, and the reason the rule cannot apply there.
+
+    No billable account can hold WRITE over `public` - `implicit_grants` caps
+    every non-platform identity at `reader` and `validate_pattern` refuses to
+    write a policy over the workspace - so demanding a billable owner yields a
+    trigger that fails on every fire rather than a safely-owned one. And the run
+    is billed: an owner with no billing membership resolves to the house
+    account, which is what "updating the public data is on the house" means in
+    the metering.
+    """
+    catalog = _public_catalog()
+    _add_dataset(catalog, "security.nvd_updates")
+
+    catalog.create_trigger(
+        "security.nvd_updates",
+        name="t",
+        target_task="security.nvd_merge",
+        kind="task",
+        author="xb500",
+    )
+    assert catalog.list_triggers("security.nvd_updates")[0]["runs-as"] == "xb500"
+
+
+def test_federator_may_not_own_a_trigger_even_in_public():
+    """Only the COSTING half of the rationale is answered in `public`. The other
+    half is about federator specifically - its credential is shipped to every
+    service that commits a dataset - and is untouched by where the trigger
+    lives."""
+    catalog = _public_catalog()
+    _add_dataset(catalog, "security.nvd_updates")
+
+    with pytest.raises(PlatformIdentityOwnerRefused):
+        catalog.create_trigger(
+            "security.nvd_updates",
+            name="t",
+            target_task="security.nvd_merge",
+            kind="task",
+            author="federator",
+        )
+
+
+def test_the_public_exemption_does_not_reach_materialized_views():
+    """The MV paths do not pass `workspace`, so they get the unexempted rule.
+    Nothing the platform maintains needs an xb500-owned view, and an exemption
+    nothing needs is one nobody is checking."""
+    catalog = _public_catalog()
+
+    with pytest.raises(PlatformIdentityOwnerRefused):
+        catalog.create_materialized_view(
+            "security.mv",
+            sql="SELECT 1",
+            source_tables=["security.nvd_updates"],
+            author="xb500",
+        )
 
 
 def test_the_ownership_gate_is_by_exemption_not_by_allowlist():
