@@ -87,21 +87,67 @@ TRIGGERS_SUBCOLLECTION = "triggers"
 # two strings. If a third name is ever added, both lists move together.
 PLATFORM_IDENTITIES = frozenset({"federator", "xb500"})
 
+# The reserved workspace of curated open data, and the identity that maintains
+# it. Together they are the one place the rule above cannot apply - see
+# `_assert_can_own`.
+PUBLIC_WORKSPACE = "public"
+PUBLIC_MAINTENANCE_IDENTITY = "xb500"
 
-def _assert_can_own(principal: str | None, what: str) -> None:
+
+def _assert_can_own(principal: str | None, what: str, *, workspace: str | None = None) -> None:
     """Refuse a platform identity as an unattended-run owner.
 
     Silent on None: a missing owner is a different failure with its own
     handling at fire time (`MaterializedViewOwnerMissing`, `TaskOwnerMissing`),
     and conflating the two would report "cannot be billed" for a damaged record.
+
+    ONE EXEMPTION: `xb500` may own a TRIGGER in `public`. The rule assumes a
+    billable owner is always available and that reaching for a platform identity
+    is a way of dodging the bill. In `public`, neither half holds.
+
+    Reached only by passing `workspace`, which the trigger paths do and the
+    materialized-view paths deliberately do not: a view in `public` is not
+    something the platform currently maintains, and an exemption nothing needs
+    is one nobody is checking. A caller that omits the argument gets the
+    unexempted rule, so a path added later arrives strict by default.
+
+    There is no billable owner to demand. `public` is reserved:
+    `opteryx_access.checks.implicit_grants` caps every non-platform identity at
+    `reader` over `public.*` and answers from that pass without consulting
+    issued policies, and `validate_pattern` refuses to write a policy over the
+    workspace at all - so WRITE there is reachable only by the identities in
+    `PLATFORM_IDENTITIES`. Requiring a billable owner for a trigger whose task
+    writes `public` does not yield a safely-owned trigger; it yields one that
+    fails on every fire.
+
+    And the work is not unbilled. Maintaining public data is on the house, and
+    that is already how it is metered: jobs.opteryx resolves an owner with no
+    billing membership to `HOUSE_BILLING_ACCOUNT`
+    (`interface._billing_account_for_principal`), a fallback documented there as
+    keeping a platform-armed trigger off a customer's bill. "Charged to nobody"
+    describes an identity the biller has no answer for, and it has one.
+
+    `federator` stays refused, here as everywhere. Only the COSTING half of the
+    original rationale is answered above; the other half is untouched, and is
+    about that identity specifically - its credential is shipped to every
+    service that commits a dataset, making it the widest authority in the system
+    to hang standing work on. `xb500` is held by the xb500 service and the Pi
+    that runs the ingest jobs, which is why it can carry this and federator
+    cannot.
     """
-    if principal and principal.strip().lower() in PLATFORM_IDENTITIES:
-        raise PlatformIdentityOwnerRefused(
-            f"{principal} cannot be the owner of {what}. It is a platform identity "
-            "rather than an account, so work it performs is billed to nobody - and "
-            "unattended runs execute as the owner. Use a user or service account, "
-            "both of which carry a billing account."
-        )
+    if not principal:
+        return
+    normalized = principal.strip().lower()
+    if normalized not in PLATFORM_IDENTITIES:
+        return
+    if workspace == PUBLIC_WORKSPACE and normalized == PUBLIC_MAINTENANCE_IDENTITY:
+        return
+    raise PlatformIdentityOwnerRefused(
+        f"{principal} cannot be the owner of {what}. It is a platform identity "
+        "rather than an account, so work it performs is billed to nobody - and "
+        "unattended runs execute as the owner. Use a user or service account, "
+        "both of which carry a billing account."
+    )
 
 
 # Subcollection under a dataset document holding the relationships DECLARED ON
@@ -3195,7 +3241,9 @@ class OpteryxCatalog(Metastore):
         # workspace's data outward under a stored credential, and it would have
         # slipped straight through an allowlist keyed on `task`.
         if kind != MV_REFRESH_TRIGGER_KIND:
-            _assert_can_own(author, f"trigger {name} on {dataset_identifier}")
+            _assert_can_own(
+                author, f"trigger {name} on {dataset_identifier}", workspace=self.workspace
+            )
         collection, dataset_name = self._local_parts(dataset_identifier)
         if not self._dataset_doc_ref(collection, dataset_name).get().exists:
             raise DatasetNotFound(f"Dataset not found: {collection}.{dataset_name}")
@@ -4348,7 +4396,9 @@ class OpteryxCatalog(Metastore):
         triggers came to be pinned to `federator` - a check only the SQL path
         applied was a check the SQL path alone obeyed.
         """
-        _assert_can_own(new_owner, f"trigger {name} on {dataset_identifier}")
+        _assert_can_own(
+            new_owner, f"trigger {name} on {dataset_identifier}", workspace=self.workspace
+        )
         collection, dataset_name = self._local_parts(dataset_identifier)
         ref = self._triggers_collection(collection, dataset_name).document(name)
         if not ref.get().exists:
