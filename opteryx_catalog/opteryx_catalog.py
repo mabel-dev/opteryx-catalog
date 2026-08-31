@@ -50,6 +50,7 @@ from .exceptions import ViewNotFound
 from .exceptions import WorkspaceDeletionProtected
 from .exceptions import WorkspaceNotFound
 from .exceptions import WorkspaceStorageReclaimFailed
+from .exceptions import PlatformIdentityOwnerRefused
 from .iops.base import FileIO
 from .resource_types import ResourceType
 from .webhooks import send_webhook
@@ -70,6 +71,38 @@ logger = logging.getLogger(__name__)
 # dataset document on every call and must not pay for opt-in state. The commit
 # path reads this subcollection to decide what to fire.
 TRIGGERS_SUBCOLLECTION = "triggers"
+
+# Identities the platform runs itself as. They may not be pinned as a trigger's
+# or a materialized view's `runs-as`: nothing bills them, so work pinned to one
+# is standing compute charged to nobody, and `federator`'s credential is
+# deliberately distributed to every service that commits a dataset, which makes
+# it the widest authority in the system to hand unattended work.
+#
+# Deliberately a short, closed list, mirroring `opteryx_access.checks`, which
+# holds the same names for the same reason and is where the SQL surface's gate
+# reads them. Duplicated rather than imported because this library depends on
+# neither the engine nor the access package - it is installed in services that
+# have no permissions capability at all - and a check that silently vanished
+# when an optional dependency was absent would be worse than a second copy of
+# two strings. If a third name is ever added, both lists move together.
+PLATFORM_IDENTITIES = frozenset({"federator", "xb500"})
+
+
+def _assert_can_own(principal: str | None, what: str) -> None:
+    """Refuse a platform identity as an unattended-run owner.
+
+    Silent on None: a missing owner is a different failure with its own
+    handling at fire time (`MaterializedViewOwnerMissing`, `TaskOwnerMissing`),
+    and conflating the two would report "cannot be billed" for a damaged record.
+    """
+    if principal and principal.strip().lower() in PLATFORM_IDENTITIES:
+        raise PlatformIdentityOwnerRefused(
+            f"{principal} cannot be the owner of {what}. It is a platform identity "
+            "rather than an account, so work it performs is billed to nobody - and "
+            "unattended runs execute as the owner. Use a user or service account, "
+            "both of which carry a billing account."
+        )
+
 
 # Subcollection under a dataset document holding the relationships DECLARED ON
 # that dataset - one document per relationship, keyed by the constraint name,
@@ -245,6 +278,10 @@ MAX_TAG_NAME_LENGTH = 128
 # The only trigger kind in v1: re-run a materialized view's defining SQL when
 # the dataset carrying the trigger takes a user-created commit.
 MV_REFRESH_TRIGGER_KIND = "materialized_view_refresh"
+# Trigger kind for a task run. Defined here beside the refresh kind, and
+# imported by `trigger_firing`, so the creation gate and the firing path cannot
+# disagree about which triggers carry an identity of their own.
+TASK_TRIGGER_KIND = "task"
 
 # Value of a dataset document's `dataset-type` field marking it as the backing
 # table of a materialized view. Plain datasets have no `dataset-type` field.
@@ -3124,7 +3161,6 @@ class OpteryxCatalog(Metastore):
         author: str | None = None,
         kind: str = MV_REFRESH_TRIGGER_KIND,
         target_task: str | None = None,
-        runs_as: str | None = None,
     ) -> None:
         """Attach a trigger to a dataset.
 
@@ -3146,6 +3182,20 @@ class OpteryxCatalog(Metastore):
         """
         if author is None:
             raise ValueError("author must be provided when creating a trigger")
+        # The author becomes `runs-as` below, so the ownership rule applies here
+        # too - and applies at creation rather than only on transfer, which is
+        # the ordering that actually keeps a platform identity off the field.
+        #
+        # Gated by EXEMPTION rather than by an allowlist of kinds: every kind
+        # carries `runs-as` except the refresh, which resolves its identity from
+        # the view's own record and ignores the field. A kind added later
+        # therefore arrives gated, and an author who cannot be billed is refused
+        # by default rather than by someone remembering to extend a list. That
+        # is the direction the mistake should fall in - `http_endpoint` posts a
+        # workspace's data outward under a stored credential, and it would have
+        # slipped straight through an allowlist keyed on `task`.
+        if kind != MV_REFRESH_TRIGGER_KIND:
+            _assert_can_own(author, f"trigger {name} on {dataset_identifier}")
         collection, dataset_name = self._local_parts(dataset_identifier)
         if not self._dataset_doc_ref(collection, dataset_name).get().exists:
             raise DatasetNotFound(f"Dataset not found: {collection}.{dataset_name}")
@@ -3200,16 +3250,24 @@ class OpteryxCatalog(Metastore):
                 # not the task, because that is what separates unattended from
                 # attended: a person running EXECUTE runs the task as themselves
                 # and answers for it, so there is nothing to pin - a trigger
-                # fires with nobody present. Pinned on first registration
-                # (explicit runs_as is for trusted platform callers; the SQL
-                # surface always pins the author) and preserved across
-                # re-registration so an edit never silently transfers whose
-                # authority the work runs with. Moved only by
-                # `set_trigger_owner`. MV refresh triggers ignore this - a
-                # refresh resolves its identity from the view's own record.
+                # fires with nobody present.
+                #
+                # ALWAYS the author on first registration, with no override.
+                # There used to be a `runs_as` argument "for trusted platform
+                # callers", and every caller that used it pinned `federator` -
+                # which is how five ops ingest triggers came to run unattended
+                # with the one credential shipped to every committing service.
+                # A creation path that can name someone other than the person
+                # creating it is a path for pinning work on an identity that
+                # never agreed to carry it; moving an owner is a deliberate,
+                # audited act, so it belongs to `set_trigger_owner` alone.
+                #
+                # Preserved across re-registration so an edit never silently
+                # transfers whose authority the work runs with. MV refresh
+                # triggers ignore this - a refresh resolves its identity from
+                # the view's own record.
                 "runs-as": (
                     ((existing.to_dict() or {}).get("runs-as") if existing.exists else None)
-                    or runs_as
                     or author
                 ),
                 "created-by": author,
@@ -4283,10 +4341,14 @@ class OpteryxCatalog(Metastore):
     ) -> None:
         """Repoint the identity a trigger's unattended runs execute as.
 
-        The caller (the engine's binder, for the SQL surface) has already
-        established the incoming owner is one who can be billed; this records
-        the transfer and audits who made it.
+        A platform identity is refused here, not merely by whatever surface the
+        caller came in through. The engine's binder asks the same question of
+        `ALTER TRIGGER ... OWNER TO`, but this method is reachable by anything
+        holding the library, and the direct calls are exactly how the ops ingest
+        triggers came to be pinned to `federator` - a check only the SQL path
+        applied was a check the SQL path alone obeyed.
         """
+        _assert_can_own(new_owner, f"trigger {name} on {dataset_identifier}")
         collection, dataset_name = self._local_parts(dataset_identifier)
         ref = self._triggers_collection(collection, dataset_name).document(name)
         if not ref.get().exists:
@@ -4877,6 +4939,10 @@ class OpteryxCatalog(Metastore):
         """
         if author is None:
             raise ValueError("author must be provided when creating a materialized view")
+        # The author becomes `runs-as` below on first registration, so the
+        # ownership rule is applied at the point the identity is pinned rather
+        # than only when one is transferred.
+        _assert_can_own(author, "a materialized view")
 
         identifier = self._qualify(identifier)
         collection, dataset_name = self._local_parts(identifier)
@@ -4949,9 +5015,12 @@ class OpteryxCatalog(Metastore):
                 "dataset-type": MATERIALIZED_VIEW_TYPE,
                 "statement-id": statement_id,
                 "source-tables": relative_sources,
-                # Pinned: an existing value survives re-registration, so editing
-                # a view never silently transfers whose authority it refreshes
-                # with. `set_materialized_view_owner` is the only way to move it.
+                # Pinned to the AUTHOR: the identity that ran the statement is
+                # necessarily one that held every grant the statement needed, so
+                # it is the only owner derivable here that is known to work.
+                # An existing value survives re-registration, so editing a view
+                # never silently transfers whose authority it refreshes with;
+                # `set_materialized_view_owner` is the only way to move it.
                 "runs-as": data.get("runs-as") or author,
                 "last-refreshed-at-ms": data.get("last-refreshed-at-ms"),
                 "last-refresh-status": data.get("last-refresh-status"),
@@ -5143,6 +5212,11 @@ class OpteryxCatalog(Metastore):
             raise ValueError("author must be provided when changing a materialized view owner")
         if not new_owner:
             raise ValueError("new_owner must be provided")
+        # Refused here as well as in the binder, for the reason set out on
+        # `set_trigger_owner`: a refresh runs as this identity, unattended and
+        # on a schedule, so a platform identity would be standing compute billed
+        # to nobody.
+        _assert_can_own(new_owner, f"materialized view {identifier}")
 
         identifier = self._qualify(identifier)
         collection, dataset_name = self._local_parts(identifier)
