@@ -383,6 +383,41 @@ each refresh writes a fresh copy. A refresh blocked this way surfaces like any
 other fire failure: alert, audit record, `last-fired-status: egress-blocked`, and
 the commit that fired it is untouched.
 
+#### SECURE — the sanctioned exemption
+
+Clearing the lock is all-or-nothing: `ALTER WORKSPACE ichnos SET
+egress_protection TO OFF` unlocks every copy out of `ichnos`, for everyone,
+until somebody puts it back. Where the copy that has to be allowed is one known
+statement — a platform pipeline moving billing events into another workspace,
+say — marking that object SECURE is the narrow form: one named object, into
+named destination workspaces, withdrawable on its own, with the lock left on for
+everything else.
+
+```python
+# Run against the SOURCE workspace - the one being copied out of.
+ichnos.mark_secure("ws.ops.billing_events_ingest", ["platform"], author="owner")
+ichnos.list_secure()          # everything ichnos has sanctioned, with who and when
+ichnos.clear_secure("ws.ops.billing_events_ingest", author="owner")
+```
+
+**Only the source can sanction, and that is structural.** The record lives in
+the SOURCE workspace's `$properties`, under `secure_objects`, and a handle only
+ever writes its own workspace's properties. A flag stored on the object would be
+settable by whoever may edit the object — the party the lock protects against —
+which makes it self-granting and the rule advisory. Here the destination cannot
+sanction a copy into itself however hard it tries.
+
+**Both the object and the destination must match.** A task's `writes` can be
+changed by redefining it, so an exemption naming only the object would follow
+that redefinition into a workspace its source never agreed to.
+
+Anything malformed reads as NOT sanctioned. This is the permitting half of a
+default-closed rule, so it has to be the conservative one about records it does
+not understand — the opposite of `_guard_is_on`, and for the same reason.
+`secure_objects` is a reserved property for that reason too: it is shaped, and an
+unshaped one fails open, so it goes through `mark_secure` (which validates) or it
+does not go.
+
 **What it is not: containment.** Anyone with `reader` can still `SELECT` the
 data and paste it wherever they like, and nothing here prevents that — it is
 leaky by construction, in the way a VPC Service Controls perimeter is an egress

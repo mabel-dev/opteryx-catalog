@@ -420,10 +420,18 @@ Remaining, not in scope here:
   `enforce_egress_policy` and `EgressRestricted`. Until that is released and installed, every
   cross-workspace write fails closed with the "catalog too old" message.
 
-Compatible with, and deliberately not foreclosing, the open questions: definer's rights for
+Compatible with, and deliberately not foreclosing, the open question of definer's rights for
 refresh (an identity question — orthogonal to whether the copy may cross the boundary at
-all), and a `SECURE` flag marking a sanctioned declassification, which would be a documented
-exemption checked inside `enforce_egress_policy`.
+all).
+
+**`SECURE` landed 2026-09-01**, as an object-level exemption checked inside
+`enforce_egress_policy` exactly as sketched here. Ruled by the architect: object-level, and
+settable by the SOURCE workspace's owner only — enforced structurally, by keeping the record
+in the source workspace's own `$properties` (`mark_secure` / `clear_secure` / `list_secure`;
+see the README). Object AND destination must both match, because a task's `writes` can be
+redefined. Still to come: the SQL surface, and passing the object's identity into
+opteryx-core's bind-time `_enforce_egress`, which today sanctions nothing because it names no
+object.
 
 ## 5. Delivery phases
 

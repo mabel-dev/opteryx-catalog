@@ -339,6 +339,25 @@ MATERIALIZED_VIEW_TYPE = "materialized_view"
 # for what that does and does not stop.
 EGRESS_PROTECTION_PROPERTY = "egress_protection"
 
+# Workspace `$properties` field: the objects this workspace has SANCTIONED to
+# copy its data out despite `egress_protection` - the SECURE flag. A map of
+# fully-qualified object identifier to
+# `{"destinations": [...], "secured-by": ..., "secured-at-ms": ...}`.
+#
+# It lives under the SOURCE workspace, and that placement is the whole design.
+# A flag stored on the object would be set by whoever may edit the object, which
+# is the party the protection protects AGAINST - self-granting, and the rule
+# becomes advisory. A handle only ever writes its own workspace's properties
+# (`set_workspace_properties` has the same constraint for the same reason), so
+# "only the source may sanction this" is enforced by where the bytes live rather
+# than by a check someone can forget to make.
+#
+# `destinations` is a list of WORKSPACE names, and it is pinned deliberately: a
+# task's `writes` can be changed by redefining it, so an exemption naming only
+# the object would follow that redefinition into a workspace its source never
+# agreed to.
+SECURE_OBJECTS_PROPERTY = "secure_objects"
+
 # Workspace `$properties` flag: when on, the workspace itself cannot be deleted.
 DELETION_PROTECTION_PROPERTY = "deletion_protection"
 
@@ -359,17 +378,42 @@ class EgressRefusal:
     workspace: str
     destination: str
     operation: str
+    # The object doing the copying, when the copy has one - a task, a
+    # materialized view. Lets the remediation name the exact SECURE statement
+    # rather than a template. None for an anonymous copy (a hand-typed CTAS).
+    secured: str | None = None
 
     @property
     def remediation(self) -> str:
-        """The statement that clears this refusal - run against the SOURCE."""
-        return f"ALTER WORKSPACE {self.workspace} SET {EGRESS_PROTECTION_PROPERTY} TO OFF."
+        """The statements that clear this refusal - both run against the SOURCE.
+
+        Two, and the narrow one is named first. `SET egress_protection TO OFF`
+        unlocks every copy out of the workspace for everyone; `SET SECURE`
+        sanctions this one object into this one destination and leaves the lock
+        on for everything else. Someone reading this message is usually trying to
+        get one pipeline through, and should be handed the key to one door before
+        the key to the building.
+        """
+        if self.secured:
+            narrow = (
+                f"ALTER WORKSPACE {self.workspace} SET SECURE {self.secured} "
+                f"TO {self.destination}"
+            )
+        else:
+            narrow = (
+                f"ALTER WORKSPACE {self.workspace} SET SECURE <object> TO {self.destination} "
+                "(for a task or materialized view)"
+            )
+        return (
+            f"{narrow}, or clear it for every copy with "
+            f"ALTER WORKSPACE {self.workspace} SET {EGRESS_PROTECTION_PROPERTY} TO OFF."
+        )
 
     def __str__(self) -> str:
         return (
             f"Cannot {self.operation}: it would copy data out of workspace "
             f"'{self.workspace}' into '{self.destination}', and "
-            f"'{self.workspace}' restricts egress. Clear it with {self.remediation}"
+            f"'{self.workspace}' restricts egress. Sanction it with {self.remediation}"
         )
 
 
@@ -2241,11 +2285,165 @@ class OpteryxCatalog(Metastore):
             return True
         return _guard_is_on(doc.to_dict() or {}, EGRESS_PROTECTION_PROPERTY)
 
+    # ------------------------------------------------------------------
+    # SECURE - sanctioned exemptions from the egress lock
+    # ------------------------------------------------------------------
+
+    def mark_secure(
+        self, identifier: str, destinations: Iterable[str], author: str | None = None
+    ) -> None:
+        """Sanction one object to copy THIS workspace's data into `destinations`.
+
+        The narrow alternative to clearing the lock. `ALTER WORKSPACE <source>
+        SET egress_protection TO OFF` is the only exemption that exists without
+        this, and it is a blunt one: it unlocks every copy out of the workspace,
+        for everyone, until somebody puts it back. A SECURE object is one named
+        statement, into named workspaces, revocable on its own.
+
+        Recorded on THIS workspace because this workspace is the one being
+        copied out of - see `SECURE_OBJECTS_PROPERTY` for why that placement is
+        the enforcement and not merely the filing.
+
+        `identifier` must be FULLY QUALIFIED. The object generally lives in
+        another workspace, so there is no sensible workspace to complete a short
+        name with: qualifying it here against `self.workspace` would silently
+        sanction an object of the same name in the wrong place.
+
+        `destinations` are WORKSPACE names, not relations. The question a source
+        owner is answering is "may this thing put my rows in that workspace",
+        and a copy is refused or allowed per crossing, so that is the grain the
+        record is kept at.
+
+        Args:
+            identifier: fully-qualified object - a task, a materialized view.
+            destinations: workspace names this object may copy into. Non-empty.
+            author: the identity sanctioning it, for the audit record.
+
+        Raises:
+            ValueError: on a short identifier, empty destinations, or a
+                destination naming this workspace (which is not egress at all).
+        """
+        if len(identifier.split(".")) < 3:
+            raise ValueError(
+                f"a SECURE object must be fully qualified as "
+                f"'workspace.collection.name': {identifier}"
+            )
+
+        destinations = list(dict.fromkeys(destinations))
+        if not destinations:
+            raise ValueError(
+                "a SECURE exemption must name at least one destination workspace; "
+                "an exemption to nowhere exempts nothing"
+            )
+        if any("." in destination for destination in destinations):
+            raise ValueError(
+                f"SECURE destinations are workspace names, not relations: {destinations}"
+            )
+        if self.workspace in destinations:
+            raise ValueError(
+                f"{self.workspace} cannot be a SECURE destination for its own data - "
+                "a copy that stays inside one workspace is not egress and is never refused"
+            )
+
+        # Read-modify-write, because Firestore cannot merge INTO a map value
+        # without rewriting it. Two sanctions racing can lose one; that loses an
+        # EXEMPTION, so the loser is refused rather than wrongly allowed, and
+        # re-running the statement fixes it. A silent permit would be the
+        # dangerous way for this to be wrong, and it is not the way it is wrong.
+        secured = dict(self._secure_objects())
+        secured[identifier] = {
+            "destinations": destinations,
+            "secured-by": author,
+            "secured-at-ms": int(time.time() * 1000),
+        }
+        self._catalog_ref.document("$properties").set(
+            {SECURE_OBJECTS_PROPERTY: secured}, merge=True
+        )
+
+        emit_audit(
+            "mark_secure",
+            resource_type=ResourceType.WORKSPACE,
+            workspace=self.workspace,
+            resource=self.workspace,
+            author=author,
+            secured=identifier,
+            destinations=destinations,
+        )
+
+    def clear_secure(
+        self, identifier: str, author: str | None = None, missing_ok: bool = False
+    ) -> None:
+        """Withdraw an object's sanction. The next copy it attempts is refused."""
+        secured = dict(self._secure_objects())
+        if identifier not in secured:
+            if missing_ok:
+                return
+            raise KeyError(f"{identifier} is not marked SECURE in {self.workspace}")
+
+        del secured[identifier]
+        self._catalog_ref.document("$properties").set(
+            {SECURE_OBJECTS_PROPERTY: secured}, merge=True
+        )
+
+        emit_audit(
+            "clear_secure",
+            resource_type=ResourceType.WORKSPACE,
+            workspace=self.workspace,
+            resource=self.workspace,
+            author=author,
+            secured=identifier,
+        )
+
+    def _secure_objects(self, workspace: str | None = None) -> dict:
+        """`workspace`'s SECURE map, read fresh, `{}` for anything unreadable.
+
+        Read fresh every time for the reason `is_egress_restricted` is: a cached
+        answer would let a long-lived handle keep copying after a sanction was
+        withdrawn.
+
+        A missing document, a missing key, or a value that is not a map all read
+        as no exemptions - which REFUSES rather than permits, so the shapes that
+        mean "nothing to say here" resolve to the safe answer.
+        """
+        doc = self._foreign_properties_ref(workspace or self.workspace).get()
+        if not doc.exists:
+            return {}
+        secured = (doc.to_dict() or {}).get(SECURE_OBJECTS_PROPERTY)
+        if not isinstance(secured, dict):
+            return {}
+        return secured
+
+    def list_secure(self, workspace: str | None = None) -> dict:
+        """Everything `workspace` (default: this one) has sanctioned."""
+        return self._secure_objects(workspace)
+
+    def is_secure(self, identifier: str, destination: str, workspace: str | None = None) -> bool:
+        """Whether `workspace` has sanctioned `identifier` to copy into `destination`.
+
+        Both halves must match. The object alone is not enough: `writes` is a
+        property of a statement that can be redefined, so an exemption that
+        followed the object wherever it later pointed would let a redefinition
+        collect a sanction it was never given.
+
+        Anything malformed reads as NOT secure. This is the permitting half of a
+        default-closed rule, which is the half that has to be conservative about
+        records it does not understand - the opposite of `_guard_is_on`, and for
+        the same reason.
+        """
+        record = self._secure_objects(workspace).get(identifier)
+        if not isinstance(record, dict):
+            return False
+        destinations = record.get("destinations")
+        if not isinstance(destinations, (list, tuple)):
+            return False
+        return destination in destinations
+
     def egress_verdict(
         self,
         source_workspaces: Iterable[str],
         destination_workspace: str,
         operation: str,
+        secured: str | None = None,
     ) -> list[EgressRefusal]:
         """Every source workspace that refuses this copy, in first-seen order.
 
@@ -2272,6 +2470,13 @@ class OpteryxCatalog(Metastore):
             destination_workspace: workspace the copy writes into.
             operation: what is being attempted, for the message - e.g.
                 "create materialized view mart.daily".
+            secured: the fully-qualified object doing the copying, if it has an
+                identity a source could have sanctioned - a task, a materialized
+                view. A source workspace that has marked it SECURE for this
+                destination does not refuse. None means "no object to check",
+                which is not the same as "not sanctioned" but reaches the same
+                answer, and is what an anonymous copy (a hand-typed CTAS)
+                passes.
         """
         refusals: list[EgressRefusal] = []
         checked: set[str] = set()
@@ -2280,11 +2485,17 @@ class OpteryxCatalog(Metastore):
                 continue
             checked.add(source_workspace)
             if self.is_egress_restricted(source_workspace):
+                # The sanctioned exemption, read only once a workspace has
+                # actually refused - so the ordinary allowed path costs nothing,
+                # the same bargain the rest of this method makes.
+                if secured and self.is_secure(secured, destination_workspace, source_workspace):
+                    continue
                 refusals.append(
                     EgressRefusal(
                         workspace=source_workspace,
                         destination=destination_workspace,
                         operation=operation,
+                        secured=secured,
                     )
                 )
         return refusals
@@ -2294,6 +2505,7 @@ class OpteryxCatalog(Metastore):
         source_workspaces: Iterable[str],
         destination_workspace: str,
         operation: str,
+        secured: str | None = None,
     ) -> None:
         """Refuse a copy that would land a source workspace's data elsewhere.
 
@@ -2333,12 +2545,17 @@ class OpteryxCatalog(Metastore):
             destination_workspace: workspace the copy writes into.
             operation: what is being attempted, for the error message - e.g.
                 "create materialized view mart.daily".
+            secured: the object doing the copying, for the SECURE exemption -
+                see `egress_verdict`.
 
         Raises:
             EgressRestricted: if any source workspace differs from the
-                destination and has `egress_protection` set.
+                destination, has `egress_protection` set, and has not marked
+                `secured` as sanctioned for this destination.
         """
-        refusals = self.egress_verdict(source_workspaces, destination_workspace, operation)
+        refusals = self.egress_verdict(
+            source_workspaces, destination_workspace, operation, secured=secured
+        )
         if refusals:
             raise EgressRestricted(str(refusals[0]))
 
@@ -2357,6 +2574,13 @@ class OpteryxCatalog(Metastore):
             "deleted-by",
             "locked-by",
             "locked-at-ms",
+            # SECURE exemptions are shaped, and a malformed one fails OPEN
+            # where a malformed guard flag fails closed: `destinations` written
+            # as the string "platform" rather than a list would exempt every
+            # destination whose name it contains, because membership on a string
+            # is a substring test. Set them through `mark_secure`, which
+            # validates the shape; `is_secure` refuses to read any other.
+            SECURE_OBJECTS_PROPERTY,
         }
     )
 
@@ -3188,6 +3412,7 @@ class OpteryxCatalog(Metastore):
             (self._source_workspace(source) for source in source_tables),
             self.workspace,
             f"{operation} materialized view {identifier}",
+            secured=self._qualify(identifier),
         )
 
     def enforce_task_egress(
@@ -3231,6 +3456,7 @@ class OpteryxCatalog(Metastore):
                 (self.workspace,),
                 destination,
                 f"{operation} task {identifier}",
+                secured=self._qualify(identifier),
             )
 
     def _assert_no_trigger_cycle(self, dataset_identifier: str, target_view: str) -> None:
@@ -3412,6 +3638,43 @@ class OpteryxCatalog(Metastore):
         if target_task is not None:
             task_collection, task_document = self._task_parts(target_task)
             task_ref = self._task_doc_ref(task_collection, task_document)
+
+            # EGRESS, AT THE MOMENT THE COPY BECOMES AUTOMATED. A trigger is
+            # what turns a task into an automated, durable, repeating write -
+            # the three words the egress rule is written in - so arming one is
+            # the creation-time moment that matches `create_materialized_view`'s
+            # check, and like that one it REFUSES rather than warns. Before the
+            # trigger document is written: a refused arming must leave nothing
+            # behind, not a trigger that fails forever at fire time.
+            #
+            # Placed after the validation above - and after the firing dataset's
+            # existence check in particular - mirroring `_enforce_egress` in the
+            # engine (opteryx/planner/binder/relation.py): a caller who cannot
+            # name a dataset they may attach a trigger to learns that first, and
+            # so cannot use this path to probe another workspace's protection
+            # state. It goes through `enforce_egress_policy` like every other
+            # caller, so a policy that grows (an object-level exemption, say) is
+            # answered here without this path being touched.
+            #
+            # The fire-time check in `_fire_task` is NOT made redundant by this
+            # one. Protection can be taken, and a task repointed at a foreign
+            # destination, long after its trigger was armed - the same
+            # both-ends-of-the-object's-life reasoning
+            # `enforce_materialized_view_egress` gives for a view.
+            #
+            # A task with no document has no recorded `writes` and is left to
+            # the fire-time check, as this method deliberately does not require
+            # the task to exist.
+            #
+            # The hole is `enforce_task_egress`'s and stays open here: a task
+            # whose `writes` was never declared passes vacuously, because an
+            # empty list means the question was never asked rather than that
+            # the task writes nothing.
+            task_snapshot = task_ref.get()
+            if task_snapshot.exists:
+                self.enforce_task_egress(
+                    target_task, (task_snapshot.to_dict() or {}).get("writes") or (), "arm"
+                )
 
         now_ms = int(time.time() * 1000)
 

@@ -55,6 +55,7 @@ from datetime import UTC
 from datetime import datetime
 from datetime import timedelta
 from typing import Any
+from typing import Iterable
 
 import urllib.parse
 import urllib.request
@@ -125,7 +126,9 @@ def firing_enabled() -> bool:
 HOUSE_BILLING_ACCOUNT = "opteryx"
 
 
-def policies_for(catalog, principal: str | None) -> list[dict] | None:
+def policies_for(
+    catalog, principal: str | None, workspaces: Iterable[str] | None = None
+) -> list[dict] | None:
     """The principal's current access policies, in job-document shape.
 
     Read from `{workspace}/$policies/access` - policy.opteryx's storage,
@@ -137,22 +140,59 @@ def policies_for(catalog, principal: str | None) -> list[dict] | None:
     the refresh's acting identity and policies itself rather than trusting a
     submission to carry them, and this is the data-access half of that. Read at
     submission time deliberately: a revoked role stops the very next refresh.
+
+    `workspaces` NAMES THE WORKSPACES TO READ, and defaults to this catalog's
+    own - which was the only behaviour, and was a silent authority ceiling on
+    any statement that crossed a workspace. A minted token carries the
+    principal's policies from EVERY workspace (authenticate.opteryx builds the
+    claim with a collection-group query), so a person running a statement
+    interactively is bound against all of them; an unattended run of the SAME
+    statement was bound against one, and every relation outside it was denied
+    however the principal was actually granted. A task writing another
+    workspace therefore failed on every fire, as a job error, with the trigger
+    reporting `enqueued`.
+
+    Deliberately a NAMED SET rather than "everywhere". The caller knows which
+    relations the statement touches, so the run is bound against exactly those
+    workspaces - which keeps the least-privilege posture `opteryx_access.store`
+    states when it refuses a general cross-workspace policy dump, and keeps the
+    cost one already-indexed query per workspace involved rather than a
+    collection-group scan. Read in the order given, deduplicated, so a job
+    document is stable across submissions.
+
+    Any workspace's `$policies/access` is readable through any handle in this
+    database - workspaces are sibling root collections, the same property
+    `_foreign_properties_ref` relies on for the egress flag - so this needs no
+    handle per workspace, and constructs none.
     """
     if not principal:
         return None
     from google.cloud.firestore_v1 import FieldFilter
 
-    access = (
-        catalog.firestore_client.collection(catalog.workspace)
-        .document("$policies")
-        .collection("access")
-    )
-    policies = []
-    query = access.where(filter=FieldFilter("principal", "in", [principal, "*"]))
-    for doc in query.stream():
-        data = doc.to_dict() or {}
-        role, pattern = data.get("role"), data.get("pattern")
-        if role and pattern:
+    names = list(dict.fromkeys(workspaces)) if workspaces else [catalog.workspace]
+
+    policies: list[dict] = []
+    seen: set = set()
+    for workspace in names:
+        access = (
+            catalog.firestore_client.collection(workspace)
+            .document("$policies")
+            .collection("access")
+        )
+        query = access.where(filter=FieldFilter("principal", "in", [principal, "*"]))
+        for doc in query.stream():
+            data = doc.to_dict() or {}
+            role, pattern = data.get("role"), data.get("pattern")
+            if not (role and pattern):
+                continue
+            # Document ids are unique per workspace, not across them, so the id
+            # alone cannot be the key: two workspaces can hold a policy of the
+            # same id saying different things, and either dropping one or
+            # emitting both as duplicates would be wrong.
+            key = (workspace, doc.id, role, pattern)
+            if key in seen:
+                continue
+            seen.add(key)
             policies.append({"role": role, "pattern": pattern, "policy": doc.id})
     return policies or None
 
