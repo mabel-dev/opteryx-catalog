@@ -2782,12 +2782,31 @@ class OpteryxCatalog(Metastore):
         author: str | None = None,
         description: str | None = None,
         update_if_exists: bool = False,
+        writes: list[str] | None = None,
     ) -> None:
         """Register a task: a statement the platform runs on its own.
 
         The statement is versioned in a `statement` subcollection, the same way
         a view's and a materialized view's are, so redefining a task keeps its
         history rather than overwriting it.
+
+        `writes` is what the statement writes, derived from its own AST by the
+        caller's planner. Recorded because a task is otherwise a graph node with
+        edges only coming in: a trigger says which dataset FIRES a task and
+        nothing says which dataset it FEEDS, so a pipeline of
+        `raw -> task -> curated -> task -> marts` reads as disconnected
+        fragments. It is a description of the statement, so it is written on
+        every registration and NEVER carried from the previous one - a
+        redefinition that changes the target must not leave the old answer
+        standing.
+
+        It is recorded, not enforced. Nothing here refuses a task that writes
+        back to a dataset that fires it, and `_assert_no_trigger_cycle` still
+        walks refresh triggers only. That loop is real and predates this field
+        - a task's write lands a user commit, and `_after_commit` fires that
+        dataset's triggers afresh - but until now nothing recorded enough to
+        SEE it. This makes it visible; refusing it is a separate decision, and
+        one that could reject wiring already in place.
 
         A task carries NO identity of its own. A person running it with EXECUTE
         runs it as themselves; an unattended run carries the identity of the
@@ -2842,6 +2861,10 @@ class OpteryxCatalog(Metastore):
             {
                 "name": task_name,
                 "statement-id": statement_id,
+                # See the note above: written from THIS registration every time,
+                # with no `data.get` fallback, because it describes the statement
+                # being recorded and not the one it replaces.
+                "writes": list(writes or []),
                 "description": description if description is not None else data.get("description"),
                 "created-by": data.get("created-by") or author,
                 "created-at-ms": data.get("created-at-ms") or now_ms,
@@ -2849,11 +2872,21 @@ class OpteryxCatalog(Metastore):
                 "suspended-by": data.get("suspended-by"),
                 "last-fired-at-ms": data.get("last-fired-at-ms"),
                 "last-fired-status": data.get("last-fired-status"),
-                # The `current_version` of the last run that succeeded. Not a
-                # consumer offset - nothing reads it to decide a window - but the
-                # breadcrumb that makes a MISSED window detectable: a firing whose
-                # parent_version does not meet this has a gap behind it.
+                # The `current_version` of the last run that succeeded. With the
+                # one-trigger rule this is a GUARD, not only a breadcrumb: one
+                # trigger means one source, so it and every fire's window are
+                # readings of the same version sequence, and `_fire_task` can
+                # compare them - skipping a superseded run and widening over the
+                # gap a failed predecessor left.
                 "last-window-to": data.get("last-window-to"),
+                # WHICH trigger fires this task, `{source, name}`, or None. The
+                # reverse of the edge Firestore stores - a trigger lives under
+                # the dataset that fires it - and what `create_trigger` reads to
+                # enforce the one-trigger rule without a collection-group scan.
+                # CARRIED across re-registration: redefining a statement does not
+                # rewire it, and dropping the pointer here would silently hand
+                # the task a second trigger.
+                "trigger": data.get("trigger"),
             }
         )
 
@@ -2902,6 +2935,11 @@ class OpteryxCatalog(Metastore):
             "workspace": self.workspace,
             "sql": sql,
             "statement-id": statement_id,
+            # The relations this task's statement writes. Empty for a task
+            # registered before the field existed, which is indistinguishable
+            # from a task that writes nothing - the honest reading of a record
+            # that was never asked the question.
+            "writes": list(data.get("writes") or []),
             "description": data.get("description"),
             "created-by": data.get("created-by"),
             "created-at-ms": data.get("created-at-ms"),
@@ -2914,6 +2952,10 @@ class OpteryxCatalog(Metastore):
             "last-fired-at-ms": data.get("last-fired-at-ms"),
             "last-fired-status": data.get("last-fired-status"),
             "last-window-to": data.get("last-window-to"),
+            # The one trigger that fires this task, `{source, name}`, or None for
+            # a manual-only task. See `create_trigger` for why there is at most
+            # one.
+            "trigger": data.get("trigger"),
         }
 
     def list_tasks(self, collection: str) -> list:
@@ -2955,11 +2997,18 @@ class OpteryxCatalog(Metastore):
         status: str,
         window_to: int | None = None,
     ) -> None:
-        """Stamp a task's last-fired fields, and its window breadcrumb on success.
+        """Stamp a task's last-fired fields, and its window on success.
 
         `window_to` is recorded ONLY when the run succeeded: a failed run
-        consumed nothing, and advancing the breadcrumb past it would hide the
-        very gap the breadcrumb exists to expose.
+        consumed nothing, and advancing it past one would hide the very gap it
+        exists to expose - and, now that `_fire_task` widens a window back to
+        this value, the gap is what makes the next run cover those commits.
+
+        The status vocabulary, as `information_schema.tasks.last_fired_status`
+        reports it: `enqueued` (a run was submitted), `superseded` (the window
+        guard found this commit already consumed, so nothing was submitted),
+        `suspended`, `owner-missing`, `egress-blocked`, `error`. Anything the
+        worker records on completion joins them here.
         """
         collection, task_name = self._task_parts(identifier)
 
@@ -3198,6 +3247,24 @@ class OpteryxCatalog(Metastore):
                     continue
                 stack.append((self._qualify(downstream), [*path, current]))
 
+    def _release_task_trigger(self, task_ref, name: str, source: str) -> None:
+        """Clear a task's `trigger` back-pointer, if it names THIS trigger.
+
+        Conditional on the name and the source because the pointer is what the
+        one-trigger rule reads: clearing one that names a different, live
+        trigger would let a second one through. A task document that is gone
+        holds no pointer and needs no clearing - `drop_task` runs before its
+        triggers are noticed, and that ordering is unchanged.
+        """
+        if task_ref is None:
+            return
+        doc = task_ref.get()
+        if not doc.exists:
+            return
+        held = (doc.to_dict() or {}).get("trigger") or {}
+        if (held.get("name"), held.get("source")) == (name, source):
+            task_ref.update({"trigger": None})
+
     def create_trigger(
         self,
         dataset_identifier: str,
@@ -3270,17 +3337,43 @@ class OpteryxCatalog(Metastore):
             self._assert_no_trigger_cycle(dataset_identifier, target_view)
 
         trigger_ref = self._triggers_collection(collection, dataset_name).document(name)
-        existing = trigger_ref.get()
-        if existing.exists:
-            claimed = (existing.to_dict() or {}).get(target_field)
-            if claimed and claimed != target:
-                raise MaterializedViewError(
-                    f"trigger {name} on {collection}.{dataset_name} already refreshes "
-                    f"{claimed}; refusing to repoint it at {target}"
-                )
+        source = self._qualify(dataset_identifier)
 
-        trigger_ref.set(
-            {
+        # THE ONE-TRIGGER RULE. A task has at most one trigger; a materialized
+        # view keeps as many as it has sources, so this is gated on the target
+        # being a task and MV refresh wiring is untouched by it.
+        #
+        # Why a flat rule over all tasks rather than only window-consuming ones:
+        # a task's unattended window is the committing snapshot and its parent,
+        # bound at fire time from the source dataset (`_fire_task`). Two sources
+        # feed two INCOMPARABLE version sequences through the same two parameter
+        # names, and nothing in the statement can tell whose it was handed - the
+        # result is plausible wrong rows and no error, ever. The same interleave
+        # corrupts `last-window-to`, which is why that stayed a breadcrumb rather
+        # than becoming the supersession guard it now is. Refusing by CARDINALITY
+        # kills the ambiguity without classifying statements at creation time:
+        # with one source there is nothing to declare and nothing to mis-bind.
+        #
+        # The cost is fan-in: "run t when either A or B changes" is now two tasks
+        # (each correctly windowed on its own source) or a materialized view (if
+        # the work is a derivation, it was a rewrite all along). That case was
+        # exactly the broken one.
+        #
+        # Triggers live under their SOURCE dataset, so "does this task have a
+        # trigger" is a reverse lookup. The answer is kept as a back-pointer on
+        # the task document and written in the SAME transaction as the trigger,
+        # because either half alone is the half-wired state: a back-pointer with
+        # no trigger locks the task out of ever getting one, and a trigger with
+        # no back-pointer lets a second one through.
+        task_ref = None
+        if target_task is not None:
+            task_collection, task_document = self._task_parts(target_task)
+            task_ref = self._task_doc_ref(task_collection, task_document)
+
+        now_ms = int(time.time() * 1000)
+
+        def _record(prior: dict) -> dict:
+            return {
                 "name": name,
                 "kind": kind,
                 "target-view": target_view,
@@ -3288,12 +3381,8 @@ class OpteryxCatalog(Metastore):
                 "statement-id": statement_id,
                 # Preserved across re-registration: repointing or recreating a
                 # trigger must not quietly un-pause one an operator paused.
-                "suspended-at-ms": (existing.to_dict() or {}).get("suspended-at-ms")
-                if existing.exists
-                else None,
-                "suspended-by": (existing.to_dict() or {}).get("suspended-by")
-                if existing.exists
-                else None,
+                "suspended-at-ms": prior.get("suspended-at-ms"),
+                "suspended-by": prior.get("suspended-by"),
                 # The identity an UNATTENDED run executes as. On the trigger and
                 # not the task, because that is what separates unattended from
                 # attended: a person running EXECUTE runs the task as themselves
@@ -3314,16 +3403,50 @@ class OpteryxCatalog(Metastore):
                 # transfers whose authority the work runs with. MV refresh
                 # triggers ignore this - a refresh resolves its identity from
                 # the view's own record.
-                "runs-as": (
-                    ((existing.to_dict() or {}).get("runs-as") if existing.exists else None)
-                    or author
-                ),
+                "runs-as": prior.get("runs-as") or author,
                 "created-by": author,
-                "created-at-ms": int(time.time() * 1000),
+                "created-at-ms": now_ms,
                 "last-fired-at-ms": None,
                 "last-fired-status": None,
             }
-        )
+
+        @firestore.transactional
+        def _attach(transaction) -> None:
+            # Every read first: a Firestore transaction refuses a read that
+            # follows a write in the same transaction.
+            existing = trigger_ref.get(transaction=transaction)
+            prior = (existing.to_dict() or {}) if existing.exists else {}
+            task_doc = None if task_ref is None else task_ref.get(transaction=transaction)
+
+            if existing.exists:
+                claimed = prior.get(target_field)
+                if claimed and claimed != target:
+                    raise MaterializedViewError(
+                        f"trigger {name} on {collection}.{dataset_name} already refreshes "
+                        f"{claimed}; refusing to repoint it at {target}"
+                    )
+
+            # A task with no document holds no back-pointer, so the rule cannot
+            # be enforced for one - and this method deliberately does not require
+            # the task to exist (`drop_task` leaves its triggers behind, and
+            # integrity reports the dangling pair). Writing a stub task document
+            # to carry the pointer would invent a task nobody created, which is
+            # worse than leaving a dangling trigger the sweep already surfaces.
+            if task_doc is not None and task_doc.exists:
+                held = (task_doc.to_dict() or {}).get("trigger") or {}
+                held_name = held.get("name")
+                if held_name and (held_name, held.get("source")) != (name, source):
+                    raise MaterializedViewError(
+                        f"task {target_task} is already fired by {held_name} ON "
+                        f"{held.get('source')}; a task has one trigger - its window "
+                        "is that source's version sequence."
+                    )
+
+            transaction.set(trigger_ref, _record(prior))
+            if task_doc is not None and task_doc.exists:
+                transaction.update(task_ref, {"trigger": {"source": source, "name": name}})
+
+        _attach(self.firestore_client.transaction())
 
         # The existence check at the top and the write above are separate
         # operations, so a concurrent `drop_dataset` can interleave: its sweep
@@ -3334,6 +3457,10 @@ class OpteryxCatalog(Metastore):
         # interleaving into a clean failure instead of an orphan.
         if not self._dataset_doc_ref(collection, dataset_name).get().exists:
             trigger_ref.delete()
+            # The back-pointer goes with it. Leaving one behind would be worse
+            # than the orphan this arm exists to prevent: the task would be
+            # locked out of ever taking a trigger by one that no longer exists.
+            self._release_task_trigger(task_ref, name, source)
             raise DatasetNotFound(f"Dataset not found: {collection}.{dataset_name}")
 
         emit_audit(
@@ -3368,11 +3495,27 @@ class OpteryxCatalog(Metastore):
             raise ValueError("author must be provided when dropping a trigger")
         collection, dataset_name = self._local_parts(dataset_identifier)
         doc_ref = self._triggers_collection(collection, dataset_name).document(name)
-        if not doc_ref.get().exists:
+        existing = doc_ref.get()
+        if not existing.exists:
             if missing_ok:
                 return
             raise TriggerNotFound(f"Trigger not found: {name} on {collection}.{dataset_name}")
+        target_task = (existing.to_dict() or {}).get("target-task")
         doc_ref.delete()
+
+        # The back-pointer the one-trigger rule reads goes with the trigger.
+        # Left standing it would be a phantom: the task could never take another
+        # trigger, refused on behalf of one that no longer exists - and repoint,
+        # which is a drop followed by a create, would be the first thing to hit
+        # it. Cleared AFTER the delete so a failure here leaves a task that is
+        # over-constrained rather than one that could take a second trigger.
+        if target_task is not None:
+            task_collection, task_document = self._task_parts(target_task)
+            self._release_task_trigger(
+                self._task_doc_ref(task_collection, task_document),
+                name,
+                self._qualify(dataset_identifier),
+            )
 
         emit_audit(
             "drop_trigger",
