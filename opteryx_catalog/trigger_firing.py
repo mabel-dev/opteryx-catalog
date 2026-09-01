@@ -487,7 +487,15 @@ def _fire_task(
 
     Because the window is a snapshot and its own parent it spans exactly one
     commit, so a compaction can only ever be one of its endpoints - never
-    something inside it whose rewritten files would read as new rows.
+    something inside it whose rewritten files would read as new rows. The one
+    exception is a window widened over a gap (below), which spans back to the
+    last commit a run actually consumed.
+
+    The window is then checked against `last-window-to` before anything is
+    submitted: a commit already consumed is skipped as superseded, and one that
+    starts beyond where the last success ended is widened back to it. Both
+    comparisons are within ONE dataset's version sequence, which is what the
+    one-trigger rule guarantees and what makes them mean anything.
     """
     target_task = trigger["target-task"]
     task = catalog.get_task(target_task)
@@ -518,13 +526,63 @@ def _fire_task(
     parent_version = (
         NO_PARENT_VERSION_FLOOR if parent_snapshot_id is None else int(parent_snapshot_id)
     )
+    current_version = int(snapshot_id)
+
+    # THE WINDOW GUARD. `last-window-to` is the `current_version` the last
+    # SUCCESSFUL run consumed to. It is usable as a guard - rather than the
+    # breadcrumb it was - only because a task has exactly one trigger
+    # (`create_trigger`'s one-trigger rule): one trigger is one source, so this
+    # scalar and the window being bound here are readings of the SAME version
+    # sequence. With two sources they were interleaved ids from two incomparable
+    # ones, and either comparison below would have been a coin toss - skipping
+    # every fire from whichever dataset's ids ran lower, forever and silently.
+    #
+    # None for a task that has never succeeded, which is the ordinary state of a
+    # new one: no floor, nothing to compare, and the first run takes its window
+    # as bound.
+    last_window_to = task.get("last-window-to")
+    if last_window_to is not None:
+        last_window_to = int(last_window_to)
+
+        if current_version <= last_window_to:
+            # SUPERSEDED: a run has already consumed through this commit. Reached
+            # by a fire that queued behind a later one and outlived the dedup
+            # window - re-running it would reprocess rows a successful run
+            # already took. Recorded on the task rather than dropped silently,
+            # so "nothing happened, deliberately" is visible where someone looks
+            # for the run they expected.
+            catalog.mark_task_fired(target_task, status="superseded")
+            catalog.mark_trigger_fired(dataset_identifier, trigger["name"], status="superseded")
+            write_audit_record(
+                {
+                    "event": "task.superseded",
+                    "workspace": getattr(catalog, "workspace", None),
+                    "dataset": dataset_identifier,
+                    "trigger": trigger["name"],
+                    "target_task": target_task,
+                    "current_version": current_version,
+                    "last_window_to": last_window_to,
+                    "author": author,
+                }
+            )
+            return
+
+        if parent_version > last_window_to:
+            # GAP: the run that should have covered `last_window_to ->
+            # parent_version` never succeeded, so the commits in between were
+            # consumed by nobody. Widen this window back to the last covered
+            # point rather than starting at this commit's parent and leaving
+            # them behind for good. Because `mark_task_fired` stamps only on
+            # SUCCESS, the gap stays visible - and keeps widening the next
+            # window - until a run actually covers it.
+            parent_version = last_window_to
 
     # Both versions are integers off the catalog's own records, coerced here so
     # nothing but a number can reach the statement text.
     sql_text = (
         f"EXECUTE {task['identifier']} "
         f"USING {parent_version} AS parent_version, "
-        f"{int(snapshot_id)} AS current_version"
+        f"{current_version} AS current_version"
     )
 
     execution_id, outcome = _submit_task_job(

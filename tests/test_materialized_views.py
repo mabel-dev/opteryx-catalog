@@ -46,7 +46,11 @@ class _DocRef:
         self._exists = False
         self._subcollections = {}
 
-    def get(self):
+    # `transaction` is accepted and ignored: these fakes are single-threaded, so
+    # a transactional read sees what an ordinary one would. What the transaction
+    # is here to prove is the ORDER (every read before any write) and the
+    # ALL-OR-NOTHING, which `_Transaction` below mimics.
+    def get(self, transaction=None):
         return _Doc(self.id, self._data, self._exists)
 
     def set(self, data, merge=False):
@@ -79,8 +83,57 @@ class _Collection:
             self._docs[doc_id] = _DocRef(doc_id)
         return self._docs[doc_id]
 
-    def stream(self):
+    def stream(self, transaction=None):
         return [ref.get() for ref in self._docs.values() if ref._exists]
+
+
+class _Transaction:
+    """Enough of a Firestore transaction for `@firestore.transactional`.
+
+    The decorator drives four private methods on whatever it is handed
+    (`_clean_up`, `_begin`, `_commit`, plus `_read_only`/`_max_attempts`/`_id`),
+    so a double has to answer them. Implemented rather than mocked away because
+    the point is to keep the guarantee honest: writes land together at commit,
+    and a refusal raised inside the body leaves NOTHING behind - which is what
+    `create_trigger`'s one-trigger refusal depends on.
+    """
+
+    _read_only = False
+    _max_attempts = 1
+    _id = b"fake-txn"
+
+    def __init__(self):
+        self.writes = []
+        self.committed = False
+
+    def _clean_up(self):
+        self.writes = []
+
+    def _begin(self, retry_id=None):
+        return None
+
+    def _rollback(self):
+        self.writes = []
+
+    def _commit(self):
+        for op, ref, data in self.writes:
+            if op == "set":
+                ref.set(data)
+            elif op == "update":
+                ref.update(data)
+            else:
+                ref.delete()
+        self.committed = True
+        return []
+
+    def set(self, ref, data, merge=False):
+        self.writes.append(("set", ref, data))
+
+    def update(self, ref, data):
+        self.writes.append(("update", ref, data))
+
+    def delete(self, ref):
+        self.writes.append(("delete", ref, None))
 
 
 class _FirestoreClient:
@@ -95,6 +148,9 @@ class _FirestoreClient:
         if name not in self._collections:
             self._collections[name] = _Collection()
         return self._collections[name]
+
+    def transaction(self):
+        return _Transaction()
 
 
 def _catalog():

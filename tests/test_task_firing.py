@@ -286,3 +286,90 @@ def test_a_failure_to_stamp_never_displaces_the_real_failure():
 
     assert alert.called
     assert "jobs down" in str(alert.call_args[0][0])
+
+
+# --- the window guard
+#
+# `last-window-to` is the `current_version` of the last SUCCESSFUL run. It is
+# readable as a guard rather than a breadcrumb only because a task has exactly
+# one trigger, so it and every window bound here are readings of one dataset's
+# version sequence. With two sources they were interleaved ids from two
+# incomparable ones and both comparisons below would have been coin tosses.
+
+
+def _windowed_catalog(last_window_to):
+    return _catalog_stub(
+        task={
+            "identifier": "ws.ops.compaction_log_ingest",
+            "name": "compaction_log_ingest",
+            "collection": "ops",
+            "sql": "INSERT INTO ops.compaction_log SELECT 1",
+            "last-window-to": last_window_to,
+        }
+    )
+
+
+def test_a_task_that_never_succeeded_takes_its_window_as_bound():
+    """None is the ordinary state of a new task: no floor, nothing to compare."""
+    catalog = _windowed_catalog(None)
+    post, _ = _fire(catalog, snapshot_id=200, parent_snapshot_id=100)
+
+    assert "USING 100 AS parent_version, 200 AS current_version" in post.call_args[0][0]["sql_text"]
+
+
+def test_a_commit_already_consumed_is_skipped_as_superseded():
+    """A fire that queued behind a later one and outlived the dedup window.
+    Re-running it would reprocess rows a successful run already took."""
+    catalog = _windowed_catalog(200)
+    post, _ = _fire(catalog, snapshot_id=200, parent_snapshot_id=100)
+
+    post.assert_not_called()
+    catalog.mark_task_fired.assert_called_once_with(
+        "ws.ops.compaction_log_ingest", status="superseded"
+    )
+    catalog.mark_trigger_fired.assert_called_once_with(
+        "ops.catalog_changes", "task__ops__compaction_log_ingest", status="superseded"
+    )
+
+
+def test_the_skip_is_recorded_rather_than_silent():
+    """A deliberate no-run has to be visible where someone looks for the run
+    they expected, rather than leaving no trace at all."""
+    catalog = _windowed_catalog(300)
+    _, audit = _fire(catalog, snapshot_id=200, parent_snapshot_id=100)
+
+    record = audit.call_args[0][0]
+    assert record["event"] == "task.superseded"
+    assert record["current_version"] == 200
+    assert record["last_window_to"] == 300
+
+
+def test_a_window_that_starts_beyond_the_last_success_is_widened_over_the_gap():
+    """The run that should have covered 150 -> 300 never succeeded, so those
+    commits were consumed by nobody. Starting at this commit's parent would
+    leave them behind for good."""
+    catalog = _windowed_catalog(150)
+    post, _ = _fire(catalog, snapshot_id=400, parent_snapshot_id=300)
+
+    assert "USING 150 AS parent_version, 400 AS current_version" in post.call_args[0][0]["sql_text"]
+
+
+def test_the_gap_stays_open_until_a_run_covers_it():
+    """`mark_task_fired` stamps only on SUCCESS, so a failed run leaves
+    `last-window-to` where it was and the next window widens over the same gap
+    again - which is what makes the gap self-healing rather than a one-shot."""
+    catalog = _windowed_catalog(150)
+    post, _ = _fire(catalog, snapshot_id=500, parent_snapshot_id=400)
+
+    assert "USING 150 AS parent_version" in post.call_args[0][0]["sql_text"]
+    # The fire path never advances it - that is the worker's job, on success.
+    catalog.mark_task_fired.assert_not_called()
+
+
+def test_a_contiguous_window_is_left_alone():
+    """The ordinary case: this commit's parent is exactly where the last
+    success ended, so there is no gap and nothing to widen."""
+    catalog = _windowed_catalog(200)
+    post, _ = _fire(catalog, snapshot_id=300, parent_snapshot_id=200)
+
+    assert "USING 200 AS parent_version, 300 AS current_version" in post.call_args[0][0]["sql_text"]

@@ -36,6 +36,48 @@ def test_create_and_read_a_task():
     assert task["last-window-to"] is None
 
 
+def test_what_a_task_writes_is_recorded():
+    """A trigger says which dataset FIRES a task; nothing said which dataset it
+    FEEDS, so a pipeline read as disconnected fragments. `writes` is that edge,
+    derived by the caller from the statement's own AST."""
+    catalog = _catalog()
+    catalog.create_task(
+        "ops.ingest",
+        sql="INSERT INTO ops.curated SELECT * FROM ops.raw",
+        author="xb500",
+        writes=["ops.curated"],
+    )
+
+    assert catalog.get_task("ops.ingest")["writes"] == ["ops.curated"]
+
+
+def test_a_task_that_writes_nothing_records_an_empty_list():
+    """Empty rather than absent: a reader never has to tell "writes nothing"
+    from "was never asked"."""
+    catalog = _catalog()
+    catalog.create_task("ops.ingest", sql="SELECT 1", author="xb500")
+
+    assert catalog.get_task("ops.ingest")["writes"] == []
+
+
+def test_redefining_replaces_what_a_task_writes():
+    """It describes THIS statement, so it is written on every registration and
+    never carried forward - a stale edge draws a pipeline that does not exist."""
+    catalog = _catalog()
+    catalog.create_task(
+        "ops.ingest", sql="INSERT INTO ops.a SELECT 1", author="xb500", writes=["ops.a"]
+    )
+    catalog.create_task(
+        "ops.ingest",
+        sql="INSERT INTO ops.b SELECT 1",
+        author="xb500",
+        writes=["ops.b"],
+        update_if_exists=True,
+    )
+
+    assert catalog.get_task("ops.ingest")["writes"] == ["ops.b"]
+
+
 def test_a_task_is_not_a_dataset():
     """It must not be scannable or appear where relations are listed."""
     catalog = _catalog()
@@ -401,3 +443,179 @@ def test_name_holder_reports_the_kind():
     assert catalog.name_holder("ops", "t") == "task"
     _add_dataset(catalog, "ops.d")
     assert catalog.name_holder("ops", "d") == "dataset"
+
+
+# --- the one-trigger rule
+
+
+def test_a_task_records_which_trigger_fires_it():
+    """The reverse of the edge Firestore stores. A trigger lives under the
+    dataset that fires it, so without this pointer "does task t have a trigger"
+    is a collection-group scan - which is the verifier, not the hot path."""
+    catalog = _catalog()
+    catalog.create_task("ops.ingest", sql="SELECT 1", author="xb500")
+    _add_dataset(catalog, "ops.src")
+
+    catalog.create_trigger(
+        "ops.src", name="t", target_task="ops.ingest", kind="task", author="olive"
+    )
+
+    assert catalog.get_task("ops.ingest")["trigger"] == {"source": "ws.ops.src", "name": "t"}
+
+
+def test_a_task_may_have_only_one_trigger():
+    """The rule the whole windowing design rests on. Two sources feed two
+    incomparable version sequences through `parent_version`/`current_version`,
+    and nothing in the statement can tell whose it was handed."""
+    catalog = _catalog()
+    catalog.create_task("ops.ingest", sql="SELECT 1", author="xb500")
+    _add_dataset(catalog, "ops.a")
+    _add_dataset(catalog, "ops.b")
+    catalog.create_trigger(
+        "ops.a", name="from_a", target_task="ops.ingest", kind="task", author="olive"
+    )
+
+    with pytest.raises(Exception, match="already fired by from_a ON ws.ops.a"):
+        catalog.create_trigger(
+            "ops.b", name="from_b", target_task="ops.ingest", kind="task", author="olive"
+        )
+
+    # And the refused wiring left nothing behind on the second dataset.
+    assert catalog.list_triggers("ops.b") == []
+    assert catalog.get_task("ops.ingest")["trigger"]["source"] == "ws.ops.a"
+
+
+def test_the_refusal_names_the_trigger_and_its_source():
+    """An operator meeting this needs to know which wire already exists - the
+    fix is to drop one, and they cannot drop what they cannot name."""
+    catalog = _catalog()
+    catalog.create_task("ops.ingest", sql="SELECT 1", author="xb500")
+    _add_dataset(catalog, "ops.a")
+    _add_dataset(catalog, "ops.b")
+    catalog.create_trigger(
+        "ops.a", name="from_a", target_task="ops.ingest", kind="task", author="olive"
+    )
+
+    with pytest.raises(Exception) as caught:
+        catalog.create_trigger(
+            "ops.b", name="from_b", target_task="ops.ingest", kind="task", author="olive"
+        )
+    assert "a task has one trigger" in str(caught.value)
+    assert "version sequence" in str(caught.value)
+
+
+def test_re_registering_the_same_trigger_is_not_a_second_one():
+    """`CREATE OR REPLACE TASK ... ON <table>` re-plants its own trigger on
+    every run. Repointing itself must not read as a collision."""
+    catalog = _catalog()
+    catalog.create_task("ops.ingest", sql="SELECT 1", author="xb500")
+    _add_dataset(catalog, "ops.src")
+    catalog.create_trigger(
+        "ops.src", name="t", target_task="ops.ingest", kind="task", author="olive"
+    )
+
+    catalog.create_trigger(
+        "ops.src", name="t", target_task="ops.ingest", kind="task", author="olive"
+    )
+
+    assert catalog.get_task("ops.ingest")["trigger"] == {"source": "ws.ops.src", "name": "t"}
+
+
+def test_dropping_the_trigger_frees_the_task_to_take_another():
+    """The pointer is not a tombstone. Left standing it would refuse every
+    future trigger on behalf of one that no longer exists - and repoint, which
+    is a drop followed by a create, would be the first thing to hit it."""
+    catalog = _catalog()
+    catalog.create_task("ops.ingest", sql="SELECT 1", author="xb500")
+    _add_dataset(catalog, "ops.a")
+    _add_dataset(catalog, "ops.b")
+    catalog.create_trigger(
+        "ops.a", name="from_a", target_task="ops.ingest", kind="task", author="olive"
+    )
+
+    catalog.drop_trigger("ops.a", "from_a", author="olive")
+    assert catalog.get_task("ops.ingest")["trigger"] is None
+
+    catalog.create_trigger(
+        "ops.b", name="from_b", target_task="ops.ingest", kind="task", author="olive"
+    )
+    assert catalog.get_task("ops.ingest")["trigger"] == {"source": "ws.ops.b", "name": "from_b"}
+
+
+def test_dropping_one_trigger_does_not_clear_another_tasks_pointer():
+    """Cleared only when the pointer names THIS trigger. Clearing one that names
+    a different, live trigger would let a second one through."""
+    catalog = _catalog()
+    catalog.create_task("ops.ingest", sql="SELECT 1", author="xb500")
+    catalog.create_task("ops.other", sql="SELECT 2", author="xb500")
+    _add_dataset(catalog, "ops.src")
+    catalog.create_trigger(
+        "ops.src", name="a", target_task="ops.ingest", kind="task", author="olive"
+    )
+    catalog.create_trigger(
+        "ops.src", name="b", target_task="ops.other", kind="task", author="olive"
+    )
+
+    catalog.drop_trigger("ops.src", "a", author="olive")
+
+    assert catalog.get_task("ops.ingest")["trigger"] is None
+    assert catalog.get_task("ops.other")["trigger"] == {"source": "ws.ops.src", "name": "b"}
+
+
+def test_redefining_a_task_keeps_its_trigger():
+    """`writes`, `description` and the statement are properties of the
+    registration; the wiring is not. Dropping the pointer on a redefinition
+    would silently hand the task a second trigger."""
+    catalog = _catalog()
+    catalog.create_task("ops.ingest", sql="SELECT 1", author="xb500")
+    _add_dataset(catalog, "ops.src")
+    catalog.create_trigger(
+        "ops.src", name="t", target_task="ops.ingest", kind="task", author="olive"
+    )
+
+    catalog.create_task("ops.ingest", sql="SELECT 2", author="olive", update_if_exists=True)
+
+    assert catalog.get_task("ops.ingest")["trigger"] == {"source": "ws.ops.src", "name": "t"}
+
+
+def test_the_rule_does_not_reach_materialized_views():
+    """A refresh is a wholesale re-derivation: it consumes no window, so which
+    commit fired it is irrelevant to what it produces, and a view legitimately
+    keeps one trigger per source."""
+    catalog = _catalog()
+    _add_dataset(catalog, "ops.a")
+    _add_dataset(catalog, "ops.b")
+
+    catalog.create_trigger("ops.a", name="mv__ops__v", target_view="ops.v", author="olive")
+    catalog.create_trigger("ops.b", name="mv__ops__v", target_view="ops.v", author="olive")
+
+    assert catalog.list_triggers("ops.a")[0]["target-view"] == "ws.ops.v"
+    assert catalog.list_triggers("ops.b")[0]["target-view"] == "ws.ops.v"
+
+
+def test_the_trigger_and_the_back_pointer_are_written_together():
+    """One Firestore transaction. Either half alone is the half-wired state this
+    codebase refuses everywhere else: a pointer with no trigger locks the task
+    out of ever getting one, and a trigger with no pointer lets a second one
+    through - which is the bug the rule exists to stop."""
+    catalog = _catalog()
+    catalog.create_task("ops.ingest", sql="SELECT 1", author="xb500")
+    _add_dataset(catalog, "ops.src")
+
+    transactions = []
+    real = catalog.firestore_client.transaction
+
+    def _watched():
+        transaction = real()
+        transactions.append(transaction)
+        return transaction
+
+    catalog.firestore_client.transaction = _watched
+    catalog.create_trigger(
+        "ops.src", name="t", target_task="ops.ingest", kind="task", author="olive"
+    )
+
+    assert len(transactions) == 1
+    assert transactions[0].committed
+    # Both writes on the one transaction, so neither can land without the other.
+    assert {op for op, _, _ in transactions[0].writes} == {"set", "update"}
