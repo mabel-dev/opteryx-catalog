@@ -659,3 +659,77 @@ def test_a_task_that_never_declared_its_writes_is_not_checked():
     catalog = _catalog()
 
     catalog.enforce_task_egress("ws.ops.ingest", [])
+
+
+def test_arming_a_trigger_on_a_task_that_writes_another_workspace_is_refused():
+    """The creation-time end of the gate. A trigger is what turns the task's
+    write into an automated, durable, repeating copy out of `ws`, so CREATE
+    TRIGGER is the moment that has to refuse it - not the first fire, hours
+    later, in a job nobody is reading."""
+    catalog = _catalog()
+    catalog.create_task(
+        "ops.ingest",
+        sql="INSERT INTO platform.billing.events SELECT * FROM ops.raw",
+        author="xb500",
+        writes=["platform.billing.events"],
+    )
+    _add_dataset(catalog, "ops.src")
+
+    with pytest.raises(EgressRestricted, match="arm task ws.ops.ingest"):
+        catalog.create_trigger(
+            "ops.src", name="t", target_task="ops.ingest", kind="task", author="olive"
+        )
+
+
+def test_a_refused_arming_leaves_no_trigger_behind():
+    """A refusal that still wrote the document would be the worst of both: the
+    task armed, and failing forever at fire time."""
+    catalog = _catalog()
+    catalog.create_task(
+        "ops.ingest", sql="SELECT 1", author="xb500", writes=["platform.billing.events"]
+    )
+    _add_dataset(catalog, "ops.src")
+
+    with pytest.raises(EgressRestricted):
+        catalog.create_trigger(
+            "ops.src", name="t", target_task="ops.ingest", kind="task", author="olive"
+        )
+
+    assert list(catalog._triggers_collection("ops", "src").stream()) == []
+    # And the task is not left holding a back-pointer to a trigger that was
+    # never written - that would lock it out of ever taking one.
+    assert catalog.get_task("ops.ingest")["trigger"] is None
+
+
+def test_the_source_workspace_can_clear_egress_and_arm_the_same_trigger():
+    """The SOURCE's owner decides - `ws`, whose commit fires the task - not the
+    destination's, and not a grant."""
+    catalog = _catalog()
+    catalog.create_task(
+        "ops.ingest", sql="SELECT 1", author="xb500", writes=["platform.billing.events"]
+    )
+    _add_dataset(catalog, "ops.src")
+    _set_egress_restriction(catalog, "ws", False)
+
+    catalog.create_trigger(
+        "ops.src", name="t", target_task="ops.ingest", kind="task", author="olive"
+    )
+
+    assert catalog.get_task("ops.ingest")["trigger"] == {"source": "ws.ops.src", "name": "t"}
+
+
+def test_a_task_writing_its_own_workspace_arms_normally():
+    catalog = _catalog()
+    catalog.create_task(
+        "ops.ingest",
+        sql="INSERT INTO ops.curated SELECT * FROM ops.raw",
+        author="xb500",
+        writes=["ops.curated"],
+    )
+    _add_dataset(catalog, "ops.src")
+
+    catalog.create_trigger(
+        "ops.src", name="t", target_task="ops.ingest", kind="task", author="olive"
+    )
+
+    assert catalog.get_task("ops.ingest")["trigger"] == {"source": "ws.ops.src", "name": "t"}
