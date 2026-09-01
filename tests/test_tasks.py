@@ -12,11 +12,13 @@ from __future__ import annotations
 
 import pytest
 
+from opteryx_catalog.exceptions import EgressRestricted
 from opteryx_catalog.exceptions import PlatformIdentityOwnerRefused
 from opteryx_catalog.exceptions import TaskAlreadyExists
 from opteryx_catalog.exceptions import TaskNotFound
 from test_materialized_views import _add_dataset
 from test_materialized_views import _catalog
+from test_materialized_views import _set_egress_restriction
 
 
 # --- registration
@@ -619,3 +621,41 @@ def test_the_trigger_and_the_back_pointer_are_written_together():
     assert transactions[0].committed
     # Both writes on the one transaction, so neither can land without the other.
     assert {op for op, _, _ in transactions[0].writes} == {"set", "update"}
+
+
+# --- the egress gate
+
+
+def test_a_task_writing_another_workspace_is_refused():
+    """The source is the workspace whose commit fires the task - `ws` here -
+    and its flag is what decides, exactly as it does for a CTAS out of it. On
+    by default, so this needs no setup at all."""
+    catalog = _catalog()
+
+    with pytest.raises(EgressRestricted, match="run task ws.ops.ingest"):
+        catalog.enforce_task_egress("ws.ops.ingest", ["platform.billing.events"])
+
+
+def test_a_task_writing_its_own_workspace_is_not_a_copy_out_of_anywhere():
+    catalog = _catalog()
+
+    catalog.enforce_task_egress("ws.ops.ingest", ["ops.curated", "ws.ops.other"])
+
+
+def test_the_source_workspace_can_clear_it():
+    """`ALTER WORKSPACE ws SET egress_protection TO OFF` - the source's owner,
+    not the destination's, and not a grant."""
+    catalog = _catalog()
+    _set_egress_restriction(catalog, "ws", False)
+
+    catalog.enforce_task_egress("ws.ops.ingest", ["platform.billing.events"])
+
+
+def test_a_task_that_never_declared_its_writes_is_not_checked():
+    """The hole, pinned so it is a known one rather than a surprise: an empty
+    `writes` means the question was never asked, and is indistinguishable from
+    a task that writes nothing. The engine still refuses the copy when the run
+    binds - what is lost here is the visible fire failure."""
+    catalog = _catalog()
+
+    catalog.enforce_task_egress("ws.ops.ingest", [])

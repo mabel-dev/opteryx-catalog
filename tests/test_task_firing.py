@@ -17,6 +17,7 @@ from unittest.mock import patch
 import pytest
 
 from opteryx_catalog import trigger_firing
+from opteryx_catalog.exceptions import EgressRestricted
 from opteryx_catalog.exceptions import TaskError
 from opteryx_catalog.exceptions import TaskOwnerMissing
 from opteryx_catalog.trigger_firing import fire_triggers
@@ -373,3 +374,74 @@ def test_a_contiguous_window_is_left_alone():
     post, _ = _fire(catalog, snapshot_id=300, parent_snapshot_id=200)
 
     assert "USING 200 AS parent_version, 300 AS current_version" in post.call_args[0][0]["sql_text"]
+
+
+# --- the egress gate ----------------------------------------------------
+
+
+def test_the_gate_is_asked_about_what_the_task_writes():
+    """A task's destinations are the foreign end, not its sources - the mirror
+    image of a materialized view, which materializes into its own workspace."""
+    target = "ws.ops.billing_events_ingest"
+    catalog = _catalog_stub(
+        triggers=[_task_trigger(name="task__ops__billing_events_ingest", target=target)],
+        task={
+            "identifier": target,
+            "name": "billing_events_ingest",
+            "collection": "ops",
+            "sql": "INSERT INTO platform.billing.events SELECT 1",
+            "writes": ["platform.billing.events"],
+        },
+    )
+    _fire(catalog)
+
+    catalog.enforce_task_egress.assert_called_once_with(target, ["platform.billing.events"])
+
+
+def test_a_blocked_task_is_a_fire_failure_not_a_job_failure():
+    """The whole point of checking here. The engine refuses this again when the
+    run binds, but that refusal lands inside a job while the trigger records
+    `enqueued` and looks healthy - which is how a cross-workspace task stopped
+    feeding its target for weeks without anything saying so."""
+    catalog = _catalog_stub()
+    catalog.enforce_task_egress.side_effect = EgressRestricted(
+        "opteryx refuses this copy; ALTER WORKSPACE opteryx SET egress_protection TO OFF"
+    )
+
+    with (
+        patch.object(trigger_firing, "_submit_task_job") as submit,
+        patch.object(trigger_firing, "_alert") as alert,
+        patch.object(trigger_firing, "write_audit_record"),
+    ):
+        fire_triggers(
+            catalog,
+            "ops.catalog_changes",
+            author="alice",
+            snapshot_id=200,
+            parent_snapshot_id=100,
+        )  # must not raise - the commit is never broken by a fire
+
+    # Blocked before the job document, so there is nothing for a worker to take.
+    submit.assert_not_called()
+    assert isinstance(alert.call_args.args[0], EgressRestricted)
+    catalog.mark_trigger_fired.assert_called_once_with(
+        "ops.catalog_changes", "task__ops__compaction_log_ingest", status="egress-blocked"
+    )
+
+
+def test_a_blocked_window_is_not_consumed():
+    """`last-window-to` advances only on success, so the commits inside a
+    blocked window are picked up by the next fire once the block is cleared."""
+    catalog = _catalog_stub()
+    catalog.enforce_task_egress.side_effect = EgressRestricted("refused")
+
+    with (
+        patch.object(trigger_firing, "_submit_task_job"),
+        patch.object(trigger_firing, "_alert"),
+        patch.object(trigger_firing, "write_audit_record"),
+    ):
+        fire_triggers(
+            catalog, "ops.catalog_changes", author="alice", snapshot_id=200, parent_snapshot_id=100
+        )
+
+    catalog.mark_task_fired.assert_not_called()
