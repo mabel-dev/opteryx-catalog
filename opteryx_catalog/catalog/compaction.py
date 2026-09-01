@@ -323,10 +323,20 @@ MAX_MEMORY_BYTES = MAX_SELECTED_BUDGET_BYTES
 # memory: it keeps a single decluster op from rewriting the whole dataset at
 # once (resumability, and less contention with a live compactor). A larger
 # overlapping cluster is declustered a chunk at a time and converges over passes.
-# At 3x target a pass declusters up to ~three target-sized files into ~three
-# disjoint outputs. Tunable; raising it only trades bigger snapshots for fewer
-# passes, never memory (streaming is window-bounded).
-DECLUSTER_MAX_COMBINED_BYTES = 3 * TARGET_SIZE_BYTES
+# At two targets plus headroom a pass declusters the motivating pair - two
+# overlapping ~4 GB files into two disjoint outputs - and refuses a third.
+# Tunable; raising it only trades bigger snapshots for fewer passes, never
+# memory (streaming is window-bounded).
+#
+# Lowered from 3x target (12 GB) after a live pass on opteryx.test.pypi packed
+# to the old cap and could not finish: three files, 11.97 GB by this budget unit
+# but only 52 MB on disk and 21.4M rows, which outran the worker's request
+# timeout. Note what that says about the unit - for string-heavy data the budget
+# unit overstates on-disk bytes by two orders of magnitude, so this cap bounds
+# FILES per pass far more tightly than it bounds TIME. Two pypi files are still
+# ~10M rows. A bound in rows is the missing one; this is not it.
+DECLUSTER_MAX_COMBINED_MB = 8704  # 8.5 GB - two targets plus headroom
+DECLUSTER_MAX_COMBINED_BYTES = DECLUSTER_MAX_COMBINED_MB * 1024 * 1024
 
 # --- Three-pass streaming execution --------------------------------------------
 #
@@ -433,7 +443,7 @@ COMPACTION_TMPDIR = os.environ.get("OPTERYX_COMPACTION_TMPDIR") or None
 #
 # What has to fit is the COMPRESSED bytes of one pass's candidate files, which
 # the selection caps bound: a decluster group is at most
-# DECLUSTER_MAX_COMBINED_BYTES (12 GB uncompressed) and a combine-split at most
+# DECLUSTER_MAX_COMBINED_BYTES (8.5 GB uncompressed) and a combine-split at most
 # MAX_SELECTED_BUDGET_BYTES, so at the ~8.6x zstd ratio measured on
 # github.events a pass caches well under 2 GB. The default share leaves room for
 # data that compresses far worse than that; a pass that does overrun simply

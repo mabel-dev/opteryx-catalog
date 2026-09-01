@@ -24,6 +24,12 @@ workspace can take the lock afterwards, and the refresh is what turns one grant
 into a standing copy. A blocked refresh is a fire failure like any other: alert,
 audit, `last-fired-status: egress-blocked`, commit untouched.
 
+The same gate covers a task run, inverted: the source is the dataset that fired
+it and the destinations are what its statement writes (`enforce_task_egress`).
+A cross-workspace task write is refused again by the engine when the run binds,
+but only this end can report it as a fire failure rather than as an error in a
+job nobody is reading.
+
 The job document carries `origin: "trigger"`, which is what keeps these off
 `/jobs/recent` (filtered in jobs.opteryx) and tells the worker to stamp the
 MV's refresh state on completion.
@@ -576,6 +582,18 @@ def _fire_task(
             # SUCCESS, the gap stays visible - and keeps widening the next
             # window - until a run actually covers it.
             parent_version = last_window_to
+
+    # The egress gate, on the same terms as a refresh: before the job document,
+    # so a blocked run leaves nothing for a worker to pick up, and re-checked
+    # here because the SOURCE workspace's protection - this one's, the firing
+    # dataset's - can be taken, or the task repointed at a foreign target, long
+    # after the trigger was armed.
+    #
+    # A task's write into ANOTHER workspace is the textbook standing copy: this
+    # fires on every commit, forever. The engine refuses it again when the run
+    # binds; without this the refusal only ever surfaced there, inside a job,
+    # while the trigger recorded `enqueued` and looked healthy.
+    catalog.enforce_task_egress(target_task, task.get("writes") or ())
 
     # Both versions are integers off the catalog's own records, coerced here so
     # nothing but a number can reach the statement text.

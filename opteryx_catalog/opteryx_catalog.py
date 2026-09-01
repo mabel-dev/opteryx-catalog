@@ -3190,6 +3190,49 @@ class OpteryxCatalog(Metastore):
             f"{operation} materialized view {identifier}",
         )
 
+    def enforce_task_egress(
+        self, identifier: str, writes: Iterable[str], operation: str = "run"
+    ) -> None:
+        """Egress gate for an unattended task run, at fire time.
+
+        The MV gate's mirror image, and the direction is genuinely inverted. A
+        materialized view materializes INTO its own workspace, so the sources
+        are the foreign end. A trigger-fired task is the opposite: the source is
+        the dataset whose commit fired it - always this workspace, because a
+        trigger can only target a task the firing dataset's own catalog can
+        resolve - and the DESTINATIONS are what the statement writes, which is
+        where a foreign workspace shows up.
+
+        That copy is exactly what egress protection exists to refuse: automated,
+        durable and repeating, one per commit, forever. The engine refuses it
+        again when the run binds; this is the earlier of the two, so a blocked
+        task is reported as a blocked FIRE - alert, audit, `last-fired-status:
+        egress-blocked` - instead of an engine error in a job nobody is reading.
+
+        Only the firing dataset counts as a source. A task's statement may read
+        other workspaces, and this cannot see them: `writes` is recorded on the
+        task, the read set is not. The engine's bind-time gate has the whole
+        list and is what covers them; this covers the copy the TRIGGER creates.
+
+        ⛔ An empty `writes` means the question was never asked - a task
+        registered before the field existed, or by a caller that omitted it -
+        and is indistinguishable from a task that writes nothing. Nothing is
+        checked in that case. It is the hole in this gate, not a decision that
+        the copy is allowed.
+        """
+        destinations = []
+        for target in writes:
+            destination = self._source_workspace(target)
+            if destination not in destinations:
+                destinations.append(destination)
+
+        for destination in destinations:
+            self.enforce_egress_policy(
+                (self.workspace,),
+                destination,
+                f"{operation} task {identifier}",
+            )
+
     def _assert_no_trigger_cycle(self, dataset_identifier: str, target_view: str) -> None:
         """Refuse a refresh trigger that would close a loop in the trigger graph.
 
