@@ -125,9 +125,30 @@ def firing_enabled() -> bool:
 
 HOUSE_BILLING_ACCOUNT = "opteryx"
 
+# The roles a policy may carry into a run, and the ONLY place this list is
+# applied on the unattended path. Must stay in sync with
+# authenticate.opteryx's `app/policies.VALID_ROLES`, control.opteryx's
+# create/update validation, and `opteryx_access.roles.ROLES` - the other points
+# where a role string is gated before or after it reaches Firestore.
+#
+# No `admin`: it is a BILLING role, never a data role. The engine's
+# `ACTION_ROLES` has no entry for it, so a run carrying one held a role that
+# authorised nothing while reading, to anyone looking at the job document, as
+# though it authorised everything. authenticate drops it before minting a
+# token; this drops it before it reaches a job, so the two paths hand the
+# engine the same vocabulary.
+VALID_ROLES = frozenset({"owner", "writer", "reader"})
+
+# Policies written against this principal grant every HUMAN user. A service
+# principal is not "any user" - see `policies_for`'s `include_wildcard`.
+WILDCARD_PRINCIPAL = "*"
+
 
 def policies_for(
-    catalog, principal: str | None, workspaces: Iterable[str] | None = None
+    catalog,
+    principal: str | None,
+    workspaces: Iterable[str] | None = None,
+    include_wildcard: bool = False,
 ) -> list[dict] | None:
     """The principal's current access policies, in job-document shape.
 
@@ -164,12 +185,29 @@ def policies_for(
     database - workspaces are sibling root collections, the same property
     `_foreign_properties_ref` relies on for the egress flag - so this needs no
     handle per workspace, and constructs none.
+
+    `include_wildcard` mirrors `authenticate.opteryx.fetch_policies_for_principal`,
+    name, default and meaning: wildcard-principal grants reach a HUMAN's token
+    and deliberately not a client_credentials caller's, because a service
+    account is not "any user" and granting it broad access implicitly is exactly
+    what nobody would notice. It was unconditionally on here, so an unattended
+    run could carry grants the same principal's own token would not. Off by
+    default, as it is there; the caller opts in where it can say the acting
+    identity is a real account.
+
+    Roles are filtered to `VALID_ROLES` for the same reason authenticate filters
+    them: this is the sole path by which policies reach an unattended run, so a
+    role written some other way must not travel silently.
     """
     if not principal:
         return None
     from google.cloud.firestore_v1 import FieldFilter
 
     names = list(dict.fromkeys(workspaces)) if workspaces else [catalog.workspace]
+
+    principals = [principal]
+    if include_wildcard and principal != WILDCARD_PRINCIPAL:
+        principals.append(WILDCARD_PRINCIPAL)
 
     policies: list[dict] = []
     seen: set = set()
@@ -179,11 +217,21 @@ def policies_for(
             .document("$policies")
             .collection("access")
         )
-        query = access.where(filter=FieldFilter("principal", "in", [principal, "*"]))
+        query = access.where(filter=FieldFilter("principal", "in", principals))
         for doc in query.stream():
             data = doc.to_dict() or {}
             role, pattern = data.get("role"), data.get("pattern")
             if not (role and pattern):
+                continue
+            if role not in VALID_ROLES:
+                logger.warning(
+                    "policies_for: skipping policy %s in %s for principal=%s - "
+                    "invalid role=%r",
+                    doc.id,
+                    workspace,
+                    principal,
+                    role,
+                )
                 continue
             # Document ids are unique per workspace, not across them, so the id
             # alone cannot be the key: two workspaces can hold a policy of the

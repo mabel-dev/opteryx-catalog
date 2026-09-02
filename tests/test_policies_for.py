@@ -141,18 +141,113 @@ def test_no_workspace_is_read_twice():
     assert catalog.firestore_client.read == ["opteryx"]
 
 
-def test_the_wildcard_principal_is_still_carried():
-    """Unchanged by the widening: a `*` policy grants every human user, and the
-    principal would hold it interactively too."""
+# --- the wildcard principal
+#
+# `*` grants every HUMAN user. This was unconditionally on, so an unattended run
+# could carry grants the same principal's own token would not: authenticate mints
+# wildcard policies into a person's token and deliberately not into a
+# client_credentials caller's. Same name, same default, same meaning here.
+
+
+def test_the_wildcard_is_off_by_default():
     catalog = _catalog(
         platform=[
             _Doc("p-all", {"principal": "*", "role": "reader", "pattern": "platform.public.*"})
         ]
     )
 
-    policies = policies_for(catalog, "ingest", ["platform"])
+    assert policies_for(catalog, "ingest", ["platform"]) is None
+
+
+def test_the_wildcard_is_carried_when_the_caller_opts_in():
+    """The caller opts in where it can say the acting identity is a real
+    account - a trigger's pinned owner, which the catalog refuses to let be a
+    platform identity."""
+    catalog = _catalog(
+        platform=[
+            _Doc("p-all", {"principal": "*", "role": "reader", "pattern": "platform.public.*"})
+        ]
+    )
+
+    policies = policies_for(catalog, "ingest", ["platform"], include_wildcard=True)
 
     assert [p["pattern"] for p in policies] == ["platform.public.*"]
+
+
+def test_the_wildcard_principal_is_not_asked_for_twice():
+    """`*` running as itself would otherwise query `principal in ["*", "*"]`."""
+    catalog = _catalog(
+        platform=[_Doc("p-all", {"principal": "*", "role": "reader", "pattern": "platform.*"})]
+    )
+
+    policies = policies_for(catalog, "*", ["platform"], include_wildcard=True)
+
+    assert [p["pattern"] for p in policies] == ["platform.*"]
+
+
+# --- roles
+#
+# The engine's `ACTION_ROLES` has no entry for `admin` - it is a BILLING role.
+# A run carrying one held a role that authorised nothing while reading, on the
+# job document, as though it authorised everything. authenticate drops it before
+# minting a token; this drops it before it reaches a job.
+
+
+def test_a_billing_role_never_reaches_a_run():
+    catalog = _catalog(
+        platform=[
+            _Doc("p-admin", {"principal": "ingest", "role": "admin", "pattern": "platform.*"})
+        ]
+    )
+
+    assert policies_for(catalog, "ingest", ["platform"]) is None
+
+
+def test_an_unknown_role_never_reaches_a_run():
+    catalog = _catalog(
+        platform=[
+            _Doc("p-odd", {"principal": "ingest", "role": "superuser", "pattern": "platform.*"})
+        ]
+    )
+
+    assert policies_for(catalog, "ingest", ["platform"]) is None
+
+
+def test_the_data_roles_all_travel():
+    catalog = _catalog(
+        platform=[
+            _Doc("p-o", {"principal": "ingest", "role": "owner", "pattern": "platform.a.*"}),
+            _Doc("p-w", {"principal": "ingest", "role": "writer", "pattern": "platform.b.*"}),
+            _Doc("p-r", {"principal": "ingest", "role": "reader", "pattern": "platform.c.*"}),
+        ]
+    )
+
+    policies = policies_for(catalog, "ingest", ["platform"])
+
+    assert sorted(p["role"] for p in policies) == ["owner", "reader", "writer"]
+
+
+def test_a_dropped_role_does_not_drop_its_neighbours():
+    """The filter is per row, not per workspace - one bad document must not
+    cost a principal the grants beside it."""
+    catalog = _catalog(
+        platform=[
+            _Doc("p-admin", {"principal": "ingest", "role": "admin", "pattern": "platform.*"}),
+            _Doc("p-w", {"principal": "ingest", "role": "writer", "pattern": "platform.billing.*"}),
+        ]
+    )
+
+    policies = policies_for(catalog, "ingest", ["platform"])
+
+    assert [p["pattern"] for p in policies] == ["platform.billing.*"]
+
+
+def test_the_valid_roles_match_the_token_minters():
+    """These two lists deciding differently is a run whose authority depends on
+    whether a person or a trigger started it."""
+    from opteryx_catalog.trigger_firing import VALID_ROLES
+
+    assert VALID_ROLES == {"owner", "writer", "reader"}
 
 
 def test_another_principals_policies_are_never_carried():
