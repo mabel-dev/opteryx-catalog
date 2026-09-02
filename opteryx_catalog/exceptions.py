@@ -152,6 +152,43 @@ class TaskOwnerMissing(TaskError):
     """
 
 
+class TaskWindowUnbound(TaskError):
+    """A windowed task was fired by an event that carries no window.
+
+    A commit binds a window - the committing snapshot and its parent - into
+    `:parent_version` and `:current_version`. A clock tick or a signal has no
+    commit, so a trigger held by a task binds one from the dataset named with
+    OVER, or binds nothing. `create_trigger` refuses to arm a sourceless
+    trigger on a statement that consumes a window, but the statement can be
+    replaced after arming; this is the fire-time half of that check, recorded
+    as `window-unbound` rather than run with parameters nothing filled.
+    """
+
+
+class ListenerError(KeyError, CatalogError):
+    """A task notification subscription that cannot proceed."""
+
+
+class ListenerAlreadyExists(ListenerError):
+    """The user already listens to this task.
+
+    A task holds one subscription per user, so a second LISTEN is refused
+    rather than merged. Refusing is what lets the caller be TOLD what they are
+    already subscribed to; an upsert would silently change a filter they set
+    deliberately.
+    """
+
+
+class ListenerNotFound(ListenerError):
+    """The user does not listen to this task.
+
+    UNLISTEN refuses rather than deleting nothing: a delete that succeeds on
+    zero rows tells someone they have stopped receiving notifications they were
+    never receiving, and leaves the real subscription - under a name they
+    mistyped - still running.
+    """
+
+
 class TagError(CatalogError):
     """Base for snapshot-tag failures."""
 

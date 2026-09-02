@@ -299,6 +299,39 @@ catalog.update_view_execution_metadata(
 )
 ```
 
+### Clock and signal triggers ⏰
+
+A trigger is an EVENT plus a `runs-as`. A commit trigger is held by the dataset
+whose commits fire it; a schedule or signal trigger has no dataset, so it is
+held by the task it fires, under the task document's `triggers` subcollection.
+Every trigger method takes `holder_kind="dataset"` (the default) or `"task"`.
+
+```python
+catalog.create_trigger(
+    "ops.rollup", "hourly", target_task="ops.rollup", kind="task", author="alice",
+    holder_kind="task", event_kind="schedule", schedule="0 * * * *",
+    time_zone="Europe/London", window_source="src.events",   # OVER src.events
+)
+catalog.create_trigger(
+    "ops.rollup", "on_demand", target_task="ops.rollup", kind="task", author="alice",
+    holder_kind="task", event_kind="signal",
+)
+```
+
+`window_source` names the dataset a run is windowed OVER: at fire time the
+window is that dataset's head snapshot against the task's `last-window-to`,
+with the same superseded/gap guard a commit-fired run has. Without one the
+task must be windowless, refused at arming and again at fire time
+(`window-unbound`). A task has one trigger whichever holder it lives under.
+
+The dispatcher is `dispatch.opteryx`: `trigger_firing.fire_due_schedules(client)`
+is its once-a-minute tick (a collection-group query for `next-due-at-ms <=
+now`, each hit claimed with `claim_schedule_tick` so overlapping ticks cannot
+double-fire), and `trigger_firing.fire_signal(catalog, task, caller)` is its
+webhook. The caller of a signal is the event, not the context: the run assumes
+the trigger's `runs-as` and the caller is recorded as `fired_by`. See
+`SCHEDULE_SIGNAL_TRIGGERS_DESIGN.md`.
+
 ### Materialized views and triggers ⚡
 
 A materialized view is a normal dataset document — readable as a table, with

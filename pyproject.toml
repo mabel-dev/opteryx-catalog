@@ -29,6 +29,12 @@ dependencies = [
     "google-cloud-firestore==2.*",
     "google-cloud-storage==3.*",
     "requests==2.*",
+    # Schedule triggers: cron evaluation (`opteryx_catalog.schedules`). tzdata
+    # is the IANA zone database for interpreters whose platform ships none -
+    # a slim container image, typically - so `Europe/London` resolves there
+    # as it does on a workstation.
+    "croniter>=2",
+    "tzdata",
 ]
 
 [project.optional-dependencies]

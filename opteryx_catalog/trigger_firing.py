@@ -46,21 +46,12 @@ from __future__ import annotations
 import json
 import logging
 import os
-import re
-import secrets
-import string
 import threading
 import time
-from datetime import UTC
-from datetime import datetime
-from datetime import timedelta
-from typing import Any
-from typing import Iterable
-
 import urllib.parse
 import urllib.request
-
-import requests
+from collections.abc import Iterable
+from typing import Any
 
 from .alerts import report as _alert
 from .audit import write_audit_record
@@ -69,6 +60,8 @@ from .exceptions import MaterializedViewError
 from .exceptions import MaterializedViewOwnerMissing
 from .exceptions import TaskError
 from .exceptions import TaskOwnerMissing
+from .exceptions import TaskWindowUnbound
+from .exceptions import TriggerNotFound
 
 # Trigger kind for a task run. Defined in `opteryx_catalog` beside the refresh
 # kind and re-exported here, so the creation gate that refuses a platform
@@ -76,7 +69,14 @@ from .exceptions import TaskOwnerMissing
 # are keyed off one string. The MV refresh kind is still spelled inline where it
 # is matched; it becomes a task in the next phase, at which point one kind is
 # left and this constant is the only one.
-from .opteryx_catalog import TASK_TRIGGER_KIND  # noqa: F401
+from .opteryx_catalog import COMMIT_EVENT_KIND
+from .opteryx_catalog import DATASET_HOLDER
+from .opteryx_catalog import SCHEDULE_EVENT_KIND
+from .opteryx_catalog import SIGNAL_EVENT_KIND
+from .opteryx_catalog import TASK_HOLDER
+from .opteryx_catalog import TASK_TRIGGER_KIND
+from .opteryx_catalog import TRIGGERS_SUBCOLLECTION
+from .opteryx_catalog import WINDOW_PARAMETER_PATTERN
 
 # The `parent_version` bound for a dataset's FIRST commit, which has no parent.
 # The window is then everything up to and including that commit, so this only
@@ -396,8 +396,20 @@ def _submit_task_job(
     target_task: str,
     snapshot_id: Any | None,
     fired_by: str | None,
+    holder: str | None = None,
+    holder_kind: str = DATASET_HOLDER,
+    event_kind: str = COMMIT_EVENT_KIND,
 ) -> tuple[str, str]:
     """Submit one task run to jobs. Returns `(execution_id, outcome)`.
+
+    `holder` and `holder_kind` name where the firing trigger lives - the
+    source dataset for a commit trigger, the task itself for a schedule or
+    signal - which is what jobs reads the trigger's `runs-as` back through.
+    `source_dataset` is the older spelling of the same thing for a commit
+    trigger and is kept populated for it, so jobs can move to `holder` in its
+    own release; for a task-held trigger it is None, because there is no
+    source dataset, and a jobs that still resolves identity through it will
+    refuse the run rather than guess.
 
     Like the refresh path, the payload is the statement plus provenance and
     nothing more. `EXECUTE <task> USING ...` is self-identifying - it names a
@@ -411,6 +423,9 @@ def _submit_task_job(
         "client_info": {
             "trigger": {
                 "source_dataset": source_dataset,
+                "holder": holder if holder is not None else source_dataset,
+                "holder_kind": holder_kind,
+                "event_kind": event_kind,
                 "trigger_name": trigger_name,
                 "target_task": target_task,
                 "snapshot_id": snapshot_id,
@@ -603,6 +618,16 @@ def _fire_refresh(
     )
 
 
+def _holder_kwargs(holder_kind: str) -> dict:
+    """The keyword a task-held trigger adds to every catalog trigger call.
+
+    Empty for a dataset holder so the commit path's calls are exactly what they
+    were - and what every test of them asserts - and a catalog that predates
+    holders is called the way it expects.
+    """
+    return {} if holder_kind == DATASET_HOLDER else {"holder_kind": holder_kind}
+
+
 def _fire_task(
     catalog,
     dataset_identifier: str,
@@ -610,22 +635,36 @@ def _fire_task(
     author: str | None,
     snapshot_id: Any | None,
     parent_snapshot_id: Any | None,
-) -> None:
-    """Enqueue one task run for the commit that just landed.
+    *,
+    holder_kind: str = DATASET_HOLDER,
+) -> tuple[str, str | None]:
+    """Enqueue one task run. Returns `(status, execution_id)`.
 
-    The window is bound HERE, at fire time, as the committing snapshot and its
-    parent - not left to resolve when a worker picks the job up. Execution is
-    asynchronous, so a relative window (`VERSION AS OF PREVIOUS`) would mean
-    whatever the snapshot chain looked like minutes later: with two commits in
-    flight, one window is processed twice and another never, silently. Bound
-    boundaries make a run's window exactly the commit that fired it, however
-    late it runs, and replayable afterwards by naming the same two versions.
+    `dataset_identifier` is the trigger's HOLDER: the committed dataset for a
+    commit trigger, the task itself for a schedule or signal (`holder_kind`).
+    `author` is what fired it - the committer, `"schedule"`, or the principal
+    who signalled - and is provenance only. The run's identity is the
+    trigger's `runs-as`, whichever event fired it.
 
-    Because the window is a snapshot and its own parent it spans exactly one
-    commit, so a compaction can only ever be one of its endpoints - never
-    something inside it whose rewritten files would read as new rows. The one
-    exception is a window widened over a gap (below), which spans back to the
-    last commit a run actually consumed.
+    THE WINDOW. Bound HERE, at fire time - not left to resolve when a worker
+    picks the job up. Execution is asynchronous, so a relative window
+    (`VERSION AS OF PREVIOUS`) would mean whatever the snapshot chain looked
+    like minutes later: with two commits in flight, one window is processed
+    twice and another never, silently. Bound boundaries make a run's window
+    exactly what fired it, however late it runs, and replayable afterwards by
+    naming the same two versions.
+
+    - A COMMIT binds the committing snapshot and its parent, spanning exactly
+      one commit, so a compaction can only ever be one of its endpoints.
+    - A SCHEDULE or SIGNAL windowed OVER a dataset binds that dataset's head
+      at fire time against `last-window-to`, spanning everything since the
+      last successful run - the batch form of the same window. Nothing new
+      since then is `superseded`, deliberately not an error: it is the normal
+      outcome of most ticks on a quiet dataset.
+    - A SCHEDULE or SIGNAL with no OVER binds nothing, and the statement must
+      consume nothing: `create_trigger` refused to arm one that does, and this
+      refuses again (`TaskWindowUnbound`, recorded as `window-unbound`)
+      because the statement can be replaced after arming.
 
     The window is then checked against `last-window-to` before anything is
     submitted: a commit already consumed is skipped as superseded, and one that
@@ -634,35 +673,91 @@ def _fire_task(
     one-trigger rule guarantees and what makes them mean anything.
     """
     target_task = trigger["target-task"]
+    name = trigger["name"]
+    holder_args = _holder_kwargs(holder_kind)
+    event_kind = trigger.get("event-kind") or COMMIT_EVENT_KIND
     task = catalog.get_task(target_task)
 
     # A task with no statement can never run; found here so it lands in the
-    # audit log beside the commit that tried, rather than as a job failure
+    # audit log beside the event that tried, rather than as a job failure
     # nobody is watching.
     if not task.get("sql"):
         raise TaskError(f"task has no statement recorded: {target_task}")
 
     # The identity this unattended run executes as - the TRIGGER's, never the
-    # committer's and never the task's. A task carries no identity: a person
-    # running EXECUTE runs it as themselves, and the trigger is what makes a run
-    # unattended, so the trigger is what must say whose authority it uses. See
-    # `_fire_refresh` for why a missing one is refused rather than defaulted.
+    # committer's, never the signaller's and never the task's. A task carries
+    # no identity: a person running EXECUTE runs it as themselves, and the
+    # trigger is what makes a run unattended, so the trigger is what must say
+    # whose authority it uses. See `_fire_refresh` for why a missing one is
+    # refused rather than defaulted.
     runs_as = trigger.get("runs-as")
     if not runs_as:
         raise TaskOwnerMissing(
-            f"trigger {trigger['name']} on {dataset_identifier} has no runs-as "
-            f"identity; refusing to run {target_task} as the committing user."
+            f"trigger {name} on {dataset_identifier} has no runs-as "
+            f"identity; refusing to run {target_task} as whoever fired it."
         )
 
-    # A dataset's first commit has no parent; the window is then everything up
-    # to and including it. Skipping instead would silently drop the rows of the
-    # very first commit - and provisioning a task before any data lands is the
-    # normal order, so that case is reached in practice, not in theory.
-    # See NO_PARENT_VERSION_FLOOR for why this is emphatically not 0.
-    parent_version = (
-        NO_PARENT_VERSION_FLOOR if parent_snapshot_id is None else int(parent_snapshot_id)
-    )
-    current_version = int(snapshot_id)
+    # None for a task that has never succeeded, which is the ordinary state of a
+    # new one: no floor, nothing to compare, and the first run takes its window
+    # as bound.
+    last_window_to = task.get("last-window-to")
+    if last_window_to is not None:
+        last_window_to = int(last_window_to)
+
+    def _superseded(detail: str) -> tuple[str, None]:
+        # Recorded on the task rather than dropped silently, so "nothing
+        # happened, deliberately" is visible where someone looks for the run
+        # they expected.
+        catalog.mark_task_fired(target_task, status="superseded")
+        catalog.mark_trigger_fired(dataset_identifier, name, status="superseded", **holder_args)
+        write_audit_record(
+            {
+                "event": "task.superseded",
+                "workspace": getattr(catalog, "workspace", None),
+                "dataset": dataset_identifier,
+                "trigger": name,
+                "target_task": target_task,
+                "event_kind": event_kind,
+                "current_version": current_version,
+                "last_window_to": last_window_to,
+                "detail": detail,
+                "author": author,
+            }
+        )
+        return "superseded", None
+
+    if event_kind == COMMIT_EVENT_KIND:
+        # A dataset's first commit has no parent; the window is then everything
+        # up to and including it. Skipping instead would silently drop the rows
+        # of the very first commit - and provisioning a task before any data
+        # lands is the normal order, so that case is reached in practice, not
+        # in theory. See NO_PARENT_VERSION_FLOOR for why this is emphatically
+        # not 0.
+        parent_version = (
+            NO_PARENT_VERSION_FLOOR if parent_snapshot_id is None else int(parent_snapshot_id)
+        )
+        current_version = int(snapshot_id)
+        window_source = _qualified_source(catalog, dataset_identifier)
+    else:
+        window_source = trigger.get("window-source")
+        if window_source is None:
+            wanted = sorted(set(WINDOW_PARAMETER_PATTERN.findall(task["sql"])))
+            if wanted:
+                raise TaskWindowUnbound(
+                    f"task {target_task} consumes a window ("
+                    + ", ".join(f":{w}" for w in wanted)
+                    + f") but its {event_kind} trigger {name} names no OVER dataset to "
+                    "bind one from. Recreate the trigger with OVER <table>, or remove "
+                    "the window parameters from the statement."
+                )
+            parent_version = current_version = None
+        else:
+            head = catalog.head_snapshot_id(window_source)
+            if head is None:
+                current_version = None
+                return _superseded(f"{window_source} has no snapshot; nothing to consume")
+            current_version = int(head)
+            parent_version = NO_PARENT_VERSION_FLOOR if last_window_to is None else last_window_to
 
     # THE WINDOW GUARD. `last-window-to` is the `current_version` the last
     # SUCCESSFUL run consumed to. It is usable as a guard - rather than the
@@ -672,36 +767,14 @@ def _fire_task(
     # sequence. With two sources they were interleaved ids from two incomparable
     # ones, and either comparison below would have been a coin toss - skipping
     # every fire from whichever dataset's ids ran lower, forever and silently.
-    #
-    # None for a task that has never succeeded, which is the ordinary state of a
-    # new one: no floor, nothing to compare, and the first run takes its window
-    # as bound.
-    last_window_to = task.get("last-window-to")
-    if last_window_to is not None:
-        last_window_to = int(last_window_to)
-
+    if current_version is not None and last_window_to is not None:
         if current_version <= last_window_to:
-            # SUPERSEDED: a run has already consumed through this commit. Reached
-            # by a fire that queued behind a later one and outlived the dedup
-            # window - re-running it would reprocess rows a successful run
-            # already took. Recorded on the task rather than dropped silently,
-            # so "nothing happened, deliberately" is visible where someone looks
-            # for the run they expected.
-            catalog.mark_task_fired(target_task, status="superseded")
-            catalog.mark_trigger_fired(dataset_identifier, trigger["name"], status="superseded")
-            write_audit_record(
-                {
-                    "event": "task.superseded",
-                    "workspace": getattr(catalog, "workspace", None),
-                    "dataset": dataset_identifier,
-                    "trigger": trigger["name"],
-                    "target_task": target_task,
-                    "current_version": current_version,
-                    "last_window_to": last_window_to,
-                    "author": author,
-                }
-            )
-            return
+            # SUPERSEDED: a run has already consumed through this version.
+            # Reached by a commit fire that queued behind a later one and
+            # outlived the dedup window, or by a tick on a dataset nothing has
+            # landed in since the last run - re-running would reprocess rows a
+            # successful run already took.
+            return _superseded("already consumed by an earlier successful run")
 
         if parent_version > last_window_to:
             # GAP: the run that should have covered `last_window_to ->
@@ -715,49 +788,63 @@ def _fire_task(
 
     # The egress gate, on the same terms as a refresh: before the job document,
     # so a blocked run leaves nothing for a worker to pick up, and re-checked
-    # here because the SOURCE workspace's protection - this one's, the firing
-    # dataset's - can be taken, or the task repointed at a foreign target, long
-    # after the trigger was armed.
+    # here because the SOURCE workspace's protection - this one's - can be
+    # taken, or the task repointed at a foreign target, long after the trigger
+    # was armed.
     #
     # A task's write into ANOTHER workspace is the textbook standing copy: this
-    # fires on every commit, forever. The engine refuses it again when the run
+    # fires on every event, forever. The engine refuses it again when the run
     # binds; without this the refusal only ever surfaced there, inside a job,
     # while the trigger recorded `enqueued` and looked healthy.
     catalog.enforce_task_egress(target_task, task.get("writes") or ())
 
-    # Both versions are integers off the catalog's own records, coerced here so
+    # Both versions are integers off the catalog's own records, coerced above so
     # nothing but a number can reach the statement text.
-    sql_text = (
-        f"EXECUTE {task['identifier']} "
-        f"USING {parent_version} AS parent_version, "
-        f"{current_version} AS current_version"
-    )
+    if current_version is None:
+        sql_text = f"EXECUTE {task['identifier']}"
+    else:
+        sql_text = (
+            f"EXECUTE {task['identifier']} "
+            f"USING {parent_version} AS parent_version, "
+            f"{current_version} AS current_version"
+        )
 
+    holder = (
+        _qualified_source(catalog, dataset_identifier)
+        if holder_kind == DATASET_HOLDER
+        else trigger.get("holder") or f"{getattr(catalog, 'workspace', '')}.{dataset_identifier}"
+    )
     execution_id, outcome = _submit_task_job(
         catalog,
         sql_text=sql_text,
-        source_dataset=_qualified_source(catalog, dataset_identifier),
-        trigger_name=trigger["name"],
+        source_dataset=window_source if event_kind == COMMIT_EVENT_KIND else None,
+        trigger_name=name,
         target_task=target_task,
-        snapshot_id=snapshot_id,
+        snapshot_id=snapshot_id if event_kind == COMMIT_EVENT_KIND else current_version,
         fired_by=author,
+        holder=holder,
+        holder_kind=holder_kind,
+        event_kind=event_kind,
     )
-    catalog.mark_trigger_fired(dataset_identifier, trigger["name"], status=outcome)
+    catalog.mark_trigger_fired(dataset_identifier, name, status=outcome, **holder_args)
 
     write_audit_record(
         {
             "event": "task.fired",
             "workspace": getattr(catalog, "workspace", None),
             "dataset": dataset_identifier,
-            "trigger": trigger["name"],
+            "trigger": name,
             "target_task": target_task,
+            "event_kind": event_kind,
+            "window_source": window_source,
             "parent_version": parent_version,
-            "current_version": snapshot_id,
+            "current_version": snapshot_id if event_kind == COMMIT_EVENT_KIND else current_version,
             "execution_id": execution_id,
             "outcome": outcome,
             "author": author,
         }
     )
+    return outcome, execution_id
 
 
 def _minimum_interval_seconds(trigger: dict) -> int:
@@ -778,6 +865,7 @@ _FAILURE_STATUSES = (
     (EgressRestricted, "egress-blocked"),
     (MaterializedViewOwnerMissing, "owner-missing"),
     (TaskOwnerMissing, "owner-missing"),
+    (TaskWindowUnbound, "window-unbound"),
 )
 
 
@@ -789,6 +877,114 @@ def _failure_status(exc: BaseException) -> str:
     return "error"
 
 
+def _dispatch(
+    catalog,
+    holder: str,
+    holder_kind: str,
+    trigger: dict,
+    target: str | None,
+    fire,
+    note: str,
+    author: str | None,
+) -> tuple[str, str | None, str | None]:
+    """Run one trigger's fire under the contract every event shares.
+
+    Suspension, the firing floor, and the never-raise failure handling are the
+    same whether a commit, a tick or a signal reached the trigger, so they are
+    here once and `fire_triggers`, `fire_signal` and `fire_due_schedules` differ
+    only in how they found the trigger and what `fire` binds. Returns
+    `(status, execution_id, detail)`; `detail` is the error text of a fire that
+    raised, for a caller with someone to show it to.
+    """
+    name = trigger["name"]
+    holder_args = _holder_kwargs(holder_kind)
+
+    # Suspended by an operator. Not an error and not alerted - the trigger
+    # records that it was reached and why nothing came of it, so the
+    # suppression is visible where someone looks for the staleness rather
+    # than only in whatever they remember pausing.
+    if trigger.get("suspended-at-ms"):
+        catalog.mark_trigger_fired(holder, name, status="suspended", **holder_args)
+        return "suspended", None, None
+
+    claim = None
+    try:
+        # THE FLOOR. A trigger carrying `minimum-interval-seconds` fires at most
+        # once per interval. The right to fire is CLAIMED in a transaction
+        # on the trigger document - see `claim_trigger_fire` for why a
+        # read-then-stamp would let a burst of commits all through - and
+        # taken before the submission so the stamp cannot be keyed on an
+        # outcome. A refused claim is recorded like a suspension: not an
+        # error, not alerted, but visible where someone looks for the run
+        # they expected. A record with no floor is never claimed, so a
+        # trigger that predates the field costs exactly what it did.
+        if _minimum_interval_seconds(trigger) > 0:
+            claim = catalog.claim_trigger_fire(holder, name, **holder_args)
+            if not claim.granted:
+                catalog.mark_trigger_fired(holder, name, status="throttled", **holder_args)
+                write_audit_record(
+                    {
+                        "event": "trigger.throttled",
+                        "workspace": getattr(catalog, "workspace", None),
+                        "dataset": holder,
+                        "trigger": name,
+                        "target_view": target,
+                        "minimum_interval_seconds": claim.interval_seconds,
+                        "last_claimed_at_ms": claim.at_ms,
+                        "author": author,
+                    }
+                )
+                return "throttled", None, None
+        result = fire()
+    except Exception as exc:  # noqa: BLE001 - the caller's path must survive
+        # A claim whose fire raised is handed back first, so the failure
+        # does not also silence the next interval. Guarded like the stamp
+        # below: the alert is what must still happen.
+        if claim is not None and claim.granted:
+            try:
+                catalog.release_trigger_fire(holder, name, claim, **holder_args)
+            except Exception:  # noqa: BLE001 - never displace the real failure
+                logger.warning("could not release the fire claim on trigger %s", name)
+        # Stamp the trigger BEFORE alerting. Every expected outcome above
+        # records itself - suspended, egress-blocked, owner-missing - but an
+        # unexpected exception used to record nothing at all, so a trigger
+        # failing on every commit was indistinguishable from one that had
+        # never fired: `last-fired-at-ms` and `last-fired-status` both stayed
+        # null, and SHOW TRIGGERS / information_schema showed a healthy-looking
+        # row. That is how a TaskNotFound went unnoticed while it fired hourly.
+        #
+        # Guarded because this is the failure path of the failure path: if
+        # stamping also fails, the alert below is what must still happen.
+        status = _failure_status(exc)
+        try:
+            catalog.mark_trigger_fired(holder, name, status=status, **holder_args)
+        except Exception:  # noqa: BLE001 - never displace the real failure
+            logger.warning("could not record the fire failure on trigger %s", name)
+        _alert(
+            exc,
+            note=note,
+            fingerprint=("trigger-fire-failed", holder, name),
+            context={"dataset": holder, "trigger": name, "target_view": target},
+        )
+        write_audit_record(
+            {
+                "event": "trigger.fire_failed",
+                "workspace": getattr(catalog, "workspace", None),
+                "dataset": holder,
+                "trigger": name,
+                "target_view": target,
+                "error": str(exc),
+                "author": author,
+            }
+        )
+        return status, None, str(exc)
+
+    if isinstance(result, tuple):
+        status, execution_id = result
+        return status, execution_id, None
+    return "enqueued", None, None
+
+
 def fire_triggers(
     catalog,
     dataset_identifier: str,
@@ -796,7 +992,7 @@ def fire_triggers(
     snapshot_id: Any | None = None,
     parent_snapshot_id: Any | None = None,
 ) -> None:
-    """Fire every refresh trigger on a dataset that just took a user commit.
+    """Fire every trigger on a dataset that just took a user commit.
 
     One refresh per distinct target view, however many triggers point at it.
     Never raises: each trigger's failure is alerted and audited individually,
@@ -824,13 +1020,13 @@ def fire_triggers(
         kind = trigger.get("kind")
         if kind == "materialized_view_refresh":
             target_view = trigger.get("target-view")
-            fire = lambda: _fire_refresh(  # noqa: E731
+            fire = lambda: _fire_refresh(
                 catalog, dataset_identifier, trigger, author, snapshot_id
             )
             note = "materialized view refresh NOT enqueued - the view is going stale"
         elif kind == TASK_TRIGGER_KIND:
             target_view = trigger.get("target-task")
-            fire = lambda: _fire_task(  # noqa: E731
+            fire = lambda: _fire_task(
                 catalog, dataset_identifier, trigger, author, snapshot_id, parent_snapshot_id
             )
             note = "task NOT enqueued - its output is going stale"
@@ -838,94 +1034,250 @@ def fire_triggers(
             continue
         if not target_view or target_view in seen_targets:
             continue
-
-        # Suspended by an operator. Not an error and not alerted - the trigger
-        # records that it was reached and why nothing came of it, so the
-        # suppression is visible where someone looks for the staleness rather
-        # than only in whatever they remember pausing.
-        if trigger.get("suspended-at-ms"):
-            catalog.mark_trigger_fired(dataset_identifier, trigger["name"], status="suspended")
+        # A dataset holds commit triggers only; a record that says otherwise is
+        # misfiled, and firing it on a commit would bind a window it was never
+        # meant to have. Left for integrity to report.
+        if (trigger.get("event-kind") or COMMIT_EVENT_KIND) != COMMIT_EVENT_KIND:
             continue
 
+        # Marked as seen even when suspended or throttled: a second trigger at
+        # the same target must not fire in its place.
         seen_targets.add(target_view)
-        claim = None
+        _dispatch(catalog, dataset_identifier, DATASET_HOLDER, trigger, target_view, fire, note, author)
+
+
+# --- Firing from the clock and from a signal ------------------------------------
+#
+# Both are dispatch.opteryx's to call. Neither has a commit: the task's own
+# trigger record says how the run is windowed (`window-source`) and as whom it
+# runs (`runs-as`), and the event supplies only provenance - `"schedule"`, or
+# the principal who signalled.
+
+
+def _task_trigger(catalog, task_identifier: str, expected_event: str) -> tuple[dict, dict]:
+    """The task and its one held trigger, which must be of `expected_event`.
+
+    Found through the back-pointer rather than by listing: the pointer is
+    what the one-trigger rule maintains, so a task with a commit trigger on
+    some dataset reports that - `TriggerNotFound` naming what it has - rather
+    than an empty subcollection that looks like "no trigger".
+    """
+    task = catalog.get_task(task_identifier)
+    held = task.get("trigger") or {}
+    if not held.get("name"):
+        raise TriggerNotFound(f"task {task['identifier']} has no trigger")
+    if held.get("source") != task["identifier"]:
+        raise TriggerNotFound(
+            f"task {task['identifier']} is fired by {held['name']} ON {held.get('source')}, "
+            f"a commit trigger, not a {expected_event}"
+        )
+    triggers = {
+        t.get("name"): t for t in catalog.list_triggers(task_identifier, holder_kind=TASK_HOLDER)
+    }
+    trigger = triggers.get(held["name"])
+    if trigger is None:
+        raise TriggerNotFound(
+            f"task {task['identifier']} points at trigger {held['name']}, which does not exist"
+        )
+    if (trigger.get("event-kind") or COMMIT_EVENT_KIND) != expected_event:
+        raise TriggerNotFound(
+            f"trigger {held['name']} on {task['identifier']} is a "
+            f"{trigger.get('event-kind') or COMMIT_EVENT_KIND} trigger, not a {expected_event}"
+        )
+    return task, trigger
+
+
+def fire_signal(catalog, task_identifier: str, caller: str) -> dict:
+    """Fire a task's signal trigger because `caller` asked.
+
+    The caller is the EVENT, not the context: recorded as `fired_by`, and the
+    run assumes the trigger's `runs-as` exactly as a commit-fired run does.
+    Whether the caller may do this - SIGNAL on the task - is the endpoint's
+    question, answered before this is reached; this trusts the name it is
+    handed the way `fire_triggers` trusts the committer's.
+
+    Never raises for a fire that failed: that is recorded on the trigger,
+    alerted, and returned as the status, so a webhook sender sees the same
+    outcome an operator would find on the record. Raises `TaskNotFound` and
+    `TriggerNotFound` for a request that names nothing to fire, which are
+    the caller's to see as a 404.
+    """
+    task, trigger = _task_trigger(catalog, task_identifier, SIGNAL_EVENT_KIND)
+    holder = task_identifier
+    status, execution_id, detail = _dispatch(
+        catalog,
+        holder,
+        TASK_HOLDER,
+        trigger,
+        task["identifier"],
+        lambda: _fire_task(catalog, holder, trigger, caller, None, None, holder_kind=TASK_HOLDER),
+        "signalled task NOT enqueued",
+        caller,
+    )
+    return {
+        "status": status,
+        "execution_id": execution_id,
+        "trigger": trigger["name"],
+        "task": task["identifier"],
+        "detail": detail,
+    }
+
+
+def _due_schedule_triggers(client, now_ms: int) -> list[tuple[str, str, str, str, dict]]:
+    """`(workspace, collection, task, trigger name, record)` for every due schedule.
+
+    ONE collection-group query across every workspace in the database, which
+    is what one clock wants: workspaces are sibling root collections and their
+    `triggers` subcollections share a name. Suspended records are filtered
+    here rather than in the query - Firestore cannot ask "is null" cheaply -
+    and are stamped `suspended` by `_dispatch` so the suppression is visible.
+
+    A trigger not under a task is not a schedule, whatever its record says
+    (`create_trigger` refuses the combination); skipped, and left for
+    integrity to report.
+    """
+    from google.cloud.firestore_v1 import FieldFilter
+
+    query = (
+        client.collection_group(TRIGGERS_SUBCOLLECTION)
+        .where(filter=FieldFilter("event-kind", "==", SCHEDULE_EVENT_KIND))
+        .where(filter=FieldFilter("next-due-at-ms", "<=", now_ms))
+    )
+    due = []
+    for doc in query.stream():
+        path = getattr(getattr(doc, "reference", None), "path", None) or ""
+        parts = path.split("/")
+        # {workspace}/{collection}/tasks/{task}/triggers/{name}
+        if len(parts) != 6 or parts[2] != "tasks" or parts[4] != TRIGGERS_SUBCOLLECTION:
+            logger.warning("schedule trigger at an unexpected path, not fired: %s", path)
+            continue
+        data = doc.to_dict() or {}
+        data.setdefault("name", parts[5])
+        due.append((parts[0], parts[1], parts[3], parts[5], data))
+    return due
+
+
+def _default_catalog_factory(client):
+    def _build(workspace: str):
+        from .opteryx_catalog import OpteryxCatalog
+
+        return OpteryxCatalog(
+            workspace=workspace,
+            firestore_project=getattr(client, "project", None),
+            firestore_database=getattr(client, "_database", None),
+        )
+
+    return _build
+
+
+def fire_due_schedules(client, now_ms: int | None = None, catalog_factory=None) -> list[dict]:
+    """Fire every schedule trigger that is due, across every workspace. Never raises.
+
+    The clock's tick. Holds nothing between calls: which triggers are due is
+    asked of Firestore every time, so a restart, a redeploy or a stalled
+    minute costs nothing and the next tick finds the same due records. Each
+    due trigger is CLAIMED (`claim_schedule_tick`) before it fires, which is
+    what lets two ticks overlap - a rollout serving two revisions - without
+    double-firing; a claim the fire could not honour is handed back.
+
+    `catalog_factory(workspace)` builds the per-workspace handle a fire needs;
+    the default constructs one on `client`'s project and database. One handle
+    per workspace per tick, however many triggers it holds.
+
+    Returns one outcome per due trigger, in the shape `fire_signal` returns
+    plus `workspace` and `skipped_occurrences`, for the tick's log line.
+    """
+    now_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
+    if not firing_enabled():
+        return []
+
+    try:
+        due = _due_schedule_triggers(client, now_ms)
+    except Exception as exc:  # noqa: BLE001 - the loop must survive
+        _alert(
+            exc,
+            note="reading due schedule triggers failed - NOTHING fired this tick",
+            fingerprint=("schedule-scan-failed",),
+            context={"now_ms": now_ms},
+        )
+        return []
+
+    build = catalog_factory or _default_catalog_factory(client)
+    handles: dict = {}
+    outcomes = []
+    for workspace, collection, task_name, name, trigger in due:
+        task_identifier = f"{collection}.{task_name}"
+        outcome = {
+            "workspace": workspace,
+            "task": f"{workspace}.{task_identifier}",
+            "trigger": name,
+            "status": "error",
+            "execution_id": None,
+            "detail": None,
+            "skipped_occurrences": 0,
+        }
         try:
-            # THE FLOOR. A trigger carrying `minimum-interval-seconds` fires at most
-            # once per interval. The right to fire is CLAIMED in a transaction
-            # on the trigger document - see `claim_trigger_fire` for why a
-            # read-then-stamp would let a burst of commits all through - and
-            # taken before the submission so the stamp cannot be keyed on an
-            # outcome. A refused claim is recorded like a suspension: not an
-            # error, not alerted, but visible where someone looks for the run
-            # they expected. A record with no floor is never claimed, so a
-            # trigger that predates the field costs exactly what it did.
-            if _minimum_interval_seconds(trigger) > 0:
-                claim = catalog.claim_trigger_fire(dataset_identifier, trigger["name"])
-                if not claim.granted:
-                    catalog.mark_trigger_fired(
-                        dataset_identifier, trigger["name"], status="throttled"
-                    )
-                    write_audit_record(
-                        {
-                            "event": "trigger.throttled",
-                            "workspace": getattr(catalog, "workspace", None),
-                            "dataset": dataset_identifier,
-                            "trigger": trigger["name"],
-                            "target_view": target_view,
-                            "minimum_interval_seconds": claim.interval_seconds,
-                            "last_claimed_at_ms": claim.at_ms,
-                            "author": author,
-                        }
-                    )
-                    continue
-            fire()
-        except Exception as exc:  # noqa: BLE001 - commit path must survive
-            # A claim whose fire raised is handed back first, so the failure
-            # does not also silence the next interval. Guarded like the stamp
-            # below: the alert is what must still happen.
-            if claim is not None and claim.granted:
-                try:
-                    catalog.release_trigger_fire(dataset_identifier, trigger["name"], claim)
-                except Exception:  # noqa: BLE001 - never displace the real failure
-                    logger.warning(
-                        "could not release the fire claim on trigger %s", trigger.get("name")
-                    )
-            # Stamp the trigger BEFORE alerting. Every expected outcome above
-            # records itself - suspended, egress-blocked, owner-missing - but an
-            # unexpected exception used to record nothing at all, so a trigger
-            # failing on every commit was indistinguishable from one that had
-            # never fired: `last-fired-at-ms` and `last-fired-status` both stayed
-            # null, and SHOW TRIGGERS / information_schema showed a healthy-looking
-            # row. That is how a TaskNotFound went unnoticed while it fired hourly.
-            #
-            # Guarded because this is the failure path of the failure path: if
-            # stamping also fails, the alert below is what must still happen.
-            try:
-                catalog.mark_trigger_fired(
-                    dataset_identifier, trigger["name"], status=_failure_status(exc)
-                )
-            except Exception:  # noqa: BLE001 - never displace the real failure
-                logger.warning(
-                    "could not record the fire failure on trigger %s", trigger.get("name")
-                )
-            _alert(
-                exc,
-                note=note,
-                fingerprint=("trigger-fire-failed", dataset_identifier, trigger.get("name")),
-                context={
-                    "dataset": dataset_identifier,
-                    "trigger": trigger.get("name"),
-                    "target_view": target_view,
-                },
+            catalog = handles.get(workspace)
+            if catalog is None:
+                catalog = handles[workspace] = build(workspace)
+
+            if trigger.get("suspended-at-ms"):
+                # Not claimed: the due instant stays where it is, so RESUME's
+                # recompute-from-now is what moves it, and the record shows
+                # every tick that reached it while paused.
+                catalog.mark_trigger_fired(task_identifier, name, status="suspended", holder_kind=TASK_HOLDER)
+                outcome["status"] = "suspended"
+                outcomes.append(outcome)
+                continue
+
+            claim = catalog.claim_schedule_tick(task_identifier, name, now_ms)
+            if not claim.granted:
+                # Another loop's tick took it between the scan and now.
+                outcome["status"] = "claimed-elsewhere"
+                outcomes.append(outcome)
+                continue
+            outcome["skipped_occurrences"] = claim.skipped_occurrences
+
+            status, execution_id, detail = _dispatch(
+                catalog,
+                task_identifier,
+                TASK_HOLDER,
+                trigger,
+                outcome["task"],
+                lambda catalog=catalog, task_identifier=task_identifier, trigger=trigger: _fire_task(
+                    catalog, task_identifier, trigger, "schedule", None, None, holder_kind=TASK_HOLDER
+                ),
+                "scheduled task NOT enqueued",
+                "schedule",
             )
+            if detail is not None:
+                # The fire raised: the slot was not consumed, so the tick is
+                # handed back and the next loop finds it due again.
+                try:
+                    catalog.release_schedule_tick(task_identifier, name, claim)
+                except Exception:  # noqa: BLE001 - never displace the real failure
+                    logger.warning("could not release the tick on trigger %s", name)
+            outcome.update({"status": status, "execution_id": execution_id, "detail": detail})
             write_audit_record(
                 {
-                    "event": "trigger.fire_failed",
-                    "workspace": getattr(catalog, "workspace", None),
-                    "dataset": dataset_identifier,
-                    "trigger": trigger.get("name"),
-                    "target_view": target_view,
-                    "error": str(exc),
-                    "author": author,
+                    "event": "schedule.ticked",
+                    "workspace": workspace,
+                    "task": outcome["task"],
+                    "trigger": name,
+                    "due_at_ms": claim.previous_due_ms,
+                    "next_due_at_ms": claim.next_due_ms,
+                    "skipped_occurrences": claim.skipped_occurrences,
+                    "status": status,
+                    "execution_id": execution_id,
                 }
             )
+        except Exception as exc:  # noqa: BLE001 - one bad trigger must not stop the tick
+            outcome["detail"] = str(exc)
+            _alert(
+                exc,
+                note="schedule trigger NOT fired - its task is going stale",
+                fingerprint=("schedule-tick-failed", workspace, task_identifier, name),
+                context={"workspace": workspace, "task": task_identifier, "trigger": name},
+            )
+        outcomes.append(outcome)
+    return outcomes

@@ -4,10 +4,6 @@ import hashlib
 import logging
 import re
 import secrets
-
-# The "no expectation" sentinel for save_dataset_metadata, defined with the
-# commit paths that pass it (catalog/dataset.py).
-from .catalog.dataset import _NO_SNAPSHOT_EXPECTATION
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -18,6 +14,10 @@ from google.cloud import storage
 
 from .alerts import report as _alert
 from .audit import emit_audit
+
+# The "no expectation" sentinel for save_dataset_metadata, defined with the
+# commit paths that pass it (catalog/dataset.py).
+from .catalog.dataset import _NO_SNAPSHOT_EXPECTATION
 from .catalog.dataset import SimpleDataset
 from .catalog.dataset import _as_int
 from .catalog.metadata import DatasetMetadata
@@ -27,16 +27,19 @@ from .catalog.metastore import Metastore
 from .catalog.orphan_quarantine import MAINTENANCE_SUBCOLLECTION
 from .catalog.view import View as CatalogView
 from .exceptions import CollectionAlreadyExists
-from .exceptions import ConstraintNotFound
 from .exceptions import CollectionLocked
 from .exceptions import CollectionNotEmpty
 from .exceptions import CollectionNotFound
+from .exceptions import ConstraintNotFound
 from .exceptions import DatasetAlreadyExists
 from .exceptions import DatasetLocked
 from .exceptions import DatasetNotFound
 from .exceptions import EgressRestricted
+from .exceptions import ListenerAlreadyExists
+from .exceptions import ListenerNotFound
 from .exceptions import MaterializedViewError
 from .exceptions import NameInUse
+from .exceptions import PlatformIdentityOwnerRefused
 from .exceptions import SnapshotAncestryTooDeep
 from .exceptions import SnapshotMissingError
 from .exceptions import TagAlreadyExists
@@ -50,9 +53,11 @@ from .exceptions import ViewNotFound
 from .exceptions import WorkspaceDeletionProtected
 from .exceptions import WorkspaceNotFound
 from .exceptions import WorkspaceStorageReclaimFailed
-from .exceptions import PlatformIdentityOwnerRefused
 from .iops.base import FileIO
 from .resource_types import ResourceType
+from .schedules import next_due_ms
+from .schedules import occurrences_between
+from .schedules import validate_schedule
 from .webhooks import send_webhook
 from .webhooks.events import dataset_created_payload
 from .webhooks.events import dataset_deleted_payload
@@ -211,6 +216,21 @@ TAGS_SUBCOLLECTION = "tags"
 # lives where it always has - a trigger document on that dataset.
 TASKS_SUBCOLLECTION = "tasks"
 
+# Subcollection under a TASK document holding that task's notification
+# subscriptions - one document per subscriber, keyed by the user's identity.
+# Under the task rather than under the user because a subscription is a property
+# of the task: `drop_task` sweeps them, and sweeping something that lives under
+# the task's own document cannot leave an orphan the way reaching across to
+# another dataset's documents can (see `drop_task`, which does not sweep
+# triggers for exactly that reason).
+LISTENERS_SUBCOLLECTION = "listeners"
+
+# What a subscriber asked to hear about. Closed set: a filter that is not one of
+# these is a caller error, not a filter that matches nothing. `EVERYTHING` is
+# the default because someone who did not name an outcome wants to know what
+# happened, not a subset of it.
+LISTENER_OUTCOMES = ("ERROR", "SUCCESS", "EVERYTHING")
+
 # Most tags one dataset may hold. A tag pins its snapshot from expiry until it
 # is dropped - nothing ages one out - so this is the only bound on how much
 # history a single dataset can hold alive, and every byte of it is charged.
@@ -329,6 +349,31 @@ MV_REFRESH_TRIGGER_KIND = "materialized_view_refresh"
 # disagree about which triggers carry an identity of their own.
 TASK_TRIGGER_KIND = "task"
 
+# THE EVENT AXIS. `kind` says what a trigger RUNS (a task, a refresh); the
+# event says what FIRES it, and the two are independent. A commit trigger is
+# held by the dataset whose commits fire it. A schedule or signal trigger has
+# no dataset - a clock tick and an inbound signal happen to nothing in the
+# catalog - so it is held by the task it fires, in a `triggers` subcollection
+# under the task document. Records written before the axis existed carry no
+# `event-kind` and are commit triggers; readers treat a missing value as one.
+COMMIT_EVENT_KIND = "commit"
+SCHEDULE_EVENT_KIND = "schedule"
+SIGNAL_EVENT_KIND = "signal"
+TRIGGER_EVENT_KINDS = frozenset({COMMIT_EVENT_KIND, SCHEDULE_EVENT_KIND, SIGNAL_EVENT_KIND})
+
+# What holds a triggers subcollection. Every trigger method takes a
+# `holder_kind` and defaults to the dataset, so the commit path and every
+# caller written before task-held triggers existed are unchanged.
+DATASET_HOLDER = "dataset"
+TASK_HOLDER = "task"
+TRIGGER_HOLDER_KINDS = frozenset({DATASET_HOLDER, TASK_HOLDER})
+
+# The window parameters a task statement may consume, as the engine names them
+# (`WINDOW_PARAMETERS` in opteryx's planner). Matched on the statement TEXT
+# because the catalog does not parse SQL; a `:parent_version` inside a string
+# literal would count, which errs toward refusing to arm, the safe direction.
+WINDOW_PARAMETER_PATTERN = re.compile(r":(parent_version|current_version)\b")
+
 # The floor between two firings of ONE trigger, in seconds, for a trigger
 # registered without one being named. Applied at creation and written onto the
 # record - never read as a fallback at fire time. A trigger document with no
@@ -350,6 +395,26 @@ def _validate_minimum_interval(value) -> int:
             f"(0 disables the floor), not {value!r}"
         )
     return value
+
+
+@dataclass(frozen=True)
+class ScheduleTickClaim:
+    """What `claim_schedule_tick` decided, and what `release_schedule_tick`
+    needs to undo it.
+
+    `granted` is whether this tick may fire. `previous_due_ms` is the due
+    instant that was claimed - what a release puts back - and `next_due_ms` is
+    where the record was advanced to. `skipped_occurrences` is how many firing
+    instants fell between the claimed one and now: zero on a clock that is
+    keeping up, and the size of the outage otherwise. A missed slot fires ONCE;
+    the count goes in the audit record so the outage is visible where someone
+    looks for the runs that did not happen.
+    """
+
+    granted: bool
+    previous_due_ms: int | None
+    next_due_ms: int | None
+    skipped_occurrences: int = 0
 
 
 @dataclass(frozen=True)
@@ -3243,6 +3308,11 @@ class OpteryxCatalog(Metastore):
             return
 
         self._delete_subcollection(doc_ref.collection("statement"))
+        # Subscriptions are a property of the task: the task is gone, so there is
+        # nothing left to notify about. Safe to sweep here in a way triggers are
+        # not, because these documents live under the task's OWN document - this
+        # reaches across to nothing.
+        self._delete_subcollection(doc_ref.collection(LISTENERS_SUBCOLLECTION))
         doc_ref.delete()
 
         emit_audit(
@@ -3253,6 +3323,140 @@ class OpteryxCatalog(Metastore):
             resource=task_name,
             author=author,
         )
+
+    def _listeners_collection(self, collection: str, task_name: str):
+        return self._task_doc_ref(collection, task_name).collection(LISTENERS_SUBCOLLECTION)
+
+    def add_listener(self, identifier: str | tuple, user: str, outcome: str = "EVERYTHING") -> None:
+        """Subscribe `user` to a task's run outcomes.
+
+        The user's identity is the DOCUMENT ID, which is what makes one
+        subscription per user a property of the storage rather than a rule
+        something has to remember to check. A second LISTEN is a document that
+        already exists.
+
+        The caller's authority to subscribe was decided before this - `LISTEN`
+        is a read activity, gated on the caller being able to see what the task
+        writes - and is NOT re-checked here, nor at delivery. This records what
+        it is given, as every other catalog write does.
+        """
+        if not user:
+            raise ValueError("user must be provided when adding a listener")
+        outcome = (outcome or "EVERYTHING").upper()
+        if outcome not in LISTENER_OUTCOMES:
+            raise ValueError(
+                f"unknown listener outcome {outcome!r}; expected one of "
+                + ", ".join(LISTENER_OUTCOMES)
+            )
+
+        collection, task_name = self._task_parts(identifier)
+        # The task must exist: subscribing to a name nothing answers to is a
+        # subscription that can never fire, and the typo is the likely cause.
+        self.get_task((collection, task_name))
+
+        doc_ref = self._listeners_collection(collection, task_name).document(user)
+        if doc_ref.get().exists:
+            raise ListenerAlreadyExists(
+                f"{user} already listens to {collection}.{task_name}"
+            )
+
+        doc_ref.set(
+            {
+                # Stored as a FIELD as well as the document id: the collection
+                # group query in `list_listeners_for_user` cannot filter on a
+                # document id across a collection group, and the workspace is
+                # what confines that query to one tenant.
+                "user": user,
+                "workspace": self.workspace,
+                "collection": collection,
+                "task": task_name,
+                "outcome": outcome,
+                "created-at-ms": int(time.time() * 1000),
+            }
+        )
+
+        emit_audit(
+            "add_listener",
+            resource_type=ResourceType.DATASET,
+            workspace=self.workspace,
+            collection=collection,
+            resource=task_name,
+            author=user,
+        )
+
+    def drop_listener(self, identifier: str | tuple, user: str) -> None:
+        """Remove `user`'s subscription to a task.
+
+        Raises when there is no subscription rather than deleting nothing. A
+        silent no-op tells someone they have unsubscribed from notifications
+        they were never receiving, and leaves the real subscription - under the
+        name they meant - still running.
+        """
+        if not user:
+            raise ValueError("user must be provided when dropping a listener")
+
+        collection, task_name = self._task_parts(identifier)
+        doc_ref = self._listeners_collection(collection, task_name).document(user)
+        if not doc_ref.get().exists:
+            raise ListenerNotFound(f"{user} does not listen to {collection}.{task_name}")
+
+        doc_ref.delete()
+
+        emit_audit(
+            "drop_listener",
+            resource_type=ResourceType.DATASET,
+            workspace=self.workspace,
+            collection=collection,
+            resource=task_name,
+            author=user,
+        )
+
+    def list_listeners(self, identifier: str | tuple) -> list:
+        """Every subscription on a task - the fan-out list at fire time.
+
+        NOT a SQL surface. `SHOW LISTENERS` answers for one user; this answers
+        for one task, which would tell whoever asked who else is watching it.
+        """
+        collection, task_name = self._task_parts(identifier)
+        listeners = []
+        for doc in self._listeners_collection(collection, task_name).stream():
+            data = doc.to_dict() or {}
+            data.setdefault("user", doc.id)
+            listeners.append(data)
+        return listeners
+
+    def list_listeners_for_user(self, user: str) -> list:
+        """Every subscription `user` holds in this workspace.
+
+        A collection group query, because subscriptions live under the tasks
+        they belong to and there is no per-user index of them. The workspace
+        filter is the only thing confining this to one tenant, so - as in
+        `list_relationships_in_workspace` - a row from elsewhere is a hard
+        failure rather than something to skip.
+        """
+        if not user:
+            raise ValueError("user must be provided when listing listeners")
+
+        from google.cloud.firestore_v1 import FieldFilter
+
+        query = (
+            self.firestore_client.collection_group(LISTENERS_SUBCOLLECTION)
+            .where(filter=FieldFilter("workspace", "==", self.workspace))
+            .where(filter=FieldFilter("user", "==", user))
+        )
+        listeners = []
+        for doc in query.stream():
+            data = doc.to_dict() or {}
+            if data.get("workspace") != self.workspace:
+                raise ValueError(
+                    "collection group query returned a listener from workspace "
+                    f"{data.get('workspace')!r} while reading {self.workspace!r} - "
+                    "the workspace filter is the only thing confining this query to "
+                    "one tenant and it is not holding"
+                )
+            data.setdefault("user", doc.id)
+            listeners.append(data)
+        return listeners
 
     def mark_task_fired(
         self,
@@ -3325,6 +3529,73 @@ class OpteryxCatalog(Metastore):
 
     def _triggers_collection(self, collection: str, dataset_name: str):
         return self._dataset_doc_ref(collection, dataset_name).collection(TRIGGERS_SUBCOLLECTION)
+
+    def _trigger_holder(self, identifier: str | tuple, holder_kind: str = DATASET_HOLDER):
+        """`(collection, leaf, triggers subcollection)` for whatever holds triggers.
+
+        The one place the two holders are told apart. A dataset holds the
+        commit triggers its commits fire; a task holds the schedule or signal
+        trigger that fires it. Every trigger method resolves through here so
+        the holder kind is a parameter of the lookup rather than a second copy
+        of each method.
+        """
+        if holder_kind == DATASET_HOLDER:
+            collection, leaf = self._local_parts(identifier)
+            return collection, leaf, self._triggers_collection(collection, leaf)
+        if holder_kind == TASK_HOLDER:
+            collection, leaf = self._task_parts(identifier)
+            return (
+                collection,
+                leaf,
+                self._task_doc_ref(collection, leaf).collection(TRIGGERS_SUBCOLLECTION),
+            )
+        raise ValueError(
+            f"unknown trigger holder kind: {holder_kind!r}; one of "
+            + ", ".join(sorted(TRIGGER_HOLDER_KINDS))
+        )
+
+    def _holder_identifier(self, identifier: str | tuple, holder_kind: str = DATASET_HOLDER) -> str:
+        """The holder's fully-qualified name, as trigger records and back-pointers store it."""
+        if holder_kind == TASK_HOLDER:
+            collection, leaf = self._task_parts(identifier)
+            return f"{self.workspace}.{collection}.{leaf}"
+        return self._qualify(identifier)
+
+    def head_snapshot_id(self, dataset_identifier: str) -> int | None:
+        """The dataset's current snapshot id, or None for one nothing has landed in.
+
+        The firing path binds a schedule- or signal-fired run's window from
+        this - the head at fire time against the task's `last-window-to` - so
+        it reads the head pointer and nothing else: no manifest, no schema, no
+        snapshot document, because a tick on a quiet dataset must cost one read.
+        """
+        collection, dataset_name = self._local_parts(dataset_identifier)
+        doc = self._dataset_doc_ref(collection, dataset_name).get()
+        if not doc.exists:
+            raise DatasetNotFound(f"Dataset not found: {collection}.{dataset_name}")
+        head = (doc.to_dict() or {}).get("current-snapshot-id")
+        return None if head is None else int(head)
+
+    def _assert_task_windowless(self, task_identifier: str, event_kind: str) -> None:
+        """Refuse to arm a sourceless clock or signal on a statement that consumes a window.
+
+        A commit binds `:parent_version`/`:current_version` from the commit; a
+        tick or a signal has no commit, so without an OVER dataset there is
+        nothing to bind and the engine would refuse the run - as a job failure
+        nobody is reading, on every fire. Refused at arming instead, naming the
+        fix. The statement can be replaced after arming, which is why
+        `trigger_firing._fire_task` asks again at fire time.
+        """
+        task = self.get_task(task_identifier)
+        wanted = sorted(set(WINDOW_PARAMETER_PATTERN.findall(task.get("sql") or "")))
+        if wanted:
+            raise ValueError(
+                f"task {task_identifier} consumes a window ("
+                + ", ".join(f":{name}" for name in wanted)
+                + f") and a {event_kind} has no commit to bind one from. Name the "
+                "dataset the run is windowed over with OVER <table>, or remove the "
+                "window parameters from the statement."
+            )
 
     def _relationships_collection(self, collection: str, dataset_name: str):
         return self._dataset_doc_ref(collection, dataset_name).collection(
@@ -3589,8 +3860,32 @@ class OpteryxCatalog(Metastore):
         kind: str = MV_REFRESH_TRIGGER_KIND,
         target_task: str | None = None,
         minimum_interval_seconds: int | None = None,
+        holder_kind: str = DATASET_HOLDER,
+        event_kind: str | None = None,
+        schedule: str | None = None,
+        time_zone: str | None = None,
+        window_source: str | None = None,
     ) -> None:
-        """Attach a trigger to a dataset.
+        """Attach a trigger to its holder: a dataset, or a task.
+
+        THE HOLDER IS WHERE THE EVENT HAPPENS. A commit trigger is held by the
+        dataset whose commits fire it (`holder_kind="dataset"`, the default,
+        and the only form until clock and signal events existed). A schedule
+        or signal trigger has no dataset - nothing in the catalog ticks or is
+        signalled - so it is held by the task it fires
+        (`holder_kind="task"`), and `target_task` must be that task. The
+        event is `event_kind`: `commit` for a dataset holder, `schedule` or
+        `signal` for a task holder; a schedule carries a five-field cron
+        `schedule` and an IANA `time_zone` (UTC when omitted), validated and
+        stamped with its first `next-due-at-ms` here.
+
+        `window_source` names the dataset a schedule- or signal-fired run is
+        windowed OVER: at fire time the window is that dataset's head snapshot
+        against the task's `last-window-to`. Without one the task must be
+        windowless, and this refuses to arm a statement that consumes
+        `:parent_version` or `:current_version` - see
+        `_assert_task_windowless`; the fire path asks again, because the
+        statement can change after arming.
 
         `minimum_interval_seconds` is the floor between two firings of this
         trigger (see `DEFAULT_MINIMUM_INTERVAL_SECONDS`). Named, it is written as
@@ -3629,6 +3924,47 @@ class OpteryxCatalog(Metastore):
             raise ValueError("author must be provided when creating a trigger")
         if minimum_interval_seconds is not None:
             _validate_minimum_interval(minimum_interval_seconds)
+        if holder_kind not in TRIGGER_HOLDER_KINDS:
+            raise ValueError(
+                f"unknown trigger holder kind: {holder_kind!r}; one of "
+                + ", ".join(sorted(TRIGGER_HOLDER_KINDS))
+            )
+        if event_kind is None and holder_kind == DATASET_HOLDER:
+            event_kind = COMMIT_EVENT_KIND
+        if event_kind not in TRIGGER_EVENT_KINDS:
+            raise ValueError(
+                f"unknown trigger event kind: {event_kind!r}; one of "
+                + ", ".join(sorted(TRIGGER_EVENT_KINDS))
+            )
+
+        # The event and the holder must agree, and the event decides which of
+        # the schedule fields may be present. Each mismatch is refused by name
+        # rather than stored and ignored: a schedule on a commit trigger would
+        # sit in the record looking honoured while the commit path never read it.
+        if holder_kind == DATASET_HOLDER:
+            if event_kind != COMMIT_EVENT_KIND:
+                raise ValueError(
+                    f"a trigger held by a dataset fires on that dataset's commits; a "
+                    f"{event_kind} trigger is held by the task it fires"
+                )
+            if schedule is not None or time_zone is not None or window_source is not None:
+                raise ValueError(
+                    "schedule, time_zone and window_source belong to a schedule or "
+                    "signal trigger, which is held by its task, not to a commit trigger"
+                )
+        else:
+            if event_kind == COMMIT_EVENT_KIND:
+                raise ValueError(
+                    "a commit trigger is held by the dataset whose commits fire it, "
+                    "not by a task"
+                )
+            if kind != TASK_TRIGGER_KIND or target_task is None:
+                raise ValueError("a trigger held by a task runs that task: pass target_task")
+            if event_kind == SCHEDULE_EVENT_KIND:
+                schedule, time_zone = validate_schedule(schedule, time_zone)
+            elif schedule is not None or time_zone is not None:
+                raise ValueError("a signal trigger has no schedule; it fires when signalled")
+
         # The author becomes `runs-as` below, so the ownership rule applies here
         # too - and applies at creation rather than only on transfer, which is
         # the ordering that actually keeps a platform identity off the field.
@@ -3642,9 +3978,15 @@ class OpteryxCatalog(Metastore):
         # data outward under a stored credential, and it would have slipped
         # straight through an allowlist keyed on `task`.
         _assert_can_own(author, f"trigger {name} on {dataset_identifier}", workspace=self.workspace)
-        collection, dataset_name = self._local_parts(dataset_identifier)
-        if not self._dataset_doc_ref(collection, dataset_name).get().exists:
-            raise DatasetNotFound(f"Dataset not found: {collection}.{dataset_name}")
+        collection, dataset_name, triggers = self._trigger_holder(dataset_identifier, holder_kind)
+        if holder_kind == DATASET_HOLDER:
+            if not self._dataset_doc_ref(collection, dataset_name).get().exists:
+                raise DatasetNotFound(f"Dataset not found: {collection}.{dataset_name}")
+        elif not self._task_doc_ref(collection, dataset_name).get().exists:
+            # Unlike a commit trigger's TARGET task, which may be registered
+            # later, the holder must exist: the trigger lives under it.
+            raise TaskNotFound(f"Task not found: {collection}.{dataset_name}")
+        source = self._holder_identifier(dataset_identifier, holder_kind)
 
         # Which field names the target depends on what the trigger runs. Both are
         # written - one of them None - so a reader never has to know the kind to
@@ -3660,6 +4002,26 @@ class OpteryxCatalog(Metastore):
             target_view = self._qualify(target_view)
             target, target_field = target_view, "target-view"
 
+        if holder_kind == TASK_HOLDER:
+            if target_task != source:
+                raise ValueError(
+                    f"a trigger held by task {source} runs that task, not {target_task}; "
+                    "a task's own trigger is the one that fires it"
+                )
+            if window_source is not None:
+                # `_local_parts` refuses another workspace's dataset. The window
+                # is bound from this handle's records at fire time, so a foreign
+                # source could never be read - and the run's own read of it is
+                # the engine's to judge, as `runs-as`, when the job binds.
+                window_collection, window_dataset = self._local_parts(window_source)
+                if not self._dataset_doc_ref(window_collection, window_dataset).get().exists:
+                    raise DatasetNotFound(
+                        f"window source not found: {window_collection}.{window_dataset}"
+                    )
+                window_source = self._qualify(window_source)
+            else:
+                self._assert_task_windowless(target_task, event_kind)
+
         # Before any write: the trigger graph must stay a DAG. Task targets are
         # not nodes in it - a task declares only its SQL, never what that SQL
         # writes, so there is no edge to draw and no walk that could find a loop
@@ -3667,8 +4029,7 @@ class OpteryxCatalog(Metastore):
         if target_view is not None:
             self._assert_no_trigger_cycle(dataset_identifier, target_view)
 
-        trigger_ref = self._triggers_collection(collection, dataset_name).document(name)
-        source = self._qualify(dataset_identifier)
+        trigger_ref = triggers.document(name)
 
         # THE ONE-TRIGGER RULE. A task has at most one trigger; a materialized
         # view keeps as many as it has sources, so this is gated on the target
@@ -3690,12 +4051,18 @@ class OpteryxCatalog(Metastore):
         # the work is a derivation, it was a rewrite all along). That case was
         # exactly the broken one.
         #
-        # Triggers live under their SOURCE dataset, so "does this task have a
-        # trigger" is a reverse lookup. The answer is kept as a back-pointer on
-        # the task document and written in the SAME transaction as the trigger,
-        # because either half alone is the half-wired state: a back-pointer with
-        # no trigger locks the task out of ever getting one, and a trigger with
-        # no back-pointer lets a second one through.
+        # The rule counts across HOLDERS. A task fired on commit and again on a
+        # schedule would be windowed on two sequences too - the commit's and,
+        # via OVER, whatever the schedule names - and the back-pointer holds one
+        # `{source, name}`, so a task-held trigger and a dataset-held one refuse
+        # each other exactly as two dataset-held ones do.
+        #
+        # Triggers live under their holder, so "does this task have a trigger"
+        # is a reverse lookup for a commit trigger. The answer is kept as a
+        # back-pointer on the task document and written in the SAME transaction
+        # as the trigger, because either half alone is the half-wired state: a
+        # back-pointer with no trigger locks the task out of ever getting one,
+        # and a trigger with no back-pointer lets a second one through.
         task_ref = None
         if target_task is not None:
             task_collection, task_document = self._task_parts(target_task)
@@ -3709,10 +4076,10 @@ class OpteryxCatalog(Metastore):
             # trigger document is written: a refused arming must leave nothing
             # behind, not a trigger that fails forever at fire time.
             #
-            # Placed after the validation above - and after the firing dataset's
+            # Placed after the validation above - and after the holder's
             # existence check in particular - mirroring `_enforce_egress` in the
             # engine (opteryx/planner/binder/relation.py): a caller who cannot
-            # name a dataset they may attach a trigger to learns that first, and
+            # name an object they may attach a trigger to learns that first, and
             # so cannot use this path to probe another workspace's protection
             # state. It goes through `enforce_egress_policy` like every other
             # caller, so a policy that grows (an object-level exemption, say) is
@@ -3726,7 +4093,7 @@ class OpteryxCatalog(Metastore):
             #
             # A task with no document has no recorded `writes` and is left to
             # the fire-time check, as this method deliberately does not require
-            # the task to exist.
+            # a commit trigger's target task to exist.
             #
             # The hole is `enforce_task_egress`'s and stays open here: a task
             # whose `writes` was never declared passes vacuously, because an
@@ -3739,11 +4106,25 @@ class OpteryxCatalog(Metastore):
                 )
 
         now_ms = int(time.time() * 1000)
+        # Recomputed on every registration, including OR REPLACE with an
+        # unchanged expression: the due instant is a function of the schedule
+        # and now, and carrying a prior one forward across a changed expression
+        # would fire the old schedule once more.
+        next_due = (
+            next_due_ms(schedule, time_zone, now_ms) if event_kind == SCHEDULE_EVENT_KIND else None
+        )
 
         def _record(prior: dict) -> dict:
             return {
                 "name": name,
                 "kind": kind,
+                "holder": source,
+                "holder-kind": holder_kind,
+                "event-kind": event_kind,
+                "schedule": schedule,
+                "time-zone": time_zone,
+                "next-due-at-ms": next_due,
+                "window-source": window_source,
                 "target-view": target_view,
                 "target-task": target_task,
                 "statement-id": statement_id,
@@ -3755,7 +4136,8 @@ class OpteryxCatalog(Metastore):
                 # not the task, because that is what separates unattended from
                 # attended: a person running EXECUTE runs the task as themselves
                 # and answers for it, so there is nothing to pin - a trigger
-                # fires with nobody present.
+                # fires with nobody present. A clock and a signal make the same
+                # point more plainly: neither event has an identity to offer.
                 #
                 # ALWAYS the author on first registration, with no override.
                 # There used to be a `runs_as` argument "for trusted platform
@@ -3768,10 +4150,7 @@ class OpteryxCatalog(Metastore):
                 # audited act, so it belongs to `set_trigger_owner` alone.
                 #
                 # Preserved across re-registration so an edit never silently
-                # transfers whose authority the work runs with. For a view's
-                # refresh triggers this is what keeps CREATE OR REPLACE from
-                # moving a view onto whoever edited it: only the trigger on a
-                # NEWLY read source is pinned to the editor.
+                # transfers whose authority the work runs with.
                 "runs-as": prior.get("runs-as") or author,
                 "created-by": author,
                 "created-at-ms": now_ms,
@@ -3806,10 +4185,11 @@ class OpteryxCatalog(Metastore):
 
             # A task with no document holds no back-pointer, so the rule cannot
             # be enforced for one - and this method deliberately does not require
-            # the task to exist (`drop_task` leaves its triggers behind, and
-            # integrity reports the dangling pair). Writing a stub task document
-            # to carry the pointer would invent a task nobody created, which is
-            # worse than leaving a dangling trigger the sweep already surfaces.
+            # a commit trigger's target task to exist (`drop_task` leaves its
+            # triggers behind, and integrity reports the dangling pair). Writing
+            # a stub task document to carry the pointer would invent a task
+            # nobody created, which is worse than leaving a dangling trigger the
+            # sweep already surfaces.
             if task_doc is not None and task_doc.exists:
                 held = (task_doc.to_dict() or {}).get("trigger") or {}
                 held_name = held.get("name")
@@ -3817,7 +4197,7 @@ class OpteryxCatalog(Metastore):
                     raise MaterializedViewError(
                         f"task {target_task} is already fired by {held_name} ON "
                         f"{held.get('source')}; a task has one trigger - its window "
-                        "is that source's version sequence."
+                        "is one source's version sequence."
                     )
 
             transaction.set(trigger_ref, _record(prior))
@@ -3827,19 +4207,26 @@ class OpteryxCatalog(Metastore):
         _attach(self.firestore_client.transaction())
 
         # The existence check at the top and the write above are separate
-        # operations, so a concurrent `drop_dataset` can interleave: its sweep
-        # of the triggers subcollection runs before this document lands, then
-        # the dataset document is deleted - and this trigger survives as the
-        # only thing under a ghost path, invisible to every code path but
+        # operations, so a concurrent drop can interleave: its sweep of the
+        # triggers subcollection runs before this document lands, then the
+        # holder's document is deleted - and this trigger survives as the only
+        # thing under a ghost path, invisible to every code path but
         # `list_documents()`. Re-checking after the write turns that
         # interleaving into a clean failure instead of an orphan.
-        if not self._dataset_doc_ref(collection, dataset_name).get().exists:
+        holder_ref = (
+            self._dataset_doc_ref(collection, dataset_name)
+            if holder_kind == DATASET_HOLDER
+            else self._task_doc_ref(collection, dataset_name)
+        )
+        if not holder_ref.get().exists:
             trigger_ref.delete()
             # The back-pointer goes with it. Leaving one behind would be worse
             # than the orphan this arm exists to prevent: the task would be
             # locked out of ever taking a trigger by one that no longer exists.
             self._release_task_trigger(task_ref, name, source)
-            raise DatasetNotFound(f"Dataset not found: {collection}.{dataset_name}")
+            if holder_kind == DATASET_HOLDER:
+                raise DatasetNotFound(f"Dataset not found: {collection}.{dataset_name}")
+            raise TaskNotFound(f"Task not found: {collection}.{dataset_name}")
 
         emit_audit(
             "create_trigger",
@@ -3850,6 +4237,8 @@ class OpteryxCatalog(Metastore):
             author=author,
             trigger=name,
             kind=kind,
+            holder_kind=holder_kind,
+            event_kind=event_kind,
             target=target,
         )
 
@@ -3859,8 +4248,9 @@ class OpteryxCatalog(Metastore):
         name: str,
         author: str | None = None,
         missing_ok: bool = False,
+        holder_kind: str = DATASET_HOLDER,
     ) -> None:
-        """Remove a trigger from a dataset.
+        """Remove a trigger from its holder - a dataset, or a task.
 
         Dropping a materialized view's refresh trigger orphans the view: it
         stays queryable but stops refreshing. That is the supported way to
@@ -3871,8 +4261,8 @@ class OpteryxCatalog(Metastore):
         """
         if not author:
             raise ValueError("author must be provided when dropping a trigger")
-        collection, dataset_name = self._local_parts(dataset_identifier)
-        doc_ref = self._triggers_collection(collection, dataset_name).document(name)
+        collection, dataset_name, triggers = self._trigger_holder(dataset_identifier, holder_kind)
+        doc_ref = triggers.document(name)
         existing = doc_ref.get()
         if not existing.exists:
             if missing_ok:
@@ -3892,7 +4282,7 @@ class OpteryxCatalog(Metastore):
             self._release_task_trigger(
                 self._task_doc_ref(task_collection, task_document),
                 name,
-                self._qualify(dataset_identifier),
+                self._holder_identifier(dataset_identifier, holder_kind),
             )
 
         emit_audit(
@@ -3905,11 +4295,18 @@ class OpteryxCatalog(Metastore):
             trigger=name,
         )
 
-    def list_triggers(self, dataset_identifier: str) -> list[dict]:
-        """All triggers attached to a dataset, as plain dicts."""
-        collection, dataset_name = self._local_parts(dataset_identifier)
+    def list_triggers(
+        self, dataset_identifier: str, holder_kind: str = DATASET_HOLDER
+    ) -> list[dict]:
+        """All triggers a holder carries, as plain dicts.
+
+        The holder is a dataset by default - the commit path's question, "what
+        does this commit fire" - or, with `holder_kind="task"`, the task whose
+        schedule or signal trigger is wanted.
+        """
+        _, _, triggers = self._trigger_holder(dataset_identifier, holder_kind)
         results = []
-        for doc in self._triggers_collection(collection, dataset_name).stream():
+        for doc in triggers.stream():
             data = doc.to_dict() or {}
             data.setdefault("name", doc.id)
             results.append(data)
@@ -4872,6 +5269,7 @@ class OpteryxCatalog(Metastore):
         name: str,
         suspended: bool,
         author: str | None = None,
+        holder_kind: str = DATASET_HOLDER,
     ) -> None:
         """Suspend or resume one trigger.
 
@@ -4880,16 +5278,26 @@ class OpteryxCatalog(Metastore):
         it - the suppression stays visible where an operator looks for the reason
         a table stopped updating, rather than leaving no trace at all.
         """
-        collection, dataset_name = self._local_parts(dataset_identifier)
-        ref = self._triggers_collection(collection, dataset_name).document(name)
-        if not ref.get().exists:
+        collection, dataset_name, triggers = self._trigger_holder(dataset_identifier, holder_kind)
+        ref = triggers.document(name)
+        existing = ref.get()
+        if not existing.exists:
             raise TriggerNotFound(f"Trigger not found: {name} on {collection}.{dataset_name}")
-        ref.update(
-            {
-                "suspended-at-ms": int(time.time() * 1000) if suspended else None,
-                "suspended-by": author if suspended else None,
-            }
-        )
+        update = {
+            "suspended-at-ms": int(time.time() * 1000) if suspended else None,
+            "suspended-by": author if suspended else None,
+        }
+        data = existing.to_dict() or {}
+        if not suspended and data.get("event-kind") == SCHEDULE_EVENT_KIND:
+            # RESUME RECOMPUTES FROM NOW. A schedule suspended for a week still
+            # holds the due instant it was paused on; left alone, the clock
+            # would fire it the moment it was resumed, for a slot nobody
+            # meant to backfill. The next occurrence after now is what a
+            # resumed schedule means.
+            update["next-due-at-ms"] = next_due_ms(
+                data.get("schedule"), data.get("time-zone"), int(time.time() * 1000)
+            )
+        ref.update(update)
 
         emit_audit(
             "suspend_trigger" if suspended else "resume_trigger",
@@ -4907,6 +5315,7 @@ class OpteryxCatalog(Metastore):
         name: str,
         new_owner: str,
         author: str | None = None,
+        holder_kind: str = DATASET_HOLDER,
     ) -> None:
         """Repoint the identity a trigger's unattended runs execute as.
 
@@ -4920,8 +5329,8 @@ class OpteryxCatalog(Metastore):
         _assert_can_own(
             new_owner, f"trigger {name} on {dataset_identifier}", workspace=self.workspace
         )
-        collection, dataset_name = self._local_parts(dataset_identifier)
-        ref = self._triggers_collection(collection, dataset_name).document(name)
+        collection, dataset_name, triggers = self._trigger_holder(dataset_identifier, holder_kind)
+        ref = triggers.document(name)
         if not ref.get().exists:
             raise TriggerNotFound(f"Trigger not found: {name} on {collection}.{dataset_name}")
         ref.update({"runs-as": new_owner})
@@ -4937,17 +5346,25 @@ class OpteryxCatalog(Metastore):
             new_owner=new_owner,
         )
 
-    def mark_trigger_fired(self, dataset_identifier: str, name: str, status: str) -> None:
+    def mark_trigger_fired(
+        self,
+        dataset_identifier: str,
+        name: str,
+        status: str,
+        holder_kind: str = DATASET_HOLDER,
+    ) -> None:
         """Stamp a trigger's last-fired fields. Called by the enqueue path."""
-        collection, dataset_name = self._local_parts(dataset_identifier)
-        self._triggers_collection(collection, dataset_name).document(name).update(
+        _, _, triggers = self._trigger_holder(dataset_identifier, holder_kind)
+        triggers.document(name).update(
             {
                 "last-fired-at-ms": int(time.time() * 1000),
                 "last-fired-status": status,
             }
         )
 
-    def claim_trigger_fire(self, dataset_identifier: str, name: str) -> TriggerFireClaim:
+    def claim_trigger_fire(
+        self, dataset_identifier: str, name: str, holder_kind: str = DATASET_HOLDER
+    ) -> TriggerFireClaim:
         """Atomically claim the right to fire one trigger now.
 
         THE RACE THIS CLOSES. A floor between firings implemented as "read the
@@ -4971,8 +5388,8 @@ class OpteryxCatalog(Metastore):
         without a write, so a trigger that predates the field costs what it
         always did. `fire_triggers` does not call this for one at all.
         """
-        collection, dataset_name = self._local_parts(dataset_identifier)
-        ref = self._triggers_collection(collection, dataset_name).document(name)
+        collection, dataset_name, triggers = self._trigger_holder(dataset_identifier, holder_kind)
+        ref = triggers.document(name)
 
         @firestore.transactional
         def _claim(transaction) -> TriggerFireClaim:
@@ -4998,7 +5415,11 @@ class OpteryxCatalog(Metastore):
         return _claim(self.firestore_client.transaction())
 
     def release_trigger_fire(
-        self, dataset_identifier: str, name: str, claim: TriggerFireClaim
+        self,
+        dataset_identifier: str,
+        name: str,
+        claim: TriggerFireClaim,
+        holder_kind: str = DATASET_HOLDER,
     ) -> None:
         """Hand back a granted claim whose fire did not happen.
 
@@ -5011,8 +5432,8 @@ class OpteryxCatalog(Metastore):
         """
         if not claim.granted or claim.interval_seconds <= 0:
             return
-        collection, dataset_name = self._local_parts(dataset_identifier)
-        ref = self._triggers_collection(collection, dataset_name).document(name)
+        _, _, triggers = self._trigger_holder(dataset_identifier, holder_kind)
+        ref = triggers.document(name)
 
         @firestore.transactional
         def _release(transaction) -> None:
@@ -5025,12 +5446,99 @@ class OpteryxCatalog(Metastore):
 
         _release(self.firestore_client.transaction())
 
+    def claim_schedule_tick(
+        self, task_identifier: str | tuple, name: str, now_ms: int | None = None
+    ) -> ScheduleTickClaim:
+        """Atomically claim a schedule trigger's due tick, advancing it past now.
+
+        COMPARE-AND-ADVANCE, in one transaction, for the reason
+        `claim_trigger_fire` gives: dispatch.opteryx runs one instance, but
+        "one" is a soft guarantee - a rollout serves two revisions at once -
+        and two loops reading the same due record must resolve to one fire.
+        Both read `next-due-at-ms`; one commits the advance; the other is
+        retried against the committed value, finds it in the future, and is
+        refused. The singleton is an optimisation, not what correctness rests
+        on.
+
+        A MISSED SLOT FIRES ONCE. A record due an hour ago is advanced to the
+        first occurrence after NOW, not to the next after its old due instant:
+        an outage does not replay every slot it covered. A run windowed OVER a
+        dataset covers the gap by construction (its window starts where the
+        last success ended), and a windowless task has nothing to replay. The
+        number of slots skipped is returned so the fire's audit record can say
+        so.
+
+        Handed back by `release_schedule_tick` if the fire raises, so a tick
+        that submitted nothing consumes nothing. A hard kill between the
+        advance and the submission loses that one slot; the next still fires.
+        At-most-once per slot, which is the only order that cannot double-fire
+        under overlap.
+        """
+        now_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
+        collection, task_name, triggers = self._trigger_holder(task_identifier, TASK_HOLDER)
+        ref = triggers.document(name)
+
+        @firestore.transactional
+        def _claim(transaction) -> ScheduleTickClaim:
+            snapshot = ref.get(transaction=transaction)
+            if not snapshot.exists:
+                raise TriggerNotFound(f"Trigger not found: {name} on {collection}.{task_name}")
+            data = snapshot.to_dict() or {}
+            if data.get("event-kind") != SCHEDULE_EVENT_KIND:
+                raise ValueError(
+                    f"trigger {name} on {collection}.{task_name} is a "
+                    f"{data.get('event-kind') or COMMIT_EVENT_KIND} trigger, not a schedule"
+                )
+            due = data.get("next-due-at-ms")
+            if due is None or int(due) > now_ms:
+                return ScheduleTickClaim(granted=False, previous_due_ms=due, next_due_ms=due)
+            due = int(due)
+            schedule, zone = data.get("schedule"), data.get("time-zone")
+            following = next_due_ms(schedule, zone, now_ms)
+            skipped = occurrences_between(schedule, zone, due, now_ms)
+            transaction.update(ref, {"next-due-at-ms": following})
+            return ScheduleTickClaim(
+                granted=True,
+                previous_due_ms=due,
+                next_due_ms=following,
+                skipped_occurrences=skipped,
+            )
+
+        return _claim(self.firestore_client.transaction())
+
+    def release_schedule_tick(
+        self, task_identifier: str | tuple, name: str, claim: ScheduleTickClaim
+    ) -> None:
+        """Hand back a granted tick whose fire did not happen.
+
+        Only while the record still holds THIS claim's advance: a release that
+        lands after a later tick claimed again would put a stale due instant
+        under a live one and fire the slot twice. Checked and written in one
+        transaction, as the claim is.
+        """
+        if not claim.granted:
+            return
+        _, _, triggers = self._trigger_holder(task_identifier, TASK_HOLDER)
+        ref = triggers.document(name)
+
+        @firestore.transactional
+        def _release(transaction) -> None:
+            snapshot = ref.get(transaction=transaction)
+            if not snapshot.exists:
+                return
+            if (snapshot.to_dict() or {}).get("next-due-at-ms") != claim.next_due_ms:
+                return
+            transaction.update(ref, {"next-due-at-ms": claim.previous_due_ms})
+
+        _release(self.firestore_client.transaction())
+
     def set_trigger_minimum_interval(
         self,
         dataset_identifier: str,
         name: str,
         seconds: int,
         author: str | None = None,
+        holder_kind: str = DATASET_HOLDER,
     ) -> None:
         """Set the floor between two firings of one trigger; 0 removes it.
 
@@ -5041,8 +5549,8 @@ class OpteryxCatalog(Metastore):
         excuse a fire that already happened.
         """
         seconds = _validate_minimum_interval(seconds)
-        collection, dataset_name = self._local_parts(dataset_identifier)
-        ref = self._triggers_collection(collection, dataset_name).document(name)
+        collection, dataset_name, triggers = self._trigger_holder(dataset_identifier, holder_kind)
+        ref = triggers.document(name)
         if not ref.get().exists:
             raise TriggerNotFound(f"Trigger not found: {name} on {collection}.{dataset_name}")
         ref.update({"minimum-interval-seconds": seconds})
