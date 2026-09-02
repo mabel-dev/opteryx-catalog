@@ -3229,10 +3229,16 @@ class OpteryxCatalog(Metastore):
         this value, the gap is what makes the next run cover those commits.
 
         The status vocabulary, as `information_schema.tasks.last_fired_status`
-        reports it: `enqueued` (a run was submitted), `superseded` (the window
-        guard found this commit already consumed, so nothing was submitted),
-        `suspended`, `owner-missing`, `egress-blocked`, `error`. Anything the
-        worker records on completion joins them here.
+        reports it. Stamped at FIRE time by `trigger_firing._fire_task`:
+        `enqueued` (a run was submitted), `superseded` (the window guard found
+        this commit already consumed, so nothing was submitted), `suspended`,
+        `owner-missing`, `egress-blocked`, `error`. Stamped at COMPLETION by
+        worker.opteryx (`_stamp_fired_task`), which is the only writer of
+        `window_to`: `succeeded`, `failed`, `denied` - the same words the
+        engine writes for a materialized view's `last-refresh-status`. Because
+        completion overwrites `enqueued`, a task whose every run fails does not
+        read as healthy; and because only success carries `window_to`, the
+        guard's floor moves only when rows were actually consumed.
         """
         collection, task_name = self._task_parts(identifier)
 
