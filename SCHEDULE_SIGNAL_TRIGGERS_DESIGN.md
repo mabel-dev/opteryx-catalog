@@ -1,7 +1,14 @@
 # Clock and Signal Triggers, and dispatch.opteryx — The Dispatcher That Did Not Exist
 
-Status: proposed 2026-09-02 (design discussion, Justin + Claude). Not
-implemented. Companion to: `TASK_WINDOWING_DESIGN.md` (the one-trigger rule
+Status: agreed 2026-09-02 (design discussion, Justin + Claude). IMPLEMENTED
+2026-09-02 across `opteryx-catalog` (holder generalisation, `schedules.py`,
+`fire_signal` / `fire_due_schedules`, the tick claim, integrity), `opteryx-core`
+(the grammar, binder, both connectors, `information_schema.triggers`),
+`opteryx-access` (the SIGNAL action) and the new `dispatch.opteryx` service.
+Not yet done: jobs.opteryx reading `client_info.trigger.holder` (§7) - until
+it does, a task-held trigger's run cannot resolve its identity there and is
+refused, which is the safe direction; and the deployment itself (§11 step 5).
+Companion to: `TASK_WINDOWING_DESIGN.md` (the one-trigger rule
 and the window guard this reuses) and `MATERIALIZED_VIEWS_TRIGGERS_PLAN.md`
 (the trigger substrate). The engine currently refuses these triggers by name
 (`pre_parse.py`, `_TRIGGER_EVENT_LEAD`) with the message "Clock and signal
@@ -409,11 +416,21 @@ no change.
    `dispatch.opteryx.app` mapped; `croniter` added to the catalog's
    dependencies.
 
-## 12. Open questions
+## 12. Decisions taken during implementation
 
-- The keyword. `OVER <table>` was chosen because it reads as "windowed over";
-  `FOR` and `OF` were the alternatives.
-- Whether a schedule trigger should ever be allowed on a task that also has a
-  commit trigger. This document says no (one trigger, one sequence). The case
-  for yes is "fire on commit, but also at least hourly", which is better
-  served by `OVER` alone on a schedule, since a quiet tick is free.
+- The keyword is `OVER <table>`; `FOR` and `OF` were the alternatives.
+- A task has one trigger whichever holder it lives under: a task with a
+  commit trigger refuses a schedule or signal and vice versa. "Fire on commit
+  but also at least hourly" is served by a schedule `OVER` the same dataset,
+  since a quiet tick is free.
+- Trigger records carry `holder` and `holder-kind` explicitly, so a record
+  read through a collection-group query (§5.1) says where it lives without
+  parsing its path, and `event-kind` is a separate axis from `kind`.
+- A schedule's `next-due-at-ms` is recomputed on `OR REPLACE` and on
+  `RESUME`, never carried forward: the due instant is a function of the
+  expression and now.
+- The signal endpoint takes the trigger's name in the URL and checks it
+  against the task's back-pointer before firing, so a stale webhook URL is a
+  404 rather than a fire of whatever trigger the task has now.
+- The token audience authenticate.opteryx mints is `opteryx`; the service
+  defaults to it.

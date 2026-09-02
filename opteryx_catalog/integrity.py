@@ -24,6 +24,17 @@ Finding kinds:
 - ``missing-source-trigger``: a materialized view with a source that
   carries no refresh trigger pointing back at it - the MV silently never
   refreshes from that source.
+- ``ghost-task``: a task path with no document, kept addressable by a
+  leftover `triggers` subcollection - the same shape as a ghost dataset,
+  reachable the same way, since a task holds its own schedule or signal
+  trigger.
+- ``stale-schedule``: a schedule trigger whose due instant is more than a
+  day in the past and which is not suspended. The clock (dispatch.opteryx)
+  advances the instant when it claims a tick, so one that has not moved is
+  the clock having stopped - or never having been pointed at this database.
+- ``dangling-window-source``: a task-held trigger windowed OVER a dataset
+  that no longer exists. It fires, fails binding the window, and alerts on
+  every tick.
 - ``trigger-cycle``: refresh triggers that close a loop. The trigger
   graph is the one that fires, and it must be a DAG - a cycle in it
   refreshes forever, since nothing at run time carries a hop count.
@@ -33,11 +44,13 @@ Finding kinds:
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from .opteryx_catalog import MATERIALIZED_VIEW_TYPE
 from .opteryx_catalog import MV_REFRESH_TRIGGER_KIND
 from .opteryx_catalog import PLATFORM_IDENTITIES
+from .opteryx_catalog import SCHEDULE_EVENT_KIND
 from .opteryx_catalog import TASKS_SUBCOLLECTION
 from .opteryx_catalog import TRIGGERS_SUBCOLLECTION
 
@@ -149,6 +162,53 @@ def _check_trigger_owner(
             f"{dataset_path}/triggers/{trigger.get('name') or '?'}",
             f"unattended runs execute as {owner}, a platform identity that nothing "
             "bills; transfer it to an account with ALTER TRIGGER ... OWNER TO",
+        )
+    return None
+
+
+# A schedule whose due instant is this far behind is one the clock is not
+# advancing. A day rather than a few minutes: the audit is a periodic sweep, not
+# the live heartbeat dispatch.opteryx keeps, and a finding here should mean
+# "stopped", not "busy".
+STALE_SCHEDULE_MS = 24 * 60 * 60 * 1000
+
+
+def _check_schedule_stale(
+    holder_path: str, trigger: dict[str, Any], now_ms: int
+) -> dict[str, str] | None:
+    """A finding for a live schedule trigger the clock has stopped advancing."""
+    if trigger.get("event-kind") != SCHEDULE_EVENT_KIND or trigger.get("suspended-at-ms"):
+        return None
+    due = trigger.get("next-due-at-ms")
+    if due is None:
+        return _finding(
+            "stale-schedule",
+            f"{holder_path}/triggers/{trigger.get('name') or '?'}",
+            "schedule trigger has no next-due-at-ms; it can never be found due",
+        )
+    if now_ms - int(due) > STALE_SCHEDULE_MS:
+        behind = (now_ms - int(due)) // (60 * 60 * 1000)
+        return _finding(
+            "stale-schedule",
+            f"{holder_path}/triggers/{trigger.get('name') or '?'}",
+            f"due {behind}h ago and never claimed; the clock is not advancing it",
+        )
+    return None
+
+
+def _check_window_source(
+    client, workspace: str, holder_path: str, trigger: dict[str, Any]
+) -> dict[str, str] | None:
+    """A finding for a task-held trigger whose OVER dataset is gone."""
+    source = trigger.get("window-source")
+    if not source:
+        return None
+    parts = _split_target(source, workspace)
+    if parts is None or not _dataset_exists(client, *parts):
+        return _finding(
+            "dangling-window-source",
+            f"{holder_path}/triggers/{trigger.get('name') or '?'}",
+            f"windowed OVER {source}, which does not exist",
         )
     return None
 
@@ -310,5 +370,32 @@ def audit_workspace(client, workspace: str) -> list[dict[str, str]]:
                 findings.extend(
                     _check_mv_sources(client, workspace, collection_ref.id, dataset_ref.id, data)
                 )
+        # Task-held triggers: the schedule or signal that fires each task. Walked
+        # with `list_documents()` for the same reason datasets are - a dropped
+        # task whose trigger survived is a ghost only that read can see.
+        now_ms = int(time.time() * 1000)
+        for task_ref in collection_ref.collection(TASKS_SUBCOLLECTION).list_documents():
+            task_path = f"{workspace}/{collection_ref.id}/{TASKS_SUBCOLLECTION}/{task_ref.id}"
+            if not task_ref.get().exists:
+                leftovers = _leftover_subcollections(task_ref)
+                findings.append(
+                    _finding(
+                        "ghost-task",
+                        task_path,
+                        "no document; kept addressable by subcollection(s): "
+                        + (", ".join(leftovers) or "unknown"),
+                    )
+                )
+                continue
+            for doc in task_ref.collection(TRIGGERS_SUBCOLLECTION).stream():
+                trigger = doc.to_dict() or {}
+                for finding in (
+                    _check_trigger(client, workspace, task_path, trigger),
+                    _check_trigger_owner(task_path, trigger),
+                    _check_schedule_stale(task_path, trigger, now_ms),
+                    _check_window_source(client, workspace, task_path, trigger),
+                ):
+                    if finding:
+                        findings.append(finding)
     findings.extend(_check_trigger_cycles(trigger_edges))
     return findings
