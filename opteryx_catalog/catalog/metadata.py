@@ -144,10 +144,11 @@ class DatasetMetadata:
     # own refresh - the registration would not survive the first one.
     statement_id: str | None = None
     source_tables: list[str] = field(default_factory=list)
-    # The pinned identity a refresh executes as. Here for exactly the reason
-    # above: it is set once at registration and never rewritten, so a commit
-    # that dropped it would silently return the view to running as whoever's
-    # write fired it - the behaviour the pin exists to remove, failing open.
+    # LEGACY, carried and never written. The identity a refresh executes as
+    # lives on each refresh TRIGGER now, not on the view; this field survives
+    # only so that a commit to a view registered under the old model does not
+    # destroy the value before `scripts/backfill_refresh_trigger_identity.py`
+    # has copied it onto the triggers. Retired with that script's last run.
     runs_as: str | None = None
     # Refresh suspended by an operator. On the VIEW rather than on its triggers:
     # a view with four sources has four triggers, and suspending three of

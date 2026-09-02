@@ -142,7 +142,7 @@ class TaskNotFound(TaskError):
 
 
 class TaskOwnerMissing(TaskError):
-    """The task has no `runs-as` identity recorded.
+    """The trigger firing a task has no `runs-as` identity recorded.
 
     Refused rather than defaulted to whoever fired it: defaulting silently
     reinstates invoker semantics, so a field lost by some unrelated write
@@ -265,12 +265,13 @@ class EgressRestricted(CatalogError):
 
 
 class MaterializedViewOwnerMissing(Alertable, CatalogError):
-    """A registered materialized view has no `runs-as` identity.
+    """A materialized view's refresh trigger has no `runs-as` identity.
 
-    Every registration writes one, and nothing but `set_materialized_view_owner`
-    rewrites it, so its absence means the record was damaged - a document edited
-    out of band, or a write path that replaced the dataset document without
-    carrying the field (the trap `DatasetMetadata` exists to close).
+    Every trigger `create_materialized_view` lands carries one, and only
+    `set_trigger_owner` and `set_materialized_view_owner` rewrite it, so its
+    absence means the record was damaged - a document edited out of band, or a
+    trigger written before the identity moved from the view onto its triggers
+    and never run through `scripts/backfill_refresh_trigger_identity.py`.
 
     `Alertable` because it is a should-be-impossible state, not a caller error.
     And raised rather than defaulted, deliberately: the obvious fallback is the
@@ -547,8 +548,8 @@ class SnapshotRaceError(CatalogError):
 
 
 class PlatformIdentityOwnerRefused(CatalogError):
-    """Raised when a platform identity is offered as a trigger's or a
-    materialized view's `runs-as`.
+    """Raised when a platform identity is offered as a trigger's `runs-as` -
+    a materialized view's refresh triggers included.
 
     A COSTING rule, not an access one, which is why it is not answerable from
     grants: these identities hold broad grants precisely because the platform

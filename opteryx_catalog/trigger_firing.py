@@ -98,6 +98,30 @@ NO_PARENT_VERSION_FLOOR = 1
 # refresh itself, which jobs runs asynchronously long after this returns.
 HTTP_TIMEOUT_SECONDS = 30
 
+
+def _qualified_source(catalog, dataset_identifier: str) -> str:
+    """The firing dataset's name as `workspace.collection.dataset`.
+
+    The commit path hands `fire_triggers` the dataset's own identifier, which
+    is `collection.dataset` - the workspace is the catalog handle's, not part
+    of the name. That spelling went onto the job document as
+    `trigger.source_dataset` verbatim, and it is the one name in the
+    provenance block that is NOT how anything else spells a resource: policy
+    patterns, the target, and every catalog record carry the workspace. The
+    run-history listing in jobs checks the caller may READ the source, and a
+    two-part name matches no `ws.coll.*` grant, so every fired run was
+    filtered out of its own history.
+
+    Qualified here, once, where the workspace is known for certain: this
+    handle's, because a trigger fires on a commit to a dataset in the
+    workspace the handle is bound to. Idempotent for a name that already
+    carries one, in the same way `_qualify` on the catalog is.
+    """
+    parts = dataset_identifier.split(".")
+    if len(parts) >= 3:
+        return dataset_identifier
+    return f"{catalog.workspace}.{dataset_identifier}"
+
 _KILL_SWITCH_ENV = "OPTERYX_TRIGGER_FIRING"
 
 logger = logging.getLogger(__name__)
@@ -416,16 +440,19 @@ def _submit_refresh_job(
 
     The payload is the REFRESH statement plus provenance, nothing more. The
     statement is self-identifying - `REFRESH MATERIALIZED VIEW <name>` parses
-    as its own query class - so jobs recognises it, resolves the view's
-    pinned `runs-as`, that principal's policies and billing account, routes it
-    to the background worker, and derives the dedup window. None of those are
-    this library's to assert: a submission that could name the actor or the
-    payer is a submission that could name them WRONGLY, and the control point
-    exists so that nothing below it has to be trusted about either.
+    as its own query class - so jobs recognises it, resolves the firing
+    trigger's pinned `runs-as` from the trigger record the provenance names,
+    that principal's policies and billing account, routes it to the background
+    worker, and derives the dedup window. None of those are this library's to
+    assert: a submission that could name the actor or the payer is a
+    submission that could name them WRONGLY, and the control point exists so
+    that nothing below it has to be trusted about either.
 
     `client_info.trigger` is provenance for the audit trail - which commit
-    fired this - not instructions. jobs derives the authoritative workspace
-    and target view from the statement itself.
+    fired this, through which trigger - not instructions. jobs derives the
+    authoritative workspace and target view from the statement itself, and
+    reads the trigger's identity from the catalog rather than from anything
+    sent here.
     """
     payload = {
         "sql_text": sql_text,
@@ -511,12 +538,22 @@ def _fire_refresh(
     # a snapshot of what it was when someone committed to a source.
     sql_text = f"REFRESH MATERIALIZED VIEW {mv['identifier']}"
 
-    # The refresh runs as the view's pinned owner, NOT as whoever's commit fired
-    # it. A committer is incidental - an ingest account with writer on a source
-    # collection and nothing on the view's would make the view permanently
-    # unrefreshable, and which principal happened to write last would decide
-    # whether a refresh worked. The owner is the identity that chose to create
-    # the standing cost, and the only one it makes sense to charge and check.
+    # The refresh runs as the TRIGGER's pinned `runs-as` - never as whoever's
+    # commit fired it, and never as anything on the view. The view is stored
+    # SQL with no identity of its own, exactly as a task is: a person running
+    # REFRESH runs it as themselves, and an unattended refresh carries the
+    # identity of the trigger that started it, the same rule `_fire_task`
+    # applies. A committer is incidental - an ingest account with writer on a
+    # source collection and nothing on the view's would make the view
+    # permanently unrefreshable, and which principal happened to write last
+    # would decide whether a refresh worked.
+    #
+    # The identity used to live on the view, on the argument that a view's N
+    # refresh triggers must share one identity and only one record can be
+    # changed atomically. They still share one: `set_materialized_view_owner`
+    # repoints every refresh trigger of a view in one batch, and
+    # `create_materialized_view` pins a new trigger to the author without
+    # touching the ones that exist. What moved is where the answer is read.
     #
     # An owner whose grants have been revoked yields no policies, the binder
     # denies, and `last-refresh-status` records it. That is the intended
@@ -528,18 +565,23 @@ def _fire_refresh(
     # so a field lost by some unrelated write reappears hours later as a
     # baffling permission denial (or, if the committer happens to be
     # privileged, as a refresh running with authority the view never had).
-    runs_as = mv.get("runs-as")
+    # Nor is the view's record consulted as a fallback: a trigger written
+    # before the identity moved onto triggers is what the backfill script is
+    # for, and reading the old field here would keep the old model alive.
+    runs_as = trigger.get("runs-as")
     if not runs_as:
         raise MaterializedViewOwnerMissing(
-            f"materialized view {target_view} has no runs-as identity; refusing to "
-            "refresh it as the committing user. Set one with ALTER MATERIALIZED "
-            f"VIEW {target_view} OWNER TO <principal>."
+            f"trigger {trigger['name']} on {dataset_identifier} has no runs-as identity; "
+            f"refusing to refresh {target_view} as the committing user. Set one with "
+            f"ALTER TRIGGER {trigger['name']} ON {dataset_identifier} OWNER TO "
+            f"<principal>, or move every refresh trigger of the view at once with "
+            f"ALTER MATERIALIZED VIEW {target_view} OWNER TO <principal>."
         )
 
     execution_id, outcome = _submit_refresh_job(
         catalog,
         sql_text=sql_text,
-        source_dataset=dataset_identifier,
+        source_dataset=_qualified_source(catalog, dataset_identifier),
         trigger_name=trigger["name"],
         target_view=target_view,
         snapshot_id=snapshot_id,
@@ -694,7 +736,7 @@ def _fire_task(
     execution_id, outcome = _submit_task_job(
         catalog,
         sql_text=sql_text,
-        source_dataset=dataset_identifier,
+        source_dataset=_qualified_source(catalog, dataset_identifier),
         trigger_name=trigger["name"],
         target_task=target_task,
         snapshot_id=snapshot_id,
@@ -716,6 +758,14 @@ def _fire_task(
             "author": author,
         }
     )
+
+
+def _minimum_interval_seconds(trigger: dict) -> int:
+    """The trigger's firing floor as listed; 0 for a record that has none."""
+    try:
+        return max(0, int(trigger.get("minimum-interval-seconds") or 0))
+    except (TypeError, ValueError):
+        return 0
 
 
 # Statuses for the failures that RAISE. Recorded in one place - the handler in
@@ -751,6 +801,9 @@ def fire_triggers(
     One refresh per distinct target view, however many triggers point at it.
     Never raises: each trigger's failure is alerted and audited individually,
     and one bad trigger does not stop the rest firing.
+
+    A trigger with a firing floor (`minimum-interval-seconds`) is claimed before it
+    fires and skipped as `throttled` inside the interval after a granted claim.
     """
     if not firing_enabled():
         return
@@ -795,9 +848,48 @@ def fire_triggers(
             continue
 
         seen_targets.add(target_view)
+        claim = None
         try:
+            # THE FLOOR. A trigger carrying `minimum-interval-seconds` fires at most
+            # once per interval. The right to fire is CLAIMED in a transaction
+            # on the trigger document - see `claim_trigger_fire` for why a
+            # read-then-stamp would let a burst of commits all through - and
+            # taken before the submission so the stamp cannot be keyed on an
+            # outcome. A refused claim is recorded like a suspension: not an
+            # error, not alerted, but visible where someone looks for the run
+            # they expected. A record with no floor is never claimed, so a
+            # trigger that predates the field costs exactly what it did.
+            if _minimum_interval_seconds(trigger) > 0:
+                claim = catalog.claim_trigger_fire(dataset_identifier, trigger["name"])
+                if not claim.granted:
+                    catalog.mark_trigger_fired(
+                        dataset_identifier, trigger["name"], status="throttled"
+                    )
+                    write_audit_record(
+                        {
+                            "event": "trigger.throttled",
+                            "workspace": getattr(catalog, "workspace", None),
+                            "dataset": dataset_identifier,
+                            "trigger": trigger["name"],
+                            "target_view": target_view,
+                            "minimum_interval_seconds": claim.interval_seconds,
+                            "last_claimed_at_ms": claim.at_ms,
+                            "author": author,
+                        }
+                    )
+                    continue
             fire()
         except Exception as exc:  # noqa: BLE001 - commit path must survive
+            # A claim whose fire raised is handed back first, so the failure
+            # does not also silence the next interval. Guarded like the stamp
+            # below: the alert is what must still happen.
+            if claim is not None and claim.granted:
+                try:
+                    catalog.release_trigger_fire(dataset_identifier, trigger["name"], claim)
+                except Exception:  # noqa: BLE001 - never displace the real failure
+                    logger.warning(
+                        "could not release the fire claim on trigger %s", trigger.get("name")
+                    )
             # Stamp the trigger BEFORE alerting. Every expected outcome above
             # records itself - suspended, egress-blocked, owner-missing - but an
             # unexpected exception used to record nothing at all, so a trigger

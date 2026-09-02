@@ -43,13 +43,17 @@ def _catalog_stub(triggers=None, mv=None):
         "sql": "SELECT * FROM ws.src.a",
         "statement-id": "1",
         "source-tables": ["ws.src.a"],
-        "runs-as": "olive",
     }
     return catalog
 
 
-def _refresh_trigger(name="refresh__mart__daily", target="ws.mart.daily"):
-    return {"name": name, "kind": "materialized_view_refresh", "target-view": target}
+def _refresh_trigger(name="refresh__mart__daily", target="ws.mart.daily", runs_as="olive"):
+    # `runs-as` on the TRIGGER: the identity an unattended refresh carries,
+    # exactly as a task trigger carries the identity of the run it starts.
+    trigger = {"name": name, "kind": "materialized_view_refresh", "target-view": target}
+    if runs_as is not None:
+        trigger["runs-as"] = runs_as
+    return trigger
 
 
 # --- pure helpers --------------------------------------------------------
@@ -58,20 +62,16 @@ def _refresh_trigger(name="refresh__mart__daily", target="ws.mart.daily"):
 # --- fire_triggers flow --------------------------------------------------
 
 
-def test_a_view_with_no_owner_refuses_to_fire():
-    """A registered view with no `runs-as` is a damaged record, not a caller
+def test_a_trigger_with_no_owner_refuses_to_fire():
+    """A refresh trigger with no `runs-as` is a damaged record, not a caller
     error, and the tempting default - the committing user - is the one answer
     guaranteed to be wrong: it silently reinstates invoker semantics, so the
     loss resurfaces hours later as a baffling permission denial.
 
-    Nothing is enqueued, the trigger records why, and it alerts.
+    Nothing is enqueued, the trigger records why, and it alerts - naming the
+    trigger and the statement that fixes it.
     """
-    mv = dict(_catalog_stub().get_materialized_view.return_value)
-    mv.pop("runs-as")
-    catalog = _catalog_stub(triggers=[_refresh_trigger()], mv=mv)
-    jobs_collection = MagicMock()
-    jobs_client = MagicMock()
-    jobs_client.collection.return_value = jobs_collection
+    catalog = _catalog_stub(triggers=[_refresh_trigger(runs_as=None)])
 
     with (
         patch.object(trigger_firing, "_alert") as alert,
@@ -80,7 +80,32 @@ def test_a_view_with_no_owner_refuses_to_fire():
         # Never raises into the commit path, whatever it finds.
         fire_triggers(catalog, "src.a", author="alice", snapshot_id=123)
 
-    jobs_collection.document.return_value.set.assert_not_called()
+    enq.assert_not_called()
+    alert.assert_called_once()
+    message = str(alert.call_args.args[0])
+    assert "refresh__mart__daily" in message
+    assert "ALTER TRIGGER refresh__mart__daily ON src.a OWNER TO" in message
+    assert "ALTER MATERIALIZED VIEW ws.mart.daily OWNER TO" in message
+    catalog.mark_trigger_fired.assert_called_once_with(
+        "src.a", "refresh__mart__daily", status="owner-missing"
+    )
+
+
+def test_the_views_own_record_is_never_a_fallback():
+    """A view registered under the old model still carries `runs-as` on its
+    own document. Reading it here would keep the old model alive one record at
+    a time - the backfill script is what moves it - so a trigger with no
+    identity is refused even when the view has one to offer."""
+    mv = dict(_catalog_stub().get_materialized_view.return_value)
+    mv["runs-as"] = "olive"
+    catalog = _catalog_stub(triggers=[_refresh_trigger(runs_as=None)], mv=mv)
+
+    with (
+        patch.object(trigger_firing, "_alert") as alert,
+        patch.object(trigger_firing, "_submit_refresh_job") as enq,
+    ):
+        fire_triggers(catalog, "src.a", author="alice", snapshot_id=123)
+
     enq.assert_not_called()
     alert.assert_called_once()
     catalog.mark_trigger_fired.assert_called_once_with(
@@ -121,9 +146,13 @@ def test_fire_submits_the_refresh_through_jobs():
     assert "SELECT" not in kwargs["sql_text"]
     # Provenance only. The acting identity, policies, billing account and dedup
     # window are deliberately ABSENT: jobs resolves all four from the statement
-    # and the view's own definition, so this library cannot be wrong about them.
+    # and the trigger record the provenance names, so this library cannot be
+    # wrong about them.
     assert kwargs["fired_by"] == "alice"
-    assert kwargs["source_dataset"] == "src.a"
+    # Fully qualified, though the commit path hands over `collection.dataset`:
+    # the job document's provenance is checked against `ws.coll.*` grants by
+    # the run-history listing, and a two-part name matched none of them.
+    assert kwargs["source_dataset"] == "ws.src.a"
     assert kwargs["snapshot_id"] == 123
     assert kwargs["target_view"] == "ws.mart.daily"
     assert "runs_as" not in kwargs
@@ -134,6 +163,14 @@ def test_fire_submits_the_refresh_through_jobs():
     catalog.mark_trigger_fired.assert_called_once_with(
         "src.a", "refresh__mart__daily", status="enqueued"
     )
+
+
+def test_qualified_source_leaves_a_qualified_name_alone():
+    """Idempotent, like `_qualify` on the catalog: a caller that already has
+    the workspace on the name must not gain a second one."""
+    catalog = _catalog_stub()
+    assert trigger_firing._qualified_source(catalog, "src.a") == "ws.src.a"
+    assert trigger_firing._qualified_source(catalog, "ws.src.a") == "ws.src.a"
 
 
 def _workspace_doc(data):
@@ -202,7 +239,6 @@ def test_one_bad_trigger_does_not_stop_the_rest():
             "name": "ok",
             "collection": "mart",
             "sql": "SELECT 1",
-            "runs-as": "olive",
         }
 
     catalog.get_materialized_view.side_effect = mv_lookup

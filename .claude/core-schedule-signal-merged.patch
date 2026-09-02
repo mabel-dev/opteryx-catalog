@@ -1,0 +1,1914 @@
+diff --git a/opteryx/connectors/capabilities/writable.py b/opteryx/connectors/capabilities/writable.py
+index 3140d5e4..0edc6541 100644
+--- a/opteryx/connectors/capabilities/writable.py
++++ b/opteryx/connectors/capabilities/writable.py
+@@ -729,21 +729,38 @@ class Writable:
+         task_name: str,
+         author: Optional[str] = None,
+         or_replace: bool = False,
++        event_kind: str = "commit",
++        schedule: Optional[str] = None,
++        time_zone: Optional[str] = None,
++        window_source: Optional[str] = None,
+     ) -> None:
+-        """Attach a trigger to `relation_name` that runs `task_name` on commit.
++        """Attach a trigger to `relation_name` that runs `task_name`.
+ 
+-        The binder has established the caller may write `relation_name`; a
++        A trigger is an EVENT plus the identity its unattended runs carry. The
++        event decides what `relation_name` is: for a commit trigger (the
++        default) it is the dataset whose user-created commits fire the trigger;
++        for a schedule or signal trigger, which has no source dataset, it is the
++        TASK itself - the trigger lives under what it fires, and `task_name` is
++        the same name. A task holds at most one trigger of any kind.
++
++        The binder has established the caller may automate `relation_name`; a
+         trigger confers no authority of its own, so nothing here re-checks what
+         the task may do - that was settled against the task's author when it was
+         created.
+ 
+         Args:
+-            relation_name: dataset whose user-created commits fire the trigger
+-            trigger_name: name, unique per dataset
++            relation_name: the holder - the dataset whose commits fire the
++                trigger, or the task for a schedule or signal trigger
++            trigger_name: name, unique per holder
+             task_name: the task to run
+             author: session user this is attributed to
+             or_replace: repoint an existing trigger of this name rather than
+                 refusing
++            event_kind: "commit" | "schedule" | "signal"
++            schedule: five-field cron expression; schedule triggers only
++            time_zone: IANA zone the schedule is read in; None means UTC
++            window_source: dataset a schedule or signal run is windowed over,
++                or None for a run with no window
+         """
+         raise NotImplementedError(f"{self.__class__.__name__} does not support **CREATE TRIGGER**")
+ 
+diff --git a/opteryx/connectors/information_schema.py b/opteryx/connectors/information_schema.py
+index 522d6850..8b6340f1 100644
+--- a/opteryx/connectors/information_schema.py
++++ b/opteryx/connectors/information_schema.py
+@@ -746,17 +746,19 @@ class InformationSchemaViewsTable(BaseTable, _KeyColumnPredicatePushable):
+ 
+ 
+ class InformationSchemaTriggersTable(BaseTable, _KeyColumnPredicatePushable):
+-    """Reads `information_schema.triggers` from the catalog's per-dataset
+-    trigger listings - list_collections() -> list_datasets() -> list_triggers(),
+-    one round trip per dataset.
+-
+-    A trigger hangs off the dataset whose commits fire it (the SOURCE table),
+-    not off its target view, so the per-row check is on that source table -
+-    and it is AUTOMATE, matching CREATE/DROP/ALTER TRIGGER's gate, which is
+-    also on the source. A row here names the identity unattended runs carry
+-    and what they fire; only an owner could have made that arrangement or can
+-    change it, so only an owner sees it. An MV whose refresh trigger has been
+-    dropped simply has no row here.
++    """Reads `information_schema.triggers` from the catalog's per-holder
++    trigger listings - list_collections() -> list_datasets() -> list_triggers()
++    for the triggers datasets hold, then list_tasks() -> list_triggers(...,
++    holder_kind="task") for the ones tasks hold; one round trip per holder.
++
++    A commit trigger hangs off the dataset whose commits fire it (the SOURCE
++    table), not off its target view. A schedule or signal trigger has no source
++    dataset and hangs off the TASK it fires. Either way the per-row check is on
++    that holder - and it is AUTOMATE, matching CREATE/DROP/ALTER TRIGGER's
++    gate, which is also on the holder. A row here names the identity
++    unattended runs carry and what they fire; only an owner could have made
++    that arrangement or can change it, so only an owner sees it. An MV whose
++    refresh trigger has been dropped simply has no row here.
+ 
+     A SUSPENDED trigger is a row, and says so: `suspended_at`/`suspended_by`.
+     That is the difference between a trigger somebody paused and one that was
+@@ -775,7 +777,22 @@ class InformationSchemaTriggersTable(BaseTable, _KeyColumnPredicatePushable):
+         "trigger_catalog",
+         "trigger_collection",
+         "trigger_name",
++        # What the trigger HANGS OFF, as `collection.name`: the dataset whose
++        # commits fire a commit trigger, or the task a schedule or signal
++        # trigger fires. `SHOW TRIGGERS FOR <name>` filters on this, so it
++        # answers for a table and for a task alike.
++        "trigger_holder",
++        # The dataset the fired run's window is bound from: the holder for a
++        # commit trigger (its window is the commit), the OVER table for a
++        # schedule or signal trigger, null when such a trigger has none.
+         "event_object_table",
++        # WHAT FIRES IT - commit, schedule or signal - and for a schedule, when.
++        # A record written before events were told apart has no `event-kind`
++        # and is a commit trigger, the only kind there was.
++        "event_kind",
++        "schedule",
++        "time_zone",
++        "next_due_at",
+         "action_kind",
+         "target",
+         # WHOSE AUTHORITY the trigger's unattended runs carry - the trigger's
+@@ -809,9 +826,11 @@ class InformationSchemaTriggersTable(BaseTable, _KeyColumnPredicatePushable):
+         "minimum_interval_seconds",
+     )
+ 
+-    # trigger_catalog/trigger_collection/event_object_table are known before
+-    # the per-dataset list_triggers() round trip, so pushing them skips those
+-    # calls entirely; trigger_name only prunes rows after the listing.
++    # trigger_catalog/trigger_collection/trigger_holder are known before the
++    # per-holder list_triggers() round trip, so pushing them skips those calls
++    # entirely; so is event_object_table for a dataset's triggers, where it is
++    # the holder. For a task's triggers it is read off the record, so it is
++    # applied after the listing there, as trigger_name is everywhere.
+     #
+     # suspended_at/suspended_by are NOT here. They are known only once the
+     # listing has been read, so pushing them would skip no round trip, and
+@@ -819,7 +838,13 @@ class InformationSchemaTriggersTable(BaseTable, _KeyColumnPredicatePushable):
+     # null-ness test is declined and left as an ordinary Filter, which is the
+     # right answer for both.
+     _pushable_columns = frozenset(
+-        {"trigger_catalog", "trigger_collection", "event_object_table", "trigger_name"}
++        {
++            "trigger_catalog",
++            "trigger_collection",
++            "trigger_holder",
++            "event_object_table",
++            "trigger_name",
++        }
+     )
+ 
+     def __init__(self, *, dataset, catalog, workspace, telemetry, execution_context=None, **kwargs):
+@@ -834,7 +859,12 @@ class InformationSchemaTriggersTable(BaseTable, _KeyColumnPredicatePushable):
+             "trigger_catalog": _lt.VARCHAR,
+             "trigger_collection": _lt.VARCHAR,
+             "trigger_name": _lt.VARCHAR,
++            "trigger_holder": _lt.VARCHAR,
+             "event_object_table": _lt.VARCHAR,
++            "event_kind": _lt.VARCHAR,
++            "schedule": _lt.VARCHAR,
++            "time_zone": _lt.VARCHAR,
++            "next_due_at": _lt.TIMESTAMP(),
+             "action_kind": _lt.VARCHAR,
+             "target": _lt.VARCHAR,
+             "runs_as": _lt.VARCHAR,
+@@ -865,7 +895,12 @@ class InformationSchemaTriggersTable(BaseTable, _KeyColumnPredicatePushable):
+         trigger_catalog = []
+         trigger_collection = []
+         trigger_name = []
++        trigger_holder = []
+         event_object_table = []
++        event_kind = []
++        schedule = []
++        time_zone = []
++        next_due_at = []
+         action_kind = []
+         # What the trigger RUNS, whichever kind it is. A trigger has exactly one
+         # target, so this is one column rather than a `target_view`/`target_task`
+@@ -882,46 +917,85 @@ class InformationSchemaTriggersTable(BaseTable, _KeyColumnPredicatePushable):
+         suspended_by = []
+         minimum_interval_seconds = []
+ 
++        def emit(collection: str, holder: str, window_from, trigger: dict) -> None:
++            """One row, from a trigger record and the holder it was read off."""
++            name_value = trigger.get("name")
++            if not _key_predicates_allow(compiled, {"trigger_name": name_value}):
++                return
++            trigger_catalog.append(self.workspace)
++            trigger_collection.append(collection)
++            trigger_name.append(name_value)
++            trigger_holder.append(holder)
++            event_object_table.append(window_from)
++            event_kind.append(trigger.get("event-kind") or "commit")
++            schedule.append(trigger.get("schedule"))
++            time_zone.append(trigger.get("time-zone"))
++            next_due_at.append(_ms_to_datetime(trigger.get("next-due-at-ms")))
++            action_kind.append(trigger.get("kind"))
++            target.append(trigger.get("target-view") or trigger.get("target-task"))
++            runs_as.append(trigger.get("runs-as"))
++            created_by.append(trigger.get("created-by"))
++            created_at.append(_ms_to_datetime(trigger.get("created-at-ms")))
++            last_fired_at.append(_ms_to_datetime(trigger.get("last-fired-at-ms")))
++            last_fired_status.append(trigger.get("last-fired-status"))
++            # Both are cleared to None on RESUME, so a resumed trigger reports
++            # nulls rather than the stamp of the suspension it came out of.
++            suspended_at.append(_ms_to_datetime(trigger.get("suspended-at-ms")))
++            suspended_by.append(trigger.get("suspended-by"))
++            minimum_interval_seconds.append(trigger.get("minimum-interval-seconds"))
++
+         # See InformationSchemaTablesTable.read_dataset - trigger_catalog is
+         # constant per reader, so an excluding predicate skips enumeration
+         # entirely rather than filtering row by row.
+         if _key_predicates_allow(compiled, {"trigger_catalog": self.workspace}):
++            # Task-held triggers exist only where the catalog has tasks at all.
++            # An older library, or a test double, has no `list_tasks` and so
++            # nothing a task could hold - the guard `is_task` applies in the
++            # connector, for the same reason.
++            list_tasks = getattr(self.catalog, "list_tasks", None)
+             for collection in self.catalog.list_collections():
+                 if not _key_predicates_allow(compiled, {"trigger_collection": collection}):
+                     continue
+                 for name in self.catalog.list_datasets(collection):
+                     source_table = f"{collection}.{name}"
+-                    if not _key_predicates_allow(compiled, {"event_object_table": source_table}):
++                    # A commit trigger's holder IS its event_object_table, so a
++                    # predicate on either skips the round trip.
++                    if not _key_predicates_allow(
++                        compiled,
++                        {"trigger_holder": source_table, "event_object_table": source_table},
++                    ):
+                         continue
+                     if not _automatable(self.execution_context, self.workspace, collection, name):
+                         continue
+                     for trigger in self.catalog.list_triggers(source_table):
+-                        name_value = trigger.get("name")
+-                        if not _key_predicates_allow(compiled, {"trigger_name": name_value}):
++                        emit(collection, source_table, source_table, trigger)
++                if list_tasks is None:
++                    continue
++                for name in list_tasks(collection):
++                    holder = f"{collection}.{name}"
++                    if not _key_predicates_allow(compiled, {"trigger_holder": holder}):
++                        continue
++                    if not _automatable(self.execution_context, self.workspace, collection, name):
++                        continue
++                    for trigger in self.catalog.list_triggers(holder, holder_kind="task"):
++                        # The window source is on the record, so a pushed
++                        # event_object_table predicate is honoured here, after
++                        # the round trip it could not skip.
++                        window_from = trigger.get("window-source")
++                        if not _key_predicates_allow(compiled, {"event_object_table": window_from}):
+                             continue
+-                        trigger_catalog.append(self.workspace)
+-                        trigger_collection.append(collection)
+-                        trigger_name.append(name_value)
+-                        event_object_table.append(source_table)
+-                        action_kind.append(trigger.get("kind"))
+-                        target.append(trigger.get("target-view") or trigger.get("target-task"))
+-                        runs_as.append(trigger.get("runs-as"))
+-                        created_by.append(trigger.get("created-by"))
+-                        created_at.append(_ms_to_datetime(trigger.get("created-at-ms")))
+-                        last_fired_at.append(_ms_to_datetime(trigger.get("last-fired-at-ms")))
+-                        last_fired_status.append(trigger.get("last-fired-status"))
+-                        # Both are cleared to None on RESUME, so a resumed
+-                        # trigger reports nulls rather than the stamp of the
+-                        # suspension it came out of.
+-                        suspended_at.append(_ms_to_datetime(trigger.get("suspended-at-ms")))
+-                        suspended_by.append(trigger.get("suspended-by"))
+-                        minimum_interval_seconds.append(trigger.get("minimum-interval-seconds"))
++                        emit(collection, holder, window_from, trigger)
+ 
+         vectors = [
+             vector_from_sequence(trigger_catalog, dtype=DrakenType.VARCHAR),
+             vector_from_sequence(trigger_collection, dtype=DrakenType.VARCHAR),
+             vector_from_sequence(trigger_name, dtype=DrakenType.VARCHAR),
++            vector_from_sequence(trigger_holder, dtype=DrakenType.VARCHAR),
+             vector_from_sequence(event_object_table, dtype=DrakenType.VARCHAR),
++            vector_from_sequence(event_kind, dtype=DrakenType.VARCHAR),
++            vector_from_sequence(schedule, dtype=DrakenType.VARCHAR),
++            vector_from_sequence(time_zone, dtype=DrakenType.VARCHAR),
++            vector_from_sequence(next_due_at, dtype=DrakenType.TIMESTAMP64),
+             vector_from_sequence(action_kind, dtype=DrakenType.VARCHAR),
+             vector_from_sequence(target, dtype=DrakenType.VARCHAR),
+             vector_from_sequence(runs_as, dtype=DrakenType.VARCHAR),
+diff --git a/opteryx/connectors/local_store_connector.py b/opteryx/connectors/local_store_connector.py
+index b163dc5c..226bc857 100644
+--- a/opteryx/connectors/local_store_connector.py
++++ b/opteryx/connectors/local_store_connector.py
+@@ -362,9 +362,31 @@ class LocalStoreConnector(Eidetic, Writable, BaseConnector):
+         task_name: str,
+         author: Optional[str] = None,
+         or_replace: bool = False,
++        event_kind: str = "commit",
++        schedule: Optional[str] = None,
++        time_zone: Optional[str] = None,
++        window_source: Optional[str] = None,
+     ) -> None:
++        # `relation_name` is the HOLDER. For a commit trigger that is the dataset
++        # whose commits fire it; for a schedule or signal trigger it is the task
++        # itself, and the sidecar lands in the task's directory - the same
++        # `triggers.json` shape, next to task.json instead of dataset.json. A
++        # table, a view and a task share one directory per name, so nothing
++        # here needs to know which kind of holder it was handed.
+         triggers = self.list_triggers(relation_name)
+         existing = next((t for t in triggers if t.get("name") == trigger_name), None)
++        if event_kind != "commit":
++            # THE ONE-TRIGGER RULE, as the catalog states it: a task has at most
++            # one trigger, because its window is one sequence. A second trigger
++            # under a task is refused whatever its name; the same name is a
++            # repoint, judged below as a commit trigger's would be.
++            held = next((t for t in triggers if t.get("name") != trigger_name), None)
++            if held is not None:
++                raise ValueError(
++                    f"task {relation_name} is already fired by {held.get('name')} ON "
++                    f"{relation_name}; a task has one trigger - its window is one "
++                    "sequence."
++                )
+         if existing is not None:
+             claimed = existing.get("target-task") or existing.get("target-view")
+             if not or_replace and claimed != task_name:
+@@ -381,6 +403,7 @@ class LocalStoreConnector(Eidetic, Writable, BaseConnector):
+                 "kind": "task",
+                 "target-task": task_name,
+                 "created-by": author,
++                "created-at-ms": int(time.time() * 1000),
+                 # The identity an UNATTENDED run carries. Pinned to the author on
+                 # creation; moved only by ALTER TRIGGER ... OWNER TO.
+                 "runs-as": (existing or {}).get("runs-as") or author,
+@@ -390,6 +413,16 @@ class LocalStoreConnector(Eidetic, Writable, BaseConnector):
+                 "minimum-interval-seconds": (existing or {}).get(
+                     "minimum-interval-seconds", DEFAULT_MINIMUM_INTERVAL_SECONDS
+                 ),
++                # The event. `kind` above keeps meaning what the trigger RUNS;
++                # this is the separate axis of what fires it. A schedule is read
++                # in UTC unless told otherwise, as the catalog defaults it.
++                "event-kind": event_kind,
++                "schedule": schedule if event_kind == "schedule" else None,
++                "time-zone": (time_zone or "UTC") if event_kind == "schedule" else None,
++                "window-source": window_source if event_kind != "commit" else None,
++                # This store has no clock and nothing ever fires from it, so
++                # the next occurrence is not computed - the catalog owns that.
++                "next-due-at-ms": None,
+             }
+         )
+         self._write_triggers(relation_name, triggers)
+@@ -583,9 +616,11 @@ class LocalStoreConnector(Eidetic, Writable, BaseConnector):
+     # Trigger records mirror the catalog's: one refresh trigger per (source,
+     # MV) pair, held in a `triggers.json` sidecar next to the SOURCE table's
+     # dataset.json - the trigger hangs off the table whose commits would fire
+-    # it, not off the MV. Nothing in this store ever fires them; they exist so
+-    # DROP TRIGGER / SHOW TRIGGERS surfaces are fully exercisable without a
+-    # remote catalog.
++    # it, not off the MV. A schedule or signal trigger has no such table and
++    # hangs off the TASK it fires, so its sidecar sits next to task.json; the
++    # path is the same function of the holder's name either way. Nothing in
++    # this store ever fires them; they exist so the trigger statement surface
++    # is fully exercisable without a remote catalog.
+     def _triggers_path(self, relation_name: str) -> str:
+         return os.path.join(self._relation_dir(relation_name), "triggers.json")
+ 
+diff --git a/opteryx/connectors/opteryx_connector.py b/opteryx/connectors/opteryx_connector.py
+index 65cf167f..e0c39068 100644
+--- a/opteryx/connectors/opteryx_connector.py
++++ b/opteryx/connectors/opteryx_connector.py
+@@ -1888,6 +1888,19 @@ class OpteryxConnector(Eidetic, Writable, PredicatePushable):
+ 
+         catalog.drop_task(relative_id, author=author)
+ 
++    def _holder_kwargs(self, relation_name: str) -> dict:
++        """`{"holder_kind": "task"}` when `relation_name` is a task, else `{}`.
++
++        The catalog keys a trigger on what HOLDS it: the dataset whose commits
++        fire a commit trigger, or the task a schedule or signal trigger fires.
++        Its trigger methods take `holder_kind` to say which, defaulting to a
++        dataset - so the keyword is passed only when the holder is a task, and
++        a dataset call keeps exactly the shape it had. That is what lets this
++        connector sit in front of an older catalog, or a test double, that has
++        never heard of task-held triggers.
++        """
++        return {"holder_kind": "task"} if self.is_task(relation_name) else {}
++
+     def create_trigger(
+         self,
+         relation_name: str,
+@@ -1895,18 +1908,48 @@ class OpteryxConnector(Eidetic, Writable, PredicatePushable):
+         task_name: str,
+         author: Optional[str] = None,
+         or_replace: bool = False,
++        event_kind: str = "commit",
++        schedule: Optional[str] = None,
++        time_zone: Optional[str] = None,
++        window_source: Optional[str] = None,
+     ) -> None:
+-        """Attach a task trigger to the dataset whose commits should fire it."""
++        """Attach a task trigger to its holder: the dataset whose commits fire
++        it, or - for a schedule or signal trigger - the task itself."""
+         from opteryx_catalog.exceptions import MaterializedViewError
+ 
+         workspace, relative_id = self._parse_identifier(relation_name)
+         catalog = self._get_catalog(workspace)
+ 
++        holder = {}
++        event = {}
++        if event_kind != "commit":
++            # No source dataset: the trigger lives under the task it fires. The
++            # event keywords go only on this path, so a commit trigger's call is
++            # byte-for-byte what it was before the other two events existed.
++            holder = {"holder_kind": "task"}
++            source = None
++            if window_source:
++                source_workspace, source = self._parse_identifier(window_source)
++                if source_workspace != workspace:
++                    # The binder refuses this first; kept here so the connector
++                    # never lands a window it could not bind at fire time.
++                    raise ValueError(
++                        f"trigger {trigger_name} on {relation_name} cannot be windowed "
++                        f"over {window_source}, which is in workspace {source_workspace}; "
++                        "the window is read from a dataset in the task's own workspace"
++                    )
++            event = {
++                "event_kind": event_kind,
++                "schedule": schedule,
++                "time_zone": time_zone,
++                "window_source": source,
++            }
++
+         if or_replace:
+             # `create_trigger` refuses to repoint an existing trigger, which is
+             # right for the implicit MV path but is exactly what OR REPLACE asks
+             # for. Drop first so the guard has nothing to refuse.
+-            catalog.drop_trigger(relative_id, trigger_name, author=author, missing_ok=True)
++            catalog.drop_trigger(relative_id, trigger_name, author=author, missing_ok=True, **holder)
+ 
+         try:
+             catalog.create_trigger(
+@@ -1915,10 +1958,13 @@ class OpteryxConnector(Eidetic, Writable, PredicatePushable):
+                 target_task=task_name,
+                 kind="task",
+                 author=author,
++                **holder,
++                **event,
+             )
+         except MaterializedViewError as exc:
+-            # The repoint guard. Surfaced as ValueError so the statement reads as
+-            # a caller error rather than an MV failure, which it is not.
++            # The repoint guard, and the one-trigger rule. Surfaced as ValueError
++            # so the statement reads as a caller error rather than an MV failure,
++            # which it is not.
+             raise ValueError(str(exc)) from exc
+ 
+     def set_trigger_owner(
+@@ -1935,7 +1981,13 @@ class OpteryxConnector(Eidetic, Writable, PredicatePushable):
+         catalog = self._get_catalog(workspace)
+ 
+         try:
+-            catalog.set_trigger_owner(relative_id, trigger_name, new_owner, author=author)
++            catalog.set_trigger_owner(
++                relative_id,
++                trigger_name,
++                new_owner,
++                author=author,
++                **self._holder_kwargs(relation_name),
++            )
+         except TriggerNotFound as exc:
+             raise ValueError(
+                 f"trigger {trigger_name} does not exist on {relation_name}"
+@@ -1955,7 +2007,13 @@ class OpteryxConnector(Eidetic, Writable, PredicatePushable):
+         catalog = self._get_catalog(workspace)
+ 
+         try:
+-            catalog.set_trigger_suspended(relative_id, trigger_name, suspended, author=author)
++            catalog.set_trigger_suspended(
++                relative_id,
++                trigger_name,
++                suspended,
++                author=author,
++                **self._holder_kwargs(relation_name),
++            )
+         except TriggerNotFound as exc:
+             raise ValueError(
+                 f"trigger {trigger_name} does not exist on {relation_name}"
+@@ -2173,10 +2231,11 @@ class OpteryxConnector(Eidetic, Writable, PredicatePushable):
+         author: Optional[str] = None,
+         missing_ok: bool = False,
+     ) -> None:
+-        """Remove a trigger from the dataset that carries it, delegating to the
+-        catalog. A missing trigger is translated into a clear ValueError unless
+-        missing_ok (IF EXISTS) - the catalog's own drop_trigger honours
+-        missing_ok, so that branch never raises."""
++        """Remove a trigger from the holder that carries it - a dataset, or a
++        task for a schedule or signal trigger - delegating to the catalog. A
++        missing trigger is translated into a clear ValueError unless missing_ok
++        (IF EXISTS) - the catalog's own drop_trigger honours missing_ok, so that
++        branch never raises."""
+         try:
+             from opteryx_catalog.exceptions import TriggerNotFound
+         except ImportError:
+@@ -2190,7 +2249,13 @@ class OpteryxConnector(Eidetic, Writable, PredicatePushable):
+         catalog = self._get_catalog(workspace)
+ 
+         try:
+-            catalog.drop_trigger(relative_id, trigger_name, author=author, missing_ok=missing_ok)
++            catalog.drop_trigger(
++                relative_id,
++                trigger_name,
++                author=author,
++                missing_ok=missing_ok,
++                **self._holder_kwargs(relation_name),
++            )
+         except TriggerNotFound as exc:
+             raise ValueError(
+                 f"trigger {trigger_name} does not exist on {relation_name} "
+@@ -2525,10 +2590,11 @@ class OpteryxConnector(Eidetic, Writable, PredicatePushable):
+         return catalog.list_tags(relative_id)
+ 
+     def list_triggers(self, relation_name: str) -> list:
+-        """The triggers attached to a dataset, as the catalog's plain dicts."""
++        """The triggers a holder carries - a dataset's, or a task's for a
++        schedule or signal trigger - as the catalog's plain dicts."""
+         workspace, relative_id = self._parse_identifier(relation_name)
+         catalog = self._get_catalog(workspace)
+-        return catalog.list_triggers(relative_id)
++        return catalog.list_triggers(relative_id, **self._holder_kwargs(relation_name))
+ 
+     # View operations (Eidetic capability)
+     def get_view(self, view_name: str):
+diff --git a/opteryx/operators/relation_management/relation_management.pyx b/opteryx/operators/relation_management/relation_management.pyx
+index 20914c43..99759d14 100644
+--- a/opteryx/operators/relation_management/relation_management.pyx
++++ b/opteryx/operators/relation_management/relation_management.pyx
+@@ -30,6 +30,34 @@ from opteryx.models import QueryProperties
+ # BasePlanNode/JoinNode in scope via _operators.pyx include.
+ 
+ 
++def _trigger_holder_exists(connector, holder: str) -> bool:
++    """Whether `holder` names something a trigger can hang off.
++
++    A commit trigger lives under a dataset; a schedule or signal trigger lives
++    under the task it fires. ALTER and DROP name the holder without saying
++    which, so either kind answers. `is_task` is on the Writable capability
++    with a False default, so a store with no tasks answers rather than raises.
++    """
++    return connector.relation_exists(holder) or connector.is_task(holder)
++
++
++def _trigger_event(node) -> str:
++    """The event half of a CREATE TRIGGER, as EXPLAIN shows it: `<table>`,
++    `schedule '<cron>' [at time zone '<zone>'] [over <table>]` or
++    `signal [over <table>]`."""
++    if node.event_kind == "schedule":
++        event = f"schedule '{node.schedule}'"
++        if node.time_zone:
++            event += f" at time zone '{node.time_zone}'"
++    elif node.event_kind == "signal":
++        event = "signal"
++    else:
++        return node.table_name
++    if node.window_source:
++        event += f" over {node.window_source}"
++    return event
++
++
+ class RelationManagementNode(BasePlanNode):
+     def __init__(self, properties: QueryProperties, **parameters):
+         BasePlanNode.__init__(self, properties=properties, **parameters)
+@@ -86,9 +114,18 @@ class RelationManagementNode(BasePlanNode):
+         # and the connector is what holds the catalog.
+         self.version_spec: Optional[str] = parameters.get("version_spec")
+ 
+-        # DROP TRIGGER
++        # CREATE / ALTER / DROP TRIGGER. `table_name` is the HOLDER the trigger
++        # hangs off: the dataset whose commits fire it, or - for a schedule or
++        # signal trigger, which has no source dataset - the task it fires.
+         self.trigger_name: Optional[str] = parameters.get("trigger_name")
+         self.table_name: Optional[str] = parameters.get("table_name")
++        # CREATE TRIGGER's event: "commit" | "schedule" | "signal", and the
++        # clauses that describe a clock or a signal. All None for a commit
++        # trigger, whose event is the commit itself.
++        self.event_kind: str = parameters.get("event_kind") or "commit"
++        self.schedule: Optional[str] = parameters.get("schedule")
++        self.time_zone: Optional[str] = parameters.get("time_zone")
++        self.window_source: Optional[str] = parameters.get("window_source")
+ 
+         # CREATE TASK / DROP TASK. `statement` carries the task's SQL with its
+         # `:name` placeholders intact - they are bound when it is EXECUTEd, not
+@@ -205,7 +242,7 @@ class RelationManagementNode(BasePlanNode):
+             on = f" on {self.on_table}" if self.on_table else ""
+             return f"create task {self.task_name}{on}"
+         if self.action == "create_trigger":
+-            return f"create trigger {self.trigger_name} on {self.table_name} execute {self.task_name}"
++            return f"create trigger {self.trigger_name} on {_trigger_event(self)} execute {self.task_name}"
+         if self.action == "alter_trigger_suspended":
+             return f"alter trigger {self.trigger_name} on {self.table_name} {'suspend' if self.suspended else 'resume'}"
+         if self.action == "alter_trigger_minimum_interval":
+@@ -473,19 +510,40 @@ class RelationManagementNode(BasePlanNode):
+             return NonTabularResult(record_count=1, status=QueryStatus.SQL_SUCCESS)
+ 
+         elif self.action == "create_trigger":
+-            if not self.connector.relation_exists(self.table_name):
+-                raise DatasetNotFoundError(connector=self.connector, dataset=self.table_name)
+-            self.connector.create_trigger(
+-                self.table_name,
+-                self.trigger_name,
+-                self.task_name,
+-                author=self._author,
+-                or_replace=self.or_replace,
+-            )
++            if self.event_kind == "commit":
++                if not self.connector.relation_exists(self.table_name):
++                    raise DatasetNotFoundError(connector=self.connector, dataset=self.table_name)
++                # The call a commit trigger has always made, with no event
++                # keywords: a connector (or a catalog behind one) that predates
++                # the other two events keeps working unchanged.
++                self.connector.create_trigger(
++                    self.table_name,
++                    self.trigger_name,
++                    self.task_name,
++                    author=self._author,
++                    or_replace=self.or_replace,
++                )
++            else:
++                # A clock or a signal has no source dataset: the holder is the
++                # task, so it is the task whose existence is checked - a dataset
++                # of that name would be the wrong kind of thing to hang it off.
++                if not self.connector.is_task(self.table_name):
++                    raise DatasetNotFoundError(connector=self.connector, dataset=self.table_name)
++                self.connector.create_trigger(
++                    self.table_name,
++                    self.trigger_name,
++                    self.task_name,
++                    author=self._author,
++                    or_replace=self.or_replace,
++                    event_kind=self.event_kind,
++                    schedule=self.schedule,
++                    time_zone=self.time_zone,
++                    window_source=self.window_source,
++                )
+             return NonTabularResult(record_count=1, status=QueryStatus.SQL_SUCCESS)
+ 
+         elif self.action == "alter_trigger_suspended":
+-            if not self.connector.relation_exists(self.table_name):
++            if not _trigger_holder_exists(self.connector, self.table_name):
+                 raise DatasetNotFoundError(connector=self.connector, dataset=self.table_name)
+             self.connector.set_trigger_suspended(
+                 self.table_name,
+@@ -511,7 +569,7 @@ class RelationManagementNode(BasePlanNode):
+         elif self.action == "alter_trigger_owner":
+             # The binder resolved CURRENT_USER to the session identity and proved
+             # that principal can be billed; this records the transfer.
+-            if not self.connector.relation_exists(self.table_name):
++            if not _trigger_holder_exists(self.connector, self.table_name):
+                 raise DatasetNotFoundError(connector=self.connector, dataset=self.table_name)
+             self.connector.set_trigger_owner(
+                 self.table_name, self.trigger_name, self.resolved_owner, author=self._author
+@@ -527,9 +585,9 @@ class RelationManagementNode(BasePlanNode):
+             return NonTabularResult(record_count=1, status=QueryStatus.SQL_SUCCESS)
+ 
+         elif self.action == "drop_trigger":
+-            # The table must exist regardless of IF EXISTS - that modifier
+-            # speaks about the trigger, not the table it hangs off.
+-            if not self.connector.relation_exists(self.table_name):
++            # The holder must exist regardless of IF EXISTS - that modifier
++            # speaks about the trigger, not the table or task it hangs off.
++            if not _trigger_holder_exists(self.connector, self.table_name):
+                 raise DatasetNotFoundError(connector=self.connector, dataset=self.table_name)
+             self.connector.drop_trigger(
+                 self.table_name,
+diff --git a/opteryx/planner/binder/relation.py b/opteryx/planner/binder/relation.py
+index 5385432e..1080a5ec 100644
+--- a/opteryx/planner/binder/relation.py
++++ b/opteryx/planner/binder/relation.py
+@@ -860,6 +860,11 @@ def visit_alter_trigger_owner(
+ 
+     Asked of the RESOLVED owner, so CURRENT_USER is judged as the principal it
+     names rather than exempted for having been spelled differently.
++
++    `table_name` is the trigger's HOLDER: the dataset for a commit trigger, the
++    task itself for a schedule or signal trigger. A task shares its namespace
++    with tables, so the same AUTOMATE grant governs either, and the trigger is
++    read back off whichever the connector says the name is.
+     """
+     from opteryx.connectors import connector_factory
+     from opteryx.connectors.capabilities import Writable
+@@ -968,21 +973,27 @@ def visit_drop_task(self, node: Node, context: BindingContext) -> Tuple[Node, Bi
+ def visit_create_trigger(self, node: Node, context: BindingContext) -> Tuple[Node, BindingContext]:
+     """Bind CREATE TRIGGER.
+ 
+-    Two gates. AUTOMATE on the TABLE the trigger hangs off - symmetric with
+-    `visit_drop_trigger`. Not WRITE: an INSERT is over when it finishes, while
+-    a trigger is a standing commitment that fires on every commit, unattended,
+-    as a pinned identity, on the owner's compute, and can write elsewhere and
+-    fire further triggers. That decides what the table DOES to the world, not
+-    what is in it, which puts it with GRANT rather than with INSERT. And the
+-    author must be a principal who can be BILLED, because the trigger's
+-    unattended runs execute as its owner and the owner pins to the author here.
+-    This is where authority is actually conferred - a task is just stored SQL,
+-    and a person running EXECUTE answers for themselves - so this is where the
+-    gate lives.
++    Two gates. AUTOMATE on the HOLDER the trigger hangs off - the table whose
++    commits fire it, or the task itself for a schedule or signal trigger -
++    symmetric with `visit_drop_trigger`. Not WRITE: an INSERT is over when it
++    finishes, while a trigger is a standing commitment that fires on every
++    commit (or tick, or signal), unattended, as a pinned identity, on the
++    owner's compute, and can write elsewhere and fire further triggers. That
++    decides what the holder DOES to the world, not what is in it, which puts it
++    with GRANT rather than with INSERT. And the author must be a principal who
++    can be BILLED, because the trigger's unattended runs execute as its owner
++    and the owner pins to the author here. This is where authority is actually
++    conferred - a task is just stored SQL, and a person running EXECUTE answers
++    for themselves - so this is where the gate lives.
+ 
+     What the task may do is NOT re-checked: its statement is gated by the binder
+     at execution, against the owner, every time it fires. A creation-time copy
+     of that check would go stale the moment the owner's grants changed.
++
++    A schedule or signal trigger takes two more, in `_bind_task_held_trigger`:
++    its `OVER` table, if any, must exist in the task's own workspace; and
++    without one the task must be windowless, because a clock has no commit to
++    bind `:parent_version` and `:current_version` from.
+     """
+     from opteryx.connectors import connector_factory
+     from opteryx.connectors.capabilities import Writable
+@@ -990,6 +1001,9 @@ def visit_create_trigger(self, node: Node, context: BindingContext) -> Tuple[Nod
+     from opteryx.managers.permissions import can_perform_action
+     from opteryx.managers.permissions import can_principal_own_materialized_view
+ 
++    event_kind = getattr(node, "event_kind", None) or "commit"
++    holder_noun = "table" if event_kind == "commit" else "task"
++
+     node.connector = connector_factory(node.table_name, telemetry=context.telemetry)
+     if not isinstance(node.connector, Writable):
+         raise ReadOnlyConnectorError(
+@@ -998,8 +1012,8 @@ def visit_create_trigger(self, node: Node, context: BindingContext) -> Tuple[Nod
+ 
+     if not can_perform_action(context.execution_context, node.table_name, action="AUTOMATE"):
+         raise PermissionError(
+-            f"User does not have permission to create a trigger on table {node.table_name} "
+-            "(owner required)"
++            f"User does not have permission to create a trigger on {holder_noun} "
++            f"{node.table_name} (owner required)"
+         )
+ 
+     author = context.execution_context.user
+@@ -1010,14 +1024,89 @@ def visit_create_trigger(self, node: Node, context: BindingContext) -> Tuple[Nod
+             "nobody - and a trigger runs its task as its owner."
+         )
+ 
++    if event_kind != "commit":
++        _bind_task_held_trigger(node, event_kind)
++
+     node.columns = []
+     return node, context
+ 
+ 
++def _bind_task_held_trigger(node: Node, event_kind: str) -> None:
++    """The checks a schedule or signal trigger takes beyond a commit trigger's.
++
++    The holder is the task (`node.table_name` and `node.task_name` are the same
++    name), so it must BE a task. The window is the decision: a commit-fired run
++    binds `:parent_version` and `:current_version` from the commit, and a clock
++    or a signal has no commit.
++
++    - With `OVER <table>`, the run is windowed over that dataset's head at fire
++      time. The dataset must exist, and in the task's own workspace: the window
++      is read from the catalog the trigger lives in, and a task may not read
++      across workspaces unattended any more than an MV may.
++    - Without it, the task's statement may not consume a window at all. Checked
++      here, at arming, against the recorded statement - so nothing is stored
++      that could only ever fail - and again at fire time by the dispatcher,
++      because the statement can be replaced after the trigger is armed.
++    """
++    from opteryx.exceptions import DatasetNotFoundError
++    from opteryx.exceptions import UnsupportedSyntaxError
++    from opteryx.planner.logical_planner.logical_planner import WINDOW_PARAMETERS
++    from opteryx.planner.logical_planner.logical_planner import _placeholder_sites
++    from opteryx.third_party import sqloxide
++
++    spelled = "ON SCHEDULE" if event_kind == "schedule" else "ON SIGNAL"
++    task = node.table_name
++
++    if not node.connector.is_task(task):
++        raise UnsupportedSyntaxError(
++            f"{task} is not a task. A trigger **{spelled}** fires a task and lives "
++            "under it, so **EXECUTE** must name one."
++        )
++
++    window_source = getattr(node, "window_source", None)
++    if window_source:
++        task_workspace = task.partition(".")[0]
++        source_workspace = window_source.partition(".")[0]
++        if source_workspace != task_workspace:
++            raise UnsupportedSyntaxError(
++                f"**OVER** {window_source} is in workspace {source_workspace}, and "
++                f"task {task} is in {task_workspace}. The window a trigger binds is "
++                "read from a dataset in the task's own workspace; a run may not be "
++                "windowed over another workspace's data."
++            )
++        if not node.connector.relation_exists(window_source):
++            raise DatasetNotFoundError(connector=node.connector, dataset=window_source)
++        return
++
++    # THE WINDOWLESS CHECK. The same reading `plan_execute` makes of a hand-run
++    # with no USING: the statement's own placeholders say whether it wants a
++    # window, and which names. Parsed rather than planned, because a statement
++    # with placeholders only binds at EXECUTE and planning would refuse it.
++    try:
++        task_sql = node.connector.task_definition(task)
++    except ValueError as exc:
++        raise UnsupportedSyntaxError(str(exc)) from exc
++    parsed = sqloxide.parse_sql(task_sql, _dialect="opteryx")
++    used = _placeholder_sites(parsed[0]) if parsed else {}
++    wanted = [name for name in WINDOW_PARAMETERS if name in used]
++    if wanted:
++        raise UnsupportedSyntaxError(
++            f"task {task} consumes a window ("
++            + ", ".join(f"`:{name}`" for name in wanted)
++            + f"), and a trigger **{spelled}** with no **OVER** has no commit to "
++            "bind one from. Either name the dataset the run is windowed over - "
++            f"**OVER** <table> - or remove "
++            + " and ".join(f"`:{name}`" for name in wanted)
++            + " from the task's statement."
++        )
++
++
+ def visit_alter_trigger_suspended(
+     self, node: Node, context: BindingContext
+ ) -> Tuple[Node, BindingContext]:
+-    """Bind ALTER TRIGGER ... SUSPEND|RESUME. Same tier as creating one: AUTOMATE."""
++    """Bind ALTER TRIGGER ... SUSPEND|RESUME. Same tier as creating one: AUTOMATE
++    on the holder - the table for a commit trigger, the task for a schedule or
++    signal trigger, which share a namespace and so a grant."""
+     from opteryx.connectors import connector_factory
+     from opteryx.connectors.capabilities import Writable
+     from opteryx.exceptions import ReadOnlyConnectorError
+@@ -1069,7 +1158,8 @@ def visit_alter_trigger_minimum_interval(
+ def visit_drop_trigger(self, node: Node, context: BindingContext) -> Tuple[Node, BindingContext]:
+     """
+     Bind the DROP TRIGGER node to determine which connector should handle
+-    removing the trigger.
++    removing the trigger. `table_name` is the holder: a table for a commit
++    trigger, the task itself for a schedule or signal trigger.
+     """
+     from opteryx.connectors import connector_factory
+     from opteryx.connectors.capabilities import Writable
+@@ -1082,9 +1172,10 @@ def visit_drop_trigger(self, node: Node, context: BindingContext) -> Tuple[Node,
+             f"connector for {node.table_name} does not support DROP TRIGGER"
+         )
+ 
+-    # AUTOMATE on the table the trigger hangs off - symmetric with creation, and
+-    # checked on the source table rather than the trigger's target view because
+-    # that is where the trigger lives and whose commits it answers to.
++    # AUTOMATE on the holder the trigger hangs off - symmetric with creation, and
++    # checked on the source table (or the task) rather than the trigger's target
++    # because that is where the trigger lives and whose event it answers to. A
++    # task shares the namespace with tables, so the same grant governs either.
+     if not can_perform_action(context.execution_context, node.table_name, action="AUTOMATE"):
+         raise PermissionError(
+             f"User does not have permission to drop a trigger on table {node.table_name} "
+diff --git a/opteryx/planner/logical_planner/logical_planner.py b/opteryx/planner/logical_planner/logical_planner.py
+index 30c47b89..761b68b7 100644
+--- a/opteryx/planner/logical_planner/logical_planner.py
++++ b/opteryx/planner/logical_planner/logical_planner.py
+@@ -3994,9 +3994,14 @@ def _plan_show_snapshots(table_name: str) -> LogicalPlan:
+ 
+ 
+ def _plan_show_triggers(table_name: str) -> LogicalPlan:
+-    """`SHOW TRIGGERS FOR <table>` — desugars to
++    """`SHOW TRIGGERS FOR <holder>` — desugars to
+     `SELECT * FROM <workspace>.information_schema.triggers
+-     WHERE event_object_table = '<collection.table>'`.
++     WHERE trigger_holder = '<collection.name>'`.
++
++    The holder is what the trigger hangs off: a dataset for a commit trigger,
++    the task itself for a schedule or signal trigger. A commit trigger's holder
++    IS its `event_object_table`, so for a table this reads exactly as it did;
++    for a task it lists the trigger the task is fired by.
+ 
+     Not a virtual dataset like SHOW USER/GRANTS: those read only session
+     variables, while triggers live in the workspace's catalog, which is only
+@@ -4005,7 +4010,7 @@ def _plan_show_triggers(table_name: str) -> LogicalPlan:
+     why the bare `SHOW TRIGGERS` form is rejected in plan_show_variables (the
+     planner has no session default workspace to scan).
+ 
+-    The filter lands on `event_object_table`, a pushable key column of the
++    The filter lands on `trigger_holder`, a pushable key column of the
+     triggers reader, so the predicate-pushdown pass turns it into skipped
+     catalog round trips rather than a post-hoc row filter.
+     """
+@@ -4013,7 +4018,7 @@ def _plan_show_triggers(table_name: str) -> LogicalPlan:
+     if not relative:
+         raise UnsupportedSyntaxError(
+             "`SHOW TRIGGERS FOR <table>` requires a workspace-qualified table "
+-            "name, e.g. `SHOW TRIGGERS FOR opteryx.test.pypi`."
++            "or task name, e.g. `SHOW TRIGGERS FOR opteryx.test.pypi`."
+         )
+     relation = f"{workspace}.information_schema.triggers"
+ 
+@@ -4028,7 +4033,7 @@ def _plan_show_triggers(table_name: str) -> LogicalPlan:
+ 
+     filter_node = LogicalPlanNode(node_type=LogicalPlanStepType.Filter)
+     filter_node.condition = build_expression_tree(
+-        relation, [("event_object_table", "Eq", relative)]
++        relation, [("trigger_holder", "Eq", relative)]
+     )
+     previous_step_id, step_id = step_id, random_string()
+     plan.add_node(step_id, filter_node)
+@@ -6256,13 +6261,22 @@ def plan_drop_task(statement, **kwargs) -> LogicalPlan:
+ 
+ 
+ def plan_create_trigger(statement, **kwargs) -> LogicalPlan:
+-    """CREATE [OR REPLACE] TRIGGER <name> ON <table> EXECUTE <task> — synthesized
+-    by pre-parse.
++    """CREATE [OR REPLACE] TRIGGER <name> ON <table> EXECUTE <task>, and the
++    ON SCHEDULE / ON SIGNAL forms — synthesized by pre-parse.
+ 
+     Standalone triggers exist because a task's firing condition is not always
+-    derivable from the task: the same task can be fired by several datasets, or
+-    by none. A materialized view's triggers ARE derived, and stay that way -
+-    this statement does not touch them.
++    derivable from the task: a task may be fired by a dataset it does not read,
++    by a clock, by a signal, or by nothing at all. A task has at most one
++    trigger (the catalog's one-trigger rule - its window is one sequence), so
++    this statement is also where that one firing condition is chosen. A
++    materialized view's triggers ARE derived, and stay that way - this
++    statement does not touch them.
++
++    `table_name` is the HOLDER the trigger lives under: the dataset whose
++    commits fire it, or - for a schedule or signal trigger, which has no source
++    dataset - the task itself. `event_kind` says which; `schedule`, `time_zone`
++    and `window_source` describe the event and are None where the form has no
++    such clause.
+     """
+     root = "CreateTrigger"
+     node = LogicalPlanNode(node_type=LogicalPlanStepType.CreateTrigger)
+@@ -6270,6 +6284,10 @@ def plan_create_trigger(statement, **kwargs) -> LogicalPlan:
+     node.table_name = statement[root]["table_name"]
+     node.task_name = statement[root]["task_name"]
+     node.or_replace = statement[root].get("or_replace", False)
++    node.event_kind = statement[root].get("event_kind") or "commit"
++    node.schedule = statement[root].get("schedule")
++    node.time_zone = statement[root].get("time_zone")
++    node.window_source = statement[root].get("window_source")
+ 
+     plan = LogicalPlan()
+     plan.add_node(random_string(), node)
+diff --git a/opteryx/planner/logical_planner/logical_planner_renderers.py b/opteryx/planner/logical_planner/logical_planner_renderers.py
+index 6c1fc3b1..d96d93cd 100644
+--- a/opteryx/planner/logical_planner/logical_planner_renderers.py
++++ b/opteryx/planner/logical_planner/logical_planner_renderers.py
+@@ -371,7 +371,18 @@ def render_analyze(node: LogicalPlanNode) -> str:
+ @register_render(LogicalPlanStepType.CreateTrigger)
+ def render_create_trigger(node: LogicalPlanNode) -> str:
+     or_replace = "OR REPLACE " if node.or_replace else ""
+-    return f"CREATE {or_replace}TRIGGER ({node.trigger_name}) ON ({node.table_name}) EXECUTE ({node.task_name})"
++    event_kind = getattr(node, "event_kind", None) or "commit"
++    if event_kind == "schedule":
++        event = f"ON SCHEDULE ('{node.schedule}')"
++        if getattr(node, "time_zone", None):
++            event += f" AT TIME ZONE ('{node.time_zone}')"
++    elif event_kind == "signal":
++        event = "ON SIGNAL"
++    else:
++        event = f"ON ({node.table_name})"
++    if getattr(node, "window_source", None):
++        event += f" OVER ({node.window_source})"
++    return f"CREATE {or_replace}TRIGGER ({node.trigger_name}) {event} EXECUTE ({node.task_name})"
+ 
+ 
+ @register_render(LogicalPlanStepType.AlterTriggerSuspended)
+diff --git a/opteryx/planner/pre_parse.py b/opteryx/planner/pre_parse.py
+index ae575159..77f5f994 100644
+--- a/opteryx/planner/pre_parse.py
++++ b/opteryx/planner/pre_parse.py
+@@ -156,26 +156,63 @@ _CREATE_TRIGGER_LEAD = re.compile(r"^\s*CREATE\s+(OR\s+REPLACE\s+)?TRIGGER\b", r
+ 
+ # CREATE [OR REPLACE] TRIGGER <name> ON <table> EXECUTE <task>
+ #
+-# `ON <table>` is a CATALOG event: the trigger fires when that dataset takes a
+-# user-created commit. Two other event kinds are imaginable and neither is
+-# accepted, because neither has anything to fire it - see `_TRIGGER_EVENT_LEAD`
+-# below. A trigger that is stored but never dispatched is worse than one that
+-# does not exist: the table it maintains silently stops updating, and the
+-# trigger record says it is fine.
++# A trigger is an EVENT plus the identity its unattended runs carry; the task it
++# fires has neither. Three events, told apart by what follows `ON`:
++#
++#   ON <table>                  a commit to that dataset. The trigger lives
++#                               under the dataset, whose commits it answers to.
++#   ON SCHEDULE '<cron>'        a clock tick. No dataset is involved, so the
++#       [AT TIME ZONE '<zone>']  trigger lives under the TASK it fires - the
++#       [OVER <table>]          holder is the task.
++#   ON SIGNAL [OVER <table>]    an inbound signal, held by the task likewise.
++#
++# `OVER <table>` is the window a clock or a signal has no commit to supply: the
++# fired run is windowed over that dataset's head (see visit_create_trigger for
++# the windowless rule when it is absent). The schedule and zone are VALUES and
++# so are quoted; every name here is an identifier and takes no placeholder, for
++# the reason given at the top of this module.
+ _CREATE_TRIGGER_RE = re.compile(
+     r"^\s*CREATE\s+(?P<or_replace>OR\s+REPLACE\s+)?TRIGGER\s+"
+     r"(?P<name>[A-Za-z_][\w$]*)\s+ON\s+(?P<table>[A-Za-z_][\w.$]*)\s+"
+     r"EXECUTE\s+(?P<task>[A-Za-z_][\w.$]*)\s*;?\s*$",
+     re.IGNORECASE | re.DOTALL,
+ )
+-# The event kinds this engine can express but cannot yet dispatch. Matched so
+-# they are refused BY NAME rather than as a generic syntax error, and so the
+-# refusal can say what is missing rather than that the word is unknown.
++_CREATE_TRIGGER_SCHEDULE_RE = re.compile(
++    r"^\s*CREATE\s+(?P<or_replace>OR\s+REPLACE\s+)?TRIGGER\s+"
++    r"(?P<name>[A-Za-z_][\w$]*)\s+ON\s+SCHEDULE\s+'(?P<schedule>(?:[^']|'')*)'"
++    r"(?:\s+AT\s+TIME\s+ZONE\s+'(?P<zone>(?:[^']|'')*)')?"
++    r"(?:\s+OVER\s+(?P<over>[A-Za-z_][\w.$]*))?"
++    r"\s+EXECUTE\s+(?P<task>[A-Za-z_][\w.$]*)\s*;?\s*$",
++    re.IGNORECASE | re.DOTALL,
++)
++_CREATE_TRIGGER_SIGNAL_RE = re.compile(
++    r"^\s*CREATE\s+(?P<or_replace>OR\s+REPLACE\s+)?TRIGGER\s+"
++    r"(?P<name>[A-Za-z_][\w$]*)\s+ON\s+SIGNAL\b"
++    r"(?:\s+OVER\s+(?P<over>[A-Za-z_][\w.$]*))?"
++    r"\s+EXECUTE\s+(?P<task>[A-Za-z_][\w.$]*)\s*;?\s*$",
++    re.IGNORECASE | re.DOTALL,
++)
++# Which event a CREATE TRIGGER names, before the form is matched in full - so a
++# malformed schedule form is refused as a schedule form, with that grammar in
++# the message, rather than as a commit form missing its table.
+ _TRIGGER_EVENT_LEAD = re.compile(
+     r"^\s*CREATE\s+(?:OR\s+REPLACE\s+)?TRIGGER\s+[A-Za-z_][\w$]*\s+ON\s+"
+-    r"(?P<kind>SCHEDULE|EVERY|EVENT|SIGNAL)\b",
++    r"(?P<kind>SCHEDULE|SIGNAL|EVERY|EVENT)\b",
+     re.IGNORECASE,
+ )
++# The commit form takes neither modifier: a commit supplies its own window (the
++# commit itself) and happens in no time zone. Matched so they are refused by
++# name rather than as a generic syntax error.
++_CREATE_TRIGGER_COMMIT_MODIFIER_RE = re.compile(
++    r"^\s*CREATE\s+(?:OR\s+REPLACE\s+)?TRIGGER\s+[A-Za-z_][\w$]*\s+ON\s+"
++    r"(?!SCHEDULE\b|SIGNAL\b|EVERY\b|EVENT\b)[A-Za-z_][\w.$]*\s+"
++    r"(?:.*\s)?(?P<modifier>OVER|AT\s+TIME\s+ZONE)\b",
++    re.IGNORECASE | re.DOTALL,
++)
++# A cron expression has five whitespace-separated fields. Checked only for
++# shape here: the catalog parses it properly when the trigger is armed, and a
++# malformed field is refused there before anything is stored.
++_CRON_FIELD_COUNT = 5
+ 
+ # ALTER TRIGGER <name> ON <table> SUSPEND|RESUME
+ #
+@@ -407,50 +444,138 @@ def _intercept_alter_materialized_view(clean_sql: str):
+     )
+ 
+ 
+-def _intercept_trigger_statements(clean_sql: str):
+-    """Recognize `DROP TRIGGER [IF EXISTS] <name> ON <table>` before the SQL
+-    parser (OpteryxDialect is not in sqlparser's allowlist for trigger
+-    statements, so they would otherwise fail to parse with an unhelpful error).
++def _intercept_create_trigger(clean_sql: str):
++    """The three CREATE TRIGGER forms, told apart by the event after `ON`.
+ 
+-    Returns a synthesized single-statement AST list, or None if the statement
+-    is not a trigger statement. `CREATE TRIGGER` is rejected here by name -
+-    triggers exist only as the automatic artifact of CREATE MATERIALIZED VIEW.
++    Every form synthesizes one `CreateTrigger` node. `table_name` is the HOLDER
++    - the dataset for a commit trigger, the task itself for a schedule or signal
++    trigger, which has no source dataset to live under. `event_kind` says which;
++    `schedule`, `time_zone` and `window_source` are None where the form has no
++    such clause.
+     """
+     from opteryx.exceptions import UnsupportedSyntaxError
+ 
+-    if _CREATE_TRIGGER_LEAD.match(clean_sql):
+-        event = _TRIGGER_EVENT_LEAD.match(clean_sql)
+-        if event is not None:
+-            # Expressible, and deliberately not accepted: nothing dispatches
+-            # either kind. A catalog event fires from the commit path; a clock
+-            # event needs something that polls for due triggers and a user event
+-            # needs a surface to signal one, and neither exists. Storing such a
+-            # trigger would leave a table quietly never updating while its
+-            # trigger record claimed otherwise.
++    event = _TRIGGER_EVENT_LEAD.match(clean_sql)
++    kind = event.group("kind").upper() if event is not None else None
++
++    if kind in ("EVERY", "EVENT"):
++        # Not forms. `ON EVERY <interval>` is a schedule spelled without a cron
++        # expression, and `ON EVENT <name>` a signal spelled with one; both are
++        # refused by name so the refusal can say what the forms are, rather than
++        # that the word is unknown.
++        raise UnsupportedSyntaxError(
++            f"**ON {kind}** is not a trigger event. A trigger fires on a commit "
++            "(**ON** <table>), on a clock (**ON SCHEDULE** '<cron>' [**AT TIME ZONE** "
++            "'<zone>'] [**OVER** <table>]) or on a signal (**ON SIGNAL** [**OVER** "
++            "<table>]), and then **EXECUTE** <task>."
++        )
++
++    if kind == "SCHEDULE":
++        match = _CREATE_TRIGGER_SCHEDULE_RE.match(clean_sql)
++        if match is None:
++            raise UnsupportedSyntaxError(
++                "Expected: **CREATE** [**OR REPLACE**] **TRIGGER** <name> **ON SCHEDULE** "
++                "'<cron>' [**AT TIME ZONE** '<zone>'] [**OVER** <table>] **EXECUTE** "
++                "<task>. The cron expression has five fields (minute, hour, day of "
++                "month, month, day of week); the table, if given, is the dataset the "
++                "run is windowed over."
++            )
++        schedule = match.group("schedule").replace("''", "'").strip()
++        if len(schedule.split()) != _CRON_FIELD_COUNT:
+             raise UnsupportedSyntaxError(
+-                f"**ON {event.group('kind').upper()}** triggers are not dispatched yet. A "
+-                "trigger fires on a catalog event - a commit to a dataset - written "
+-                "**ON** <table>. Clock and signal events need a dispatcher that does "
+-                "not exist, and a trigger nothing fires is worse than none."
++                f"**ON SCHEDULE** '{schedule}' is not a cron expression: expected "
++                f"{_CRON_FIELD_COUNT} whitespace-separated fields (minute, hour, day "
++                f"of month, month, day of week), e.g. '0 * * * *' for every hour."
+             )
+-        match = _CREATE_TRIGGER_RE.match(clean_sql)
++        zone = match.group("zone")
++        return [
++            {
++                "CreateTrigger": {
++                    "trigger_name": match.group("name"),
++                    "table_name": match.group("task"),
++                    "task_name": match.group("task"),
++                    "or_replace": match.group("or_replace") is not None,
++                    "event_kind": "schedule",
++                    "schedule": schedule,
++                    "time_zone": zone.replace("''", "'") if zone is not None else None,
++                    "window_source": match.group("over"),
++                }
++            }
++        ]
++
++    if kind == "SIGNAL":
++        match = _CREATE_TRIGGER_SIGNAL_RE.match(clean_sql)
+         if match is None:
+             raise UnsupportedSyntaxError(
+-                "Expected: **CREATE** [**OR REPLACE**] **TRIGGER** <name> **ON** "
+-                "<table> **EXECUTE** <task>. The table is the dataset whose commits "
+-                "fire it; the task is what it runs."
++                "Expected: **CREATE** [**OR REPLACE**] **TRIGGER** <name> **ON SIGNAL** "
++                "[**OVER** <table>] **EXECUTE** <task>. A signal carries no schedule "
++                "and no time zone; the table, if given, is the dataset the run is "
++                "windowed over."
+             )
+         return [
+             {
+                 "CreateTrigger": {
+                     "trigger_name": match.group("name"),
+-                    "table_name": match.group("table"),
++                    "table_name": match.group("task"),
+                     "task_name": match.group("task"),
+                     "or_replace": match.group("or_replace") is not None,
++                    "event_kind": "signal",
++                    "schedule": None,
++                    "time_zone": None,
++                    "window_source": match.group("over"),
+                 }
+             }
+         ]
+ 
++    modifier = _CREATE_TRIGGER_COMMIT_MODIFIER_RE.match(clean_sql)
++    if modifier is not None:
++        spelled = " ".join(modifier.group("modifier").upper().split())
++        raise UnsupportedSyntaxError(
++            f"**{spelled}** does not apply to a commit trigger. A trigger **ON** "
++            "<table> is windowed by the commit that fires it and fires at the moment "
++            "of that commit; **OVER** and **AT TIME ZONE** belong to the **ON SCHEDULE** "
++            "and **ON SIGNAL** forms, which have no commit to take either from."
++        )
++    match = _CREATE_TRIGGER_RE.match(clean_sql)
++    if match is None:
++        raise UnsupportedSyntaxError(
++            "Expected: **CREATE** [**OR REPLACE**] **TRIGGER** <name> **ON** "
++            "<table> **EXECUTE** <task>, or **ON SCHEDULE** '<cron>' [**AT TIME ZONE** "
++            "'<zone>'] [**OVER** <table>], or **ON SIGNAL** [**OVER** <table>]. The "
++            "table is the dataset whose commits fire it; the task is what it runs."
++        )
++    return [
++        {
++            "CreateTrigger": {
++                "trigger_name": match.group("name"),
++                "table_name": match.group("table"),
++                "task_name": match.group("task"),
++                "or_replace": match.group("or_replace") is not None,
++                "event_kind": "commit",
++                "schedule": None,
++                "time_zone": None,
++                "window_source": None,
++            }
++        }
++    ]
++
++
++def _intercept_trigger_statements(clean_sql: str):
++    """Recognize the trigger statements before the SQL parser (OpteryxDialect
++    is not in sqlparser's allowlist for trigger statements, so they would
++    otherwise fail to parse with an unhelpful error).
++
++    Returns a synthesized single-statement AST list, or None if the statement
++    is not a trigger statement. In ALTER and DROP, `ON <holder>` names what the
++    trigger hangs off: a dataset for a commit trigger, the task itself for a
++    schedule or signal trigger. The grammar cannot tell the two apart and does
++    not try; the binder asks the connector which the name is.
++    """
++    from opteryx.exceptions import UnsupportedSyntaxError
++
++    if _CREATE_TRIGGER_LEAD.match(clean_sql):
++        return _intercept_create_trigger(clean_sql)
++
+     if _ALTER_TRIGGER_LEAD.match(clean_sql):
+         match = _ALTER_TRIGGER_OWNER_RE.match(clean_sql)
+         if match is not None:
+diff --git a/tests/storage/test_create_task_ddl.py b/tests/storage/test_create_task_ddl.py
+index 744281b8..1784e6c0 100644
+--- a/tests/storage/test_create_task_ddl.py
++++ b/tests/storage/test_create_task_ddl.py
+@@ -662,20 +662,30 @@ def test_set_minimum_interval_on_a_missing_trigger_is_refused(tmp_path):
+         list(owner.execute_to_morsels("ALTER TRIGGER nope ON ws.src SET MINIMUM INTERVAL TO 5"))
+ 
+ 
+-def test_undispatchable_event_kinds_are_refused(tmp_path):
+-    """A trigger nothing fires is worse than none: the table it maintains stops
+-    updating while the trigger record says it is fine."""
++def test_words_that_are_not_events_are_refused_by_name(tmp_path):
++    """ON EVERY and ON EVENT are not forms. They are refused by name, and the
++    refusal says what the forms are - a commit, a schedule or a signal - rather
++    than that the word is unknown."""
+     _setup_workspace(tmp_path)
+     owner = opteryx.session(user="olive", access_policies=_OWNER_POLICY)
+ 
+     for sql in (
+-        "CREATE TRIGGER t ON SCHEDULE '1 minute' EXECUTE ws.t",
++        "CREATE TRIGGER t ON EVERY 1 MINUTE EXECUTE ws.t",
+         "CREATE TRIGGER t ON EVENT something EXECUTE ws.t",
+     ):
+-        with pytest.raises(UnsupportedSyntaxError, match="not dispatched yet"):
++        with pytest.raises(UnsupportedSyntaxError, match="is not a trigger event"):
+             list(owner.execute_to_morsels(sql))
+ 
+ 
++def test_a_schedule_must_be_a_cron_expression(tmp_path):
++    """Five fields, checked for shape here; the catalog parses it properly."""
++    _setup_workspace(tmp_path)
++    owner = opteryx.session(user="olive", access_policies=_OWNER_POLICY)
++
++    with pytest.raises(UnsupportedSyntaxError, match="not a cron expression"):
++        list(owner.execute_to_morsels("CREATE TRIGGER t ON SCHEDULE '1 minute' EXECUTE ws.t"))
++
++
+ # --- ALTER TASK
+ 
+ 
+diff --git a/tests/storage/test_triggers_ddl.py b/tests/storage/test_triggers_ddl.py
+index b5d84864..6d8f7975 100644
+--- a/tests/storage/test_triggers_ddl.py
++++ b/tests/storage/test_triggers_ddl.py
+@@ -3,11 +3,14 @@
+ # See the License at http://www.apache.org/licenses/LICENSE-2.0
+ # Distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND.
+ 
+-"""DROP TRIGGER / SHOW TRIGGERS / information_schema.triggers.
++"""CREATE / ALTER / DROP TRIGGER, SHOW TRIGGERS and information_schema.triggers.
+ 
+-Triggers exist only as the automatic artifact of CREATE MATERIALIZED VIEW: a
+-refresh trigger lands on each SOURCE table (the table whose commits fire it),
+-so a trigger is always found against that source table, never the target view.
++A trigger is an EVENT plus the identity its unattended runs carry, and it lives
++under whatever holds the event. A commit trigger (a materialized view's refresh
++trigger, or `ON <table> EXECUTE <task>`) lands on the SOURCE table whose commits
++fire it, never on the target. A schedule or signal trigger has no source table
++and lands on the TASK it fires - the holder is the task - and a task holds at
++most one trigger of any kind.
+ 
+ Two harnesses, mirroring test_materialized_views.py / test_catalog_ddl_delegation.py:
+ - LocalStoreConnector executes the whole statement surface against its
+@@ -32,6 +35,10 @@ try:
+     from opteryx_catalog.exceptions import TriggerNotFound
+ except ImportError:  # wheel predates triggers; the connector catches KeyError then
+     TriggerNotFound = KeyError
++try:
++    from opteryx_catalog.exceptions import TaskNotFound
++except ImportError:  # wheel predates tasks; the connector then sees no task API
++    TaskNotFound = KeyError
+ 
+ _OWNER_POLICY = [{"pattern": "*", "role": "owner"}]
+ 
+@@ -213,6 +220,292 @@ def test_drop_trigger_without_table_rejected(tmp_path):
+         list(owner.execute_to_morsels("DROP TRIGGER t"))
+ 
+ 
++# ---------------------------------------------------------------------------
++# LocalStoreConnector: schedule and signal triggers, held by the task they fire
++# ---------------------------------------------------------------------------
++
++
++def _create_task(session, name="ws.t", statement="SELECT a FROM ws.src"):
++    list(session.execute_to_morsels(f"CREATE TASK {name} AS {statement}"))
++
++
++_WINDOWED = "SELECT a FROM ws.src WHERE a > :parent_version AND a <= :current_version"
++
++
++def test_schedule_trigger_lands_under_the_task(tmp_path):
++    """No source dataset, so the record hangs off the task: the sidecar sits
++    next to task.json, and the source table carries nothing."""
++    _setup_workspace(tmp_path)
++    owner = opteryx.session(user="olive", access_policies=_OWNER_POLICY)
++    _seed_source(owner)
++    _create_task(owner)
++
++    list(owner.execute_to_morsels("CREATE TRIGGER tick ON SCHEDULE '0 * * * *' EXECUTE ws.t"))
++
++    assert _source_triggers(tmp_path, "ws.src") == []
++    triggers = _source_triggers(tmp_path, "ws.t")
++    assert len(triggers) == 1
++    record = triggers[0]
++    assert record["name"] == "tick"
++    # `kind` keeps meaning what the trigger RUNS; the event is its own axis.
++    assert record["kind"] == "task"
++    assert record["target-task"] == "ws.t"
++    assert record["event-kind"] == "schedule"
++    assert record["schedule"] == "0 * * * *"
++    assert record["time-zone"] == "UTC"
++    assert record["window-source"] is None
++    assert record["runs-as"] == "olive"
++    assert record["created-by"] == "olive"
++
++
++def test_schedule_trigger_with_time_zone_and_window(tmp_path):
++    """OVER names the dataset the run is windowed over, which is what lets a
++    windowed task be fired by a clock at all."""
++    _setup_workspace(tmp_path)
++    owner = opteryx.session(user="olive", access_policies=_OWNER_POLICY)
++    _seed_source(owner)
++    _create_task(owner, "ws.delta", _WINDOWED)
++
++    list(
++        owner.execute_to_morsels(
++            "CREATE TRIGGER nightly ON SCHEDULE '0 3 * * *' AT TIME ZONE 'Europe/London' "
++            "OVER ws.src EXECUTE ws.delta"
++        )
++    )
++
++    record = _source_triggers(tmp_path, "ws.delta")[0]
++    assert record["event-kind"] == "schedule"
++    assert record["schedule"] == "0 3 * * *"
++    assert record["time-zone"] == "Europe/London"
++    assert record["window-source"] == "ws.src"
++
++
++def test_signal_trigger_lands_under_the_task(tmp_path):
++    _setup_workspace(tmp_path)
++    owner = opteryx.session(user="olive", access_policies=_OWNER_POLICY)
++    _seed_source(owner)
++    _create_task(owner)
++
++    list(owner.execute_to_morsels("CREATE TRIGGER poke ON SIGNAL EXECUTE ws.t"))
++
++    record = _source_triggers(tmp_path, "ws.t")[0]
++    assert record["name"] == "poke"
++    assert record["event-kind"] == "signal"
++    assert record["schedule"] is None
++    assert record["time-zone"] is None
++    assert record["window-source"] is None
++
++
++def test_signal_trigger_with_window(tmp_path):
++    _setup_workspace(tmp_path)
++    owner = opteryx.session(user="olive", access_policies=_OWNER_POLICY)
++    _seed_source(owner)
++    _create_task(owner, "ws.delta", _WINDOWED)
++
++    list(owner.execute_to_morsels("CREATE TRIGGER poke ON SIGNAL OVER ws.src EXECUTE ws.delta"))
++
++    record = _source_triggers(tmp_path, "ws.delta")[0]
++    assert record["event-kind"] == "signal"
++    assert record["window-source"] == "ws.src"
++
++
++def test_a_windowed_task_needs_over(tmp_path):
++    """THE WINDOWLESS CHECK. A commit binds `:parent_version` and
++    `:current_version`; a clock has no commit. Without OVER the task must not
++    consume a window - refused at arming, before anything is written, and the
++    refusal names the parameters and the two ways out."""
++    _setup_workspace(tmp_path)
++    owner = opteryx.session(user="olive", access_policies=_OWNER_POLICY)
++    _seed_source(owner)
++    _create_task(owner, "ws.delta", _WINDOWED)
++
++    for sql in (
++        "CREATE TRIGGER tick ON SCHEDULE '0 * * * *' EXECUTE ws.delta",
++        "CREATE TRIGGER poke ON SIGNAL EXECUTE ws.delta",
++    ):
++        with pytest.raises(UnsupportedSyntaxError) as caught:
++            list(owner.execute_to_morsels(sql))
++        message = str(caught.value)
++        assert ":parent_version" in message
++        assert ":current_version" in message
++        assert "OVER" in message
++    assert _source_triggers(tmp_path, "ws.delta") == []
++
++    # The same task, windowed over its source, is accepted.
++    list(owner.execute_to_morsels("CREATE TRIGGER tick ON SCHEDULE '0 * * * *' OVER ws.src EXECUTE ws.delta"))
++    assert _source_triggers(tmp_path, "ws.delta")[0]["window-source"] == "ws.src"
++
++
++def test_over_must_name_a_dataset_in_the_tasks_workspace(tmp_path):
++    """The window is read from the catalog the trigger lives in; a run may not
++    be windowed over another workspace's data."""
++    _setup_workspace(tmp_path)
++    register_workspace("elsewhere", LocalStoreConnector, store_root=str(tmp_path / "elsewhere"))
++    owner = opteryx.session(user="olive", access_policies=_OWNER_POLICY)
++    _seed_source(owner)
++    _seed_source(owner, "elsewhere.src")
++    _create_task(owner, "ws.delta", _WINDOWED)
++
++    with pytest.raises(UnsupportedSyntaxError, match="own workspace"):
++        list(
++            owner.execute_to_morsels(
++                "CREATE TRIGGER tick ON SCHEDULE '0 * * * *' OVER elsewhere.src EXECUTE ws.delta"
++            )
++        )
++    assert _source_triggers(tmp_path, "ws.delta") == []
++
++
++def test_over_must_name_a_dataset_that_exists(tmp_path):
++    _setup_workspace(tmp_path)
++    owner = opteryx.session(user="olive", access_policies=_OWNER_POLICY)
++    _seed_source(owner)
++    _create_task(owner)
++
++    with pytest.raises(DatasetNotFoundError):
++        list(
++            owner.execute_to_morsels(
++                "CREATE TRIGGER tick ON SCHEDULE '0 * * * *' OVER ws.no_such EXECUTE ws.t"
++            )
++        )
++
++
++def test_a_schedule_trigger_must_execute_a_task(tmp_path):
++    """The holder is the task, so EXECUTE must name one - a table of that name
++    is the wrong kind of thing to hang a clock off."""
++    _setup_workspace(tmp_path)
++    owner = opteryx.session(user="olive", access_policies=_OWNER_POLICY)
++    _seed_source(owner)
++
++    with pytest.raises(UnsupportedSyntaxError, match="is not a task"):
++        list(owner.execute_to_morsels("CREATE TRIGGER tick ON SCHEDULE '0 * * * *' EXECUTE ws.src"))
++    with pytest.raises(UnsupportedSyntaxError, match="is not a task"):
++        list(owner.execute_to_morsels("CREATE TRIGGER poke ON SIGNAL EXECUTE ws.nope"))
++
++
++def test_a_task_holds_one_trigger(tmp_path):
++    """The one-trigger rule: a task's window is one sequence, so a second
++    trigger under it is refused whatever its event."""
++    _setup_workspace(tmp_path)
++    owner = opteryx.session(user="olive", access_policies=_OWNER_POLICY)
++    _seed_source(owner)
++    _create_task(owner)
++    list(owner.execute_to_morsels("CREATE TRIGGER tick ON SCHEDULE '0 * * * *' EXECUTE ws.t"))
++
++    with pytest.raises(ValueError, match="one trigger"):
++        list(owner.execute_to_morsels("CREATE TRIGGER poke ON SIGNAL EXECUTE ws.t"))
++    with pytest.raises(ValueError, match="one trigger"):
++        list(owner.execute_to_morsels("CREATE TRIGGER hourly ON SCHEDULE '30 * * * *' EXECUTE ws.t"))
++
++    assert [t["name"] for t in _source_triggers(tmp_path, "ws.t")] == ["tick"]
++
++
++def test_or_replace_rewrites_the_schedule_and_keeps_the_owner(tmp_path):
++    _setup_workspace(tmp_path)
++    owner = opteryx.session(user="olive", access_policies=_OWNER_POLICY)
++    _seed_source(owner)
++    _create_task(owner)
++    list(owner.execute_to_morsels("CREATE TRIGGER tick ON SCHEDULE '0 * * * *' EXECUTE ws.t"))
++    list(owner.execute_to_morsels("ALTER TRIGGER tick ON ws.t OWNER TO rhea"))
++
++    list(
++        owner.execute_to_morsels(
++            "CREATE OR REPLACE TRIGGER tick ON SCHEDULE '*/5 * * * *' EXECUTE ws.t"
++        )
++    )
++
++    triggers = _source_triggers(tmp_path, "ws.t")
++    assert len(triggers) == 1
++    assert triggers[0]["schedule"] == "*/5 * * * *"
++    assert triggers[0]["runs-as"] == "rhea"
++
++
++def test_alter_and_drop_against_a_task_holder(tmp_path):
++    """ON <holder> in ALTER and DROP names the task the way it names a table;
++    the grammar does not change and the engine works out which it was."""
++    _setup_workspace(tmp_path)
++    owner = opteryx.session(user="olive", access_policies=_OWNER_POLICY)
++    _seed_source(owner)
++    _create_task(owner)
++    list(owner.execute_to_morsels("CREATE TRIGGER tick ON SCHEDULE '0 * * * *' EXECUTE ws.t"))
++
++    list(owner.execute_to_morsels("ALTER TRIGGER tick ON ws.t SUSPEND"))
++    assert _source_triggers(tmp_path, "ws.t")[0]["suspended-at-ms"] is not None
++    list(owner.execute_to_morsels("ALTER TRIGGER tick ON ws.t RESUME"))
++    assert _source_triggers(tmp_path, "ws.t")[0]["suspended-at-ms"] is None
++
++    list(owner.execute_to_morsels("ALTER TRIGGER tick ON ws.t OWNER TO rhea"))
++    assert _source_triggers(tmp_path, "ws.t")[0]["runs-as"] == "rhea"
++
++    list(owner.execute_to_morsels("DROP TRIGGER tick ON ws.t"))
++    assert _source_triggers(tmp_path, "ws.t") == []
++    # And the task is still there: the trigger was the task's, not the task.
++    list(owner.execute_to_morsels("CREATE TRIGGER poke ON SIGNAL EXECUTE ws.t"))
++    assert _source_triggers(tmp_path, "ws.t")[0]["event-kind"] == "signal"
++
++
++def test_drop_trigger_on_a_missing_holder_errors_even_with_if_exists(tmp_path):
++    """IF EXISTS speaks about the trigger, not the task it hangs off - the same
++    rule as for a table."""
++    _setup_workspace(tmp_path)
++    owner = opteryx.session(user="olive", access_policies=_OWNER_POLICY)
++
++    with pytest.raises(DatasetNotFoundError):
++        list(owner.execute_to_morsels("DROP TRIGGER IF EXISTS tick ON ws.no_such_task"))
++
++
++def test_the_commit_form_takes_neither_window_nor_zone(tmp_path):
++    """A commit supplies its own window and happens in no time zone; both
++    modifiers are refused by name rather than as a generic syntax error."""
++    _setup_workspace(tmp_path)
++    owner = opteryx.session(user="olive", access_policies=_OWNER_POLICY)
++
++    with pytest.raises(UnsupportedSyntaxError, match="OVER.*does not apply to a commit trigger"):
++        list(owner.execute_to_morsels("CREATE TRIGGER t ON ws.src OVER ws.other EXECUTE ws.t"))
++    with pytest.raises(UnsupportedSyntaxError, match="AT TIME ZONE.*does not apply to a commit trigger"):
++        list(owner.execute_to_morsels("CREATE TRIGGER t ON ws.src AT TIME ZONE 'UTC' EXECUTE ws.t"))
++
++
++def test_words_that_are_not_events_are_refused_by_name(tmp_path):
++    _setup_workspace(tmp_path)
++    owner = opteryx.session(user="olive", access_policies=_OWNER_POLICY)
++
++    for sql in (
++        "CREATE TRIGGER t ON EVERY 5 MINUTES EXECUTE ws.t",
++        "CREATE TRIGGER t ON EVENT deploy EXECUTE ws.t",
++    ):
++        with pytest.raises(UnsupportedSyntaxError, match="is not a trigger event"):
++            list(owner.execute_to_morsels(sql))
++
++
++def test_malformed_schedule_and_signal_forms_are_refused_with_their_grammar(tmp_path):
++    _setup_workspace(tmp_path)
++    owner = opteryx.session(user="olive", access_policies=_OWNER_POLICY)
++
++    with pytest.raises(UnsupportedSyntaxError, match="not a cron expression"):
++        list(owner.execute_to_morsels("CREATE TRIGGER t ON SCHEDULE 'hourly' EXECUTE ws.t"))
++    with pytest.raises(UnsupportedSyntaxError, match="ON SCHEDULE"):
++        list(owner.execute_to_morsels("CREATE TRIGGER t ON SCHEDULE 0 * * * * EXECUTE ws.t"))
++    with pytest.raises(UnsupportedSyntaxError, match="ON SIGNAL"):
++        list(owner.execute_to_morsels("CREATE TRIGGER t ON SIGNAL AT TIME ZONE 'UTC' EXECUTE ws.t"))
++
++
++def test_the_commit_form_is_unchanged(tmp_path):
++    _setup_workspace(tmp_path)
++    owner = opteryx.session(user="olive", access_policies=_OWNER_POLICY)
++    _seed_source(owner)
++    _seed_source(owner, "ws.other")
++    _create_task(owner)
++
++    list(owner.execute_to_morsels("CREATE TRIGGER fire ON ws.other EXECUTE ws.t"))
++
++    record = _source_triggers(tmp_path, "ws.other")[0]
++    assert record["name"] == "fire"
++    assert record["target-task"] == "ws.t"
++    assert record["event-kind"] == "commit"
++    assert record["window-source"] is None
++    assert _source_triggers(tmp_path, "ws.t") == []
++
++
+ # ---------------------------------------------------------------------------
+ # Catalog-backed connector: delegation, information_schema.triggers, SHOW TRIGGERS
+ # ---------------------------------------------------------------------------
+@@ -273,6 +566,18 @@ class _FakeCatalog:
+             raise TriggerNotFound(f"Trigger not found: {name} on {identifier}")
+         _FakeCatalog.calls.append(("set_trigger_minimum_interval", identifier, name, seconds, author))
+ 
++    # Deliberately NO `holder_kind` and no event keywords: this is the shape the
++    # catalog had before task-held triggers existed, and a commit trigger's call
++    # must still fit it - a TypeError here is the connector leaking the new
++    # keywords onto the old path.
++    def create_trigger(
++        self, identifier, name, target_task=None, kind="materialized_view_refresh", author=None
++    ):
++        _FakeCatalog.calls.append(("create_trigger", identifier, name, target_task, kind, author))
++
++    def set_trigger_suspended(self, identifier, name, suspended, author=None):
++        _FakeCatalog.calls.append(("set_trigger_suspended", identifier, name, suspended, author))
++
+ 
+ @pytest.fixture
+ def catalog_workspace():
+@@ -282,6 +587,84 @@ def catalog_workspace():
+     return _FakeCatalog
+ 
+ 
++class _FakeTaskCatalog(_FakeCatalog):
++    """The fake above, plus tasks - so a trigger can be held by one. Two tasks
++    in coll1: `nightly`, windowless, and `delta`, which consumes a window. One
++    schedule trigger, `tick`, held by `nightly`. Its trigger methods take
++    `holder_kind`, as the catalog's do, and record what they were passed."""
++
++    tasks = {
++        "coll1.nightly": "SELECT a FROM cat.coll1.src",
++        "coll1.delta": (
++            "SELECT a FROM cat.coll1.src "
++            "WHERE a > :parent_version AND a <= :current_version"
++        ),
++    }
++
++    def get_task(self, identifier):
++        if identifier not in self.tasks:
++            raise TaskNotFound(f"Task not found: {identifier}")
++        return {"sql": self.tasks[identifier]}
++
++    def list_tasks(self, collection):
++        _FakeCatalog.calls.append(("list_tasks", collection))
++        prefix = f"{collection}."
++        return [name[len(prefix):] for name in self.tasks if name.startswith(prefix)]
++
++    def dataset_exists(self, identifier):
++        return identifier in {"coll1.src", "coll1.other", "coll2.empty"}
++
++    def list_triggers(self, identifier, holder_kind="dataset"):
++        if holder_kind == "dataset":
++            return _FakeCatalog.list_triggers(self, identifier)
++        _FakeCatalog.calls.append(("list_triggers", identifier, holder_kind))
++        if identifier != "coll1.nightly":
++            return []
++        return [
++            {
++                "name": "tick",
++                "kind": "task",
++                "target-task": "cat.coll1.nightly",
++                "runs-as": "olive",
++                "created-by": "olive",
++                "created-at-ms": _NOW_MS,
++                "event-kind": "schedule",
++                "schedule": "0 3 * * *",
++                "time-zone": "UTC",
++                "next-due-at-ms": _NOW_MS + 3_600_000,
++                "window-source": None,
++                "last-fired-at-ms": None,
++                "last-fired-status": None,
++            }
++        ]
++
++    def create_trigger(self, identifier, name, **kwargs):
++        _FakeCatalog.calls.append(("create_trigger", identifier, name, kwargs))
++
++    def drop_trigger(self, identifier, name, author=None, missing_ok=False, holder_kind="dataset"):
++        _FakeCatalog.calls.append(
++            ("drop_trigger", identifier, name, author, missing_ok, holder_kind)
++        )
++
++    def set_trigger_owner(self, identifier, name, new_owner, author=None, holder_kind="dataset"):
++        _FakeCatalog.calls.append(
++            ("set_trigger_owner", identifier, name, new_owner, author, holder_kind)
++        )
++
++    def set_trigger_suspended(self, identifier, name, suspended, author=None, holder_kind="dataset"):
++        _FakeCatalog.calls.append(
++            ("set_trigger_suspended", identifier, name, suspended, author, holder_kind)
++        )
++
++
++@pytest.fixture
++def task_catalog_workspace():
++    _FakeCatalog.calls = []
++    _FakeCatalog.missing_triggers = set()
++    register_workspace("cat", OpteryxConnector, catalog=_FakeTaskCatalog)
++    return _FakeTaskCatalog
++
++
+ def test_drop_trigger_delegates_to_catalog_with_user(catalog_workspace):
+     session = opteryx.session(user="alice", access_policies=_OWNER_POLICY)
+     list(session.execute_to_morsels("DROP TRIGGER refresh__coll1__mv ON cat.coll1.src"))
+@@ -314,6 +697,153 @@ def test_drop_trigger_not_found_translated(catalog_workspace):
+     list(session.execute_to_morsels("DROP TRIGGER IF EXISTS gone ON cat.coll1.src"))
+ 
+ 
++def test_commit_trigger_call_shape_is_unchanged(catalog_workspace):
++    """The fake's `create_trigger` takes no `holder_kind` and no event keyword,
++    so this passing IS the proof that a commit trigger's call is byte-for-byte
++    what it was before schedule and signal triggers existed."""
++    session = opteryx.session(user="alice", access_policies=_OWNER_POLICY)
++    list(session.execute_to_morsels("CREATE TRIGGER fire ON cat.coll1.src EXECUTE cat.coll1.ingest"))
++
++    assert catalog_workspace.calls == [
++        ("create_trigger", "coll1.src", "fire", "cat.coll1.ingest", "task", "alice")
++    ]
++
++
++def test_commit_trigger_alter_and_drop_shapes_are_unchanged(catalog_workspace):
++    session = opteryx.session(user="alice", access_policies=_OWNER_POLICY)
++    list(session.execute_to_morsels("ALTER TRIGGER refresh__coll1__mv ON cat.coll1.src SUSPEND"))
++    list(session.execute_to_morsels("DROP TRIGGER refresh__coll1__mv ON cat.coll1.src"))
++
++    assert catalog_workspace.calls == [
++        ("set_trigger_suspended", "coll1.src", "refresh__coll1__mv", True, "alice"),
++        ("drop_trigger", "coll1.src", "refresh__coll1__mv", "alice", False),
++    ]
++
++
++def test_schedule_trigger_is_created_under_the_task(task_catalog_workspace):
++    """Holder is the task, `holder_kind="task"`, the event goes with it, and the
++    window source is passed relative to the workspace as every identifier is."""
++    session = opteryx.session(user="alice", access_policies=_OWNER_POLICY)
++    list(
++        session.execute_to_morsels(
++            "CREATE TRIGGER nightly ON SCHEDULE '0 3 * * *' AT TIME ZONE 'Europe/London' "
++            "OVER cat.coll1.src EXECUTE cat.coll1.delta"
++        )
++    )
++
++    assert [c for c in task_catalog_workspace.calls if c[0] == "create_trigger"] == [
++        (
++            "create_trigger",
++            "coll1.delta",
++            "nightly",
++            {
++                "target_task": "cat.coll1.delta",
++                "kind": "task",
++                "author": "alice",
++                "holder_kind": "task",
++                "event_kind": "schedule",
++                "schedule": "0 3 * * *",
++                "time_zone": "Europe/London",
++                "window_source": "coll1.src",
++            },
++        )
++    ]
++
++
++def test_signal_trigger_is_created_under_the_task(task_catalog_workspace):
++    session = opteryx.session(user="alice", access_policies=_OWNER_POLICY)
++    list(session.execute_to_morsels("CREATE TRIGGER poke ON SIGNAL EXECUTE cat.coll1.nightly"))
++
++    assert [c for c in task_catalog_workspace.calls if c[0] == "create_trigger"] == [
++        (
++            "create_trigger",
++            "coll1.nightly",
++            "poke",
++            {
++                "target_task": "cat.coll1.nightly",
++                "kind": "task",
++                "author": "alice",
++                "holder_kind": "task",
++                "event_kind": "signal",
++                "schedule": None,
++                "time_zone": None,
++                "window_source": None,
++            },
++        )
++    ]
++
++
++def test_or_replace_drops_under_the_task_first(task_catalog_workspace):
++    session = opteryx.session(user="alice", access_policies=_OWNER_POLICY)
++    list(
++        session.execute_to_morsels(
++            "CREATE OR REPLACE TRIGGER tick ON SCHEDULE '0 * * * *' EXECUTE cat.coll1.nightly"
++        )
++    )
++
++    calls = [c for c in task_catalog_workspace.calls if c[0] in ("drop_trigger", "create_trigger")]
++    assert calls[0] == ("drop_trigger", "coll1.nightly", "tick", "alice", True, "task")
++    assert calls[1][0:3] == ("create_trigger", "coll1.nightly", "tick")
++
++
++def test_windowed_task_without_over_is_refused_before_the_catalog_is_written(
++    task_catalog_workspace,
++):
++    session = opteryx.session(user="alice", access_policies=_OWNER_POLICY)
++
++    with pytest.raises(UnsupportedSyntaxError, match="parent_version"):
++        list(
++            session.execute_to_morsels(
++                "CREATE TRIGGER tick ON SCHEDULE '0 3 * * *' EXECUTE cat.coll1.delta"
++            )
++        )
++
++    assert not [c for c in task_catalog_workspace.calls if c[0] == "create_trigger"]
++
++
++def test_over_across_workspaces_is_refused_on_the_catalog_path(task_catalog_workspace):
++    session = opteryx.session(user="alice", access_policies=_OWNER_POLICY)
++
++    with pytest.raises(UnsupportedSyntaxError, match="own workspace"):
++        list(
++            session.execute_to_morsels(
++                "CREATE TRIGGER tick ON SCHEDULE '0 3 * * *' OVER other.coll1.src "
++                "EXECUTE cat.coll1.delta"
++            )
++        )
++
++
++def test_alter_and_drop_against_a_task_holder_pass_holder_kind(task_catalog_workspace):
++    session = opteryx.session(user="alice", access_policies=_OWNER_POLICY)
++    list(session.execute_to_morsels("ALTER TRIGGER tick ON cat.coll1.nightly SUSPEND"))
++    list(session.execute_to_morsels("ALTER TRIGGER tick ON cat.coll1.nightly OWNER TO bob"))
++    list(session.execute_to_morsels("DROP TRIGGER tick ON cat.coll1.nightly"))
++
++    writes = [
++        c
++        for c in task_catalog_workspace.calls
++        if c[0] in ("set_trigger_suspended", "set_trigger_owner", "drop_trigger")
++    ]
++    assert writes == [
++        ("set_trigger_suspended", "coll1.nightly", "tick", True, "alice", "task"),
++        ("set_trigger_owner", "coll1.nightly", "tick", "bob", "alice", "task"),
++        ("drop_trigger", "coll1.nightly", "tick", "alice", False, "task"),
++    ]
++    # The owner transfer read the trigger back off the TASK, not off a dataset.
++    assert ("list_triggers", "coll1.nightly", "task") in task_catalog_workspace.calls
++
++
++def test_dataset_holder_still_takes_the_old_shape_beside_task_holders(task_catalog_workspace):
++    """A catalog that knows task holders is still called the old way for a
++    dataset: `holder_kind` is never passed for one."""
++    session = opteryx.session(user="alice", access_policies=_OWNER_POLICY)
++    list(session.execute_to_morsels("DROP TRIGGER refresh__coll1__mv ON cat.coll1.src"))
++
++    assert ("drop_trigger", "coll1.src", "refresh__coll1__mv", "alice", False, "dataset") in (
++        task_catalog_workspace.calls
++    )
++
++
+ # --- information_schema.triggers
+ 
+ 
+@@ -665,3 +1195,94 @@ def test_information_schema_triggers_created_at_is_timestamp(catalog_workspace):
+     created_at = rows[0]["created_at"]
+     assert isinstance(created_at, datetime.datetime)
+     assert created_at.year == 2025
++
++
++# --- task-held triggers in information_schema.triggers and SHOW TRIGGERS
++
++
++def test_information_schema_lists_task_held_triggers(task_catalog_workspace):
++    """Two holders, two rows. The commit trigger's holder is its
++    event_object_table; the schedule trigger's holder is the task, its
++    event_object_table the OVER dataset (here none), and the event columns say
++    what fires it and when."""
++    session = opteryx.session(user="alice", access_policies=_OWNER_POLICY)
++    rows = _morsels_to_rows(
++        session.execute_to_morsels("SELECT * FROM cat.information_schema.triggers")
++    )
++
++    by_name = {row["trigger_name"]: row for row in rows}
++    assert set(by_name) == {"refresh__coll1__mv", "tick"}
++
++    commit = by_name["refresh__coll1__mv"]
++    assert commit["trigger_holder"] == "coll1.src"
++    assert commit["event_object_table"] == "coll1.src"
++    # Written before events were told apart: no `event-kind` on the record,
++    # and it is a commit trigger, the only kind there was.
++    assert commit["event_kind"] == "commit"
++    assert commit["schedule"] is None
++    assert commit["time_zone"] is None
++    assert commit["next_due_at"] is None
++
++    tick = by_name["tick"]
++    assert tick["trigger_collection"] == "coll1"
++    assert tick["trigger_holder"] == "coll1.nightly"
++    assert tick["event_object_table"] is None
++    assert tick["event_kind"] == "schedule"
++    assert tick["schedule"] == "0 3 * * *"
++    assert tick["time_zone"] == "UTC"
++    assert isinstance(tick["next_due_at"], datetime.datetime)
++    assert tick["next_due_at"].year == 2025
++    assert tick["action_kind"] == "task"
++    assert tick["target"] == "cat.coll1.nightly"
++    assert tick["runs_as"] == "olive"
++
++
++def test_information_schema_triggers_without_a_task_api_lists_datasets_only(catalog_workspace):
++    """A catalog with no `list_tasks` has nothing a task could hold, and is
++    never asked - the base fake would raise on `holder_kind`."""
++    session = opteryx.session(user="alice", access_policies=_OWNER_POLICY)
++    rows = _morsels_to_rows(
++        session.execute_to_morsels("SELECT trigger_holder, event_kind FROM cat.information_schema.triggers")
++    )
++    assert rows == [{"trigger_holder": "coll1.src", "event_kind": "commit"}]
++
++
++def test_information_schema_triggers_filters_on_event_kind(task_catalog_workspace):
++    session = opteryx.session(user="alice", access_policies=_OWNER_POLICY)
++    rows = _morsels_to_rows(
++        session.execute_to_morsels(
++            "SELECT trigger_name FROM cat.information_schema.triggers "
++            "WHERE event_kind = 'schedule'"
++        )
++    )
++    assert [r["trigger_name"] for r in rows] == ["tick"]
++
++
++def test_show_triggers_for_task(task_catalog_workspace):
++    session = opteryx.session(user="alice", access_policies=_OWNER_POLICY)
++    rows = _morsels_to_rows(session.execute_to_morsels("SHOW TRIGGERS FOR cat.coll1.nightly"))
++
++    assert len(rows) == 1
++    assert rows[0]["trigger_name"] == "tick"
++    assert rows[0]["trigger_holder"] == "coll1.nightly"
++    assert rows[0]["event_kind"] == "schedule"
++    # The holder predicate is pushed: the dataset holders were never listed.
++    assert ("list_triggers", "coll1.src") not in task_catalog_workspace.calls
++
++
++def test_show_triggers_for_table_lists_only_that_tables_triggers(task_catalog_workspace):
++    """SHOW TRIGGERS FOR a table filters on the holder, which for a commit
++    trigger is its event_object_table - so this reads as it always did, and a
++    task's trigger does not leak into a table's listing."""
++    session = opteryx.session(user="alice", access_policies=_OWNER_POLICY)
++    rows = _morsels_to_rows(session.execute_to_morsels("SHOW TRIGGERS FOR cat.coll1.src"))
++
++    assert [r["trigger_name"] for r in rows] == ["refresh__coll1__mv"]
++    assert rows[0]["event_object_table"] == "coll1.src"
++    assert ("list_triggers", "coll1.nightly", "task") not in task_catalog_workspace.calls
++
++
++def test_show_triggers_for_task_without_triggers_is_empty(task_catalog_workspace):
++    session = opteryx.session(user="alice", access_policies=_OWNER_POLICY)
++    rows = _morsels_to_rows(session.execute_to_morsels("SHOW TRIGGERS FOR cat.coll1.delta"))
++    assert rows == []

@@ -217,26 +217,40 @@ def test_federator_may_not_own_a_trigger_even_in_public():
         )
 
 
-def test_the_public_exemption_does_not_reach_materialized_views():
-    """The MV paths do not pass `workspace`, so they get the unexempted rule.
-    Nothing the platform maintains needs an xb500-owned view, and an exemption
-    nothing needs is one nobody is checking."""
+def test_the_public_exemption_reaches_a_views_refresh_triggers_on_the_same_terms():
+    """A view's refresh triggers are triggers: pinned to the author and gated
+    exactly as a task's trigger is, exemption included. The MV path used to get
+    the unexempted rule because the identity sat on the view, which nothing in
+    `public` needed; now that it sits on the trigger there is one rule, and a
+    second one for the same field would be a second thing to keep in step."""
     catalog = _public_catalog()
+    _add_dataset(catalog, "security.nvd_updates")
+    _add_dataset(catalog, "security.mv")
+
+    catalog.create_materialized_view(
+        "security.mv",
+        sql="SELECT 1",
+        source_tables=["security.nvd_updates"],
+        author="xb500",
+    )
+    [trigger] = catalog.list_triggers("security.nvd_updates")
+    assert trigger["runs-as"] == "xb500"
 
     with pytest.raises(PlatformIdentityOwnerRefused):
         catalog.create_materialized_view(
             "security.mv",
             sql="SELECT 1",
             source_tables=["security.nvd_updates"],
-            author="xb500",
+            author="federator",
+            update_if_exists=True,
         )
 
 
-def test_the_ownership_gate_is_by_exemption_not_by_allowlist():
-    """Only the MV refresh kind is exempt - it resolves its identity from the
-    view's record and ignores `runs-as`. Any OTHER kind, including ones added
-    after this test was written, is gated: a new kind must not arrive
-    ungoverned because a list keyed on `task` was never extended."""
+def test_the_ownership_gate_covers_every_kind():
+    """No kind is exempt. The MV refresh used to be - it resolved its identity
+    from the view's record - and any OTHER kind, including ones added after
+    this test was written, is gated: a new kind must not arrive ungoverned
+    because a list keyed on `task` was never extended."""
     catalog = _catalog()
     _add_dataset(catalog, "ops.src")
 
@@ -246,6 +260,14 @@ def test_the_ownership_gate_is_by_exemption_not_by_allowlist():
             name="t",
             target_task="ops.ingest",
             kind="http_endpoint",
+            author="federator",
+        )
+    with pytest.raises(PlatformIdentityOwnerRefused):
+        catalog.create_trigger(
+            "ops.src",
+            name="r",
+            target_view="ops.v",
+            kind="materialized_view_refresh",
             author="federator",
         )
 
@@ -370,7 +392,7 @@ def test_a_trigger_targets_a_view_or_a_task_never_both():
             name="t",
             target_view="ws.m.d",
             target_task="ws.ops.ingest",
-            author="xb500",
+            author="olive",
         )
 
 
@@ -379,7 +401,7 @@ def test_a_trigger_requires_a_target():
     _add_dataset(catalog, "ops.catalog_changes")
 
     with pytest.raises(ValueError, match="requires a target"):
-        catalog.create_trigger("ops.catalog_changes", name="t", author="xb500")
+        catalog.create_trigger("ops.catalog_changes", name="t", author="olive")
 
 
 def test_a_task_trigger_will_not_be_repointed():

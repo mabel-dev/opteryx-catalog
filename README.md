@@ -111,6 +111,39 @@ Enqueue failures never break the commit that triggered them — they alert and
 write a `trigger.fire_failed` audit record instead. A missed fire is a stale
 materialized view, so keep alerting configured wherever firing is enabled.
 
+#### The firing floor (`minimum-interval-seconds`)
+
+A trigger fires at most once per `minimum-interval-seconds`. A commit inside the
+interval after a firing is recorded on the trigger as `last-fired-status:
+throttled` and audited as `trigger.throttled`, but enqueues nothing — it is not
+an error and does not alert, like a suspension. It is a throttle, not a
+debounce: the *first* commit in a burst fires, and later ones in the interval
+are dropped, so the target is refreshed as of that first commit until the next
+commit after the interval fires again. Throttled task fires stay correct
+because the next fire widens its window back over the skipped commits.
+
+- **New triggers get 120 seconds** (`DEFAULT_MINIMUM_INTERVAL_SECONDS`), written
+  onto the record at `create_trigger`. Pass `minimum_interval_seconds=0` for none,
+  or any non-negative whole number of seconds.
+- **Existing triggers are untouched.** The floor is read from the record and
+  never defaulted at fire time, so a trigger document without the field fires
+  on every commit as before and pays no extra Firestore round trip. Give one a
+  floor with `set_trigger_minimum_interval(dataset, trigger, seconds)`, or in SQL
+  with `ALTER TRIGGER <name> ON <table> SET MINIMUM INTERVAL TO <n> [SECONDS|MINUTES]`;
+  `0` removes it. Re-registering a trigger (`CREATE OR REPLACE MATERIALIZED VIEW` rewrites
+  every source trigger) keeps the floor the record already holds.
+- **Two commits milliseconds apart cannot both fire.** The right to fire is
+  claimed in a Firestore transaction on the trigger document
+  (`claim_trigger_fire`), which stamps `last-claimed-at-ms` in the same
+  transaction that reads it. Of two concurrent claims one commits and the other
+  is retried against the fresh stamp and refused. The claim is keyed on its own
+  field rather than `last-fired-at-ms`, which records failures too, and a fire
+  that raises after claiming hands the claim back (`release_trigger_fire`) so an
+  outage does not also silence the next interval.
+- The floor is per **trigger**, not per target: a view with two sources has two
+  triggers, each with its own floor. Coalescing what gets through stays with
+  jobs' dedup window.
+
 ### Alerting 🚨
 
 When the catalog detects a *platform inconsistency* — a state that should be impossible, like a

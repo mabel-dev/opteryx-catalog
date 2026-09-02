@@ -316,10 +316,11 @@ def test_a_trigger_owned_by_a_platform_identity_is_reported():
     assert "federator" in findings[0]["detail"]
 
 
-def test_a_refresh_trigger_is_exempt_from_the_owner_check():
-    """A refresh ignores `runs-as` entirely and resolves its identity from the
-    view's own record, so a value sitting on the trigger decides nothing and
-    reporting it would be noise."""
+def test_a_refresh_trigger_owned_by_a_platform_identity_is_reported():
+    """A refresh runs as its trigger's `runs-as`, like any other unattended
+    work, so a platform identity there is the same unbilled standing compute it
+    is on a task trigger. It used to be exempt here because the identity lived
+    on the view and the trigger's field decided nothing."""
     client = _Client()
     src = _add_dataset(client, "ws", "src", "a")
     _add_dataset(client, "ws", "mart", "daily")
@@ -332,7 +333,10 @@ def test_a_refresh_trigger_is_exempt_from_the_owner_check():
         }
     )
 
-    assert audit_workspace(client, "ws") == []
+    findings = audit_workspace(client, "ws")
+
+    assert [f["kind"] for f in findings] == ["platform-identity-owner"]
+    assert "federator" in findings[0]["detail"]
 
 
 def test_an_account_owned_trigger_is_fine():

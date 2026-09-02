@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "web",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["/Users/justin/Nextcloud/web.opteryx/scripts/run_local.py", "--host", "127.0.0.1", "--port", "8000", "--no-open"],
+      "port": 8000
+    }
+  ]
+}
