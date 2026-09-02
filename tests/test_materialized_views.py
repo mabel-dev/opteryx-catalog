@@ -136,6 +136,25 @@ class _Transaction:
         self.writes.append(("delete", ref, None))
 
 
+class _Batch:
+    """Enough of a Firestore write batch: nothing lands until `commit`, and
+    then everything does - which is what `set_materialized_view_owner` leans
+    on to keep a view's refresh triggers agreeing at every moment."""
+
+    def __init__(self):
+        self.writes = []
+        self.committed = False
+
+    def update(self, ref, data):
+        self.writes.append((ref, data))
+
+    def commit(self):
+        for ref, data in self.writes:
+            ref.update(data)
+        self.committed = True
+        return []
+
+
 class _FirestoreClient:
     """A stand-in for the Firestore client, whose root collections are the
     workspaces - which is what lets a handle bound to one workspace read
@@ -143,6 +162,7 @@ class _FirestoreClient:
 
     def __init__(self):
         self._collections = {}
+        self.batches = []
 
     def collection(self, name):
         if name not in self._collections:
@@ -151,6 +171,11 @@ class _FirestoreClient:
 
     def transaction(self):
         return _Transaction()
+
+    def batch(self):
+        batch = _Batch()
+        self.batches.append(batch)
+        return batch
 
 
 def _catalog():
@@ -599,21 +624,65 @@ def test_mv_cycle_rejected():
     catalog._assert_no_materialized_view_cycle("ws.mart.mv1", ["ws.mart.mv2"])
 
 
-# --- runs-as (the pinned refresh identity) ------------------------------
+# --- runs-as (the refresh identity, on the triggers) --------------------
+#
+# A trigger is an event plus a `runs-as`. The view is stored SQL with no
+# identity of its own - a person running REFRESH runs it as themselves - so
+# the identity an unattended refresh carries lives on each refresh trigger,
+# exactly where a task trigger keeps the identity of the run it starts.
 
 
-def test_runs_as_is_pinned_to_the_creator():
+def _refresh_triggers(catalog, view="ws.mart.daily", sources=("src.a",)):
+    """`{source: runs-as}` for the view's refresh trigger on each source."""
+    name = OpteryxCatalog._mv_trigger_name(view)
+    found = {}
+    for source in sources:
+        [trigger] = [t for t in catalog.list_triggers(source) if t["name"] == name]
+        found[source] = trigger.get("runs-as")
+    return found
+
+
+def test_runs_as_is_pinned_on_each_refresh_trigger_not_the_view():
     catalog = _catalog()
     _add_dataset(catalog, "src.a")
-    _register_mv(catalog, "mart.daily", sources=("src.a",))
+    _add_dataset(catalog, "src.b")
+    _register_mv(catalog, "mart.daily", sources=("src.a", "src.b"))
 
-    assert catalog.get_materialized_view("mart.daily")["runs-as"] == "alice"
+    assert _refresh_triggers(catalog, sources=("src.a", "src.b")) == {
+        "src.a": "alice",
+        "src.b": "alice",
+    }
+    # Nothing on the view: not on its record, not in its document.
+    assert "runs-as" not in catalog.get_materialized_view("mart.daily")
+    assert "runs-as" not in catalog._dataset_doc_ref("mart", "daily").get().to_dict()
+
+
+def test_a_refresh_trigger_is_gated_like_a_task_trigger():
+    """Pinned to the author under the same platform-identity rule
+    `create_trigger` applies to a task's trigger, and refused up front - before
+    the statement version is written - rather than partway through the
+    triggers."""
+    from opteryx_catalog.exceptions import PlatformIdentityOwnerRefused
+
+    catalog = _catalog()
+    _add_dataset(catalog, "src.a")
+    _add_dataset(catalog, "mart.daily")
+
+    with pytest.raises(PlatformIdentityOwnerRefused):
+        catalog.create_materialized_view(
+            "mart.daily", "SELECT * FROM src.a", ["src.a"], author="federator"
+        )
+
+    assert catalog.list_triggers("src.a") == []
+    assert catalog._dataset_doc_ref("mart", "daily").get().to_dict().get("dataset-type") is None
 
 
 def test_editing_a_view_does_not_transfer_who_it_runs_as():
     """The whole point of pinning. Someone else redefining the view records
-    them as the statement's author, but the view keeps refreshing under the
-    identity it was created with - transferring that takes an explicit act."""
+    them as the statement's author, but the trigger on a source the view
+    already read keeps the identity it was created with; only the trigger on a
+    NEWLY read source is pinned to the editor. Moving the rest takes an
+    explicit act."""
     catalog = _catalog()
     _add_dataset(catalog, "src.a")
     _add_dataset(catalog, "src.b")
@@ -621,30 +690,128 @@ def test_editing_a_view_does_not_transfer_who_it_runs_as():
 
     catalog.create_materialized_view(
         "mart.daily",
-        "SELECT * FROM src.b",
-        ["src.b"],
+        "SELECT * FROM src.a JOIN src.b",
+        ["src.a", "src.b"],
         author="bob",
         update_if_exists=True,
     )
 
+    assert _refresh_triggers(catalog, sources=("src.a", "src.b")) == {
+        "src.a": "alice",  # unchanged by bob's edit
+        "src.b": "bob",  # new source, new trigger, bob's
+    }
     record = catalog.get_materialized_view("mart.daily")
-    assert record["runs-as"] == "alice"  # unchanged by bob's edit
-    assert record["last-updated-by"] == "bob"  # but bob is on the record
+    assert record["last-updated-by"] == "bob"  # bob is on the record
     assert isinstance(record["last-updated-at-ms"], int)
 
 
-def test_set_materialized_view_owner_moves_it():
+def test_a_legacy_view_level_owner_is_inherited_by_a_trigger_it_would_otherwise_pin_to_the_editor():
+    """A view registered before the identity moved onto its triggers carries
+    `runs-as` on its own document, and its triggers carry none. Until the
+    backfill script has moved it, a re-registration must not pin such a
+    trigger to whoever is editing - that is the silent transfer the pin
+    exists to prevent - so a trigger the edit creates or first pins inherits
+    the view's value instead."""
+    catalog = _catalog()
+    _add_dataset(catalog, "src.a")
+    _add_dataset(catalog, "src.b")
+    _register_mv(catalog, "mart.daily", sources=("src.a",))
+    # Rewind to the old model: identity on the view, none on the trigger.
+    catalog._dataset_doc_ref("mart", "daily").update({"runs-as": "alice"})
+    name = OpteryxCatalog._mv_trigger_name("ws.mart.daily")
+    trigger_ref = catalog._triggers_collection("src", "a").document(name)
+    trigger_ref.set({k: v for k, v in trigger_ref.get().to_dict().items() if k != "runs-as"})
+    assert _refresh_triggers(catalog) == {"src.a": None}
+
+    catalog.create_materialized_view(
+        "mart.daily",
+        "SELECT * FROM src.a JOIN src.b",
+        ["src.a", "src.b"],
+        author="bob",
+        update_if_exists=True,
+    )
+
+    assert _refresh_triggers(catalog, sources=("src.a", "src.b")) == {
+        "src.a": "alice",
+        "src.b": "alice",
+    }
+    # The legacy field is left for the backfill to retire, not destroyed here.
+    assert catalog._dataset_doc_ref("mart", "daily").get().to_dict()["runs-as"] == "alice"
+
+
+def test_set_materialized_view_owner_moves_every_refresh_trigger_at_once():
+    """The convenience over `set_trigger_owner`: N sources are N triggers, and
+    they are repointed in ONE batch so the view never refreshes as two
+    identities depending on which source was written last."""
+    catalog = _catalog()
+    _add_dataset(catalog, "src.a")
+    _add_dataset(catalog, "src.b")
+    _register_mv(catalog, "mart.daily", sources=("src.a", "src.b"))
+
+    catalog.set_materialized_view_owner("mart.daily", "svc-etl", author="admin")
+
+    assert _refresh_triggers(catalog, sources=("src.a", "src.b")) == {
+        "src.a": "svc-etl",
+        "src.b": "svc-etl",
+    }
+    [batch] = catalog.firestore_client.batches
+    assert batch.committed and len(batch.writes) == 2
+    record = catalog.get_materialized_view("mart.daily")
+    # A transfer is not an edit: no new statement version, sources untouched,
+    # and still nothing on the view itself.
+    assert record["last-updated-by"] == "alice"
+    assert record["source-tables"] == ["ws.src.a", "ws.src.b"]
+    assert "runs-as" not in catalog._dataset_doc_ref("mart", "daily").get().to_dict()
+
+
+def test_set_materialized_view_owner_finds_triggers_by_target_not_by_name():
+    """The generated name has changed shape before; a trigger written under an
+    older scheme is still this view's, and a repoint that missed it would
+    leave the view refreshing as two identities."""
+    catalog = _catalog()
+    _add_dataset(catalog, "src.a")
+    _register_mv(catalog, "mart.daily", sources=("src.a",))
+    catalog.create_trigger("src.a", "refresh__mart__daily", target_view="mart.daily", author="alice")
+    catalog.create_trigger("src.a", "other", target_view="mart.other", author="alice")
+
+    catalog.set_materialized_view_owner("mart.daily", "svc-etl", author="admin")
+
+    by_name = {t["name"]: t["runs-as"] for t in catalog.list_triggers("src.a")}
+    assert by_name["refresh__mart__daily"] == "svc-etl"
+    assert by_name[OpteryxCatalog._mv_trigger_name("ws.mart.daily")] == "svc-etl"
+    assert by_name["other"] == "alice"  # another view's trigger is not touched
+
+
+def test_set_materialized_view_owner_keeps_a_legacy_view_field_in_step():
+    """A view still carrying the old field is kept agreeing with its triggers
+    rather than having the field deleted here: retiring it is the backfill's
+    job, and a reader still on the old model must see the same answer."""
+    catalog = _catalog()
+    _add_dataset(catalog, "src.a")
+    _register_mv(catalog, "mart.daily", sources=("src.a",))
+    catalog._dataset_doc_ref("mart", "daily").update({"runs-as": "alice"})
+
+    catalog.set_materialized_view_owner("mart.daily", "svc-etl", author="admin")
+
+    assert _refresh_triggers(catalog) == {"src.a": "svc-etl"}
+    assert catalog._dataset_doc_ref("mart", "daily").get().to_dict()["runs-as"] == "svc-etl"
+
+
+def test_set_materialized_view_owner_refuses_a_platform_identity_and_a_view_with_no_triggers():
+    from opteryx_catalog.exceptions import PlatformIdentityOwnerRefused
+
     catalog = _catalog()
     _add_dataset(catalog, "src.a")
     _register_mv(catalog, "mart.daily", sources=("src.a",))
 
-    catalog.set_materialized_view_owner("mart.daily", "svc-etl", author="admin")
+    with pytest.raises(PlatformIdentityOwnerRefused):
+        catalog.set_materialized_view_owner("mart.daily", "federator", author="admin")
+    assert _refresh_triggers(catalog) == {"src.a": "alice"}
 
-    record = catalog.get_materialized_view("mart.daily")
-    assert record["runs-as"] == "svc-etl"
-    # A transfer is not an edit: no new statement version, sources untouched.
-    assert record["last-updated-by"] == "alice"
-    assert record["source-tables"] == ["ws.src.a"]
+    # Nothing to repoint is a refusal, not a silent no-op.
+    catalog.drop_trigger("src.a", OpteryxCatalog._mv_trigger_name("ws.mart.daily"), author="a")
+    with pytest.raises(MaterializedViewError, match="no refresh trigger"):
+        catalog.set_materialized_view_owner("mart.daily", "svc-etl", author="admin")
 
 
 def test_set_materialized_view_owner_requires_author_and_a_view():
@@ -730,11 +897,26 @@ def test_registration_survives_a_commit():
     assert record["sql"] == "SELECT * FROM src.a"
     assert record["last-refresh-status"] == "success"
     assert record["last-refresh-execution-id"] == "job-1"
-    # The pinned owner must survive too. It is written once at registration and
-    # never rewritten, so a commit that dropped it would silently return the
-    # view to running as whoever's write fired it - failing open, and only
-    # visible as a permission denial on the next refresh.
-    assert record["runs-as"] == "alice"
+    # The refresh identity is on the triggers, which a commit to the view does
+    # not touch - and the view's document gains no `runs-as` on the way back.
+    assert _refresh_triggers(catalog) == {"src.a": "alice"}
+    assert "runs-as" not in catalog._dataset_doc_ref("mart", "daily").get().to_dict()
+
+
+def test_a_legacy_view_level_owner_survives_a_commit_until_the_backfill_retires_it():
+    """Nothing writes the view-level field any more, but a commit must not
+    DESTROY it before the backfill has copied it onto the triggers - the trap
+    `DatasetMetadata` exists to close, one last time."""
+    catalog = _catalog()
+    _add_dataset(catalog, "src.a")
+    _register_mv(catalog)
+    catalog._dataset_doc_ref("mart", "daily").update({"runs-as": "alice"})
+
+    doc = catalog._dataset_doc_ref("mart", "daily").get()
+    dataset = catalog._build_dataset("mart.daily", "mart", "daily", doc, False)
+    catalog.save_dataset_metadata("mart.daily", dataset.metadata)
+
+    assert catalog._dataset_doc_ref("mart", "daily").get().to_dict()["runs-as"] == "alice"
 
 
 def test_mark_materialized_view_refreshed():
@@ -976,10 +1158,15 @@ def test_egress_lock_turned_on_after_registration_blocks_refresh():
     assert enqueue.call_count == 1
     assert catalog.list_triggers("src.a")[0]["last-fired-status"] == "enqueued"
 
-    # ichnos changes its mind.
+    # ichnos changes its mind. The next commit lands after the trigger's
+    # firing floor - inside it the fire would be throttled before the gate
+    # is reached, which is a different arm.
     _set_egress_restriction(catalog, "ichnos", True)
 
+    import time as _time
+
     with (
+        patch.object(_time, "time", return_value=_time.time() + 200),
         patch.object(trigger_firing, "_alert") as alert,
         patch.object(trigger_firing, "write_audit_record") as audit,
         patch.object(trigger_firing, "_submit_refresh_job", return_value=("exec-1", "enqueued")) as enqueue,
@@ -1082,3 +1269,227 @@ def test_a_trigger_never_survives_a_concurrent_dataset_drop():
         catalog.create_trigger("src.a", "t", target_view="mart.daily", author="alice")
 
     assert not any(True for _ in catalog._triggers_collection("src", "a").stream())
+
+
+# --- the firing floor ----------------------------------------------------
+
+
+def _trigger_doc(catalog, dataset="src.a", name="t1"):
+    collection, dataset_name = dataset.split(".")
+    return (
+        catalog._dataset_doc_ref(collection, dataset_name)
+        .collection(TRIGGERS_SUBCOLLECTION)
+        .document(name)
+    )
+
+
+def test_create_trigger_records_the_default_floor():
+    """A NEW trigger takes the default. Written onto the record rather than
+    read as a fallback at fire time, which is what keeps it off every trigger
+    that already exists."""
+    from opteryx_catalog.opteryx_catalog import DEFAULT_MINIMUM_INTERVAL_SECONDS
+
+    catalog = _catalog()
+    _add_dataset(catalog, "src.a")
+    catalog.create_trigger("src.a", "t1", target_view="mart.daily", author="alice")
+
+    written = _trigger_doc(catalog).get().to_dict()
+    assert written["minimum-interval-seconds"] == DEFAULT_MINIMUM_INTERVAL_SECONDS == 120
+    assert written["last-claimed-at-ms"] is None
+
+
+def test_create_trigger_takes_an_explicit_floor_and_zero_means_none():
+    catalog = _catalog()
+    _add_dataset(catalog, "src.a")
+    catalog.create_trigger(
+        "src.a", "t1", target_view="mart.daily", author="alice", minimum_interval_seconds=30
+    )
+    assert _trigger_doc(catalog).get().to_dict()["minimum-interval-seconds"] == 30
+
+    catalog.create_trigger(
+        "src.a", "t2", target_view="mart.daily", author="alice", minimum_interval_seconds=0
+    )
+    assert _trigger_doc(catalog, name="t2").get().to_dict()["minimum-interval-seconds"] == 0
+
+
+@pytest.mark.parametrize("bad", [-1, True, "120", 1.5])
+def test_create_trigger_refuses_a_floor_that_is_not_a_whole_number_of_seconds(bad):
+    catalog = _catalog()
+    _add_dataset(catalog, "src.a")
+    with pytest.raises(ValueError):
+        catalog.create_trigger(
+            "src.a", "t1", target_view="mart.daily", author="alice", minimum_interval_seconds=bad
+        )
+    assert not _trigger_doc(catalog).get().exists
+
+
+def test_re_registration_keeps_the_floor_the_record_holds_unless_one_is_named():
+    """CREATE OR REPLACE MATERIALIZED VIEW re-registers every source trigger.
+    That must not reset a floor an operator set, and must not reopen a window
+    the standing claim was closing."""
+    catalog = _catalog()
+    _add_dataset(catalog, "src.a")
+    catalog.create_trigger(
+        "src.a", "t1", target_view="mart.daily", author="alice", minimum_interval_seconds=30
+    )
+    _trigger_doc(catalog).update({"last-claimed-at-ms": 999})
+
+    catalog.create_trigger("src.a", "t1", target_view="mart.daily", author="alice")
+    written = _trigger_doc(catalog).get().to_dict()
+    assert written["minimum-interval-seconds"] == 30
+    assert written["last-claimed-at-ms"] == 999
+
+    catalog.create_trigger(
+        "src.a", "t1", target_view="mart.daily", author="alice", minimum_interval_seconds=45
+    )
+    assert _trigger_doc(catalog).get().to_dict()["minimum-interval-seconds"] == 45
+
+
+def test_a_record_that_predates_the_floor_is_granted_without_a_write():
+    """Existing triggers are not affected: no field, no floor, no claim
+    written - the fire costs what it always did."""
+    catalog = _catalog()
+    _add_dataset(catalog, "src.a")
+    _trigger_doc(catalog).set({"name": "t1", "kind": "materialized_view_refresh"})
+
+    claim = catalog.claim_trigger_fire("src.a", "t1")
+
+    assert claim.granted
+    assert claim.interval_seconds == 0
+    assert "last-claimed-at-ms" not in _trigger_doc(catalog).get().to_dict()
+
+
+def test_a_claim_is_refused_inside_the_floor_and_granted_after_it():
+    import time as _time
+
+    catalog = _catalog()
+    _add_dataset(catalog, "src.a")
+    catalog.create_trigger(
+        "src.a", "t1", target_view="mart.daily", author="alice", minimum_interval_seconds=120
+    )
+
+    with patch.object(_time, "time", return_value=1_000.0):
+        first = catalog.claim_trigger_fire("src.a", "t1")
+    assert first.granted
+    assert first.at_ms == 1_000_000
+    assert first.previous_ms is None
+    assert _trigger_doc(catalog).get().to_dict()["last-claimed-at-ms"] == 1_000_000
+
+    # 119.999s later: refused, and the refusal names the claim that holds.
+    with patch.object(_time, "time", return_value=1_119.999):
+        second = catalog.claim_trigger_fire("src.a", "t1")
+    assert not second.granted
+    assert second.at_ms == 1_000_000
+    assert second.interval_seconds == 120
+    assert _trigger_doc(catalog).get().to_dict()["last-claimed-at-ms"] == 1_000_000
+
+    # Exactly the interval later: the floor is "less than", so this fires.
+    with patch.object(_time, "time", return_value=1_120.0):
+        third = catalog.claim_trigger_fire("src.a", "t1")
+    assert third.granted
+    assert third.previous_ms == 1_000_000
+    assert _trigger_doc(catalog).get().to_dict()["last-claimed-at-ms"] == 1_120_000
+
+
+def test_the_claim_is_read_and_written_in_one_transaction():
+    """The point of the whole thing. The fake transaction records what was
+    staged; the claim's write must go through it, never straight to the
+    document - a direct update is exactly the read-then-stamp gap."""
+    catalog = _catalog()
+    _add_dataset(catalog, "src.a")
+    catalog.create_trigger(
+        "src.a", "t1", target_view="mart.daily", author="alice", minimum_interval_seconds=120
+    )
+    transaction = _Transaction()
+    with patch.object(catalog.firestore_client, "transaction", return_value=transaction):
+        claim = catalog.claim_trigger_fire("src.a", "t1")
+
+    assert claim.granted
+    assert transaction.committed
+    assert [(op, data) for op, _, data in transaction.writes] == [
+        ("update", {"last-claimed-at-ms": claim.at_ms})
+    ]
+
+
+def test_a_missing_trigger_cannot_be_claimed():
+    catalog = _catalog()
+    _add_dataset(catalog, "src.a")
+    with pytest.raises(TriggerNotFound):
+        catalog.claim_trigger_fire("src.a", "nope")
+
+
+def test_release_puts_the_previous_claim_back():
+    """A fire that raised after claiming must not silence the next interval."""
+    import time as _time
+
+    catalog = _catalog()
+    _add_dataset(catalog, "src.a")
+    catalog.create_trigger(
+        "src.a", "t1", target_view="mart.daily", author="alice", minimum_interval_seconds=120
+    )
+    _trigger_doc(catalog).update({"last-claimed-at-ms": 500_000})
+
+    with patch.object(_time, "time", return_value=1_000.0):
+        claim = catalog.claim_trigger_fire("src.a", "t1")
+    assert claim.granted and claim.previous_ms == 500_000
+
+    catalog.release_trigger_fire("src.a", "t1", claim)
+    assert _trigger_doc(catalog).get().to_dict()["last-claimed-at-ms"] == 500_000
+
+    # ...and the very next claim is granted again.
+    with patch.object(_time, "time", return_value=1_001.0):
+        assert catalog.claim_trigger_fire("src.a", "t1").granted
+
+
+def test_release_does_not_clobber_a_newer_claim():
+    """A late release - the interval elapsed and another commit claimed - must
+    leave the live claim alone, or it reopens the window the floor closed."""
+    import time as _time
+
+    catalog = _catalog()
+    _add_dataset(catalog, "src.a")
+    catalog.create_trigger(
+        "src.a", "t1", target_view="mart.daily", author="alice", minimum_interval_seconds=120
+    )
+    with patch.object(_time, "time", return_value=1_000.0):
+        stale = catalog.claim_trigger_fire("src.a", "t1")
+    with patch.object(_time, "time", return_value=2_000.0):
+        live = catalog.claim_trigger_fire("src.a", "t1")
+    assert stale.granted and live.granted
+
+    catalog.release_trigger_fire("src.a", "t1", stale)
+    assert _trigger_doc(catalog).get().to_dict()["last-claimed-at-ms"] == live.at_ms
+
+
+def test_release_of_an_ungranted_or_floorless_claim_writes_nothing():
+    from opteryx_catalog.opteryx_catalog import TriggerFireClaim
+
+    catalog = _catalog()
+    _add_dataset(catalog, "src.a")
+    _trigger_doc(catalog).set({"name": "t1", "kind": "materialized_view_refresh"})
+
+    refused = TriggerFireClaim(granted=False, at_ms=1, previous_ms=None, interval_seconds=120)
+    floorless = TriggerFireClaim(granted=True, at_ms=1, previous_ms=None, interval_seconds=0)
+    catalog.release_trigger_fire("src.a", "t1", refused)
+    catalog.release_trigger_fire("src.a", "t1", floorless)
+    assert "last-claimed-at-ms" not in _trigger_doc(catalog).get().to_dict()
+
+
+def test_set_trigger_minimum_interval_is_how_an_existing_trigger_acquires_a_floor():
+    catalog = _catalog()
+    _add_dataset(catalog, "src.a")
+    _trigger_doc(catalog).set({"name": "t1", "kind": "materialized_view_refresh"})
+
+    with patch("opteryx_catalog.opteryx_catalog.emit_audit") as audit:
+        catalog.set_trigger_minimum_interval("src.a", "t1", 60, author="olive")
+    assert _trigger_doc(catalog).get().to_dict()["minimum-interval-seconds"] == 60
+    assert audit.call_args[0][0] == "alter_trigger_minimum_interval"
+    assert audit.call_args[1]["minimum_interval_seconds"] == 60
+
+    catalog.set_trigger_minimum_interval("src.a", "t1", 0, author="olive")
+    assert catalog.claim_trigger_fire("src.a", "t1").interval_seconds == 0
+
+    with pytest.raises(ValueError):
+        catalog.set_trigger_minimum_interval("src.a", "t1", -5, author="olive")
+    with pytest.raises(TriggerNotFound):
+        catalog.set_trigger_minimum_interval("src.a", "nope", 60, author="olive")

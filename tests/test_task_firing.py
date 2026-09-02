@@ -184,14 +184,18 @@ def test_mv_and_task_triggers_coexist_on_one_dataset():
     """Both kinds fire from the same commit; neither swallows the other."""
     catalog = _catalog_stub(
         triggers=[
-            {"name": "refresh__m__d", "kind": "materialized_view_refresh", "target-view": "ws.m.d"},
+            {
+                "name": "refresh__m__d",
+                "kind": "materialized_view_refresh",
+                "target-view": "ws.m.d",
+                "runs-as": "olive",
+            },
             _task_trigger(),
         ]
     )
     catalog.get_materialized_view.return_value = {
         "identifier": "ws.m.d",
         "sql": "SELECT 1",
-        "runs-as": "olive",
         "source-tables": [],
     }
     with (
@@ -445,3 +449,150 @@ def test_a_blocked_window_is_not_consumed():
         )
 
     catalog.mark_task_fired.assert_not_called()
+
+
+# --- the firing floor
+
+
+def _claim(granted, at_ms=1_000_000, previous_ms=None, interval_seconds=120):
+    from opteryx_catalog.opteryx_catalog import TriggerFireClaim
+
+    return TriggerFireClaim(
+        granted=granted, at_ms=at_ms, previous_ms=previous_ms, interval_seconds=interval_seconds
+    )
+
+
+def _floored_catalog(seconds=120, **task):
+    return _catalog_stub(triggers=[{**_task_trigger(), "minimum-interval-seconds": seconds}], **task)
+
+
+def test_a_trigger_with_no_floor_is_never_claimed():
+    """Existing triggers are not affected: no field, no transaction, no change
+    in what a commit costs."""
+    catalog = _catalog_stub()
+    post, _ = _fire(catalog)
+
+    post.assert_called_once()
+    catalog.claim_trigger_fire.assert_not_called()
+    catalog.release_trigger_fire.assert_not_called()
+
+
+def test_a_granted_claim_fires_and_is_kept():
+    catalog = _floored_catalog()
+    catalog.claim_trigger_fire.return_value = _claim(True)
+    post, _ = _fire(catalog)
+
+    catalog.claim_trigger_fire.assert_called_once_with(
+        "ops.catalog_changes", "task__ops__compaction_log_ingest"
+    )
+    post.assert_called_once()
+    catalog.release_trigger_fire.assert_not_called()
+    catalog.mark_trigger_fired.assert_called_once_with(
+        "ops.catalog_changes", "task__ops__compaction_log_ingest", status="enqueued"
+    )
+
+
+def test_a_commit_inside_the_floor_is_throttled_not_fired():
+    """Recorded like a suspension - not an error, not alerted, visible where
+    someone looks for the run they expected."""
+    catalog = _floored_catalog()
+    catalog.claim_trigger_fire.return_value = _claim(False, at_ms=1_000_000)
+    with patch.object(trigger_firing, "_alert") as alert:
+        post, audit = _fire(catalog)
+
+    post.assert_not_called()
+    alert.assert_not_called()
+    catalog.get_task.assert_not_called()
+    catalog.mark_trigger_fired.assert_called_once_with(
+        "ops.catalog_changes", "task__ops__compaction_log_ingest", status="throttled"
+    )
+    record = audit.call_args[0][0]
+    assert record["event"] == "trigger.throttled"
+    assert record["minimum_interval_seconds"] == 120
+    assert record["last_claimed_at_ms"] == 1_000_000
+    assert record["target_view"] == "ws.ops.compaction_log_ingest"
+
+
+def test_a_fire_that_raises_gives_its_claim_back():
+    """Otherwise a jobs outage at fire time would also silence the next
+    interval, and the commit that lands 30 seconds later would be throttled
+    behind a run that never happened."""
+    catalog = _floored_catalog()
+    claim = _claim(True)
+    catalog.claim_trigger_fire.return_value = claim
+
+    with (
+        patch.object(trigger_firing, "_post_job", side_effect=RuntimeError("jobs is down")),
+        patch.object(trigger_firing, "write_audit_record"),
+        patch.object(trigger_firing, "_alert") as alert,
+    ):
+        fire_triggers(
+            catalog, "ops.catalog_changes", author="alice", snapshot_id=200, parent_snapshot_id=100
+        )
+
+    catalog.release_trigger_fire.assert_called_once_with(
+        "ops.catalog_changes", "task__ops__compaction_log_ingest", claim
+    )
+    alert.assert_called_once()
+    catalog.mark_trigger_fired.assert_called_once_with(
+        "ops.catalog_changes", "task__ops__compaction_log_ingest", status="error"
+    )
+
+
+def test_a_release_that_fails_does_not_displace_the_alert():
+    catalog = _floored_catalog()
+    catalog.claim_trigger_fire.return_value = _claim(True)
+    catalog.release_trigger_fire.side_effect = RuntimeError("firestore hiccup")
+
+    with (
+        patch.object(trigger_firing, "_post_job", side_effect=RuntimeError("jobs is down")),
+        patch.object(trigger_firing, "write_audit_record"),
+        patch.object(trigger_firing, "_alert") as alert,
+    ):
+        fire_triggers(
+            catalog, "ops.catalog_changes", author="alice", snapshot_id=200, parent_snapshot_id=100
+        )
+
+    alert.assert_called_once()
+    assert alert.call_args[0][0].args == ("jobs is down",)
+
+
+def test_a_claim_that_cannot_be_taken_is_a_fire_failure():
+    """Firestore refusing the transaction is the same shape as jobs refusing
+    the submission: alerted, stamped, never raised into the commit."""
+    catalog = _floored_catalog()
+    catalog.claim_trigger_fire.side_effect = RuntimeError("transaction aborted")
+
+    with patch.object(trigger_firing, "_alert") as alert:
+        post, _ = _fire(catalog)
+
+    post.assert_not_called()
+    alert.assert_called_once()
+    catalog.release_trigger_fire.assert_not_called()
+    catalog.mark_trigger_fired.assert_called_once_with(
+        "ops.catalog_changes", "task__ops__compaction_log_ingest", status="error"
+    )
+
+
+def test_a_suspended_trigger_is_not_claimed():
+    """Suspension is checked first, so a paused trigger neither fires nor
+    burns an interval."""
+    catalog = _catalog_stub(
+        triggers=[{**_task_trigger(), "minimum-interval-seconds": 120, "suspended-at-ms": 1}]
+    )
+    post, _ = _fire(catalog)
+
+    post.assert_not_called()
+    catalog.claim_trigger_fire.assert_not_called()
+    catalog.mark_trigger_fired.assert_called_once_with(
+        "ops.catalog_changes", "task__ops__compaction_log_ingest", status="suspended"
+    )
+
+
+@pytest.mark.parametrize("value", [0, None, "", "abc", -5])
+def test_a_floor_that_is_not_a_positive_number_is_no_floor(value):
+    catalog = _floored_catalog(seconds=value)
+    post, _ = _fire(catalog)
+
+    post.assert_called_once()
+    catalog.claim_trigger_fire.assert_not_called()

@@ -73,8 +73,9 @@ logger = logging.getLogger(__name__)
 TRIGGERS_SUBCOLLECTION = "triggers"
 
 # Identities the platform runs itself as. They may not be pinned as a trigger's
-# or a materialized view's `runs-as`: nothing bills them, so work pinned to one
-# is standing compute charged to nobody, and `federator`'s credential is
+# `runs-as` - a materialized view's refresh triggers included: nothing bills
+# them, so work pinned to one is standing compute charged to nobody, and
+# `federator`'s credential is
 # deliberately distributed to every service that commits a dataset, which makes
 # it the widest authority in the system to hand unattended work.
 #
@@ -105,11 +106,10 @@ def _assert_can_own(principal: str | None, what: str, *, workspace: str | None =
     billable owner is always available and that reaching for a platform identity
     is a way of dodging the bill. In `public`, neither half holds.
 
-    Reached only by passing `workspace`, which the trigger paths do and the
-    materialized-view paths deliberately do not: a view in `public` is not
-    something the platform currently maintains, and an exemption nothing needs
-    is one nobody is checking. A caller that omits the argument gets the
-    unexempted rule, so a path added later arrives strict by default.
+    Reached only by passing `workspace`, which every trigger path does - a
+    materialized view's refresh triggers are triggers, pinned and gated on
+    exactly the terms a task's trigger is. A caller that omits the argument
+    gets the unexempted rule, so a path added later arrives strict by default.
 
     There is no billable owner to demand. `public` is reserved:
     `opteryx_access.checks.implicit_grants` caps every non-platform identity at
@@ -328,6 +328,45 @@ MV_REFRESH_TRIGGER_KIND = "materialized_view_refresh"
 # imported by `trigger_firing`, so the creation gate and the firing path cannot
 # disagree about which triggers carry an identity of their own.
 TASK_TRIGGER_KIND = "task"
+
+# The floor between two firings of ONE trigger, in seconds, for a trigger
+# registered without one being named. Applied at creation and written onto the
+# record - never read as a fallback at fire time. A trigger document with no
+# `minimum-interval-seconds` predates the field and fires on every commit exactly as
+# it always has, so the default reaches new triggers and nothing that exists.
+#
+# The floor is a THROTTLE: the first commit in a burst fires, and commits inside
+# the interval after it do not. It is per trigger, not per target - a view with
+# two sources has two triggers, each with its own floor - and the coalescing of
+# what does get through stays with jobs' dedup window.
+DEFAULT_MINIMUM_INTERVAL_SECONDS = 120
+
+
+def _validate_minimum_interval(value) -> int:
+    """`minimum-interval-seconds` is a non-negative integer; 0 means no floor."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(
+            "minimum_interval_seconds must be a non-negative integer number of seconds "
+            f"(0 disables the floor), not {value!r}"
+        )
+    return value
+
+
+@dataclass(frozen=True)
+class TriggerFireClaim:
+    """What `claim_trigger_fire` decided, and what `release_trigger_fire` needs
+    to undo it.
+
+    `granted` is whether this fire may proceed. `at_ms` is this claim's own
+    stamp when granted, and the standing stamp that refused it otherwise.
+    `previous_ms` is what the record held before a granted claim - what a
+    release puts back - and `interval_seconds` is the floor that was applied.
+    """
+
+    granted: bool
+    at_ms: int
+    previous_ms: int | None
+    interval_seconds: int
 
 # Value of a dataset document's `dataset-type` field marking it as the backing
 # table of a materialized view. Plain datasets have no `dataset-type` field.
@@ -3549,15 +3588,33 @@ class OpteryxCatalog(Metastore):
         author: str | None = None,
         kind: str = MV_REFRESH_TRIGGER_KIND,
         target_task: str | None = None,
+        minimum_interval_seconds: int | None = None,
     ) -> None:
         """Attach a trigger to a dataset.
 
+        `minimum_interval_seconds` is the floor between two firings of this
+        trigger (see `DEFAULT_MINIMUM_INTERVAL_SECONDS`). Named, it is written as
+        given, 0 meaning none. Left None, a record that already carries the
+        field keeps what it has - re-registering a view over its sources must
+        not quietly reset a floor an operator set - and a record that does not
+        takes the default.
+
         A trigger is an instruction to the commit path: when this dataset takes
         a user-created data commit, enqueue the reaction described by `kind` -
-        in v1 always a materialized-view refresh of `target_view`. Creating a
-        trigger is an update to the dataset that carries it, which is why the
-        caller-side permission model demands writer on that dataset, not on the
-        target view.
+        a materialized-view refresh of `target_view`, or a run of `target_task`.
+        Creating a trigger is an update to the dataset that carries it, which
+        is why the caller-side permission model demands writer on that dataset,
+        not on the target.
+
+        A trigger is an EVENT plus a `runs-as`. The event - a commit today, a
+        clock tick or a signal later - has no identity of its own, so the
+        trigger carries the identity the work it starts will execute as. The
+        work itself has none: a task and a materialized view are both stored
+        SQL, and a person running EXECUTE or REFRESH runs them as themselves.
+        `runs-as` is the author's on first registration and survives
+        re-registration; `set_trigger_owner` moves one trigger's, and
+        `set_materialized_view_owner` moves every refresh trigger of a view
+        at once.
 
         Refuses to close a cycle in the trigger graph - see
         `_assert_no_trigger_cycle` - and refuses to overwrite a trigger of the
@@ -3570,22 +3627,21 @@ class OpteryxCatalog(Metastore):
         """
         if author is None:
             raise ValueError("author must be provided when creating a trigger")
+        if minimum_interval_seconds is not None:
+            _validate_minimum_interval(minimum_interval_seconds)
         # The author becomes `runs-as` below, so the ownership rule applies here
         # too - and applies at creation rather than only on transfer, which is
         # the ordering that actually keeps a platform identity off the field.
         #
-        # Gated by EXEMPTION rather than by an allowlist of kinds: every kind
-        # carries `runs-as` except the refresh, which resolves its identity from
-        # the view's own record and ignores the field. A kind added later
-        # therefore arrives gated, and an author who cannot be billed is refused
-        # by default rather than by someone remembering to extend a list. That
-        # is the direction the mistake should fall in - `http_endpoint` posts a
-        # workspace's data outward under a stored credential, and it would have
-        # slipped straight through an allowlist keyed on `task`.
-        if kind != MV_REFRESH_TRIGGER_KIND:
-            _assert_can_own(
-                author, f"trigger {name} on {dataset_identifier}", workspace=self.workspace
-            )
+        # EVERY kind, with no allowlist and no exemption. The refresh used to be
+        # exempt because it resolved its identity from the view's own record;
+        # it carries its own now, like any other trigger, and is gated like any
+        # other. A kind added later therefore arrives gated, and an author who
+        # cannot be billed is refused by default rather than by someone
+        # remembering to extend a list - `http_endpoint` posts a workspace's
+        # data outward under a stored credential, and it would have slipped
+        # straight through an allowlist keyed on `task`.
+        _assert_can_own(author, f"trigger {name} on {dataset_identifier}", workspace=self.workspace)
         collection, dataset_name = self._local_parts(dataset_identifier)
         if not self._dataset_doc_ref(collection, dataset_name).get().exists:
             raise DatasetNotFound(f"Dataset not found: {collection}.{dataset_name}")
@@ -3712,14 +3768,24 @@ class OpteryxCatalog(Metastore):
                 # audited act, so it belongs to `set_trigger_owner` alone.
                 #
                 # Preserved across re-registration so an edit never silently
-                # transfers whose authority the work runs with. MV refresh
-                # triggers ignore this - a refresh resolves its identity from
-                # the view's own record.
+                # transfers whose authority the work runs with. For a view's
+                # refresh triggers this is what keeps CREATE OR REPLACE from
+                # moving a view onto whoever edited it: only the trigger on a
+                # NEWLY read source is pinned to the editor.
                 "runs-as": prior.get("runs-as") or author,
                 "created-by": author,
                 "created-at-ms": now_ms,
                 "last-fired-at-ms": None,
                 "last-fired-status": None,
+                # The firing floor, and the claim `claim_trigger_fire` holds
+                # under it. The claim is carried across re-registration so a
+                # redefinition cannot open a window the floor was closing.
+                "minimum-interval-seconds": (
+                    minimum_interval_seconds
+                    if minimum_interval_seconds is not None
+                    else prior.get("minimum-interval-seconds", DEFAULT_MINIMUM_INTERVAL_SECONDS)
+                ),
+                "last-claimed-at-ms": prior.get("last-claimed-at-ms"),
             }
 
         @firestore.transactional
@@ -4881,6 +4947,117 @@ class OpteryxCatalog(Metastore):
             }
         )
 
+    def claim_trigger_fire(self, dataset_identifier: str, name: str) -> TriggerFireClaim:
+        """Atomically claim the right to fire one trigger now.
+
+        THE RACE THIS CLOSES. A floor between firings implemented as "read the
+        last stamp, compare, then fire" is two operations with a gap between
+        them, and two commits landing within milliseconds both read the old
+        stamp and both fire - the floor holds for everything except the burst
+        it exists for. Here the read and the stamp are ONE Firestore
+        transaction. Firestore serializes conflicting transactions: of two
+        concurrent claims one commits, and the other is retried against the
+        committed stamp and refused. There is no window between them of any
+        width, so this is not "usually" one fire per interval - it is one.
+
+        The claim is `last-claimed-at-ms`, deliberately NOT `last-fired-at-ms`.
+        That stamp records every outcome - `error`, `egress-blocked`,
+        `owner-missing` - so a floor keyed on it would let a fire that failed
+        silence the next interval. The claim is taken BEFORE the submission and
+        handed back by `release_trigger_fire` if the submission raises, so a
+        fire that did nothing consumes nothing.
+
+        A record with no floor (`minimum-interval-seconds` absent or 0) is granted
+        without a write, so a trigger that predates the field costs what it
+        always did. `fire_triggers` does not call this for one at all.
+        """
+        collection, dataset_name = self._local_parts(dataset_identifier)
+        ref = self._triggers_collection(collection, dataset_name).document(name)
+
+        @firestore.transactional
+        def _claim(transaction) -> TriggerFireClaim:
+            snapshot = ref.get(transaction=transaction)
+            if not snapshot.exists:
+                raise TriggerNotFound(f"Trigger not found: {name} on {collection}.{dataset_name}")
+            data = snapshot.to_dict() or {}
+            interval = int(data.get("minimum-interval-seconds") or 0)
+            previous = data.get("last-claimed-at-ms")
+            previous = None if previous is None else int(previous)
+            now_ms = int(time.time() * 1000)
+
+            if interval > 0 and previous is not None and now_ms - previous < interval * 1000:
+                return TriggerFireClaim(
+                    granted=False, at_ms=previous, previous_ms=None, interval_seconds=interval
+                )
+            if interval > 0:
+                transaction.update(ref, {"last-claimed-at-ms": now_ms})
+            return TriggerFireClaim(
+                granted=True, at_ms=now_ms, previous_ms=previous, interval_seconds=interval
+            )
+
+        return _claim(self.firestore_client.transaction())
+
+    def release_trigger_fire(
+        self, dataset_identifier: str, name: str, claim: TriggerFireClaim
+    ) -> None:
+        """Hand back a granted claim whose fire did not happen.
+
+        Only while the record still holds THIS claim. A release that runs late
+        - after the interval elapsed and a later commit claimed - would
+        otherwise put an old stamp under a live claim and let a second fire
+        through under it, which is the race `claim_trigger_fire` closes.
+        Checked and written in one transaction for the same reason the claim
+        is. A claim that wrote nothing has nothing to give back.
+        """
+        if not claim.granted or claim.interval_seconds <= 0:
+            return
+        collection, dataset_name = self._local_parts(dataset_identifier)
+        ref = self._triggers_collection(collection, dataset_name).document(name)
+
+        @firestore.transactional
+        def _release(transaction) -> None:
+            snapshot = ref.get(transaction=transaction)
+            if not snapshot.exists:
+                return
+            if (snapshot.to_dict() or {}).get("last-claimed-at-ms") != claim.at_ms:
+                return
+            transaction.update(ref, {"last-claimed-at-ms": claim.previous_ms})
+
+        _release(self.firestore_client.transaction())
+
+    def set_trigger_minimum_interval(
+        self,
+        dataset_identifier: str,
+        name: str,
+        seconds: int,
+        author: str | None = None,
+    ) -> None:
+        """Set the floor between two firings of one trigger; 0 removes it.
+
+        The only way a trigger that predates the field acquires one, and the
+        way an operator turns the default off for a trigger that needs every
+        commit. The standing claim is left alone: lowering the floor takes
+        effect at the next commit, and raising it does not retroactively
+        excuse a fire that already happened.
+        """
+        seconds = _validate_minimum_interval(seconds)
+        collection, dataset_name = self._local_parts(dataset_identifier)
+        ref = self._triggers_collection(collection, dataset_name).document(name)
+        if not ref.get().exists:
+            raise TriggerNotFound(f"Trigger not found: {name} on {collection}.{dataset_name}")
+        ref.update({"minimum-interval-seconds": seconds})
+
+        emit_audit(
+            "alter_trigger_minimum_interval",
+            resource_type=ResourceType.DATASET,
+            workspace=self.workspace,
+            collection=collection,
+            resource=dataset_name,
+            author=author,
+            trigger=name,
+            minimum_interval_seconds=seconds,
+        )
+
     # ------------------------------------------------------------------
     # Snapshot tags
     # ------------------------------------------------------------------
@@ -5424,12 +5601,19 @@ class OpteryxCatalog(Metastore):
         restricts egress is refused with `EgressRestricted`, at refresh time as
         well as here.
 
-        The identity a refresh runs as (`runs-as`) is pinned at creation and is
-        NOT changed by re-registration - editing a view does not transfer it,
-        only `set_materialized_view_owner` does. The confused-deputy risk that
-        would otherwise create is closed on the caller side: the engine re-runs
-        the full creation authorization against whoever is editing, so an editor
-        can never repoint a view at sources they could not read themselves.
+        The view carries NO identity of its own. A refresh runs as the
+        `runs-as` of the TRIGGER that fired it, exactly as a task runs as its
+        trigger's: the identity belongs to what starts the work, and a person
+        running REFRESH runs it as themselves. Each refresh trigger landed here
+        is pinned to the author under the same platform-identity gate a task
+        trigger gets, and a trigger that already exists keeps the `runs-as` it
+        has - so a re-registration pins only the triggers it creates (a newly
+        read source) to the editor, and editing a view never transfers the
+        identity behind the sources it already had. Moving all of them at once
+        is `set_materialized_view_owner`. The confused-deputy risk that leaves
+        is closed on the caller side: the engine re-runs the full creation
+        authorization against whoever is editing, so an editor can never
+        repoint a view at sources they could not read themselves.
 
         Args:
             identifier: the (existing) backing table, 'collection.dataset' or
@@ -5437,17 +5621,24 @@ class OpteryxCatalog(Metastore):
             sql: the defining SELECT, as executable text.
             source_tables: every catalog table the SELECT reads - triggers land
                 on each. Accepted in either form, stored fully qualified.
-            author: the identity registering the MV. Becomes `runs-as` on a
-                first registration; on a re-registration it is recorded as the
-                statement's author and the existing `runs-as` is left alone.
+            author: the identity registering the MV. Recorded as the
+                statement's author, and becomes `runs-as` on every refresh
+                trigger this call CREATES; a trigger that already exists keeps
+                its own.
             update_if_exists: allow re-registration of an existing MV.
         """
         if author is None:
             raise ValueError("author must be provided when creating a materialized view")
-        # The author becomes `runs-as` below on first registration, so the
-        # ownership rule is applied at the point the identity is pinned rather
-        # than only when one is transferred.
-        _assert_can_own(author, "a materialized view")
+        # The author becomes `runs-as` on every refresh trigger created below,
+        # and `create_trigger` refuses a platform identity on the same terms it
+        # refuses one for a task. Asked here as well so the refusal lands before
+        # the statement version and the source list are written, rather than
+        # partway through the triggers.
+        _assert_can_own(
+            author,
+            f"the refresh triggers of materialized view {identifier}",
+            workspace=self.workspace,
+        )
 
         identifier = self._qualify(identifier)
         collection, dataset_name = self._local_parts(identifier)
@@ -5520,13 +5711,11 @@ class OpteryxCatalog(Metastore):
                 "dataset-type": MATERIALIZED_VIEW_TYPE,
                 "statement-id": statement_id,
                 "source-tables": relative_sources,
-                # Pinned to the AUTHOR: the identity that ran the statement is
-                # necessarily one that held every grant the statement needed, so
-                # it is the only owner derivable here that is known to work.
-                # An existing value survives re-registration, so editing a view
-                # never silently transfers whose authority it refreshes with;
-                # `set_materialized_view_owner` is the only way to move it.
-                "runs-as": data.get("runs-as") or author,
+                # No `runs-as`: the view has no identity, its refresh triggers
+                # do. A legacy value already on the document is left alone here
+                # (`update` does not touch it) for the backfill -
+                # `scripts/backfill_refresh_trigger_identity.py` - to move onto
+                # the triggers and retire.
                 "last-refreshed-at-ms": data.get("last-refreshed-at-ms"),
                 "last-refresh-status": data.get("last-refresh-status"),
                 "last-refresh-execution-id": data.get("last-refresh-execution-id"),
@@ -5534,11 +5723,29 @@ class OpteryxCatalog(Metastore):
         )
 
         # Reconcile triggers: one per current source, none on former sources.
+        # A trigger `create_trigger` makes here is pinned to the author; one
+        # that already exists keeps its own `runs-as`.
         trigger_name = self._mv_trigger_name(identifier)
         previous_sources = [self._qualify(s) for s in data.get("source-tables") or []]
         for removed in (s for s in previous_sources if s not in relative_sources):
             self.drop_trigger(removed, trigger_name, author=author, missing_ok=True)
+
+        # TRANSITIONAL. A view registered before its identity moved onto its
+        # triggers still carries `runs-as` on its own document, and its
+        # triggers may carry none. A trigger this re-registration creates or
+        # first pins would otherwise be pinned to the EDITOR - the silent
+        # transfer the pin exists to prevent - so such a trigger inherits the
+        # view's legacy value instead. Written directly rather than through
+        # `set_trigger_owner`: the value is already pinned and already firing,
+        # and re-judging it here would turn an edit into a refusal. Retired
+        # along with the field by `scripts/backfill_refresh_trigger_identity.py`.
+        legacy_owner = data.get("runs-as") if already_mv else None
         for source in relative_sources:
+            src_coll, src_name = self._local_parts(source)
+            trigger_ref = self._triggers_collection(src_coll, src_name).document(trigger_name)
+            held = None
+            if legacy_owner:
+                held = (trigger_ref.get().to_dict() or {}).get("runs-as")
             self.create_trigger(
                 source,
                 trigger_name,
@@ -5546,6 +5753,8 @@ class OpteryxCatalog(Metastore):
                 statement_id=statement_id,
                 author=author,
             )
+            if legacy_owner and not held and legacy_owner != author:
+                trigger_ref.update({"runs-as": legacy_owner})
 
         emit_audit(
             "update_materialized_view" if already_mv else "create_materialized_view",
@@ -5562,10 +5771,11 @@ class OpteryxCatalog(Metastore):
         """The MV's registration record: defining SQL, sources, refresh state.
 
         `identifier` is the qualified name, so callers stop rebuilding it from
-        the decomposed parts. `runs-as` is the pinned identity a refresh
-        executes as; `last-updated-by`/`last-updated-at-ms` are the author and
-        time of the current statement version - who last changed the definition,
-        which is a different question and a different person.
+        the decomposed parts. There is no `runs-as`: a view has no identity of
+        its own, and the identity a refresh executes as is on each refresh
+        trigger (`list_triggers` on a source). `last-updated-by`/
+        `last-updated-at-ms` are the author and time of the current statement
+        version - who last changed the definition.
         """
         identifier = self._qualify(identifier)
         collection, dataset_name = self._local_parts(identifier)
@@ -5599,7 +5809,6 @@ class OpteryxCatalog(Metastore):
             "sql": sql,
             "statement-id": statement_id,
             "source-tables": data.get("source-tables") or [],
-            "runs-as": data.get("runs-as"),
             "suspended-at-ms": data.get("suspended-at-ms"),
             "suspended-by": data.get("suspended-by"),
             "last-updated-by": last_updated_by,
@@ -5699,29 +5908,46 @@ class OpteryxCatalog(Metastore):
     def set_materialized_view_owner(
         self, identifier: str, new_owner: str, author: str | None = None
     ) -> None:
-        """Repoint a materialized view's `runs-as` identity.
+        """Repoint the `runs-as` of EVERY refresh trigger of a view, at once.
 
-        The only thing that moves a pinned owner. Deliberately narrow: it writes
-        no statement version and reconciles no triggers, because the definition
-        has not changed - only whose authority refreshes it.
+        A convenience over `set_trigger_owner`, which moves one trigger. A view
+        with N sources has N refresh triggers, and if they ran as N identities
+        the view would refresh with whichever one's source was written to last
+        - whose grants and whose bill, decided by commit order. This writes all
+        of them in ONE Firestore batch, so the view's triggers agree before and
+        after and at no moment in between. `set_trigger_owner` on a single
+        refresh trigger stays available; a deliberate per-trigger split is then
+        visible in `information_schema.triggers` as exactly that.
+
+        Deliberately narrow otherwise: no statement version is written and no
+        trigger is created or dropped, because the definition has not changed -
+        only whose authority refreshes it.
+
+        The triggers are found by TARGET rather than by name, the way the
+        integrity audit finds them: the generated name has changed shape
+        before, and a view whose triggers predate the digest suffix is still
+        one view. A view with no refresh trigger on any source has nothing to
+        repoint and is refused - re-register it with CREATE OR REPLACE first.
 
         The caller-side permission model gates this on WORKSPACE owner rather
-        than on the view. At creation `runs-as` is necessarily an identity that
-        held every grant the statement needed, because it was the identity that
-        ran it; this method breaks that invariant by letting a view be pointed
-        at someone else's authority, and nothing here can check another
-        principal's grants. A workspace owner can already grant themselves
-        anything, so requiring that tier escalates nothing.
+        than on the view. At creation a trigger's `runs-as` is necessarily an
+        identity that held every grant the statement needed, because it was
+        the identity that ran it; this method breaks that invariant by letting
+        a view be pointed at someone else's authority, and nothing here can
+        check another principal's grants. A workspace owner can already grant
+        themselves anything, so requiring that tier escalates nothing.
         """
         if not author:
             raise ValueError("author must be provided when changing a materialized view owner")
         if not new_owner:
             raise ValueError("new_owner must be provided")
         # Refused here as well as in the binder, for the reason set out on
-        # `set_trigger_owner`: a refresh runs as this identity, unattended and
-        # on a schedule, so a platform identity would be standing compute billed
-        # to nobody.
-        _assert_can_own(new_owner, f"materialized view {identifier}")
+        # `set_trigger_owner` and on the same terms - this is N of those.
+        _assert_can_own(
+            new_owner,
+            f"the refresh triggers of materialized view {identifier}",
+            workspace=self.workspace,
+        )
 
         identifier = self._qualify(identifier)
         collection, dataset_name = self._local_parts(identifier)
@@ -5733,8 +5959,40 @@ class OpteryxCatalog(Metastore):
         if data.get("dataset-type") != MATERIALIZED_VIEW_TYPE:
             raise MaterializedViewError(f"Not a materialized view: {identifier}")
 
-        previous_owner = data.get("runs-as")
-        doc_ref.update({"runs-as": new_owner})
+        repointed: list[dict] = []
+        batch = self.firestore_client.batch()
+        for source in data.get("source-tables") or []:
+            source = self._qualify(source)
+            if self._source_workspace(source) != self.workspace:
+                # Not reachable from this handle, and not registrable either:
+                # a cross-workspace source is refused at creation.
+                continue
+            src_coll, src_name = self._local_parts(source)
+            triggers = self._triggers_collection(src_coll, src_name)
+            for snapshot in triggers.stream():
+                trigger = snapshot.to_dict() or {}
+                target = trigger.get("target-view")
+                if trigger.get("kind") != MV_REFRESH_TRIGGER_KIND or not target:
+                    continue
+                if self._qualify(target) != identifier:
+                    continue
+                batch.update(triggers.document(snapshot.id), {"runs-as": new_owner})
+                repointed.append(
+                    {"source": source, "name": snapshot.id, "previous": trigger.get("runs-as")}
+                )
+        if not repointed:
+            raise MaterializedViewError(
+                f"materialized view {identifier} has no refresh trigger on any of its "
+                "sources, so there is nothing to repoint; re-register it with "
+                "CREATE OR REPLACE MATERIALIZED VIEW first"
+            )
+        # TRANSITIONAL: a view registered before its identity moved onto its
+        # triggers may still carry `runs-as` on its own document. Kept in step
+        # rather than deleted, so anything still reading it sees the answer
+        # the triggers now give; retiring the field is the backfill's job.
+        if data.get("runs-as"):
+            batch.update(doc_ref, {"runs-as": new_owner})
+        batch.commit()
 
         emit_audit(
             "alter_materialized_view_owner",
@@ -5743,8 +6001,9 @@ class OpteryxCatalog(Metastore):
             collection=collection,
             resource=dataset_name,
             author=author,
-            previous_owner=previous_owner,
+            previous_owners=sorted({t["previous"] for t in repointed if t["previous"]}),
             new_owner=new_owner,
+            triggers=[f"{t['name']} ON {t['source']}" for t in repointed],
         )
 
     def list_materialized_views(self, collection: str) -> list[str]:
@@ -6415,39 +6674,45 @@ class OpteryxCatalog(Metastore):
         if expected_current_snapshot_id is not _NO_SNAPSHOT_EXPECTATION:
             self._refuse_if_pointer_moved(doc_ref, identifier, expected_current_snapshot_id)
 
-        doc_ref.set(
-            {
-                "name": dataset_name,
-                "collection": collection,
-                "workspace": self.workspace,
-                "location": metadata.location,
-                "properties": metadata.properties,
-                "format-version": metadata.format_version,
-                "annotations": metadata.annotations,
-                # The head pointer - see DatasetMetadata.current_snapshot_id.
-                "current-snapshot-id": metadata.current_snapshot_id,
-                "current-schema-id": metadata.current_schema_id,
-                "timestamp-ms": metadata.timestamp_ms,
-                "author": metadata.author,
-                "description": metadata.description,
-                "describer": metadata.describer,
-                "maintenance-policy": metadata.maintenance_policy,
-                "sort-orders": metadata.sort_orders,
-                "refresh-frequency-mins": metadata.refresh_frequency_mins,
-                # Materialized-view registration. This `set()` replaces the
-                # whole document, so omitting these would de-register a
-                # materialized view on its very first refresh commit.
-                "dataset-type": metadata.dataset_type,
-                "statement-id": metadata.statement_id,
-                "source-tables": metadata.source_tables,
-                "runs-as": metadata.runs_as,
-                "suspended-at-ms": metadata.suspended_at_ms,
-                "suspended-by": metadata.suspended_by,
-                "last-refreshed-at-ms": metadata.last_refreshed_at_ms,
-                "last-refresh-status": metadata.last_refresh_status,
-                "last-refresh-execution-id": metadata.last_refresh_execution_id,
-            }
-        )
+        document = {
+            "name": dataset_name,
+            "collection": collection,
+            "workspace": self.workspace,
+            "location": metadata.location,
+            "properties": metadata.properties,
+            "format-version": metadata.format_version,
+            "annotations": metadata.annotations,
+            # The head pointer - see DatasetMetadata.current_snapshot_id.
+            "current-snapshot-id": metadata.current_snapshot_id,
+            "current-schema-id": metadata.current_schema_id,
+            "timestamp-ms": metadata.timestamp_ms,
+            "author": metadata.author,
+            "description": metadata.description,
+            "describer": metadata.describer,
+            "maintenance-policy": metadata.maintenance_policy,
+            "sort-orders": metadata.sort_orders,
+            "refresh-frequency-mins": metadata.refresh_frequency_mins,
+            # Materialized-view registration. This `set()` replaces the
+            # whole document, so omitting these would de-register a
+            # materialized view on its very first refresh commit.
+            "dataset-type": metadata.dataset_type,
+            "statement-id": metadata.statement_id,
+            "source-tables": metadata.source_tables,
+            "suspended-at-ms": metadata.suspended_at_ms,
+            "suspended-by": metadata.suspended_by,
+            "last-refreshed-at-ms": metadata.last_refreshed_at_ms,
+            "last-refresh-status": metadata.last_refresh_status,
+            "last-refresh-execution-id": metadata.last_refresh_execution_id,
+        }
+        # TRANSITIONAL. A view registered before its identity moved onto its
+        # refresh triggers carries `runs-as` on its own document. Nothing
+        # writes that field any more, but a commit must not DESTROY it before
+        # `scripts/backfill_refresh_trigger_identity.py` has copied it onto
+        # the triggers - so a value that was read is written back, and a
+        # document without one is left without one.
+        if metadata.runs_as is not None:
+            document["runs-as"] = metadata.runs_as
+        doc_ref.set(document)
 
         # Metadata persisted in primary `datasets` collection only.
 

@@ -138,11 +138,10 @@ def _check_trigger_owner(
     targets, so "which triggers are running on an identity nobody pays for" is
     a question the audit answers rather than one someone has to think to ask.
 
-    Refresh triggers are exempt: they ignore `runs-as` and resolve their
-    identity from the view's own record, which `_check_mv_sources` covers.
+    Every kind. A view's refresh triggers carry their own `runs-as` like any
+    other trigger; they used to be exempt here because the identity lived on
+    the view, and that is no longer where a refresh reads it.
     """
-    if trigger.get("kind") == MV_REFRESH_TRIGGER_KIND:
-        return None
     owner = trigger.get("runs-as")
     if owner and owner.strip().lower() in PLATFORM_IDENTITIES:
         return _finding(
