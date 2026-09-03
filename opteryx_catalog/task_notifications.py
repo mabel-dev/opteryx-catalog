@@ -1,6 +1,11 @@
-"""Telling a task's subscribers what happened to it.
+"""Telling a subscriber what happened to the thing they subscribed to.
 
-`LISTEN TO <task>` records who wants to know; this is what tells them. The feed
+`LISTEN TO <name>` records who wants to know; this is what tells them. The name
+is whatever a TRIGGER TARGETS - a TASK it runs with EXECUTE, or a MATERIALIZED
+VIEW it refreshes. The two fire paths differ only in the statement they build:
+they share the suspension check, the egress enforcement, the required `runs-as`
+and the dispatch contract, so they share this too. Only `window-unbound` is
+task-only, because only a task binds a window. The feed
 is control.opteryx's (`POST /v1/internal/notifications`), which is deliberately
 the only writer to `notifications/{client_id}/items` - so this enqueues one
 Cloud Tasks request per recipient rather than writing there itself. That route
@@ -9,8 +14,11 @@ Cloud Tasks request per recipient rather than writing there itself. That route
 TWO EMIT POINTS, because a task fails in two disjoint places and a subscriber
 told about only one of them learns nothing in the worse case:
 
-  - **The run ran and failed** - `succeeded`/`failed`/`denied`, stamped by
-    worker.opteryx in `_stamp_fired_task`. Call `notify_run_finished`.
+  - **The run ran and failed** - `succeeded`/`failed`/`denied`. For a task that
+    is worker.opteryx's `_stamp_fired_task`; for a view it is
+    `mark_materialized_view_refreshed`, which BOTH outcomes funnel through (the
+    worker stamps failures, the engine stamps success from inside the refresh)
+    and which a manual REFRESH reaches too. Call `notify_run_finished`.
   - **The run never started** - `egress-blocked`, `owner-missing`,
     `window-unbound`, `error`, raised in `trigger_firing._dispatch`. These never
     reach a worker, so nothing there could notify about them. Call
@@ -39,6 +47,7 @@ import json
 import logging
 import os
 import re
+import uuid
 from typing import Any
 from typing import Optional
 
@@ -91,61 +100,86 @@ def _wants(subscribed_to: Optional[str], outcome: str) -> bool:
 # REMEDY, in the second person, naming the statement that fixes it - not a
 # restatement of the status, which the title already carries. Success is the one
 # entry that instructs nothing, because there is nothing to do about it.
+#
+# The wording follows the object's KIND, which the subscription itself records.
+# Nothing here re-derives it.
+
+_NOUNS = {"task": "Task", "materialized_view": "Materialized view"}
+
+_DEFINITION_STATEMENTS = {
+    "task": "SHOW CREATE TASK {object}",
+    "materialized_view": "SHOW CREATE MATERIALIZED VIEW {object}",
+}
+
+# Who to point at for a missing owner. A view's refresh triggers must all share
+# one identity, and ALTER MATERIALIZED VIEW ... OWNER TO repoints every one of
+# them in a single batch - so sending a reader to the per-trigger statement
+# would have them fix one of N and wonder why it still fails.
+_OWNER_STATEMENTS = {
+    "task": "ALTER TRIGGER {trigger} ON {holder} OWNER TO <principal>",
+    "materialized_view": "ALTER MATERIALIZED VIEW {object} OWNER TO <principal>",
+}
+
+# Where the object's own state is readable. Two tables, because a task is not a
+# relation and a view is.
+_STATE_STATEMENTS = {
+    "task": (
+        "SELECT * FROM {workspace}.information_schema.tasks WHERE task_name = '{name}'"
+    ),
+    "materialized_view": (
+        "SELECT * FROM {workspace}.information_schema.views WHERE table_name = '{name}'"
+    ),
+}
 
 _BODIES = {
     "succeeded": (
-        "The run completed. SELECT * FROM {workspace}.information_schema.tasks WHERE "
-        "task_name = '{task_name}' shows when it last ran and how far its window has "
-        "been consumed."
+        "The run completed. {state_statement} shows when it last ran."
     ),
     # Never started.
     "egress-blocked": (
-        "This task writes into another workspace, and {workspace}'s egress protection "
-        "refuses it - so the run was never submitted. Sanction this one task with "
-        "ALTER WORKSPACE {workspace} SET SECURE {task} TO <destination workspace>. "
-        "Turning egress protection off would unlock every copy out of {workspace}, "
-        "not just this one."
+        "This {noun_lower} writes into another workspace, and {workspace}'s egress "
+        "protection refuses it - so the run was never submitted. Sanction this one "
+        "object with ALTER WORKSPACE {workspace} SET SECURE {object} TO "
+        "<destination workspace>. Turning egress protection off would unlock every "
+        "copy out of {workspace}, not just this one."
     ),
     "owner-missing": (
-        "The trigger that fires this task has no owner recorded, and an unattended run "
-        "has no identity of its own to execute as - so nothing was submitted. Record "
-        "one with ALTER TRIGGER {trigger} ON {holder} OWNER TO <principal>; the run "
-        "will execute as, and be billed to, that principal."
+        "The trigger that fires this {noun_lower} has no owner recorded, and an "
+        "unattended run has no identity of its own to execute as - so nothing was "
+        "submitted. Record one with {owner_statement}; the run will execute as, and "
+        "be billed to, that principal."
     ),
     "window-unbound": (
-        "This task consumes a window (:parent_version / :current_version) but the event "
-        "that fired it carries none, so there was nothing to bind and no run was "
-        "submitted. Either give the trigger a source to take its window from - "
-        "CREATE OR REPLACE TRIGGER {trigger} ON ... OVER <table> - or redefine the task "
-        "with a statement that takes no window."
+        "This task consumes a window (:parent_version / :current_version) but the "
+        "event that fired it carries none, so there was nothing to bind and no run "
+        "was submitted. Either give the trigger a source to take its window from - "
+        "CREATE OR REPLACE TRIGGER {trigger} ON ... OVER <table> - or redefine the "
+        "task with a statement that takes no window."
     ),
     "error": (
-        "The trigger could not submit a run. SELECT * FROM "
-        "{workspace}.information_schema.tasks WHERE task_name = '{task_name}' shows the "
-        "task's last-fired status; the error is below."
+        "The trigger could not submit a run. {state_statement} shows the last recorded "
+        "status; the error is below."
     ),
     # Ran and did not succeed.
     "failed": (
-        "The run was submitted and the statement failed. SHOW CREATE TASK {task} is what "
-        "ran; the error is below. Nothing was consumed, so the next run will cover this "
-        "window as well as its own."
+        "The run was submitted and the statement failed. {definition_statement} is "
+        "what ran; the error is below."
     ),
     "denied": (
-        "The run was refused on permissions. An unattended run executes as the trigger's "
-        "owner, not as you, so it is that principal that lacks access - grant it what the "
-        "statement needs, or move the trigger with ALTER TRIGGER {trigger} ON {holder} "
-        "OWNER TO <principal>."
+        "The run was refused on permissions. An unattended run executes as the "
+        "trigger's owner, not as you, so it is that principal that lacks access - "
+        "grant it what the statement needs, or move it with {owner_statement}."
     ),
 }
 
 _TITLES = {
-    "egress-blocked": "Task {task_name} is blocked and is not running",
-    "owner-missing": "Task {task_name} has no owner and is not running",
-    "window-unbound": "Task {task_name} cannot bind its window and is not running",
-    "error": "Task {task_name} could not be started",
-    "failed": "Task {task_name} failed",
-    "denied": "Task {task_name} was refused on permissions",
-    "succeeded": "Task {task_name} succeeded",
+    "egress-blocked": "{noun} {name} is blocked and is not running",
+    "owner-missing": "{noun} {name} has no owner and is not running",
+    "window-unbound": "{noun} {name} cannot bind its window and is not running",
+    "error": "{noun} {name} could not be started",
+    "failed": "{noun} {name} failed",
+    "denied": "{noun} {name} was refused on permissions",
+    "succeeded": "{noun} {name} succeeded",
 }
 
 
@@ -164,25 +198,40 @@ def _split(task_identifier: str) -> tuple[str, str, str]:
     return "", "", parts[0]
 
 
-def _compose(status: str, task_identifier: str, *, trigger: str, holder: str, detail: str) -> tuple:
+def _compose(
+    status: str,
+    identifier: str,
+    *,
+    kind: str = "task",
+    trigger: str = "",
+    holder: str = "",
+    detail: str = "",
+) -> tuple:
     """`(title, body)` for one outcome - the whole of what a reader sees."""
-    workspace, collection, task_name = _split(task_identifier)
+    workspace, collection, name = _split(identifier)
+    noun = _NOUNS.get(kind, "Object")
     fields = {
-        "task": task_identifier,
-        "task_name": task_name,
+        "object": identifier,
+        "name": name,
         "collection": collection,
         "workspace": workspace or "<workspace>",
         "trigger": trigger or "<trigger>",
         "holder": holder or "<table>",
+        "noun": noun,
+        "noun_lower": noun.lower(),
     }
+    # Resolved before the body, because the bodies interpolate them.
+    fields["definition_statement"] = _DEFINITION_STATEMENTS.get(kind, "").format(**fields)
+    fields["owner_statement"] = _OWNER_STATEMENTS.get(kind, "").format(**fields)
+    fields["state_statement"] = _STATE_STATEMENTS.get(kind, "").format(**fields)
 
-    title = _TITLES.get(status, "Task {task_name}: {status}").format(status=status, **fields)
+    title = _TITLES.get(status, "{noun} {name}: {status}").format(status=status, **fields)
 
     body_template = _BODIES.get(status)
     if body_template is None:
         # A status with no body written for it. Named plainly rather than
         # dressed up as advice - a made-up instruction is worse than none.
-        body = f"The task's run finished with status '{status}'."
+        body = f"The run finished with status '{status}'."
     else:
         body = body_template.format(**fields)
 
@@ -194,13 +243,34 @@ def _compose(status: str, task_identifier: str, *, trigger: str, holder: str, de
 # --- delivery ------------------------------------------------------------------
 
 
+def _setting(key: str) -> Optional[str]:
+    """One configuration value, from wherever this deployment serves it.
+
+    `opteryx_shared_services` resolves ENVVAR first and then the fleet's config
+    DOCUMENT, and the fleet is migrating settings out of per-service ENVVARs
+    into that document - so reading `os.environ` alone would go quiet on any
+    service that has already moved, with `_notify` reporting "not configured"
+    for a setting that is configured.
+
+    Detected rather than depended on, exactly as `alerts/_secrets` detects
+    `google-cloud-secret-manager` and `_enqueue` detects Cloud Tasks: this
+    library is also used where that package is not installed, and there ENVVARs
+    are the whole of the configuration.
+    """
+    try:
+        from opteryx_shared_services.config import get_config
+    except ImportError:
+        return os.getenv(key)
+    return get_config(key) or os.getenv(key)
+
+
 def _config() -> tuple[Optional[str], Optional[str], Optional[str]]:
     """`(control_url, admin_token, queue_path)`, each None when unset."""
-    url = os.getenv("CONTROL_URL")
+    url = _setting("CONTROL_URL")
     return (
         url.rstrip("/") if url else None,
-        os.getenv("CONTROL_ADMIN_TOKEN"),
-        os.getenv("OPTERYX_NOTIFICATIONS_QUEUE"),
+        _setting("CONTROL_ADMIN_TOKEN"),
+        _setting("OPTERYX_NOTIFICATIONS_QUEUE"),
     )
 
 
@@ -228,7 +298,7 @@ def _enqueue(url: str, token: str, queue_path: str, payload: dict[str, Any]) -> 
     )
 
 
-def _notify(catalog, task_identifier: str, status: str, outcome: str, **context) -> int:
+def _notify(catalog, identifier: str, status: str, outcome: str, **context) -> int:
     """Tell every subscriber who asked about `outcome`. Returns how many were told.
 
     Never raises: see the module docstring. Returns 0 for every reason there is
@@ -244,24 +314,17 @@ def _notify(catalog, task_identifier: str, status: str, outcome: str, **context)
         return 0
 
     try:
-        listeners = catalog.list_listeners(task_identifier)
+        listeners = catalog.list_listeners(identifier)
     except Exception as exc:  # noqa: BLE001 - the caller's outcome is already recorded
         _alert(
             exc,
-            note="task subscribers could not be read; nobody was notified",
-            fingerprint=("task-listeners-unreadable", str(task_identifier)),
-            context={"task": task_identifier, "status": status},
+            note="subscribers could not be read; nobody was notified",
+            fingerprint=("listeners-unreadable", str(identifier)),
+            context={"object": identifier, "status": status},
         )
         return 0
 
-    title, body = _compose(
-        status,
-        task_identifier,
-        trigger=context.get("trigger") or "",
-        holder=context.get("holder") or "",
-        detail=context.get("detail") or "",
-    )
-    workspace, collection, task_name = _split(task_identifier)
+    workspace, collection, name = _split(identifier)
     severity = SEVERITY_INFO if outcome == _SUCCESS else SEVERITY_ACTION
 
     sent = 0
@@ -275,11 +338,25 @@ def _notify(catalog, task_identifier: str, status: str, outcome: str, **context)
             # drifted or a record is corrupt, and both are ours to know about.
             _alert(
                 ValueError(f"subscriber {client_id!r} is not a valid notification recipient"),
-                note="a task subscriber cannot be addressed and was not notified",
-                fingerprint=("task-listener-unaddressable", str(task_identifier), client_id),
-                context={"task": task_identifier},
+                note="a subscriber cannot be addressed and was not notified",
+                fingerprint=("listener-unaddressable", str(identifier), client_id),
+                context={"object": identifier},
             )
             continue
+
+        # Composed per subscriber because the KIND comes off the subscription
+        # record. Every subscription to one object carries the same kind, so
+        # this is the same text each time - read from the record rather than
+        # from a second lookup, which is the whole reason the kind is stored.
+        kind = listener.get("kind") or "task"
+        title, body = _compose(
+            status,
+            identifier,
+            kind=kind,
+            trigger=context.get("trigger") or "",
+            holder=context.get("holder") or "",
+            detail=context.get("detail") or "",
+        )
 
         payload = {
             "client_id": client_id,
@@ -287,13 +364,13 @@ def _notify(catalog, task_identifier: str, status: str, outcome: str, **context)
             "title": title,
             "body": body,
             "severity": severity,
-            # Where clicking it goes. The task's own page - which is where every
-            # remedy above is carried out.
+            # Where clicking it goes. The object's own page - which is where
+            # every remedy above is carried out.
             "target": {
-                "kind": "task",
+                "kind": kind,
                 "workspace": workspace,
                 "collection": collection,
-                "task": task_name,
+                "object": name,
             },
         }
         try:
@@ -302,28 +379,30 @@ def _notify(catalog, task_identifier: str, status: str, outcome: str, **context)
         except Exception as exc:  # noqa: BLE001 - Cloud Tasks client boundary
             _alert(
                 exc,
-                note="a task outcome notification could not be queued",
-                fingerprint=("task-notification-unqueueable", str(task_identifier)),
-                context={"task": task_identifier, "status": status, "client_id": client_id},
+                note="an outcome notification could not be queued",
+                fingerprint=("notification-unqueueable", str(identifier)),
+                context={"object": identifier, "status": status, "client_id": client_id},
             )
     return sent
 
 
-def notify_fire_failed(catalog, task_identifier: str, status: str, **context) -> int:
+def notify_fire_failed(catalog, identifier: str, status: str, **context) -> int:
     """A run that NEVER STARTED. Called from `trigger_firing._dispatch`.
 
     Always an error outcome: every status reaching here is a fire that raised,
-    and the task did not run.
+    so nothing ran - whether the trigger was going to EXECUTE a task or REFRESH
+    a view.
     """
-    return _notify(catalog, task_identifier, status, _ERROR, **context)
+    return _notify(catalog, identifier, status, _ERROR, **context)
 
 
-def notify_run_finished(catalog, task_identifier: str, status: str, **context) -> int:
-    """A run that STARTED. Called from worker.opteryx's `_stamp_fired_task`.
+def notify_run_finished(catalog, identifier: str, status: str, **context) -> int:
+    """A run that STARTED - a task's, from worker.opteryx's `_stamp_fired_task`,
+    or a view's, from `mark_materialized_view_refreshed`.
 
     `succeeded` is the only success; `failed` and `denied` are errors. A status
     this does not recognise is treated as an error, because the one thing worse
     than an unhelpful notification is silence about a run that did not work.
     """
     outcome = _SUCCESS if status == "succeeded" else _ERROR
-    return _notify(catalog, task_identifier, status, outcome, **context)
+    return _notify(catalog, identifier, status, outcome, **context)

@@ -216,14 +216,27 @@ TAGS_SUBCOLLECTION = "tags"
 # lives where it always has - a trigger document on that dataset.
 TASKS_SUBCOLLECTION = "tasks"
 
-# Subcollection under a TASK document holding that task's notification
-# subscriptions - one document per subscriber, keyed by the user's identity.
-# Under the task rather than under the user because a subscription is a property
-# of the task: `drop_task` sweeps them, and sweeping something that lives under
-# the task's own document cannot leave an orphan the way reaching across to
-# another dataset's documents can (see `drop_task`, which does not sweep
+# Subcollection holding an object's notification subscriptions - one document
+# per subscriber, keyed by the user's identity.
+#
+# It hangs off whatever a TRIGGER TARGETS: a task document for a task fired by
+# EXECUTE, a dataset document for a materialized view refreshed by REFRESH. The
+# two fire paths differ only in the statement they build - they share the
+# suspension check, the egress enforcement, the required `runs-as` and the
+# dispatch contract - so they share one subscription concept too.
+#
+# Under the target rather than under the user because a subscription is a
+# property of the target: the drop sweeps them, and sweeping something held
+# under the target's own document cannot leave an orphan the way reaching across
+# to another dataset's documents can (see `drop_task`, which does not sweep
 # triggers for exactly that reason).
 LISTENERS_SUBCOLLECTION = "listeners"
+
+# What kind of object a subscription hangs off. A table, a view and a task share
+# one namespace, so a name identifies exactly one of them and the caller never
+# has to say which - this is the ANSWER, recorded so a listing can render it.
+LISTENER_KIND_TASK = "task"
+LISTENER_KIND_MATERIALIZED_VIEW = "materialized_view"
 
 # What a subscriber asked to hear about. Closed set: a filter that is not one of
 # these is a caller error, not a filter that matches nothing. `EVERYTHING` is
@@ -1602,6 +1615,10 @@ class OpteryxCatalog(Metastore):
         self._delete_subcollection(
             doc_ref.collection(RELATIONSHIP_SUPPRESSIONS_SUBCOLLECTION)
         )
+        # Subscriptions are a property of what they hang off - here, a
+        # materialized view, whose drop routes through this method. Nothing is
+        # left to notify about, and an ordinary dataset simply has none.
+        self._delete_subcollection(doc_ref.collection(LISTENERS_SUBCOLLECTION))
         doc_ref.delete()
 
         send_webhook(
@@ -3324,8 +3341,38 @@ class OpteryxCatalog(Metastore):
             author=author,
         )
 
-    def _listeners_collection(self, collection: str, task_name: str):
-        return self._task_doc_ref(collection, task_name).collection(LISTENERS_SUBCOLLECTION)
+    def _listener_holder(self, identifier: str | tuple) -> tuple:
+        """`(document ref, kind, collection, name)` for a subscribable object.
+
+        A subscription hangs off what a trigger TARGETS. Both kinds are looked
+        up by the one name because a table, a view and a task share a single
+        namespace - so exactly one of these answers, and the caller never has to
+        say which it meant.
+
+        Raises when the name is neither. Subscribing to a table would be a
+        subscription nothing could ever fire.
+        """
+        collection, name = self._task_parts(identifier)
+
+        task_ref = self._task_doc_ref(collection, name)
+        if task_ref.get().exists:
+            return task_ref, LISTENER_KIND_TASK, collection, name
+
+        dataset_ref = self._dataset_doc_ref(collection, name)
+        dataset = dataset_ref.get()
+        if dataset.exists and (dataset.to_dict() or {}).get("dataset-type") == (
+            MATERIALIZED_VIEW_TYPE
+        ):
+            return dataset_ref, LISTENER_KIND_MATERIALIZED_VIEW, collection, name
+
+        raise TaskNotFound(
+            f"Nothing to subscribe to: {collection}.{name} is not a task or a "
+            "materialized view"
+        )
+
+    def _listeners_collection(self, collection: str, name: str):
+        holder, _kind, _collection, _name = self._listener_holder((collection, name))
+        return holder.collection(LISTENERS_SUBCOLLECTION)
 
     def add_listener(self, identifier: str | tuple, user: str, outcome: str = "EVERYTHING") -> None:
         """Subscribe `user` to a task's run outcomes.
@@ -3349,16 +3396,14 @@ class OpteryxCatalog(Metastore):
                 + ", ".join(LISTENER_OUTCOMES)
             )
 
-        collection, task_name = self._task_parts(identifier)
-        # The task must exist: subscribing to a name nothing answers to is a
-        # subscription that can never fire, and the typo is the likely cause.
-        self.get_task((collection, task_name))
+        # Resolves the target and proves it exists in one step: subscribing to a
+        # name nothing answers to is a subscription that can never fire, and a
+        # typo is the likely cause.
+        holder, kind, collection, name = self._listener_holder(identifier)
 
-        doc_ref = self._listeners_collection(collection, task_name).document(user)
+        doc_ref = holder.collection(LISTENERS_SUBCOLLECTION).document(user)
         if doc_ref.get().exists:
-            raise ListenerAlreadyExists(
-                f"{user} already listens to {collection}.{task_name}"
-            )
+            raise ListenerAlreadyExists(f"{user} already listens to {collection}.{name}")
 
         doc_ref.set(
             {
@@ -3369,7 +3414,11 @@ class OpteryxCatalog(Metastore):
                 "user": user,
                 "workspace": self.workspace,
                 "collection": collection,
-                "task": task_name,
+                "object": name,
+                # Recorded rather than re-derived at read time: a listing would
+                # otherwise cost a lookup per row to say what it is subscribed
+                # to, and the answer cannot change - the namespace is one.
+                "kind": kind,
                 "outcome": outcome,
                 "created-at-ms": int(time.time() * 1000),
             }
@@ -3380,7 +3429,7 @@ class OpteryxCatalog(Metastore):
             resource_type=ResourceType.DATASET,
             workspace=self.workspace,
             collection=collection,
-            resource=task_name,
+            resource=name,
             author=user,
         )
 
@@ -3395,10 +3444,10 @@ class OpteryxCatalog(Metastore):
         if not user:
             raise ValueError("user must be provided when dropping a listener")
 
-        collection, task_name = self._task_parts(identifier)
-        doc_ref = self._listeners_collection(collection, task_name).document(user)
+        holder, _kind, collection, name = self._listener_holder(identifier)
+        doc_ref = holder.collection(LISTENERS_SUBCOLLECTION).document(user)
         if not doc_ref.get().exists:
-            raise ListenerNotFound(f"{user} does not listen to {collection}.{task_name}")
+            raise ListenerNotFound(f"{user} does not listen to {collection}.{name}")
 
         doc_ref.delete()
 
@@ -3407,7 +3456,7 @@ class OpteryxCatalog(Metastore):
             resource_type=ResourceType.DATASET,
             workspace=self.workspace,
             collection=collection,
-            resource=task_name,
+            resource=name,
             author=user,
         )
 
@@ -3417,16 +3466,16 @@ class OpteryxCatalog(Metastore):
         NOT a SQL surface. `SHOW LISTENERS` answers for one user; this answers
         for one task, which would tell whoever asked who else is watching it.
         """
-        collection, task_name = self._task_parts(identifier)
+        holder, _kind, _collection, _name = self._listener_holder(identifier)
         listeners = []
-        for doc in self._listeners_collection(collection, task_name).stream():
+        for doc in holder.collection(LISTENERS_SUBCOLLECTION).stream():
             data = doc.to_dict() or {}
             data.setdefault("user", doc.id)
             listeners.append(data)
         return listeners
 
     def list_listeners_for_user(self, user: str) -> list:
-        """Every subscription `user` holds in this workspace.
+        """Every subscription `user` holds in this workspace, of either kind.
 
         A collection group query, because subscriptions live under the tasks
         they belong to and there is no per-user index of them. The workspace
@@ -6724,6 +6773,25 @@ class OpteryxCatalog(Metastore):
             author=author,
             status=status,
             execution_id=execution_id,
+        )
+
+        # Tell whoever subscribed with `LISTEN TO <view>`. THE single funnel for
+        # a view's run outcomes: the engine stamps success from inside the
+        # refresh, the worker stamps failures from outside it, so hooking here
+        # covers both where a task needed a hook in each service.
+        #
+        # A MANUAL `REFRESH MATERIALIZED VIEW` reaches this too, and is notified
+        # like any other. Neither caller can tell a hand-run refresh from a
+        # trigger-fired one - the engine has no provenance at the stamp - and a
+        # subscriber asked to hear when the view refreshes, not who asked for
+        # it. Narrowing this later would mean plumbing that provenance through.
+        from .task_notifications import notify_run_finished
+
+        notify_run_finished(
+            self,
+            f"{self.workspace}.{collection}.{dataset_name}",
+            status,
+            detail=f"execution {execution_id}" if execution_id else "",
         )
 
     def update_view_execution_metadata(

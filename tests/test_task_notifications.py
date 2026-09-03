@@ -12,6 +12,7 @@ Every failure body is INSTRUCTIVE: it names the statement that fixes it.
 from __future__ import annotations
 
 import json
+import re
 from unittest.mock import MagicMock
 from unittest.mock import patch
 
@@ -120,17 +121,36 @@ def test_the_payload_matches_the_routes_contract(configured):
         tn.notify_run_finished(catalog, "ws.ops.rollup", "failed")
 
     payload = _enqueued(enqueue)[0]
-    assert set(payload) == {"client_id", "kind", "title", "body", "severity", "target"}
+    assert set(payload) == {"client_id", "id", "kind", "title", "body", "severity", "target"}
+    # The idempotency key control.opteryx uses as the document id, so a Cloud
+    # Tasks retry of this same body is a no-op rather than a second bell.
+    assert re.match(r"^[A-Za-z0-9_-]{8,64}$", payload["id"])
     assert payload["kind"] == tn.KIND_FAILED
     assert payload["severity"] == tn.SEVERITY_ACTION
     assert payload["target"] == {
         "kind": "task",
         "workspace": "ws",
         "collection": "ops",
-        "task": "rollup",
+        "object": "rollup",
     }
     # It has to survive the trip as JSON: Cloud Tasks carries the body encoded.
     json.dumps(payload)
+
+
+def test_each_notification_carries_its_own_idempotency_key(configured):
+    """Fixed before the request is queued, so retries reuse it - but distinct
+    per recipient and per event, so two real failures are two bells."""
+    catalog = _Catalog(
+        [{"user": "alice", "outcome": "ERROR"}, {"user": "bobby", "outcome": "ERROR"}]
+    )
+
+    with patch.object(tn, "_enqueue") as enqueue:
+        tn.notify_run_finished(catalog, "ws.ops.rollup", "failed")
+        tn.notify_run_finished(catalog, "ws.ops.rollup", "failed")
+
+    keys = [payload["id"] for payload in _enqueued(enqueue)]
+    assert len(keys) == 4
+    assert len(set(keys)) == 4
 
 
 def test_a_success_is_informational_not_actionable(configured):
