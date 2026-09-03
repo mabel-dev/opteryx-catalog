@@ -368,3 +368,4 @@ def test_listing_requires_a_user(capsys):
 
     with pytest.raises(ValueError, match="user must be provided"):
         catalog.list_listeners_for_user("")
+
