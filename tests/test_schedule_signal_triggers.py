@@ -291,6 +291,39 @@ def test_suspend_and_resume_through_the_task_holder():
         catalog.list_triggers("ops.rollup", holder_kind="view")
 
 
+# --- the pre-shared URL's salt -----------------------------------------------------------
+
+
+def test_a_signal_trigger_can_be_armed_rotated_and_disarmed_for_url_firing():
+    catalog = _catalog()
+    _task(catalog)
+    _signal(catalog)
+    assert _held(catalog).get("signal-salt") is None, "no URL until an owner asks for one"
+
+    catalog.set_trigger_signal_salt("ops.rollup", "on_demand", "salt-1", author="alice")
+    trigger = _held(catalog)
+    assert trigger["signal-salt"] == "salt-1"
+    assert trigger["signal-salt-rotated-by"] == "alice"
+    assert trigger["signal-salt-rotated-at-ms"] is not None
+
+    catalog.set_trigger_signal_salt("ops.rollup", "on_demand", "salt-2", author="alice")
+    assert _held(catalog)["signal-salt"] == "salt-2"
+
+    catalog.set_trigger_signal_salt("ops.rollup", "on_demand", None, author="alice")
+    trigger = _held(catalog)
+    assert trigger["signal-salt"] is None and trigger["signal-salt-rotated-at-ms"] is None
+
+
+def test_only_a_signal_trigger_can_be_fired_by_url():
+    catalog = _catalog()
+    _task(catalog)
+    _schedule(catalog)
+    with pytest.raises(ValueError, match="not a signal trigger"):
+        catalog.set_trigger_signal_salt("ops.rollup", "hourly", "salt", author="alice")
+    with pytest.raises(TriggerNotFound):
+        catalog.set_trigger_signal_salt("ops.rollup", "nope", "salt", author="alice")
+
+
 # --- the tick claim ------------------------------------------------------------------------
 
 
@@ -380,7 +413,7 @@ def test_a_signal_fires_the_task_as_the_triggers_identity():
 
     assert outcome == {
         "status": "enqueued", "execution_id": "x1", "trigger": "on_demand",
-        "task": "ws.ops.rollup", "detail": None,
+        "task": "ws.ops.rollup", "detail": None, "channel": "bearer",
     }
     payload = post.call_args[0][0]
     # Windowless: no USING.
@@ -695,3 +728,76 @@ def test_integrity_sees_task_held_triggers():
     with patch("opteryx_catalog.integrity.time.time", return_value=two_days_on / 1000):
         kinds = {f["kind"] for f in audit_workspace(client, "ws")}
     assert "stale-schedule" not in kinds
+
+
+# --- signed URLs ------------------------------------------------------------------------
+
+
+def test_a_signing_key_binds_a_signature_to_one_task_and_one_identity():
+    from opteryx_catalog.trigger_firing import signal_signature
+    from opteryx_catalog.trigger_firing import signal_signature_matches
+
+    catalog = _catalog()
+    _task(catalog)
+    _signal(catalog)
+    key = catalog.rotate_signal_token("ops.rollup", author="alice")
+    assert len(key) >= 40
+    stored = _held(catalog)
+    assert stored["signal-token"] == key and stored["signal-token-rotated-at-ms"]
+
+    signature = signal_signature(key, "ws.ops.rollup", "github-actions")
+    assert signal_signature_matches(key, "ws.ops.rollup", "github-actions", signature)
+    assert signal_signature_matches(key, "ws.ops.rollup", "github-actions", signature.upper())
+    # Another task, another identity, or a different key: no.
+    assert not signal_signature_matches(key, "ws.ops.other", "github-actions", signature)
+    assert not signal_signature_matches(key, "ws.ops.rollup", "someone-else", signature)
+    assert not signal_signature_matches("other-key", "ws.ops.rollup", "github-actions", signature)
+    assert not signal_signature_matches(None, "ws.ops.rollup", "github-actions", signature)
+    assert not signal_signature_matches(key, "ws.ops.rollup", "github-actions", None)
+    # HMAC with a separator: the boundary between task and identity matters.
+    assert signal_signature(key, "ws.ops.rollup", "ab") != signal_signature(key, "ws.ops.rollupa", "b")
+
+
+def test_rotating_invalidates_every_url_and_clearing_revokes_them_all():
+    from opteryx_catalog.trigger_firing import signal_signature
+    from opteryx_catalog.trigger_firing import signal_signature_matches
+
+    catalog = _catalog()
+    _task(catalog)
+    _signal(catalog)
+    first = catalog.rotate_signal_token("ops.rollup", author="alice")
+    old_url = signal_signature(first, "ws.ops.rollup", "github-actions")
+    second = catalog.rotate_signal_token("ops.rollup", author="alice")
+    assert second != first
+    assert not signal_signature_matches(_held(catalog)["signal-token"], "ws.ops.rollup", "github-actions", old_url)
+
+    catalog.clear_signal_token("ops.rollup", author="alice")
+    assert _held(catalog)["signal-token"] is None
+    assert not signal_signature_matches(
+        _held(catalog)["signal-token"], "ws.ops.rollup", "github-actions",
+        signal_signature(second, "ws.ops.rollup", "github-actions"),
+    )
+
+
+def test_only_a_signal_trigger_takes_a_key():
+    catalog = _catalog()
+    with pytest.raises(TaskNotFound):
+        catalog.rotate_signal_token("ops.rollup", author="alice")
+    _task(catalog)
+    with pytest.raises(TriggerNotFound, match="no trigger"):
+        catalog.rotate_signal_token("ops.rollup", author="alice")
+    _schedule(catalog)
+    with pytest.raises(TriggerNotFound, match="not a signal trigger"):
+        catalog.rotate_signal_token("ops.rollup", author="alice")
+    with pytest.raises(ValueError, match="author"):
+        catalog.rotate_signal_token("ops.rollup")
+
+
+def test_a_signed_fire_records_its_channel():
+    catalog = _catalog()
+    _task(catalog)
+    _signal(catalog)
+    with _submitting() as (post, _audit, _alert):
+        outcome = fire_signal(catalog, "ops.rollup", caller="github-actions", channel="signed-url")
+    assert outcome["channel"] == "signed-url"
+    assert post.call_args[0][0]["client_info"]["trigger"]["fired_by"] == "github-actions"

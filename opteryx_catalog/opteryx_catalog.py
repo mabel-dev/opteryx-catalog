@@ -5346,6 +5346,56 @@ class OpteryxCatalog(Metastore):
             new_owner=new_owner,
         )
 
+    def set_trigger_signal_salt(
+        self,
+        task_identifier: str | tuple,
+        name: str,
+        salt: str | None,
+        author: str | None = None,
+    ) -> None:
+        """Arm, rotate or disarm a signal trigger's pre-shared-URL firing.
+
+        The URL a webhook sender calls carries a signature: an HMAC over the
+        task's qualified name and this salt, under a key only dispatch.opteryx
+        holds. The catalog stores the SALT, which is not secret - it exists so
+        one trigger's URL can be revoked (salt cleared) or rotated (new salt)
+        without rotating the platform key and invalidating every other URL.
+        A trigger with no salt has no URL: the fire endpoint answers 404 for
+        it, exactly as for a task that does not exist.
+
+        Signal triggers only. A schedule fires on its own clock and a commit
+        trigger on its dataset; a URL that fired either would be a second
+        event on a trigger that has one.
+        """
+        collection, task_name, triggers = self._trigger_holder(task_identifier, TASK_HOLDER)
+        ref = triggers.document(name)
+        existing = ref.get()
+        if not existing.exists:
+            raise TriggerNotFound(f"Trigger not found: {name} on {collection}.{task_name}")
+        if (existing.to_dict() or {}).get("event-kind") != SIGNAL_EVENT_KIND:
+            raise ValueError(
+                f"trigger {name} on {collection}.{task_name} is not a signal trigger; "
+                "only a signal trigger can be fired by URL"
+            )
+        now_ms = int(time.time() * 1000)
+        ref.update(
+            {
+                "signal-salt": salt,
+                "signal-salt-rotated-at-ms": now_ms if salt else None,
+                "signal-salt-rotated-by": author if salt else None,
+            }
+        )
+
+        emit_audit(
+            "rotate_trigger_signal_url" if salt else "revoke_trigger_signal_url",
+            resource_type=ResourceType.DATASET,
+            workspace=self.workspace,
+            collection=collection,
+            resource=task_name,
+            author=author,
+            trigger=name,
+        )
+
     def mark_trigger_fired(
         self,
         dataset_identifier: str,
@@ -5505,6 +5555,81 @@ class OpteryxCatalog(Metastore):
             )
 
         return _claim(self.firestore_client.transaction())
+
+    def rotate_signal_token(self, task_identifier: str | tuple, author: str | None = None) -> str:
+        """Mint a new signal token for a task's signal trigger, replacing any before it.
+
+        The token backs the SIGNED URL form of a signal: dispatch.opteryx hands
+        an owner `/invoke/{ws}/{coll}/{task}/by/{identity}/{signature}` where the
+        signature is `signal_signature(token, task, identity)`, and a sender
+        holding that URL - and nothing else - can fire the trigger attributed
+        to `identity`. The token is the platform's, never shown to anyone: the
+        signature is what leaves the building, and it is bound to one task and
+        one identity, so a URL minted for one pipeline cannot fire another or
+        be attributed to someone else.
+
+        Stored in the clear on the trigger record, because verifying a
+        signature needs the token and not a digest of it; the record is readable
+        only through the catalog's Firestore access, which already guards
+        `runs-as`. Never surfaced by `information_schema.triggers`, which
+        reports only that a token exists and when it was rotated.
+
+        Rotation invalidates EVERY URL minted from the old token at once. That is
+        the point: a URL that has leaked into a log line is revoked by
+        rotating, and the owner re-mints for the identities that should keep
+        firing. Returns the new key so a caller that must mint immediately
+        need not re-read the record; nothing else should hold it.
+        """
+        if not author:
+            raise ValueError("author must be provided when rotating a signal token")
+        collection, task_name, triggers = self._trigger_holder(task_identifier, TASK_HOLDER)
+        task_doc = self._task_doc_ref(collection, task_name).get()
+        if not task_doc.exists:
+            raise TaskNotFound(f"Task not found: {collection}.{task_name}")
+        pointer = (task_doc.to_dict() or {}).get("trigger") or {}
+        ref = triggers.document(pointer.get("name") or "")
+        record = ref.get() if pointer.get("name") else None
+        if record is None or not record.exists:
+            raise TriggerNotFound(f"task {collection}.{task_name} has no trigger held by it")
+        if (record.to_dict() or {}).get("event-kind") != SIGNAL_EVENT_KIND:
+            raise TriggerNotFound(
+                f"trigger {pointer['name']} on {collection}.{task_name} is not a signal trigger"
+            )
+        token = secrets.token_urlsafe(32)
+        ref.update({"signal-token": token, "signal-token-rotated-at-ms": int(time.time() * 1000)})
+        emit_audit(
+            "rotate_signal_token",
+            resource_type=ResourceType.DATASET,
+            workspace=self.workspace,
+            collection=collection,
+            resource=task_name,
+            author=author,
+            trigger=pointer["name"],
+        )
+        return token
+
+    def clear_signal_token(self, task_identifier: str | tuple, author: str | None = None) -> None:
+        """Revoke a signal trigger's signal token; every signed URL stops working."""
+        if not author:
+            raise ValueError("author must be provided when clearing a signal token")
+        collection, task_name, triggers = self._trigger_holder(task_identifier, TASK_HOLDER)
+        task_doc = self._task_doc_ref(collection, task_name).get()
+        if not task_doc.exists:
+            raise TaskNotFound(f"Task not found: {collection}.{task_name}")
+        pointer = (task_doc.to_dict() or {}).get("trigger") or {}
+        ref = triggers.document(pointer.get("name") or "")
+        if not pointer.get("name") or not ref.get().exists:
+            raise TriggerNotFound(f"task {collection}.{task_name} has no trigger held by it")
+        ref.update({"signal-token": None, "signal-token-rotated-at-ms": None})
+        emit_audit(
+            "clear_signal_token",
+            resource_type=ResourceType.DATASET,
+            workspace=self.workspace,
+            collection=collection,
+            resource=task_name,
+            author=author,
+            trigger=pointer["name"],
+        )
 
     def release_schedule_tick(
         self, task_identifier: str | tuple, name: str, claim: ScheduleTickClaim

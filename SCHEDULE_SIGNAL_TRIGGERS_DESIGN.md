@@ -169,56 +169,75 @@ be able to name.
 
 ## 4. The service: `dispatch.opteryx` at `dispatch.opteryx.app`
 
-A small Cloud Run service, **min instances 1, max instances 1, CPU always
-allocated**, that does three things and holds no state:
+A small Cloud Run service, **min instances 1, max instances 1, a quarter of a
+CPU**, that does three things and holds no state:
 
 1. **Signal endpoint** — authenticates the caller, checks SIGNAL on the task,
    calls the library's fire function, returns the outcome.
-2. **Clock loop** — a thread that once a minute calls the library's due-scan
-   function.
-3. **Health endpoint** — reports the time of the last tick.
+2. **Tick endpoint** — `POST /api/v1/tick`, called once a minute by a Cloud
+   Scheduler job, runs the library's due-scan function inside the request.
+3. **Health endpoint** — reports the time of the last completed tick.
 
 Everything with logic in it lives in `opteryx_catalog.trigger_firing`, where it
 is tested against the same fake Firestore the trigger tests already use. The
-service is a FastAPI app, a thread, and a Dockerfile. It authenticates to jobs
-as `federator`, exactly as the commit path does (`_federator_token`).
+service is a FastAPI app and a Dockerfile. It authenticates to jobs as
+`federator`, exactly as the commit path does (`_federator_token`).
 
-### 4.1 Why one instance, and what that must not be relied on for
+### 4.1 The clock is a request, not a thread
 
-One always-on instance means the clock is naturally a singleton and the
-service costs a fraction of a CPU. It does NOT mean there is ever exactly one
-loop running: during a rollout the old and new revisions both serve, and Cloud
-Run replaces instances it considers unhealthy. So:
+The first design of this section had the clock as a background thread in an
+always-on instance: "min instances 1, CPU always allocated, a fraction of a
+CPU standing". Cloud Run does not sell that. A fractional CPU is only
+available with request-based CPU allocation — `Total cpu < 1 is not supported
+with cpu always allocated`, in either execution environment — and a
+request-based instance is throttled to nothing between requests, which
+starves a background thread. The choice was therefore a whole always-on core
+(about $45 a month for something idle 59 seconds in every 60) or a fraction
+of a core whose CPU is on only while a request is in flight (about $2).
 
-- **State lives in Firestore, never in memory.** The loop holds no timers. A
-  tick asks which triggers have `next-due-at-ms <= now`. A restart, a
-  redeploy or a stalled minute costs nothing; the next tick finds the same
-  due records. A slot is lost only if the service is down for the whole minute,
-  and even then the record is still due when it returns.
-- **Every fire is claimed transactionally** (§5.2). Two loops ticking at once
-  cannot double-fire. The singleton is an optimisation, not a correctness
-  requirement.
-- **CPU always allocated.** With default request-based CPU, Cloud Run throttles
-  the instance to nothing between requests and the loop stalls until the next
-  webhook arrives. This setting is what turns a fraction of a CPU into a
-  standing cost, and it is the whole price of the design.
-- **A heartbeat.** Each tick stamps a document; the existing alerting
-  (`_alert`) fires if the stamp goes stale by more than a few minutes. A
-  single instance is a single point of failure, but the state model makes the
-  failure mode "late" rather than "lost", and the heartbeat is what makes
-  "late" visible.
-- **Graceful shutdown.** Cloud Run sends SIGTERM with a short grace period.
-  The loop finishes the fire in hand and releases the claim on any it could
-  not send, the way `fire_triggers` hands a claim back when a submission
-  raises.
+The fraction, with the tick made into a request. Cloud Scheduler POSTs
+`/api/v1/tick` once a minute with an OIDC identity token for the runtime
+service account; the endpoint verifies the token against Google's
+certificates, checks the audience and that the account is the one
+configured, and runs `fire_due_schedules` synchronously before answering.
+The in-process loop thread still exists (`DISPATCH_CLOCK_ENABLED`) for local
+runs and for any platform that keeps the CPU on; in production it is off.
 
-### 4.2 Why not Cloud Scheduler, and why not Cloud Tasks
+Nothing that made the loop safe lived in the thread, which is why this is a
+one-flag change and not a redesign:
 
-Cloud Scheduler hitting a tick endpoint on jobs was the obvious alternative.
-It adds an OIDC-authenticated endpoint to jobs, a Scheduler resource to
-Terraform, and puts the clock inside the service that is supposed to be the
-control point for work rather than a source of it. The single-instance loop
-is less infrastructure and keeps the clock out of jobs.
+- **State lives in Firestore, never in memory.** A tick asks which triggers
+  have `next-due-at-ms <= now`. A restart, a redeploy, a stalled minute or a
+  Scheduler call that never arrives costs nothing; the next tick finds the
+  same due records. A slot is lost only if no tick lands for the whole
+  minute, and even then the record is still due when one does.
+- **Every fire is claimed transactionally** (§5.2). Two ticks landing at once
+  — a rollout serving two revisions, a Scheduler retry overlapping a slow
+  tick — cannot double-fire. Max instances 1 keeps one place for the tick to
+  land and one heartbeat to read; it is an optimisation, not what
+  correctness rests on.
+- **Concurrency 1**, because Cloud Run requires it for a fractional CPU. A
+  tick and a webhook arriving together queue for a few hundred milliseconds.
+  The request timeout is generous (five minutes) so a tick with a backlog
+  behind it drains in one call rather than being cut off mid-fire.
+- **A heartbeat.** A completed tick stamps a document; a tick that raised
+  does not, so `/health` goes stale (503) rather than lying, and the existing
+  alerting fires on a stale stamp. Scheduler records its own failed runs
+  against the job as well.
+- **The endpoint fails closed.** With no allowed caller configured it refuses
+  every request before reading the token. An open tick endpoint would let
+  anyone drive the clock; a closed one on a misdeployed service shows up as a
+  stale heartbeat within three minutes.
+
+### 4.2 Why not Cloud Tasks, and what became of the case against Scheduler
+
+The earlier version of this section argued against Cloud Scheduler on two
+grounds: the tick endpoint would have had to live on jobs, and it added a
+resource to keep in step. Neither survives contact with the pricing above.
+The endpoint lives on dispatch, where the clock was always meant to be, and
+the Scheduler job is one `gcloud scheduler jobs create|update` step in the
+same deploy workflow as every other piece of the service's configuration, so
+it cannot drift from the service it drives.
 
 The signal handler does not enqueue Cloud Tasks. Jobs is the one control point
 through which work reaches the workers — it resolves the trigger's `runs-as`,
@@ -307,9 +326,13 @@ stored.
 ## 6. The signal
 
 ```
-POST https://dispatch.opteryx.app/api/v1/signal/{workspace}/{collection}/{task}/{trigger}
+POST https://dispatch.opteryx.app/invoke/{workspace}/{collection}/{task}
 Authorization: Bearer <principal token>
 ```
+
+`/invoke` is for firing; `/api` is for management, including the clock's
+tick. The trigger is not named in the path: a task has one, and if it is not
+a signal trigger the request is a 404.
 
 - **Authentication** is the existing bearer token from `authenticate.opteryx`.
   The caller is a principal, human or service account.
@@ -338,6 +361,34 @@ Responses:
 Throttled, suspended and superseded are 200 because they are recorded
 outcomes the trigger chose, not caller errors, and a sender that retries on
 non-2xx must not retry them.
+
+### 6.1 Signed URLs, for senders that cannot hold a token
+
+A GitHub workflow or a SaaS webhook cannot do an OAuth flow; it can call a
+URL. So a task's owner can mint one:
+
+```
+GET|POST https://dispatch.opteryx.app/invoke/{workspace}/{collection}/{task}/by/{identity}/{signature}
+```
+
+The signature is HMAC-SHA256 over the task's qualified name and the identity,
+under a TOKEN the platform generates and keeps on the signal trigger
+(`signal-token`; `information_schema.triggers` reports only when it was
+rotated). The URL therefore fires exactly one task and is attributed to
+exactly one identity - `fired_by` - and the sender holds nothing else. The
+identity is attribution, not authentication: the authority is the owner's who
+minted it, so minting (`POST /api/v1/tasks/{ws}/{coll}/{task}/mint`),
+rotating and revoking (`POST`/`DELETE /api/v1/tasks/{ws}/{coll}/{task}/token`)
+are AUTOMATE-tier, while firing through the URL needs no bearer token at all. The run assumes the trigger's
+`runs-as`, is throttled by the same floor and windowed the same way, and every
+refusal on the public door is the same 404 so the URL space cannot enumerate
+tasks.
+
+The scope of the token is one task. Rotating it invalidates every URL minted
+from it, which is the remedy for a URL that has leaked - and a URL does leak,
+into the request log, on every call. Per-identity
+revocation, if it is ever wanted, is a revoked-identities list on the trigger
+and no change to the URLs.
 
 ## 7. Jobs and the worker
 
@@ -412,9 +463,11 @@ no change.
 3. **Signal path** in the library and the service. It exercises every new
    piece with no clock, and is the smaller half.
 4. **Clock path:** due scan, compare-and-advance, the loop, the heartbeat.
-5. **Deploy:** Cloud Run with min=max=1 and CPU always allocated;
-   `dispatch.opteryx.app` mapped; `croniter` added to the catalog's
-   dependencies.
+5. **Deploy:** Cloud Run with min=max=1, a quarter CPU, request-based
+   allocation and concurrency 1; a Cloud Scheduler job POSTing the tick every
+   minute; `dispatch.opteryx.app` mapped; `croniter` added to the catalog's
+   dependencies; the `triggers` collection-group index on `event-kind` and
+   `next-due-at-ms`.
 
 ## 12. Decisions taken during implementation
 
