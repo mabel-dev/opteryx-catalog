@@ -43,6 +43,8 @@ pattern) is exactly what this does NOT do.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -77,6 +79,7 @@ from .opteryx_catalog import TASK_HOLDER
 from .opteryx_catalog import TASK_TRIGGER_KIND
 from .opteryx_catalog import TRIGGERS_SUBCOLLECTION
 from .opteryx_catalog import WINDOW_PARAMETER_PATTERN
+from .task_notifications import notify_fire_failed
 
 # The `parent_version` bound for a dataset's FIRST commit, which has no parent.
 # The window is then everything up to and including that commit, so this only
@@ -977,6 +980,21 @@ def _dispatch(
                 "author": author,
             }
         )
+        # THE RUN NEVER STARTED, so nothing downstream can report it: the worker
+        # only ever sees runs that were submitted. This is the only place a
+        # subscriber can be told that an egress block, a missing owner or an
+        # unbindable window is quietly stopping their task - the failure mode
+        # where `last-fired-status` keeps reading `enqueued` and the output just
+        # goes stale. Tasks only; a materialized view carries no subscriptions.
+        if trigger.get("kind") == TASK_TRIGGER_KIND and target:
+            notify_fire_failed(
+                catalog,
+                target,
+                status,
+                trigger=name,
+                holder=holder,
+                detail=str(exc),
+            )
         return status, None, str(exc)
 
     if isinstance(result, tuple):
@@ -1087,7 +1105,28 @@ def _task_trigger(catalog, task_identifier: str, expected_event: str) -> tuple[d
     return task, trigger
 
 
-def fire_signal(catalog, task_identifier: str, caller: str) -> dict:
+def signal_signature(token: str, task_identifier: str, identity: str) -> str:
+    """The signature a signed invoke URL carries: HMAC-SHA256 over the task and identity.
+
+    "A hash of the token, the task name and the identity" - in the HMAC form
+    rather than a bare digest of the concatenation, so a signature cannot be
+    extended into one for a longer task name, and with a separator so
+    `("ab", "c")` and `("a", "bc")` sign differently. Hex, URL-safe as it is.
+    `task_identifier` is the fully-qualified name as the catalog stores it;
+    `token` is the task's signal token (`rotate_signal_token`).
+    """
+    message = f"{task_identifier}\n{identity}".encode()
+    return hmac.new(token.encode(), message, hashlib.sha256).hexdigest()
+
+
+def signal_signature_matches(token: str | None, task_identifier: str, identity: str, presented: str | None) -> bool:
+    """Constant-time check of a presented signature; False when there is no token."""
+    if not token or not presented:
+        return False
+    return hmac.compare_digest(signal_signature(token, task_identifier, identity), presented.strip().lower())
+
+
+def fire_signal(catalog, task_identifier: str, caller: str, channel: str = "bearer") -> dict:
     """Fire a task's signal trigger because `caller` asked.
 
     The caller is the EVENT, not the context: recorded as `fired_by`, and the
@@ -1095,6 +1134,11 @@ def fire_signal(catalog, task_identifier: str, caller: str) -> dict:
     Whether the caller may do this - SIGNAL on the task - is the endpoint's
     question, answered before this is reached; this trusts the name it is
     handed the way `fire_triggers` trusts the committer's.
+
+    `channel` says how the request arrived - `bearer` (a principal's token,
+    checked for SIGNAL by the endpoint) or `signed-url` (a URL the task's
+    owner minted; `caller` is then the identity the URL was minted for, and
+    the authority is the owner's who minted it). Provenance only.
 
     Never raises for a fire that failed: that is recorded on the trigger,
     alerted, and returned as the status, so a webhook sender sees the same
@@ -1120,6 +1164,10 @@ def fire_signal(catalog, task_identifier: str, caller: str) -> dict:
         "trigger": trigger["name"],
         "task": task["identifier"],
         "detail": detail,
+        # How the signal arrived: `bearer` for an authenticated principal,
+        # `signed-url` for a URL minted by the task's owner. Provenance for the
+        # endpoint's log line; the run's identity is the trigger's either way.
+        "channel": channel,
     }
 
 
