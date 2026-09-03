@@ -34,6 +34,9 @@ carries the statement that fixes it, and `target` carries where to go - which is
 control.opteryx's own standard for the field: "a notification you cannot act on
 from is a log line". Failures are severity `action`; a success is `info`.
 
+IDEMPOTENT. Every request carries an `id` that control.opteryx uses as the
+document id, so the queue's retries cannot turn one event into several bells.
+
 NEVER RAISES. Both call sites have already done the thing being reported - the
 run failed, or the fire did - and a bell that could not be rung must not turn
 either into something worse. Delivery reliability belongs to the queue (5
@@ -47,6 +50,7 @@ import json
 import logging
 import os
 import re
+import uuid
 import uuid
 from typing import Any
 from typing import Optional
@@ -360,6 +364,19 @@ def _notify(catalog, identifier: str, status: str, outcome: str, **context) -> i
 
         payload = {
             "client_id": client_id,
+            # THE IDEMPOTENCY KEY, fixed here - before the request is queued -
+            # which is the whole of what makes it work. Cloud Tasks retries any
+            # non-2xx and replays this exact body, so a request that landed,
+            # wrote the document and then lost its response addresses the same
+            # document on the retry instead of adding a second identical bell.
+            # control.opteryx uses it as the document id and treats a repeat as
+            # a no-op rather than an overwrite, so a notification already read
+            # or dismissed is not resurrected.
+            #
+            # Fresh per recipient and per event, deliberately NOT derived from
+            # the outcome: two real failures of the same object are two things
+            # that happened, and collapsing them would silence the second.
+            "id": uuid.uuid4().hex,
             "kind": KIND_SUCCEEDED if outcome == _SUCCESS else KIND_FAILED,
             "title": title,
             "body": body,
