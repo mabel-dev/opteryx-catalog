@@ -154,6 +154,14 @@ def _add_task(catalog, identifier="ops.rollup", writes=("marts.daily",)):
     return ref
 
 
+def _add_mv(catalog, identifier="marts.daily"):
+    """A materialized view is a dataset document wearing the MV type."""
+    collection, name = identifier.split(".", 1)
+    ref = catalog._dataset_doc_ref(collection, name)
+    ref.set({"dataset-type": "materialized_view", "name": name, "collection": collection})
+    return ref
+
+
 def _listener_ids(catalog, identifier="ops.rollup"):
     collection, name = identifier.split(".", 1)
     return sorted(
@@ -184,7 +192,8 @@ def test_the_subscription_records_what_was_asked_for(capsys):
     assert row["outcome"] == "ERROR"
     assert row["workspace"] == "ws"
     assert row["collection"] == "ops"
-    assert row["task"] == "rollup"
+    assert row["object"] == "rollup"
+    assert row["kind"] == "task"
     assert row["created-at-ms"] > 0
 
 
@@ -278,6 +287,57 @@ def test_drop_task_sweeps_the_subscriptions(capsys):
     assert task_ref.collection(LISTENERS_SUBCOLLECTION).stream() == []
 
 
+# --- materialized views, on the same terms
+#
+# A trigger either EXECUTEs a task or REFRESHes a view, and the two paths differ
+# only in the statement they build - so the subscribable object is whatever a
+# trigger targets, and both kinds live in the same subcollection under it.
+
+
+def test_a_materialized_view_can_be_subscribed_to(capsys):
+    catalog = _catalog()
+    _add_mv(catalog)
+
+    catalog.add_listener("marts.daily", user="alice", outcome="ERROR")
+
+    row = catalog.list_listeners("marts.daily")[0]
+    assert row["object"] == "daily"
+    assert row["kind"] == "materialized_view"
+
+
+def test_the_kind_is_recorded_not_re_derived(capsys):
+    """A table, a view and a task share one namespace, so the caller never says
+    which - and the answer is stored rather than looked up per row."""
+    catalog = _catalog()
+    _add_task(catalog, "ops.rollup")
+    _add_mv(catalog, "marts.daily")
+    catalog.add_listener("ops.rollup", user="alice")
+    catalog.add_listener("marts.daily", user="alice")
+
+    kinds = {row["object"]: row["kind"] for row in catalog.list_listeners_for_user("alice")}
+
+    assert kinds == {"rollup": "task", "daily": "materialized_view"}
+
+
+def test_a_plain_table_cannot_be_subscribed_to(capsys):
+    """Nothing fires a table, so the subscription could never be delivered."""
+    catalog = _catalog()
+    catalog._dataset_doc_ref("raw", "events").set({"name": "events", "collection": "raw"})
+
+    with pytest.raises(TaskNotFound):
+        catalog.add_listener("raw.events", user="alice")
+
+
+def test_dropping_the_dataset_sweeps_a_views_subscriptions(capsys):
+    catalog = _catalog()
+    mv_ref = _add_mv(catalog)
+    catalog.add_listener("marts.daily", user="alice")
+
+    catalog._delete_subcollection(mv_ref.collection(LISTENERS_SUBCOLLECTION))
+
+    assert mv_ref.collection(LISTENERS_SUBCOLLECTION).stream() == []
+
+
 # --- listing for a user
 
 
@@ -291,7 +351,7 @@ def test_a_users_listing_covers_every_task_they_listen_to(capsys):
 
     rows = catalog.list_listeners_for_user("alice")
 
-    assert sorted(row["task"] for row in rows) == ["compact", "rollup"]
+    assert sorted(row["object"] for row in rows) == ["compact", "rollup"]
     assert {row["user"] for row in rows} == {"alice"}
 
 

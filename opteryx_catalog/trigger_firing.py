@@ -982,11 +982,18 @@ def _dispatch(
         )
         # THE RUN NEVER STARTED, so nothing downstream can report it: the worker
         # only ever sees runs that were submitted. This is the only place a
-        # subscriber can be told that an egress block, a missing owner or an
-        # unbindable window is quietly stopping their task - the failure mode
-        # where `last-fired-status` keeps reading `enqueued` and the output just
-        # goes stale. Tasks only; a materialized view carries no subscriptions.
-        if trigger.get("kind") == TASK_TRIGGER_KIND and target:
+        # subscriber can be told that an egress block or a missing owner is
+        # quietly stopping their object - the failure mode where
+        # `last-fired-status` keeps reading `enqueued` and the output just goes
+        # stale.
+        #
+        # BOTH KINDS. A task fired by EXECUTE and a view refreshed by REFRESH
+        # reach here through the same contract and fail in the same ways - the
+        # suspension check, the egress enforcement and the required `runs-as`
+        # are shared, and only the statement each builds differs. `_notify` is a
+        # no-op when nothing subscribes, so an unsubscribed target costs one
+        # empty listing.
+        if target:
             notify_fire_failed(
                 catalog,
                 target,
