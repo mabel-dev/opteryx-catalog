@@ -880,6 +880,50 @@ def _failure_status(exc: BaseException) -> str:
     return "error"
 
 
+def _submit_throttled_record(
+    catalog,
+    *,
+    holder: str,
+    holder_kind: str,
+    trigger: dict,
+    target: str | None,
+    author: str | None,
+) -> None:
+    """Tell jobs a fire reached the trigger and was suppressed by its floor.
+
+    Best-effort bookkeeping, not the fire's outcome: the trigger has already
+    been stamped `throttled` and the audit line already written by the caller
+    before this runs, and neither depends on it. This only gives run-history.js
+    (web.opteryx) a row to draw for the fire alongside the runs that did
+    happen - a throttled trigger otherwise vanishes from that chart entirely,
+    which reads as nothing having tried. A failure here is logged and
+    swallowed rather than raised: losing one bar off a chart is not a reason to
+    turn a successful throttle into a recorded fire failure.
+
+    No `sql_text`: there is none, since the fire never reached the point of
+    building one. `client_info.trigger` carries what jobs would otherwise have
+    derived from the statement - see `_submit_throttled_job` in jobs.opteryx,
+    which trusts this only because the submission authenticates as `federator`,
+    exactly as a real fire's provenance is trusted.
+    """
+    kind = trigger.get("kind")
+    client_trigger = {
+        "workspace": getattr(catalog, "workspace", None),
+        "trigger_name": trigger["name"],
+        "fired_by": author,
+    }
+    if kind == "materialized_view_refresh":
+        client_trigger["target_view"] = target
+    else:
+        client_trigger["target_task"] = target
+    if holder_kind == DATASET_HOLDER:
+        client_trigger["source_dataset"] = holder
+    try:
+        _post_job({"throttled": True, "client_info": {"trigger": client_trigger}})
+    except Exception:  # noqa: BLE001 - a chart row is not worth the fire failing over
+        logger.warning("could not record the throttled fire as a job for %s", trigger["name"])
+
+
 def _dispatch(
     catalog,
     holder: str,
@@ -936,6 +980,14 @@ def _dispatch(
                         "last_claimed_at_ms": claim.at_ms,
                         "author": author,
                     }
+                )
+                _submit_throttled_record(
+                    catalog,
+                    holder=holder,
+                    holder_kind=holder_kind,
+                    trigger=trigger,
+                    target=target,
+                    author=author,
                 )
                 return "throttled", None, None
         result = fire()

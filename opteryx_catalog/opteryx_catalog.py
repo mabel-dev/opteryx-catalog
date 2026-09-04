@@ -811,8 +811,9 @@ def _snapshot_to_document(snapshot: Snapshot) -> dict:
     snapshot ancestry chain was never persisted at all. The asymmetry cut
     both ways — `user-created` existed only in `save_dataset_metadata`, so
     any path where `save_snapshot` ran last would erase that instead.
-    `DatasetCompactor` calls only `save_dataset_metadata`, so its snapshots
-    never recorded an operation type even once.
+    The compactor that pre-dated `compaction_commit` called only
+    `save_dataset_metadata`, so its snapshots never recorded an operation type
+    even once.
 
     `_snapshot_from_dict` is the reader; every key it looks for must be
     produced here. Keep the three in step.
@@ -1343,9 +1344,9 @@ class OpteryxCatalog(Metastore):
         metadata.refresh_frequency_mins = data.get("refresh-frequency-mins")
         metadata.next_field_id = data.get("next-field-id", 1)
         # Load the configured sort order. Without this the value round-tripped
-        # by save_dataset_metadata is silently dropped on read, so DatasetCompactor
-        # always sees an empty sort_orders and falls back to the (non-locality-
-        # preserving) brute strategy — i.e. order-aware compaction never runs.
+        # by save_dataset_metadata is silently dropped on read, so the engine's
+        # compaction planner always sees an empty sort_orders and falls back to the
+        # (non-locality-preserving) brute rule — order-aware compaction never runs.
         metadata.sort_orders = data.get("sort-orders") or []
         # Load the configured maintenance policy. Same failure mode as
         # sort-orders above: save_dataset_metadata writes 'maintenance-policy'
@@ -6880,7 +6881,7 @@ class OpteryxCatalog(Metastore):
         Persists a single Iceberg-style sort-order entry naming ``columns`` in
         the given order, ascending. Replaces any previously configured sort
         order outright - CLUSTER BY re-declares the physical layout, it does
-        not append to it. See ``catalog.compaction.normalize_sort_order`` for
+        not append to it. See ``catalog.sort_order.normalize_sort_order`` for
         how this shape is consumed (only the first field is currently used as
         the primary sort key for compaction).
 

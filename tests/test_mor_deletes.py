@@ -464,130 +464,68 @@ def test_materialise_live_parquet():
         materialise_live_parquet(data, [0, 1, 2, 3])
 
 
-def test_compaction_materialises_deletes():
-    """A merge that touches a delete-bearing file drops its deleted rows and
-    emits a vector-free output."""
-    from opteryx_catalog.catalog.compaction import DatasetCompactor
+def test_compaction_commit_row_count_invariant_uses_live_rows():
+    """The one check standing between a bug and silent data loss.
 
-    ds, storage = _seed_dataset(
-        {
-            "mem://ws/mor/data/f1.parquet": [10, 20, 30],
-            "mem://ws/mor/data/f2.parquet": [1, 2, 3],
-            "mem://ws/mor/data/f3.parquet": [4, 5, 6],
-        }
-    )
-    ds.delete_rows({"mem://ws/mor/data/f1.parquet": [1]}, author="tester")  # delete 20
+    Compaction only ever rewrites rows, so the outputs must hold exactly as many
+    LIVE records as the inputs did — record_count minus deleted_record_count,
+    because a rewrite MATERIALISES merge-on-read deletes and the output carries
+    no delete vector. Outputs holding the PHYSICAL count would mean resurrected
+    deleted rows; holding fewer would mean lost ones. Both are refused.
 
-    compactor = DatasetCompactor(ds, strategy="brute", author="tester", agent="test")
-    snap = compactor.compact()
-    assert snap is not None, compactor._last_error
-    assert snap.operation_type == "compact"
+    The compaction executor moved to the engine; this invariant deliberately did
+    not follow it. It lives with the commit so the catalog enforces it on any
+    caller, rather than trusting each one to check itself.
+    """
+    from opteryx_catalog.exceptions import CompactionInvariantError
 
-    entries = _current_entries(ds)
-    # Outputs carry no delete debt.
-    for e in entries:
-        assert not (e.get("deleted_record_count") or 0)
-        assert e.get("delete_file_path") is None
-    # The merged data holds exactly the live rows — 20 is gone.
-    merged_values = []
-    for e in entries:
-        merged_values.extend(_decode_values(ds.io, e["file_path"]))
-    assert sorted(merged_values) == [1, 2, 3, 4, 5, 6, 10, 30]
-    # Physical totals agree with the live merge.
-    assert snap.summary["total-records"] == 8
-
-
-def test_delete_debt_rule_selects_heavy_debt():
-    from opteryx_catalog.catalog.compaction import DatasetCompactor
-
-    ds, _ = _seed_dataset({"mem://ws/mor/data/f1.parquet": list(range(100, 110))})
-    # 2/10 deleted = 20% >= 10% default threshold.
+    ds, storage = _seed_dataset({"mem://ws/mor/data/f1.parquet": list(range(10))})
     ds.delete_rows({"mem://ws/mor/data/f1.parquet": [0, 1]}, author="tester")
 
-    compactor = DatasetCompactor(ds, strategy="brute", author="tester", agent="test")
-    plan = compactor.compact(dry_run=True, rule="debt")
-    assert plan is not None
-    assert plan["mode"] == "brute"
-    assert [e["file_path"] for e in plan["files"]] == ["mem://ws/mor/data/f1.parquet"]
-    assert "delete-debt" in plan["reason"]
-
-    # Executing the plan rewrites the file without its deleted rows.
-    snap = compactor.compact(rule="debt")
-    assert snap is not None, compactor._last_error
-    entries = _current_entries(ds)
-    assert len(entries) == 1
-    assert not (entries[0].get("deleted_record_count") or 0)
-    assert sorted(_decode_values(ds.io, entries[0]["file_path"])) == list(range(102, 110))
-    assert ds.delete_vectors() == {}
-
-
-def test_delete_debt_below_threshold_not_selected():
-    from opteryx_catalog.catalog.compaction import DatasetCompactor
-
-    ds, _ = _seed_dataset({"mem://ws/mor/data/f1.parquet": list(range(100))})
-    ds.delete_rows({"mem://ws/mor/data/f1.parquet": [0]}, author="tester")  # 1% < 10%
-
-    compactor = DatasetCompactor(ds, strategy="brute", author="tester", agent="test")
-    assert compactor.compact(dry_run=True, rule="debt") is None
-
-
-def test_delete_debt_threshold_override():
-    from opteryx_catalog.catalog.compaction import DatasetCompactor
-
-    ds, _ = _seed_dataset({"mem://ws/mor/data/f1.parquet": list(range(10))})
-    ds.delete_rows({"mem://ws/mor/data/f1.parquet": [0, 1]}, author="tester")  # 20%
-    ds.metadata.maintenance_policy["delete-debt-threshold"] = 0.5
-
-    compactor = DatasetCompactor(ds, strategy="brute", author="tester", agent="test")
-    assert compactor.compact(dry_run=True, rule="debt") is None
-    ds.metadata.maintenance_policy["delete-debt-threshold"] = 0.15
-    assert compactor.compact(dry_run=True, rule="debt") is not None
-
-
-def test_source_cache_serves_live_bytes():
-    """The streaming merge's one read point: a delete-bearing file comes out
-    of the source cache already materialised, so every downstream consumer
-    (predicate reads, sort-column projection, chunk streaming) sees live rows."""
-    import tempfile
-
-    from rugo.parquet import read_parquet
-
-    from opteryx_catalog.catalog.compaction import _SourceFileCache
-
-    storage = {}
-    mem_io = _MemIO(storage)
-    data = write_parquet(_make_morsel([10, 20, 30, 40]), compression="zstd")
-    storage["mem://f1.parquet"] = data
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        cache = _SourceFileCache(
-            mem_io, tmpdir, delete_vectors={"mem://f1.parquet": [1, 3]}
+    # A commit naming a file that is not in the manifest is refused before any
+    # row counting - it cannot be replacing what it claims to replace.
+    with pytest.raises(CompactionInvariantError, match="not in the current manifest"):
+        ds.compaction_commit(
+            files=[], retired_files=["mem://ws/mor/data/nope.parquet"], author="tester"
         )
-        src = cache.source("mem://f1.parquet")
-        with read_parquet(src) as reader:
-            values = [v for m in reader for v in m.column(b"a").to_pylist()]
-        assert values == [10, 30]
 
-        # A file with no vector passes through byte-identical.
-        storage["mem://f2.parquet"] = data
-        src2 = cache.source("mem://f2.parquet")
-        with read_parquet(src2) as reader:
-            values = [v for m in reader for v in m.column(b"a").to_pylist()]
-        assert values == [10, 20, 30, 40]
+    # Retiring nothing is a caller error, not a no-op to absorb quietly.
+    with pytest.raises(ValueError, match="retires no files"):
+        ds.compaction_commit(files=[], retired_files=[], author="tester")
 
+    # --- The case the invariant exists for: a genuine live-row mismatch. ---
+    # f1 holds 10 physical rows, 2 of them deleted, so 8 LIVE rows go in.
+    src = "mem://ws/mor/data/f1.parquet"
+    assert [e["record_count"] for e in _current_entries(ds)] == [10]
+    assert [e["deleted_record_count"] for e in _current_entries(ds)] == [2]
 
-def test_row_counts_balance_uses_live_rows():
-    from opteryx_catalog.catalog.compaction import DatasetCompactor
+    # An output carrying the PHYSICAL count is a compactor that rewrote the file
+    # without applying its delete vector: the two deleted rows come back to life.
+    resurrected = "mem://ws/mor/data/out-physical.parquet"
+    storage[resurrected] = write_parquet(_make_morsel(list(range(10))), compression="zstd")
+    with pytest.raises(CompactionInvariantError, match="8 live rows in, 10 rows out"):
+        ds.compaction_commit(files=[resurrected], retired_files=[src], author="tester")
 
-    ds, _ = _seed_dataset({"mem://ws/mor/data/f1.parquet": [1]})
-    compactor = DatasetCompactor(ds, strategy="brute", author="tester", agent="test")
-    inputs = [
-        {"file_path": "a", "record_count": 10, "deleted_record_count": 3},
-        {"file_path": "b", "record_count": 5},
-    ]
-    # Outputs holding the LIVE rows balance…
-    assert compactor._row_counts_balance(inputs, [{"record_count": 12}])
-    # …outputs holding the PHYSICAL rows (resurrected deletes) do not.
-    assert not compactor._row_counts_balance(inputs, [{"record_count": 15}])
-    # …and losing live rows does not.
-    assert not compactor._row_counts_balance(inputs, [{"record_count": 11}])
+    # An output short of the live count is rows dropped on the floor - the same
+    # refusal, from the other side.
+    lossy = "mem://ws/mor/data/out-lossy.parquet"
+    storage[lossy] = write_parquet(_make_morsel([2, 3, 4]), compression="zstd")
+    with pytest.raises(CompactionInvariantError, match="8 live rows in, 3 rows out"):
+        ds.compaction_commit(files=[lossy], retired_files=[src], author="tester")
+
+    # Both refusals leave the inputs untouched, exactly as the message promises.
+    assert [e["file_path"] for e in _current_entries(ds)] == [src]
+    assert ds.delete_vectors() == {src: [0, 1]}
+
+    # The honest output - deletes materialised, 8 live rows - commits, and the
+    # delete vector is gone because the rewrite consumed it.
+    good = "mem://ws/mor/data/out-live.parquet"
+    storage[good] = write_parquet(_make_morsel(list(range(2, 10))), compression="zstd")
+    ds.compaction_commit(files=[good], retired_files=[src], author="tester")
+
+    entries = _current_entries(ds)
+    assert [e["file_path"] for e in entries] == [good]
+    assert entries[0]["record_count"] == 8
+    assert not (entries[0].get("deleted_record_count") or 0)
+    assert sorted(_decode_values(ds.io, good)) == list(range(2, 10))
+    assert ds.delete_vectors() == {}

@@ -14,7 +14,6 @@ import pytest
 sys.path.insert(0, os.path.join(sys.path[0], ".."))
 
 from opteryx_catalog import alerts
-from opteryx_catalog.catalog.compaction import DatasetCompactor
 from opteryx_catalog.catalog.dataset import SimpleDataset
 from opteryx_catalog.catalog.deep_clean import DatasetDeepClean
 from opteryx_catalog.catalog.expiration import SnapshotExpiration
@@ -52,110 +51,12 @@ class _StubDataset:
         )
 
 
-def _compactor(identifier="landing.scan_metadata"):
-    compactor = DatasetCompactor.__new__(DatasetCompactor)
-    compactor.dataset = _StubDataset(identifier)
-    compactor._last_error = None
-    compactor._baseline_snapshot_id = None
-    return compactor
-
-
-# --------------------------------------------------------------------------
-# 1. compaction row-count invariant
-# --------------------------------------------------------------------------
-
-
-def test_row_count_mismatch_alerts_and_still_aborts(sink):
-    compactor = _compactor()
-    inputs = [{"file_path": "a.parquet", "record_count": 744}]
-    outputs = [{"file_path": "out.parquet", "record_count": 5}]
-
-    assert compactor._row_counts_balance(inputs, outputs) is False
-    assert compactor._last_error and "row-count mismatch" in compactor._last_error
-
-    assert sink.count == 1
-    alert = sink.alerts[0]
-    assert alert.severity == "CRITICAL"
-    assert alert.context["expected_rows"] == 744
-    assert alert.context["written_rows"] == 5
-    assert alert.context["dataset"] == "landing.scan_metadata"
-
-
-def test_balanced_row_counts_are_silent(sink):
-    """A healthy pass must not alert - a noisy success path buries the failures."""
-    compactor = _compactor()
-    inputs = [{"file_path": "a.parquet", "record_count": 100}]
-    outputs = [{"file_path": "out.parquet", "record_count": 100}]
-
-    assert compactor._row_counts_balance(inputs, outputs) is True
-    assert sink.count == 0
-
-
-def test_unknown_input_counts_do_not_alert(sink):
-    """An absent count is unknown, not zero; the check is skipped, not failed."""
-    compactor = _compactor()
-    inputs = [{"file_path": "a.parquet"}]
-    outputs = [{"file_path": "out.parquet", "record_count": 5}]
-
-    assert compactor._row_counts_balance(inputs, outputs) is True
-    assert sink.count == 0
-
-
-def test_two_datasets_get_two_distinct_fingerprints(sink):
-    """The per-dataset rule: one ticket per affected dataset, not one for all."""
-    for identifier in ("landing.scan_metadata", "landing.http"):
-        compactor = _compactor(identifier)
-        compactor._row_counts_balance(
-            [{"file_path": "a.parquet", "record_count": 10}],
-            [{"file_path": "b.parquet", "record_count": 1}],
-        )
-
-    assert sink.count == 2
-    assert len(set(sink.fingerprints())) == 2
-
-
-# --------------------------------------------------------------------------
-# 2. compaction entry recovery - the bug fix
-# --------------------------------------------------------------------------
-
-
-def test_failed_entry_recovery_cleans_up_and_alerts(sink):
-    """This abort used to leak: no _abort, no cleanup, just `return None`.
-
-    Every sibling abort in the same function deletes what the pass wrote and
-    records why. This one did neither, so the abort its own comment calls
-    catastrophic left orphaned files behind and read as "nothing to compact".
-    """
-    compactor = _compactor()
-    compactor._is_valid_entry = lambda entry: False
-    compactor._recover_entry = lambda entry: None
-
-    surviving = [{"file_path": "corrupt.parquet"}]
-    written = [{"file_path": "mem://landing.scan_metadata/data/new-0.parquet"}]
-
-    result = compactor._finalize_compaction_snapshot(
-        all_entries=surviving,
-        files_to_compact=[],
-        new_entries=written,
-        snapshot_id=1,
-        input_records=0,
-        input_data_size=0,
-        sort_status="none",
-    )
-
-    assert result is None
-    # The bug fix: outputs removed, and the reason recorded rather than silent.
-    assert compactor.dataset.io.deleted == [written[0]["file_path"]]
-    assert compactor._last_error and "rebuild corrupted manifest entry" in compactor._last_error
-
-    assert sink.count == 1
-    assert sink.alerts[0].severity == "CRITICAL"
-    assert sink.alerts[0].context["file_path"] == "corrupt.parquet"
-
-
-# --------------------------------------------------------------------------
-# 3. the two GC sweeps that absorb ManifestProtectionError
-# --------------------------------------------------------------------------
+# The compaction row-count invariant used to alert from `DatasetCompactor` and
+# was covered here. Compaction moved to the engine and the invariant moved with
+# the commit: `SimpleDataset.compaction_commit` RAISES `CompactionInvariantError`
+# rather than alerting and returning, so the caller can remove the files it
+# wrote. It is covered by
+# `test_mor_deletes.test_compaction_commit_row_count_invariant_uses_live_rows`.
 
 
 class _SweepCatalog:

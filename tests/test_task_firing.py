@@ -494,13 +494,30 @@ def test_a_granted_claim_fires_and_is_kept():
 
 def test_a_commit_inside_the_floor_is_throttled_not_fired():
     """Recorded like a suspension - not an error, not alerted, visible where
-    someone looks for the run they expected."""
+    someone looks for the run they expected.
+
+    No SQL is submitted for real work - the task is never touched - but a
+    bookkeeping record IS posted to jobs (`_submit_throttled_record`), so this
+    fire still shows up in run-history.js's chart instead of vanishing."""
     catalog = _floored_catalog()
     catalog.claim_trigger_fire.return_value = _claim(False, at_ms=1_000_000)
     with patch.object(trigger_firing, "_alert") as alert:
         post, audit = _fire(catalog)
 
-    post.assert_not_called()
+    post.assert_called_once_with(
+        {
+            "throttled": True,
+            "client_info": {
+                "trigger": {
+                    "workspace": "ws",
+                    "trigger_name": "task__ops__compaction_log_ingest",
+                    "fired_by": "alice",
+                    "target_task": "ws.ops.compaction_log_ingest",
+                    "source_dataset": "ops.catalog_changes",
+                }
+            },
+        }
+    )
     alert.assert_not_called()
     catalog.get_task.assert_not_called()
     catalog.mark_trigger_fired.assert_called_once_with(
@@ -511,6 +528,24 @@ def test_a_commit_inside_the_floor_is_throttled_not_fired():
     assert record["minimum_interval_seconds"] == 120
     assert record["last_claimed_at_ms"] == 1_000_000
     assert record["target_view"] == "ws.ops.compaction_log_ingest"
+
+
+def test_a_throttled_bookkeeping_post_that_fails_does_not_break_the_fire():
+    """Losing the chart row is not a reason to turn a successful throttle into
+    an alerted fire failure - see _submit_throttled_record."""
+    catalog = _floored_catalog()
+    catalog.claim_trigger_fire.return_value = _claim(False, at_ms=1_000_000)
+    with (
+        patch.object(trigger_firing, "_post_job", side_effect=RuntimeError("jobs is down")),
+        patch.object(trigger_firing, "write_audit_record"),
+        patch.object(trigger_firing, "_alert") as alert,
+    ):
+        fire_triggers(catalog, "ops.catalog_changes", author="alice", snapshot_id=200, parent_snapshot_id=100)
+
+    alert.assert_not_called()
+    catalog.mark_trigger_fired.assert_called_once_with(
+        "ops.catalog_changes", "task__ops__compaction_log_ingest", status="throttled"
+    )
 
 
 def test_a_fire_that_raises_gives_its_claim_back():
