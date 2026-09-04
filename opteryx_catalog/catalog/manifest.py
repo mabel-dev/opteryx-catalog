@@ -482,6 +482,22 @@ def _native_min_k_smallest(hash_vec, k: int) -> list:
     return heapq.nsmallest(k, distinct_vals)
 
 
+def _row_histogram_bins(histograms: list) -> int:
+    """The row-level bin count, or 0 when the columns do not share one width.
+
+    Widths legitimately vary per column: a BOOLEAN column gets an exact two-bin
+    true/false histogram (and any low-cardinality column is entitled to exact
+    bins) while the rest get HISTOGRAM_BINS. One row carries one
+    `histogram_bins`, so a mixed file is described by 0 — the "no single width"
+    marker readers normalize to None before falling back to each column's own
+    slice length, which is the real width in every case. Stamping
+    HISTOGRAM_BINS unconditionally instead makes the row claim 32 bins for a
+    histogram that holds 2.
+    """
+    widths = {len(bins) for bins in histograms if bins}
+    return widths.pop() if len(widths) == 1 else 0
+
+
 def _compute_column_stats(vec, category: str) -> tuple:
     """Compute statistics for a single column from its native draken Vector.
 
@@ -778,7 +794,7 @@ def build_parquet_manifest_entry_from_morsel(
         null_counts=null_counts,
         min_k_hashes=min_k_hashes,
         histogram_counts=histograms,
-        histogram_bins=HISTOGRAM_BINS,
+        histogram_bins=_row_histogram_bins(histograms),
         min_values=min_values,
         max_values=max_values,
         min_lengths=min_lengths_list,
@@ -1101,7 +1117,7 @@ def build_parquet_manifest_entry_from_bytes(
         null_counts=null_counts,
         min_k_hashes=min_k_hashes,
         histogram_counts=histograms,
-        histogram_bins=HISTOGRAM_BINS,
+        histogram_bins=_row_histogram_bins(histograms),
         min_values=min_values,
         max_values=max_values,
         min_lengths=min_lengths_list,
