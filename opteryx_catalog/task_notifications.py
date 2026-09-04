@@ -314,7 +314,19 @@ def _notify(catalog, identifier: str, status: str, outcome: str, **context) -> i
         # Not configured. Not an error: a deployment without the notification
         # queue - a local run, a test - has no bell to ring. Logged at debug so
         # it does not become noise on every fire.
-        logger.debug("task notifications are not configured; nothing sent")
+        #
+        # Named individually rather than as one blanket message: a deployment
+        # that has two of the three set is not "unconfigured", it is one
+        # setting away, and a caller who raises this logger to DEBUG to find
+        # out why the bell is silent should not also have to go read this
+        # function's source to learn which key `_config()` actually missed.
+        missing = [
+            name
+            for name, value in (("CONTROL_URL", url), ("CONTROL_ADMIN_TOKEN", token),
+                                 ("OPTERYX_NOTIFICATIONS_QUEUE", queue_path))
+            if not value
+        ]
+        logger.debug("task notifications are not configured; missing %s; nothing sent", missing)
         return 0
 
     try:
