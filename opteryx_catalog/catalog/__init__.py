@@ -1,4 +1,3 @@
-from .compaction import DatasetCompactor
 from .metastore import Metastore
 
-__all__ = ["DatasetCompactor", "Metastore"]
+__all__ = ["Metastore"]

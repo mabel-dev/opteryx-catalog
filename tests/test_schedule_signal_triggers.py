@@ -497,7 +497,16 @@ def test_suspended_and_throttled_signals_are_outcomes_not_errors():
         second = fire_signal(catalog, "ops.rollup", caller="hook-bot")
     assert first["status"] == "enqueued"
     assert second["status"] == "throttled" and second["execution_id"] is None
-    assert post.call_count == 1
+    # One real submission, plus a throttled bookkeeping record so this fire is
+    # not invisible to run-history.js (see _submit_throttled_record).
+    assert post.call_count == 2
+    throttled_call = post.call_args_list[-1].args[0]
+    assert throttled_call["throttled"] is True
+    throttled_trigger = throttled_call["client_info"]["trigger"]
+    assert throttled_trigger["trigger_name"] == "on_demand"
+    assert throttled_trigger["target_task"]
+    # A task-held trigger has no source dataset - see _submit_throttled_record.
+    assert "source_dataset" not in throttled_trigger
 
     catalog.set_trigger_suspended("ops.rollup", "on_demand", True, author="alice", holder_kind=TASK_HOLDER)
     with _submitting() as (post, _audit, alert):

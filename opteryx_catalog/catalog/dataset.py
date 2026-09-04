@@ -933,8 +933,8 @@ class SimpleDataset(Dataset):
         it claimed to describe. Deriving them from the entries makes drift
         impossible by construction, and means a commit that follows a
         previously truncated manifest self-corrects the counters rather than
-        inheriting the wrong ones. `DatasetCompactor` already computes its
-        totals this way.
+        inheriting the wrong ones. `compaction_commit` computes its totals this
+        way too.
         """
         total_files_size = 0
         total_data_size = 0
@@ -1052,8 +1052,8 @@ class SimpleDataset(Dataset):
         None - a write must never fail because sorting couldn't happen.
         """
         try:
-            from .compaction import normalize_sort_order
-            from .compaction import resolve_sort_column
+            from .sort_order import normalize_sort_order
+            from .sort_order import resolve_sort_column
 
             sort_order = normalize_sort_order(getattr(self.metadata, "sort_orders", None))
             if sort_order is None:
@@ -2054,6 +2054,161 @@ class SimpleDataset(Dataset):
     # read, so a caller must not be able to coin a word in it. "delete" is the
     # word `delete_rows` already uses, deliberately reused rather than doubled.
     MERGE_OPERATIONS = ("merge", "update", "delete")
+
+    def compaction_commit(
+        self,
+        files: "Iterable[str]",
+        retired_files: "Iterable[str]",
+        author: str | None = None,
+        baseline_snapshot_id: int | None = None,
+        commit_message: str | None = None,
+        agent: str = "opteryx-engine",
+    ):
+        """Retire whole data files and add their replacements, in ONE snapshot.
+
+        The commit half of compaction. ``files`` are paths already written to
+        storage; ``retired_files`` are the paths they replace. Both halves land
+        together because a reader that saw either alone would see those rows
+        twice or not at all.
+
+        WHOLE-FILE retirement, deliberately distinct from ``merge_commit``'s
+        row-ordinal form. Compaction replaces files wholesale, and saying that by
+        naming every ordinal would mean 30.9M integers to retire two
+        nyc_taxicab files — and would leave the retirement to be INFERRED by
+        noticing a file's ordinals happened to cover all its rows, rather than
+        stated.
+
+        ⛔ THE ROW-COUNT INVARIANT IS THE POINT OF THIS METHOD. Compaction only
+        ever rewrites rows, so the outputs must hold exactly as many LIVE records
+        as the inputs did. An inverted predicate, a reader regression on some
+        column type, a mis-derived chunk group: every one of them shows up here
+        as a count mismatch, and without the check they are silent data loss.
+        LIVE rows, because merge-on-read deletes are MATERIALISED by a rewrite —
+        a compacted output carries no delete vector, so it holds the input's
+        ``record_count`` minus its ``deleted_record_count``.
+
+        Raises rather than returning None on a failed invariant. The caller wrote
+        files before calling and only the caller knows how to remove them; a
+        silent None would leave them orphaned, which is exactly how the previous
+        compactor leaked one output per timed-out pass.
+        """
+        from opteryx_catalog.exceptions import CompactionInvariantError
+
+        if author is None:
+            raise ValueError("author must be provided when compacting a dataset")
+
+        retired = {path for path in (retired_files or []) if path}
+        if not retired:
+            raise ValueError("compaction_commit retires no files; nothing to replace")
+
+        prev = self.snapshot(None)
+        if prev is None:
+            raise CompactionInvariantError("cannot compact a dataset with no committed snapshot")
+
+        # A writer landing between planning and here would have its commit erased
+        # by a manifest that never saw it. `_persist_metadata` is conditional on
+        # the parent pointer and would refuse the write anyway; this refuses
+        # BEFORE the caller's outputs are counted as progress.
+        if (
+            baseline_snapshot_id is not None
+            and self.metadata.current_snapshot_id != baseline_snapshot_id
+        ):
+            raise CompactionInvariantError(
+                "dataset changed during compaction; refusing to overwrite a concurrent commit"
+            )
+
+        prev_entries = self._parent_manifest_entries(prev)
+        retained = [
+            e for e in prev_entries if isinstance(e, dict) and e.get("file_path") not in retired
+        ]
+        replaced = [
+            e for e in prev_entries if isinstance(e, dict) and e.get("file_path") in retired
+        ]
+        if len(replaced) != len(retired):
+            missing = sorted(retired - {e.get("file_path") for e in replaced})
+            raise CompactionInvariantError(
+                f"compaction_commit names {len(missing)} file(s) not in the current "
+                f"manifest: {missing[:3]}"
+            )
+
+        existing = {e.get("file_path") for e in retained if e.get("file_path")}
+        new_entries = self._build_entries_for_files(list(files), existing)
+        if not new_entries:
+            raise CompactionInvariantError("compaction_commit wrote no readable output files")
+
+        live_in = sum(
+            int(e.get("record_count") or 0) - int(e.get("deleted_record_count") or 0)
+            for e in replaced
+        )
+        rows_out = sum(int(e.get("record_count") or 0) for e in new_entries)
+        if live_in != rows_out:
+            raise CompactionInvariantError(
+                f"compaction would change the row count: {live_in} live rows in, "
+                f"{rows_out} rows out. Refusing the commit; the inputs are untouched."
+            )
+
+        merged_entries = retained + new_entries
+        snapshot_id = self._allocate_snapshot_id()
+        manifest_path = None
+        if self.catalog and hasattr(self.catalog, "write_parquet_manifest"):
+            manifest_path = self.catalog.write_parquet_manifest(
+                snapshot_id, merged_entries, self.metadata.location
+            )
+
+        added_size = sum(int(e.get("file_size_in_bytes") or 0) for e in new_entries)
+        added_data = sum(int(e.get("uncompressed_size_in_bytes") or 0) for e in new_entries)
+        removed_size = sum(int(e.get("file_size_in_bytes") or 0) for e in replaced)
+        removed_data = sum(int(e.get("uncompressed_size_in_bytes") or 0) for e in replaced)
+
+        summary = {
+            "added-data-files": len(new_entries),
+            "added-files-size": added_size,
+            "added-data-size": added_data,
+            "added-records": rows_out,
+            "deleted-data-files": len(replaced),
+            "deleted-files-size": removed_size,
+            "deleted-data-size": removed_data,
+            "deleted-records": live_in,
+            **self._totals_from_entries(merged_entries),
+            "agent_meta": {"committer": agent},
+        }
+
+        if commit_message is None:
+            commit_message = f"Compaction: {len(replaced)} files -> {len(new_entries)} files"
+
+        snap = Snapshot(
+            snapshot_id=snapshot_id,
+            timestamp_ms=snapshot_id,
+            author=author,
+            sequence_number=self._next_sequence_number(),
+            user_created=False,
+            operation_type="compact",
+            parent_snapshot_id=self.metadata.current_snapshot_id,
+            manifest_list=manifest_path,
+            schema_id=self.metadata.current_schema_id,
+            commit_message=commit_message,
+            summary=summary,
+        )
+
+        self.metadata.snapshots.append(snap)
+        self._advance_current_snapshot(snapshot_id)
+        if self.catalog and hasattr(self.catalog, "save_snapshot"):
+            self.catalog.save_snapshot(self.identifier, snap)
+        self._persist_metadata()
+
+        self._emit_audit(
+            "compact",
+            author=author,
+            snapshot_id=snapshot_id,
+            files_added=len(new_entries),
+            files_removed=len(replaced),
+            bytes_added=added_size,
+            bytes_removed=removed_size,
+            records_added=rows_out,
+            records_removed=live_in,
+        )
+        self._after_commit(author, snap)
+        return snap
 
     def merge_commit(
         self,
