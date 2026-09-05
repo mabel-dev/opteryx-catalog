@@ -183,6 +183,30 @@ def test_every_failure_names_the_statement_that_fixes_it(status, statement):
     assert statement in body
 
 
+def test_a_statement_is_a_code_span_and_an_error_is_a_fenced_block():
+    """A body is markdown, in the subset the Studio renders. The reader has to
+    be able to tell the statement they are meant to copy from the sentence
+    telling them to copy it, and an engine error - which carries its own line
+    breaks and quoting - has to render verbatim rather than as markup."""
+    _, body = tn._compose(
+        "failed",
+        "ws.ops.rollup",
+        trigger="nightly",
+        holder="ws.raw.events",
+        detail="DatasetNotFound: ws.marts.daily",
+    )
+
+    assert "`SHOW CREATE TASK ws.ops.rollup`" in body
+    assert body.endswith("```\nDatasetNotFound: ws.marts.daily\n```")
+
+
+def test_a_kind_with_no_statement_leaves_no_empty_backticks():
+    """`_code` on nothing is nothing: a bare pair of backticks would render as
+    two literal characters mid-sentence."""
+    assert tn._code("") == ""
+    assert tn._code("SHOW CREATE TASK x") == "`SHOW CREATE TASK x`"
+
+
 def test_the_error_text_is_carried_through():
     """The difference between a fixable error and a status code."""
     _, body = tn._compose(
