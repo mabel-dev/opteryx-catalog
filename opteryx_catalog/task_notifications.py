@@ -34,6 +34,14 @@ carries the statement that fixes it, and `target` carries where to go - which is
 control.opteryx's own standard for the field: "a notification you cannot act on
 from is a log line". Failures are severity `action`; a success is `info`.
 
+MARKDOWN. A body is written in the limited subset the Studio renders
+(/docs/core-concepts/markdown-in-descriptions): every SQL statement is an
+inline code span and a carried error is a fenced block, so the statement a
+reader is meant to copy is visually separate from the prose telling them to.
+The subset is deliberate - it is the same one comments and descriptions use,
+and anything outside it renders as literal text rather than as markup, so a
+body is still readable where nothing renders it (an alert, a log line).
+
 IDEMPOTENT. Every request carries an `id` that control.opteryx uses as the
 document id, so the queue's retries cannot turn one event into several bells.
 
@@ -142,8 +150,8 @@ _BODIES = {
     "egress-blocked": (
         "This {noun_lower} writes into another workspace, and {workspace}'s egress "
         "protection refuses it - so the run was never submitted. Sanction this one "
-        "object with ALTER WORKSPACE {workspace} SET SECURE {object} TO "
-        "<destination workspace>. Turning egress protection off would unlock every "
+        "object with `ALTER WORKSPACE {workspace} SET SECURE {object} TO "
+        "<destination workspace>`. Turning egress protection off would unlock every "
         "copy out of {workspace}, not just this one."
     ),
     "owner-missing": (
@@ -153,10 +161,10 @@ _BODIES = {
         "be billed to, that principal."
     ),
     "window-unbound": (
-        "This task consumes a window (:parent_version / :current_version) but the "
+        "This task consumes a window (`:parent_version` / `:current_version`) but the "
         "event that fired it carries none, so there was nothing to bind and no run "
         "was submitted. Either give the trigger a source to take its window from - "
-        "CREATE OR REPLACE TRIGGER {trigger} ON ... OVER <table> - or redefine the "
+        "`CREATE OR REPLACE TRIGGER {trigger} ON ... OVER <table>` - or redefine the "
         "task with a statement that takes no window."
     ),
     "error": (
@@ -184,6 +192,16 @@ _TITLES = {
     "denied": "{noun} {name} was refused on permissions",
     "succeeded": "{noun} {name} succeeded",
 }
+
+
+def _code(statement: str) -> str:
+    """One SQL statement as an inline code span, or "" if there is none.
+
+    Empty in, empty out: a kind with no statement recorded for it interpolates
+    nothing rather than an empty pair of backticks, which would render as two
+    literal characters in the middle of a sentence.
+    """
+    return f"`{statement}`" if statement else ""
 
 
 def _split(task_identifier: str) -> tuple[str, str, str]:
@@ -223,10 +241,14 @@ def _compose(
         "noun": noun,
         "noun_lower": noun.lower(),
     }
-    # Resolved before the body, because the bodies interpolate them.
-    fields["definition_statement"] = _DEFINITION_STATEMENTS.get(kind, "").format(**fields)
-    fields["owner_statement"] = _OWNER_STATEMENTS.get(kind, "").format(**fields)
-    fields["state_statement"] = _STATE_STATEMENTS.get(kind, "").format(**fields)
+    # Resolved before the body, because the bodies interpolate them, and each
+    # is code-spanned HERE rather than in the templates: every one of them is
+    # interpolated mid-sentence, and backticks written around `{field}` in a
+    # template would produce a bare pair of them for a kind that has no
+    # statement to name.
+    fields["definition_statement"] = _code(_DEFINITION_STATEMENTS.get(kind, "").format(**fields))
+    fields["owner_statement"] = _code(_OWNER_STATEMENTS.get(kind, "").format(**fields))
+    fields["state_statement"] = _code(_STATE_STATEMENTS.get(kind, "").format(**fields))
 
     title = _TITLES.get(status, "{noun} {name}: {status}").format(status=status, **fields)
 
@@ -239,7 +261,16 @@ def _compose(
         body = body_template.format(**fields)
 
     if detail:
-        body = f"{body}\n\n{detail}"
+        # Fenced, not appended as prose: an engine error carries its own line
+        # breaks, quoting and identifiers, and running it into the paragraph
+        # above loses the boundary between what we are saying and what the
+        # engine said. A fence also renders the text verbatim, so nothing in
+        # an error message is read as markup.
+        body = f"{body}\n\n```\n{detail}\n```"
+    # Clipped to the route's limit, which can cut mid-fence or mid-span. The
+    # renderer closes an unterminated fence at the end of the text, so the
+    # worst case is a trailing backtick shown literally - which is the right
+    # trade against refusing to send a bell because its error was long.
     return title[:MAX_TITLE], body[:MAX_BODY]
 
 
