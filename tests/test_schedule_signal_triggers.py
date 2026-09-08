@@ -604,8 +604,8 @@ def test_a_due_schedule_fires_once_and_advances():
         )
 
     assert client.query.filters == [
-        ("event-kind", "==", "schedule"),
-        ("next-due-at-ms", "<=", T0 + HOUR_MS + 5_000),
+        ("`event-kind`", "==", "schedule"),
+        ("`next-due-at-ms`", "<=", T0 + HOUR_MS + 5_000),
     ]
     assert len(outcomes) == 1
     assert outcomes[0]["status"] == "enqueued"
