@@ -39,6 +39,8 @@ import time
 
 from ..alerts import report as _alert
 from ..exceptions import ManifestProtectionError
+from ..exceptions import SnapshotAncestryTooDeep
+from ..exceptions import SnapshotMissingError
 from .dataset import select_last_user_snapshot
 from .dataset import visible_history
 from .metadata import SNAPSHOT_EXPIRED_AT_KEY
@@ -251,6 +253,49 @@ class SnapshotExpiration:
             logger.debug("Tombstone purge unavailable for %s: %s", identifier, exc)
         return purged
 
+    def _previous_user_snapshot(self, dataset, identifier: str) -> Snapshot | None:
+        """The version of the data before the current one, best-effort.
+
+        Delegates to `SimpleDataset.previous_user_snapshot()`, which walks
+        past maintenance commits on both sides of the chain to find the user
+        commit the head rests on and the one before it. Retention wants that
+        exact rule - not `snapshots[-2]` or "the next snapshot back" - for the
+        same reason `expire_dataset` already treats the last user commit
+        specially: a dataset maintained often but written rarely must not
+        lose the two real versions a human would recognise as "current" and
+        "previous" underneath a pile of same-data maintenance snapshots.
+
+        Best-effort and additive on purpose. This is never the only thing
+        protecting a dataset's data - current, tags, and the last-user-commit
+        lookback all do that independently - so a dataset whose history is
+        too shallow, too deep to walk (`SnapshotAncestryTooDeep`), whose
+        previous version has already expired out of history
+        (`SnapshotMissingError`), or that is a bare test double without this
+        method at all, simply does not get the extra protection. It never
+        aborts expiration, unlike the tag and manifest protections above -
+        those guard against deleting data outright, this only decides whether
+        one more snapshot is kept.
+        """
+        getter = getattr(dataset, "previous_user_snapshot", None)
+        if not callable(getter):
+            return None
+        try:
+            return getter()
+        except (SnapshotMissingError, SnapshotAncestryTooDeep) as exc:
+            logger.info(
+                "Could not determine the previous version of %s for retention: %s",
+                identifier,
+                exc,
+            )
+            return None
+        except Exception as exc:  # noqa: BLE001 - Firestore/catalog boundary, see above
+            logger.debug(
+                "previous_user_snapshot() unavailable for %s (%s); skipping the extra retention",
+                identifier,
+                exc,
+            )
+            return None
+
     def _expire_dataset(self, identifier: str, dry_run: bool = False) -> dict | None:
         """Apply retention policy to a single dataset (see `expire_dataset`)."""
         try:
@@ -360,6 +405,23 @@ class SnapshotExpiration:
                 logger.info(
                     "Retaining last user snapshot %s for %s (outside retention window)",
                     protected_user_snapshot.snapshot_id,
+                    identifier,
+                )
+
+            # Also always retain the version of the data BEFORE the current
+            # one - the same answer `VERSION AS OF PREVIOUS` gives. Skipping
+            # past maintenance commits matters here exactly as it does above:
+            # compaction and statistics refresh rewrite files without
+            # changing a row, so a `parent_snapshot_id` hop that lands on one
+            # of those is byte-identical to the current version and protects
+            # nothing a rollback or an audit would actually need. See
+            # `SimpleDataset.previous_user_snapshot` for the walk.
+            previous_version = self._previous_user_snapshot(dataset, identifier)
+            if previous_version is not None and previous_version not in snapshots_to_keep:
+                snapshots_to_keep.append(previous_version)
+                logger.info(
+                    "Retaining previous version %s for %s (the version before the current one)",
+                    previous_version.snapshot_id,
                     identifier,
                 )
 
