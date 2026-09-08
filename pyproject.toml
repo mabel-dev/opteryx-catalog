@@ -33,7 +33,7 @@ dependencies = [
     # is the IANA zone database for interpreters whose platform ships none -
     # a slim container image, typically - so `Europe/London` resolves there
     # as it does on a workstation.
-    "croniter>=2",
+    "croniter>=6.2.4",
     "tzdata",
 ]
 
