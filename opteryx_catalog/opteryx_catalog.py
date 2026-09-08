@@ -22,6 +22,8 @@ from .catalog.dataset import SimpleDataset
 from .catalog.dataset import _as_int
 from .catalog.metadata import DatasetMetadata
 from .catalog.metadata import Snapshot
+from .catalog.metadata import provenance_document_fields
+from .catalog.metadata import provenance_fields_from_document
 from .catalog.metadata import snapshot_is_tombstoned
 from .catalog.metastore import Metastore
 from .catalog.orphan_quarantine import MAINTENANCE_SUBCOLLECTION
@@ -816,13 +818,17 @@ def _snapshot_to_document(snapshot: Snapshot) -> dict:
     even once.
 
     `_snapshot_from_dict` is the reader; every key it looks for must be
-    produced here. Keep the three in step.
+    produced here. Keep the three in step. The provenance keys (the receipt,
+    PROVENANCE_DESIGN.md S2.1) come through `provenance_document_fields`, which
+    is shared with the reader so they cannot drift - and which OMITS a receipt
+    that was never reported rather than writing null, so absent stays absent.
     """
     summary = dict(snapshot.summary or {})
     for key in _SNAPSHOT_SUMMARY_KEYS:
         summary.setdefault(key, 0)
 
     return {
+        **provenance_document_fields(snapshot),
         "snapshot-id": snapshot.snapshot_id,
         "timestamp-ms": snapshot.timestamp_ms,
         "manifest": snapshot.manifest_list,
@@ -1122,6 +1128,11 @@ class OpteryxCatalog(Metastore):
                 "next-field-id": metadata.next_field_id,
                 "locked-by": None,
                 "locked-at-ms": None,
+                # Nothing has been written, so the (empty) source list is
+                # complete. Written explicitly: a document WITHOUT the flag is
+                # read as pre-feature history, which this is not.
+                "sources": [],
+                "sources-complete": True,
             }
         )
 
@@ -1271,6 +1282,7 @@ class OpteryxCatalog(Metastore):
             operation_type=sd.get("operation-type"),
             parent_snapshot_id=sd.get("parent-snapshot-id"),
             commit_message=sd.get("commit-message"),
+            **provenance_fields_from_document(sd),
         )
 
     def _load_tags(self, collection: str, dataset_name: str) -> tuple[dict[str, int], bool]:
@@ -1366,6 +1378,12 @@ class OpteryxCatalog(Metastore):
         metadata.dataset_type = data.get("dataset-type")
         metadata.statement_id = data.get("statement-id")
         metadata.source_tables = data.get("source-tables") or []
+        # The standing source list (PROVENANCE_DESIGN.md S2.2). A document
+        # without the flag predates the feature: whatever its content was built
+        # from was never recorded, so the list is incomplete by definition
+        # until a rewrite or a clear starts it afresh.
+        metadata.sources = list(data.get("sources") or [])
+        metadata.sources_complete = bool(data.get("sources-complete", False))
         metadata.runs_as = data.get("runs-as")
         metadata.suspended_at_ms = data.get("suspended-at-ms")
         metadata.suspended_by = data.get("suspended-by")
@@ -3129,8 +3147,18 @@ class OpteryxCatalog(Metastore):
         description: str | None = None,
         update_if_exists: bool = False,
         writes: list[str] | None = None,
+        reads: list[str] | None = None,
     ) -> None:
         """Register a task: a statement the platform runs on its own.
+
+        `reads` is the counterpart of `writes` (PROVENANCE_DESIGN.md S2.3): the
+        catalog relations the statement reads, derived by the same AST pass,
+        qualified on entry, and written from THIS registration every time. It
+        is the plan-level "what feeds the thing this task writes", answerable
+        before the task has ever run; what a run actually read is the receipt
+        on the snapshot it committed. `None` here is a caller that predates the
+        field, and is stored as an empty list like `writes` - the sweep that
+        backfills `reads` from each task's statement lives with the parser.
 
         The statement is versioned in a `statement` subcollection, the same way
         a view's and a materialized view's are, so redefining a task keeps its
@@ -3211,6 +3239,13 @@ class OpteryxCatalog(Metastore):
                 # with no `data.get` fallback, because it describes the statement
                 # being recorded and not the one it replaces.
                 "writes": list(writes or []),
+                # Qualified on entry, like `source-tables`. A one-part name is
+                # not a catalog relation (the planner drops `$planets` and
+                # information_schema before this, but a registration must not
+                # fail on one that slips through) and is kept as written.
+                "reads": sorted(
+                    {self._qualify(r) if len(r.split(".")) >= 2 else r for r in (reads or [])}
+                ),
                 "description": description if description is not None else data.get("description"),
                 "created-by": data.get("created-by") or author,
                 "created-at-ms": data.get("created-at-ms") or now_ms,
@@ -3238,6 +3273,104 @@ class OpteryxCatalog(Metastore):
 
         emit_audit(
             "update_task" if existing.exists else "create_task",
+            resource_type=ResourceType.DATASET,
+            workspace=self.workspace,
+            collection=collection,
+            resource=task_name,
+            author=author,
+            statement_id=statement_id,
+        )
+
+    def alter_task_statement(
+        self,
+        identifier: str | tuple,
+        sql: str,
+        author: str | None = None,
+        writes: list[str] | None = None,
+        reads: list[str] | None = None,
+    ) -> None:
+        """ALTER TASK <name> AS <statement>: redefine the SQL body only.
+
+        A DEDICATED method, not `create_task(..., update_if_exists=True)`
+        with a narrower caller: `create_task` carries fields this must never
+        touch - `suspended-at-ms`/`suspended-by`, `last-fired-at-ms`/
+        `last-fired-status`, `last-window-to`, and above all `trigger`, the
+        pointer to whichever trigger fires this task. A body that can only
+        set `sql`/`writes`/`reads` is auditable by construction; a shared
+        body threading a "was this a narrow alter" flag through every one of
+        `create_task`'s `data.get(...)` fallbacks would not be.
+
+        Unlike `create_task`, this does NOT create: `doc_ref.get()` not
+        existing is `TaskNotFound`, because ALTER redefines something that
+        already exists rather than making it exist. It also never touches
+        `created-by`/`created-at-ms` - a redefinition is not a new creation
+        - and, unlike `create_trigger`'s SUSPEND, there is nothing here for
+        this to preserve OR reset: `suspended-at-ms`, `last-fired-at-ms` and
+        `trigger` are simply absent from the write, so Firestore's merge-free
+        `.set()` semantics would drop them - which is exactly why this reads
+        `data` first and carries every field it does not intend to change
+        forward, the same as `create_task` does.
+
+        Emits `alter_task_statement` as its own audit action, distinct from
+        `create_task`/`update_task` - a consumer keyed only on the action
+        name (rather than on `resource_type=DATASET` generally) needs to
+        recognize this one too.
+        """
+        if not sql or not sql.strip():
+            raise ValueError("a task requires a statement")
+
+        collection, task_name = self._task_parts(identifier)
+        doc_ref = self._task_doc_ref(collection, task_name)
+        existing = doc_ref.get()
+        if not existing.exists:
+            raise TaskNotFound(f"Task not found: {collection}.{task_name}")
+        data = existing.to_dict() or {}
+
+        now_ms = int(time.time() * 1000)
+        sequence_number = 1
+        current_statement_id = data.get("statement-id")
+        if current_statement_id:
+            stmt_doc = doc_ref.collection("statement").document(str(current_statement_id)).get()
+            if stmt_doc.exists:
+                sequence_number = (stmt_doc.to_dict() or {}).get("sequence-number", 0) + 1
+
+        statements = doc_ref.collection("statement")
+        statement_id = str(now_ms)
+        while statements.document(statement_id).get().exists:
+            now_ms += 1
+            statement_id = str(now_ms)
+
+        statements.document(statement_id).set(
+            {
+                "sql": sql,
+                "timestamp-ms": now_ms,
+                "author": author,
+                "sequence-number": sequence_number,
+            }
+        )
+
+        doc_ref.set(
+            {
+                "name": task_name,
+                "statement-id": statement_id,
+                "writes": list(writes or []),
+                "reads": sorted(
+                    {self._qualify(r) if len(r.split(".")) >= 2 else r for r in (reads or [])}
+                ),
+                "description": data.get("description"),
+                "created-by": data.get("created-by"),
+                "created-at-ms": data.get("created-at-ms"),
+                "suspended-at-ms": data.get("suspended-at-ms"),
+                "suspended-by": data.get("suspended-by"),
+                "last-fired-at-ms": data.get("last-fired-at-ms"),
+                "last-fired-status": data.get("last-fired-status"),
+                "last-window-to": data.get("last-window-to"),
+                "trigger": data.get("trigger"),
+            }
+        )
+
+        emit_audit(
+            "alter_task_statement",
             resource_type=ResourceType.DATASET,
             workspace=self.workspace,
             collection=collection,
@@ -3286,6 +3419,9 @@ class OpteryxCatalog(Metastore):
             # from a task that writes nothing - the honest reading of a record
             # that was never asked the question.
             "writes": list(data.get("writes") or []),
+            # The relations the statement reads, qualified. Same caveat as
+            # `writes` for a task registered before the field existed.
+            "reads": list(data.get("reads") or []),
             "description": data.get("description"),
             "created-by": data.get("created-by"),
             "created-at-ms": data.get("created-at-ms"),
@@ -6116,6 +6252,18 @@ class OpteryxCatalog(Metastore):
         qualified = f"{collection}.{dataset_name}"
         snapshot_id = int(snapshot_id)
 
+        from .catalog.provenance import recompute_sources
+
+        snapshots_coll = self._snapshots_collection(collection, dataset_name)
+
+        def _fetch_snapshot_document(sid: int) -> dict | None:
+            doc = snapshots_coll.document(str(sid)).get()
+            return (doc.to_dict() or {}) if doc.exists else None
+
+        sources, sources_complete = recompute_sources(
+            snapshot_id, _fetch_snapshot_document, qualified, self.workspace
+        )
+
         @firestore.transactional
         def _rollback(transaction) -> dict:
             # Reads before writes - Firestore refuses the other order.
@@ -6168,6 +6316,14 @@ class OpteryxCatalog(Metastore):
             update = {
                 # The head pointer - see DatasetMetadata.current_snapshot_id.
                 "current-snapshot-id": snapshot_id,
+                # The standing source list describes the CURRENT content, and
+                # the content is about to be a different snapshot's. Recomputed
+                # from the receipts behind the new head (PROVENANCE_DESIGN.md
+                # S4.3). Read before the transaction: the chain behind a
+                # snapshot is immutable, so a concurrent commit cannot change
+                # this answer, and Firestore refuses reads after writes anyway.
+                "sources": sources,
+                "sources-complete": sources_complete,
             }
             schema_id = snapshot_data.get("schema-id")
             if schema_id is not None:
@@ -7400,6 +7556,10 @@ class OpteryxCatalog(Metastore):
             "dataset-type": metadata.dataset_type,
             "statement-id": metadata.statement_id,
             "source-tables": metadata.source_tables,
+            # The standing source list, maintained by the commit that is
+            # writing this document (see DatasetMetadata.sources).
+            "sources": list(metadata.sources or []),
+            "sources-complete": bool(metadata.sources_complete),
             "suspended-at-ms": metadata.suspended_at_ms,
             "suspended-by": metadata.suspended_by,
             "last-refreshed-at-ms": metadata.last_refreshed_at_ms,

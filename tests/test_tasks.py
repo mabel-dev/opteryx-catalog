@@ -755,3 +755,42 @@ def test_a_task_writing_its_own_workspace_arms_normally():
     )
 
     assert catalog.get_task("ops.ingest")["trigger"] == {"source": "ws.ops.src", "name": "t"}
+
+
+# --- what a task reads (PROVENANCE_DESIGN.md S2.3)
+
+
+def test_what_a_task_reads_is_recorded_qualified():
+    """The counterpart of `writes`: the plan-level "what feeds the thing this
+    task writes", answerable before the task has ever run. Qualified on entry
+    like `source-tables`, so a reader never has to guess a workspace."""
+    catalog = _catalog()
+    catalog.create_task(
+        "ops.ingest",
+        sql="INSERT INTO ops.curated SELECT * FROM ops.raw JOIN other.ops.dim USING (k)",
+        author="xb500",
+        writes=["ops.curated"],
+        reads=["ops.raw", "other.ops.dim", "ops.raw"],
+    )
+
+    assert catalog.get_task("ops.ingest")["reads"] == ["other.ops.dim", "ws.ops.raw"]
+
+
+def test_a_task_registered_without_reads_records_an_empty_list():
+    catalog = _catalog()
+    catalog.create_task("ops.ingest", sql="SELECT 1", author="xb500")
+
+    assert catalog.get_task("ops.ingest")["reads"] == []
+
+
+def test_redefining_replaces_what_a_task_reads():
+    """Written from THIS registration every time, never carried from the last:
+    a redefinition that changes the sources must not leave the old answer
+    standing beside the new statement."""
+    catalog = _catalog()
+    catalog.create_task("ops.ingest", sql="SELECT * FROM ops.raw", author="xb500", reads=["ops.raw"])
+    catalog.create_task(
+        "ops.ingest", sql="SELECT 1", author="xb500", update_if_exists=True
+    )
+
+    assert catalog.get_task("ops.ingest")["reads"] == []

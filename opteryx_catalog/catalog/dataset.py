@@ -22,7 +22,17 @@ from .manifest import build_parquet_manifest_entry_from_bytes
 from .manifest import build_parquet_manifest_entry_from_morsel
 from .metadata import DatasetMetadata
 from .metadata import Snapshot
+from .metadata import provenance_fields_from_document
+from .metadata import snapshot_is_tombstoned
 from .metastore import Dataset
+from .provenance import CLEAR
+from .provenance import REWRITE
+from .provenance import UNCHANGED
+from .provenance import ReceiptMissing
+from .provenance import effect_for_operation
+from .provenance import is_self
+from .provenance import merge_sources
+from .provenance import normalize_read_sources
 
 # Stable node identifier for this process (hex-mac-hex-pid)
 _NODE = f"{uuid.getnode():x}-{os.getpid():x}"
@@ -509,6 +519,17 @@ class SimpleDataset(Dataset):
                 )
                 if doc.exists:
                     sd = doc.to_dict() or {}
+                    if snapshot_is_tombstoned(sd):
+                        # Expired. The document is kept for the restore window
+                        # (see SNAPSHOT_EXPIRED_AT_KEY) but the data behind it
+                        # is no longer guaranteed, and every other reader of a
+                        # snapshot by id - the tag path, rollback, the history
+                        # loader - refuses one. Answering with it here made
+                        # `VERSION AS OF <expired id>` plan a scan over files
+                        # that may be gone, and made a provenance receipt's
+                        # `source_exists` say a retired version was live.
+                        # Not cached: the cache is for immutable artifacts.
+                        return None
                     snap = Snapshot(
                         snapshot_id=int(sd.get("snapshot-id") or snapshot_id),
                         timestamp_ms=int(sd.get("timestamp-ms", 0)),
@@ -521,6 +542,7 @@ class SimpleDataset(Dataset):
                         operation_type=sd.get("operation-type"),
                         parent_snapshot_id=sd.get("parent-snapshot-id"),
                         commit_message=sd.get("commit-message"),
+                        **provenance_fields_from_document(sd),
                     )
                     # Seed the id-keyed cache the same way load_dataset() does,
                     # so a historical id fetched once is not fetched again by
@@ -787,7 +809,14 @@ class SimpleDataset(Dataset):
             return {}
         return {col.name: col.id for col in schema.columns if getattr(col, "id", None) is not None}
 
-    def append(self, table: Any, author: str | None = None, commit_message: str | None = None):
+    def append(
+        self,
+        table: Any,
+        author: str | None = None,
+        commit_message: str | None = None,
+        read_sources: Iterable[Any] | None = None,
+        produced_by: str | None = None,
+    ):
         """Append a draken Morsel:
 
         - write a Parquet data file via `self.io`
@@ -874,6 +903,7 @@ class SimpleDataset(Dataset):
             summary=summary,
         )
 
+        self._stamp_provenance(snap, read_sources, produced_by)
         self.metadata.snapshots.append(snap)
         self._advance_current_snapshot(snapshot_id)
 
@@ -1000,6 +1030,87 @@ class SimpleDataset(Dataset):
             author=author,
             **detail,
         )
+
+    def _stamp_provenance(
+        self,
+        snap: Snapshot,
+        read_sources: Iterable[Any] | None,
+        produced_by: str | None,
+    ) -> None:
+        """Put the receipt on the snapshot and apply it to the source list.
+
+        THE one place the provenance rules touch a commit (PROVENANCE_DESIGN.md
+        S2.1, S2.2, S2.4). Called by every snapshot construction site before the
+        snapshot is persisted, so the receipt and the dataset's `sources` are
+        written by the same `save_snapshot`/`save_dataset_metadata` pair as the
+        data they describe.
+
+        What the commit does to `sources` is decided from the snapshot's own
+        `operation_type` and the live row count it leaves - the same rule the
+        rollback recompute applies to stored documents, so the incremental
+        answer and the recomputed one cannot disagree.
+
+        `read_sources=None` is a writer that did not report. The commit is not
+        refused - its files are already on disk - but the omission is alerted
+        and audited, and the source list is marked incomplete (or, for a
+        rewrite, emptied: the old list is certainly wrong and the new one is
+        unknown). A maintenance commit is exempt because it passes `[]` itself.
+        """
+        workspace = getattr(self.catalog, "workspace", None)
+        summary = snap.summary or {}
+        total = summary.get("total-records")
+        live = (
+            None
+            if total is None
+            else int(total) - int(summary.get("total-deleted-records") or 0)
+        )
+        effect = effect_for_operation(snap.operation_type, live)
+        snap.produced_by = produced_by
+
+        if read_sources is None:
+            snap.read_sources = None
+            snap.read_sources_truncated = False
+            if effect != UNCHANGED:
+                if effect in (REWRITE, CLEAR):
+                    self.metadata.sources = []
+                self.metadata.sources_complete = effect == CLEAR
+                exc = ReceiptMissing(
+                    f"{self.identifier}: {snap.operation_type} snapshot {snap.snapshot_id} "
+                    "was committed without a read-sources receipt"
+                ).with_alert_context(
+                    dataset=self.identifier,
+                    workspace=workspace,
+                    snapshot_id=snap.snapshot_id,
+                    operation_type=snap.operation_type,
+                )
+                _alert(
+                    exc,
+                    note="commit without provenance receipt",
+                    fingerprint=("missing-receipt", self.identifier, str(snap.operation_type)),
+                )
+                self._emit_audit(
+                    "missing_receipt",
+                    author=snap.author,
+                    snapshot_id=snap.snapshot_id,
+                    operation_type=snap.operation_type,
+                )
+            return
+
+        entries, truncated = normalize_read_sources(read_sources)
+        snap.read_sources = entries
+        snap.read_sources_truncated = truncated
+        names = [
+            entry["dataset"]
+            for entry in entries
+            if not is_self(entry["dataset"], self.identifier, workspace)
+        ]
+        merged, dropped = merge_sources(names, self.metadata.sources, effect)
+        self.metadata.sources = merged
+        if effect in (REWRITE, CLEAR):
+            # A fresh start: nothing older than this commit is in the content.
+            self.metadata.sources_complete = True
+        if dropped or (truncated and effect != UNCHANGED):
+            self.metadata.sources_complete = False
 
     def _after_commit(self, author: str | None, snapshot: Snapshot) -> None:
         """Fire this dataset's triggers for a just-landed commit.
@@ -1313,7 +1424,14 @@ class SimpleDataset(Dataset):
         )
         return schema_id
 
-    def overwrite(self, table: Any, author: str | None = None, commit_message: str | None = None):
+    def overwrite(
+        self,
+        table: Any,
+        author: str | None = None,
+        commit_message: str | None = None,
+        read_sources: Iterable[Any] | None = None,
+        produced_by: str | None = None,
+    ):
         """Replace the dataset entirely with `table` in a single snapshot.
 
         Semantics:
@@ -1407,6 +1525,7 @@ class SimpleDataset(Dataset):
         )
 
         # Replace in-memory snapshots
+        self._stamp_provenance(snap, read_sources, produced_by)
         self.metadata.snapshots.append(snap)
         self._advance_current_snapshot(snapshot_id)
 
@@ -1491,8 +1610,17 @@ class SimpleDataset(Dataset):
         author: str | None = None,
         commit_message: str | None = None,
         footer_only: bool = False,
+        read_sources: Iterable[Any] | None = None,
+        produced_by: str | None = None,
     ):
         """Add filenames to the dataset manifest without writing the files.
+
+        `read_sources` is the provenance receipt (PROVENANCE_DESIGN.md S2.1):
+        every `(dataset, snapshot_id, resolved_by)` the statement that produced
+        these files read, or `[]` for a statement that read no catalog
+        relation. `None` means "not reported" and is treated as a defect - see
+        `_stamp_provenance`. `produced_by` names the task or view that ran the
+        statement, or None for a hand-run one.
 
         - `files` is a list of file paths (strings). Files are assumed to
           already exist in storage; this method only updates the manifest.
@@ -1588,6 +1716,7 @@ class SimpleDataset(Dataset):
             summary=summary,
         )
 
+        self._stamp_provenance(snap, read_sources, produced_by)
         self.metadata.snapshots.append(snap)
         self._advance_current_snapshot(snapshot_id)
 
@@ -1598,7 +1727,12 @@ class SimpleDataset(Dataset):
         self._after_commit(author, snap)
 
     def truncate_and_add_files(
-        self, files: list[str], author: str | None = None, commit_message: str | None = None
+        self,
+        files: list[str],
+        author: str | None = None,
+        commit_message: str | None = None,
+        read_sources: Iterable[Any] | None = None,
+        produced_by: str | None = None,
     ):
         """Truncate dataset (logical) and set manifest to provided files.
 
@@ -1755,6 +1889,7 @@ class SimpleDataset(Dataset):
         )
 
         # Replace in-memory snapshots: append snapshot and update current id
+        self._stamp_provenance(snap, read_sources, produced_by)
         self.metadata.snapshots.append(snap)
         self._advance_current_snapshot(snapshot_id)
 
@@ -1838,6 +1973,8 @@ class SimpleDataset(Dataset):
         added_entries: "Iterable[dict]" = (),
         operation_type: str = "delete",
         audit_action: str = "delete",
+        read_sources: Iterable[Any] | None = None,
+        produced_by: str | None = None,
     ) -> Snapshot:
         """Shared tail of delete_rows/delete_files/merge_commit: manifest,
         snapshot, persist.
@@ -1901,6 +2038,7 @@ class SimpleDataset(Dataset):
             summary=summary,
         )
 
+        self._stamp_provenance(snap, read_sources, produced_by)
         self.metadata.snapshots.append(snap)
         self._advance_current_snapshot(snapshot_id)
 
@@ -1922,6 +2060,8 @@ class SimpleDataset(Dataset):
         positions: dict[str, Iterable[int]],
         author: str | None = None,
         commit_message: str | None = None,
+        read_sources: Iterable[Any] | None = None,
+        produced_by: str | None = None,
     ) -> Snapshot:
         """Merge-on-read delete: mark row ordinals of named data files deleted.
 
@@ -2034,6 +2174,8 @@ class SimpleDataset(Dataset):
             new_entries=new_entries,
             author=author,
             commit_message=commit_message,
+            read_sources=read_sources,
+            produced_by=produced_by,
             removed_entries=removed_entries,
             newly_deleted_records=newly_deleted,
             snapshot_id=snapshot_id,
@@ -2175,6 +2317,10 @@ class SimpleDataset(Dataset):
 
         if commit_message is None:
             commit_message = f"Compaction: {len(replaced)} files -> {len(new_entries)} files"
+        # Maintenance reads its own parent and nothing else: an empty receipt,
+        # asserted here rather than left to a caller, and no effect on `sources`.
+        read_sources: list = []
+        produced_by = None
 
         snap = Snapshot(
             snapshot_id=snapshot_id,
@@ -2190,6 +2336,7 @@ class SimpleDataset(Dataset):
             summary=summary,
         )
 
+        self._stamp_provenance(snap, read_sources, produced_by)
         self.metadata.snapshots.append(snap)
         self._advance_current_snapshot(snapshot_id)
         if self.catalog and hasattr(self.catalog, "save_snapshot"):
@@ -2218,6 +2365,8 @@ class SimpleDataset(Dataset):
         commit_message: str | None = None,
         footer_only: bool = False,
         operation: str = "merge",
+        read_sources: Iterable[Any] | None = None,
+        produced_by: str | None = None,
     ) -> Snapshot:
         """Register data files AND mark row ordinals deleted, in ONE snapshot.
 
@@ -2381,6 +2530,8 @@ class SimpleDataset(Dataset):
             added_entries=added_entries,
             operation_type=operation,
             audit_action=operation,
+            read_sources=read_sources,
+            produced_by=produced_by,
             author=author,
             commit_message=commit_message,
             removed_entries=removed_entries,
@@ -2400,6 +2551,8 @@ class SimpleDataset(Dataset):
         paths: Iterable[str],
         author: str | None = None,
         commit_message: str | None = None,
+        read_sources: Iterable[Any] | None = None,
+        produced_by: str | None = None,
     ) -> Snapshot:
         """Copy-on-write whole-file delete: drop named data files from the manifest.
 
@@ -2472,6 +2625,8 @@ class SimpleDataset(Dataset):
             new_entries=new_entries,
             author=author,
             commit_message=commit_message,
+            read_sources=read_sources,
+            produced_by=produced_by,
             removed_entries=removed_entries,
             newly_deleted_records=removed_live_records,
             snapshot_id=snapshot_id,
@@ -3000,6 +3155,11 @@ class SimpleDataset(Dataset):
             "agent": agent,
         }
 
+        # A statistics refresh rewrites no data: an empty receipt, asserted
+        # here, and no effect on `sources`.
+        read_sources: list = []
+        produced_by = None
+
         snap = Snapshot(
             snapshot_id=snapshot_id,
             timestamp_ms=getattr(prev, "timestamp_ms", snapshot_id),
@@ -3020,6 +3180,7 @@ class SimpleDataset(Dataset):
         snap.summary["agent-committer"] = agent_meta
 
         # update in-memory metadata
+        self._stamp_provenance(snap, read_sources, produced_by)
         self.metadata.snapshots.append(snap)
         self._advance_current_snapshot(snapshot_id)
 
@@ -3156,6 +3317,11 @@ class SimpleDataset(Dataset):
 
         parent_id = self.metadata.current_snapshot_id
 
+        # A truncate reads nothing and leaves nothing: an empty receipt, and
+        # the source list is cleared (PROVENANCE_DESIGN.md S2.2).
+        read_sources: list = []
+        produced_by = None
+
         snap = Snapshot(
             snapshot_id=snapshot_id,
             timestamp_ms=snapshot_id,
@@ -3171,6 +3337,7 @@ class SimpleDataset(Dataset):
         )
 
         # Append new snapshot and update current snapshot id
+        self._stamp_provenance(snap, read_sources, produced_by)
         self.metadata.snapshots.append(snap)
         self._advance_current_snapshot(snapshot_id)
 

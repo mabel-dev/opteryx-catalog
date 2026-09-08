@@ -350,3 +350,166 @@ def test_an_account_owned_trigger_is_fine():
     )
 
     assert audit_workspace(client, "ws") == []
+
+
+# --- provenance (PROVENANCE_DESIGN.md S3)
+
+_AFTER = 1_800_000_000_000  # after receipts became required
+_BEFORE = 1_700_000_000_000
+
+
+def _current_snapshot(ref, snapshot_id, **fields):
+    ref.set({**ref.get().to_dict(), "current-snapshot-id": snapshot_id})
+    ref.collection("snapshots").document(str(snapshot_id)).set(
+        {"snapshot-id": snapshot_id, "timestamp-ms": _AFTER, "operation-type": "add-files", **fields}
+    )
+
+
+def _receipt(*names):
+    return [{"dataset": n, "snapshot-id": 5, "resolved-by": "current"} for n in names]
+
+
+def test_a_current_snapshot_with_no_receipt_is_reported():
+    client = _Client()
+    ref = _add_dataset(client, "ws", "mart", "y")
+    _current_snapshot(ref, 42)
+
+    findings = audit_workspace(client, "ws")
+
+    assert [f["kind"] for f in findings] == ["missing-receipt"]
+    assert findings[0]["path"] == "ws/mart/datasets/y/snapshots/42"
+
+
+def test_pre_feature_history_is_not_a_missing_receipt():
+    client = _Client()
+    ref = _add_dataset(client, "ws", "mart", "y")
+    _current_snapshot(ref, 42, **{"timestamp-ms": _BEFORE})
+
+    assert audit_workspace(client, "ws") == []
+
+
+def test_an_empty_receipt_is_a_receipt():
+    client = _Client()
+    ref = _add_dataset(client, "ws", "mart", "y")
+    _current_snapshot(ref, 42, **{"read-sources": []})
+
+    assert audit_workspace(client, "ws") == []
+
+
+def _task(client, workspace, collection, name, **fields):
+    coll_doc = client.collection(workspace).document(collection)
+    coll_doc.set({"name": collection})
+    ref = coll_doc.collection("tasks").document(name)
+    ref.set({"name": name, **fields})
+    return ref
+
+
+def test_a_receipt_outside_the_producing_tasks_declaration_is_reported():
+    client = _Client()
+    _task(client, "ws", "ops", "t", reads=["ws.ops.a"])
+    ref = _add_dataset(client, "ws", "mart", "y")
+    _current_snapshot(
+        ref, 42, **{"read-sources": _receipt("ws.ops.a", "ws.ops.b", "ws.mart.y"), "produced-by": "task:ws.ops.t"}
+    )
+
+    findings = audit_workspace(client, "ws")
+
+    assert [f["kind"] for f in findings] == ["receipt-outside-declaration"]
+    assert "ws.ops.b" in findings[0]["detail"]
+    # The dataset itself (a MERGE reads its target) is never outside anything.
+    assert "ws.mart.y" not in findings[0]["detail"]
+
+
+def test_a_task_with_no_reads_recorded_yet_is_not_checked():
+    client = _Client()
+    _task(client, "ws", "ops", "t", writes=["ws.mart.y"])
+    ref = _add_dataset(client, "ws", "mart", "y")
+    _current_snapshot(ref, 42, **{"read-sources": _receipt("ws.ops.b"), "produced-by": "task:ws.ops.t"})
+
+    assert audit_workspace(client, "ws") == []
+
+
+def test_a_receipt_outside_a_views_source_tables_is_reported():
+    client = _Client()
+    _add_dataset(client, "ws", "ops", "a")
+    _mv_with_trigger(client, "ws", "mart", "v", ["ws.ops.a"])
+    ref = _dataset_ref(client, "ws", "mart", "v")
+    _current_snapshot(ref, 42, **{"read-sources": _receipt("ws.ops.a", "ws.ops.b"), "produced-by": "view:ws.mart.v"})
+
+    findings = audit_workspace(client, "ws")
+
+    assert [f["kind"] for f in findings] == ["receipt-outside-declaration"]
+    assert "ws.ops.b" in findings[0]["detail"]
+
+
+def test_a_hand_run_statement_is_checked_against_nothing():
+    client = _Client()
+    ref = _add_dataset(client, "ws", "mart", "y")
+    _current_snapshot(ref, 42, **{"read-sources": _receipt("ws.ops.b")})
+
+    assert audit_workspace(client, "ws") == []
+
+
+def test_a_windowed_task_that_read_past_its_window_is_reported():
+    """The fire bound `current_version` 100; the run read the window source at
+    120. A commit landed in between, and the next window binds those rows
+    again - the only place the platform can see that."""
+    client = _Client()
+    _task(
+        client, "ws", "ops", "t",
+        reads=["ws.ops.a"],
+        **{"last-window-to": 100, "trigger": {"source": "ws.ops.a", "name": "fire_t"}},
+    )
+    _add_dataset(client, "ws", "ops", "a")
+    ref = _add_dataset(client, "ws", "mart", "y")
+    _current_snapshot(
+        ref, 42,
+        **{"read-sources": [{"dataset": "ws.ops.a", "snapshot-id": 120, "resolved-by": "current"}],
+           "produced-by": "task:ws.ops.t"},
+    )
+
+    findings = audit_workspace(client, "ws")
+
+    assert [f["kind"] for f in findings] == ["window-overrun"]
+    assert "120" in findings[0]["detail"] and "100" in findings[0]["detail"]
+
+
+def test_a_windowed_task_that_read_its_window_exactly_is_fine():
+    client = _Client()
+    _task(
+        client, "ws", "ops", "t",
+        reads=["ws.ops.a"],
+        **{"last-window-to": 100, "trigger": {"source": "ws.ops.a", "name": "fire_t"}},
+    )
+    _add_dataset(client, "ws", "ops", "a")
+    ref = _add_dataset(client, "ws", "mart", "y")
+    _current_snapshot(
+        ref, 42,
+        **{"read-sources": [{"dataset": "ws.ops.a", "snapshot-id": 100, "resolved-by": "current"}],
+           "produced-by": "task:ws.ops.t"},
+    )
+
+    assert audit_workspace(client, "ws") == []
+
+
+def test_a_task_held_trigger_windows_over_its_declared_dataset():
+    """A schedule trigger lives on the TASK and names its window with OVER;
+    the holder is not the window source."""
+    client = _Client()
+    task = _task(
+        client, "ws", "ops", "t",
+        reads=["ws.ops.a"],
+        **{"last-window-to": 100, "trigger": {"source": "ws.ops.t", "name": "nightly"}},
+    )
+    task.collection("triggers").document("nightly").set(
+        {"name": "nightly", "kind": "schedule", "target-task": "ws.ops.t", "window-source": "ws.ops.a"}
+    )
+    _add_dataset(client, "ws", "ops", "a")
+    ref = _add_dataset(client, "ws", "mart", "y")
+    _current_snapshot(
+        ref, 42,
+        **{"read-sources": [{"dataset": "ws.ops.a", "snapshot-id": 150, "resolved-by": "current"}],
+           "produced-by": "task:ws.ops.t"},
+    )
+
+    assert [f["kind"] for f in audit_workspace(client, "ws")] == ["window-overrun"]

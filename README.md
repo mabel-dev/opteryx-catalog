@@ -509,6 +509,113 @@ Notes about behavior:
 - Views are stored as Firestore documents with complete metadata including SQL, schema, authorship, and execution history.
 - Table transactions are intentionally unimplemented.
 
+## Provenance 🧬
+
+Two records answer "what was this built from?", with different lifetimes
+(see `PROVENANCE_DESIGN.md`):
+
+**The receipt** — on every snapshot document, written once and never edited:
+
+```jsonc
+"read-sources": [
+  {"dataset": "opteryx.ops.stdout_log", "snapshot-id": 1788815763764, "resolved-by": "current"}
+],
+"read-source-keys": ["opteryx.ops.stdout_log", "opteryx.ops.stdout_log@1788815763764"],
+"produced-by": "task:opteryx.ops.billing_events_ingest"   // or "view:…", or absent
+```
+
+One entry per (catalog relation, snapshot) the statement that produced the
+commit read; `resolved-by` is one of `current`, `version`, `previous`, `tag`,
+`date`. Capped at 256 entries, with `read-sources-truncated: true` when the cap
+bit. `read-source-keys` (the bare name, and the name at each version) makes
+"which commits, anywhere, read X" and "which read version V of X" one
+collection-group `array_contains` query each over `snapshots` -
+`find_consumers` in `consumers.py`.
+
+**The standing source list** — on the dataset document, maintained by the
+commit path from the receipts:
+
+```jsonc
+"sources": ["opteryx.ops.stdout_log", "opteryx.ops.stderr_log"],   // most recent first, up to 64
+"sources-complete": true
+```
+
+An append adds to it, a rewrite (`CREATE OR REPLACE`, a materialized-view
+refresh) replaces it, a `TRUNCATE` or a delete that empties the table clears
+it, maintenance leaves it alone, and a rollback recomputes it from the receipts
+behind the new head. The dataset is never in its own list. `sources-complete`
+is false when a name may be missing — the cap dropped one, or a commit in the
+chain carried no receipt — and true again after the next rewrite or clear.
+
+**The declaration** — `reads` on a task document, beside `writes`: what the
+statement is declared to read, qualified, rewritten on every registration.
+`find_inbound_edges` returns it on each `writes` row. Tasks registered before
+the field existed get it from `scripts/backfill_task_reads.py`, which derives
+it from each task's current statement with the engine's parser (dry run by
+default; `--apply` writes only where the stored list is absent or differs).
+
+Every commit method (`add_files`, `truncate_and_add_files`, `merge_commit`,
+`delete_rows`, `delete_files`, `append`, `overwrite`) takes `read_sources` and
+`produced_by`. **`None` is a bug, not a state**: a statement that read no
+catalog relation — an upload, `INSERT … VALUES` — passes `[]`. A commit with
+no receipt still lands (its files are already on disk) but raises a
+`ReceiptMissing` alert, writes a `missing_receipt` audit record, marks the
+source list incomplete, and is reported by `audit_workspace` as
+`missing-receipt` for as long as it is the dataset's current snapshot. The
+sweep also reports `receipt-outside-declaration` (the current snapshot read
+something its producing task or view does not declare) and `window-overrun`
+(a windowed task read its window source past the version it was fired for).
+
+Receipts cannot be backfilled: every snapshot committed before this existed is
+permanently unrecorded, and every read surface must say "not recorded" as a
+distinct answer from "read nothing".
+
+## Firestore indexes 🗂️
+
+**Collection-group queries need an index declared for them.** Firestore
+creates single-field indexes automatically, but those are COLLECTION-scoped: a
+`collection_group(...)` query on the same field is a different query and fails
+with `FAILED_PRECONDITION` until an index with collection-group scope exists.
+Two things must both be right, and each fails differently:
+
+1. **The field path must be backticked** wherever it is not a bare identifier.
+   A path is parsed, and an unquoted segment must match
+   `[a-zA-Z_][a-zA-Z_0-9]*`, so `event-kind` is refused with
+   `INVALID_ARGUMENT` *before any index is consulted* - no amount of index
+   work fixes it. Almost every field name here is hyphenated.
+   `tests/test_firestore_field_paths.py` reads the source and fails on an
+   unquoted one, because a fake Firestore parses nothing and unit tests cannot
+   see this.
+2. **The index must exist**, with `COLLECTION_GROUP` scope.
+
+The queries this package makes, and the index each needs:
+
+| query | collection group | field | index |
+|---|---|---|---|
+| `trigger_firing._due_schedule_triggers` | `triggers` | `` `event-kind` ``, `` `next-due-at-ms` `` | composite, ASC/ASC ✅ exists |
+| `inbound_edges.find_inbound_edges` | `triggers` | `` `target-view` `` | `COLLECTION_GROUP_ASC` |
+| `inbound_edges.find_inbound_edges` | `triggers` | `` `target-task` `` | `COLLECTION_GROUP_ASC` |
+| `inbound_edges.find_inbound_edges` | `tasks` | `writes` | `COLLECTION_GROUP_CONTAINS` |
+| `consumers.find_consumers` | `snapshots` | `` `read-source-keys` `` | `COLLECTION_GROUP_CONTAINS` |
+| `list_relationships` | `relationships` | `` `references-*` `` | composite ✅ exists |
+| listener lookups | `listeners` | `workspace`, `user` | composite ✅ exists |
+
+The single-field ones are created with `indexes fields update`, not
+`indexes composite create`:
+
+```bash
+gcloud firestore indexes fields update '`target-view`' --collection-group=triggers --project=mabeldev --database=catalogs --index=order=ascending,query-scope=collection-group
+```
+
+An `array_contains` field takes `--index=array-config=contains,query-scope=collection-group`
+instead. The `FAILED_PRECONDITION` message also carries a console link that
+creates exactly the right index, which is the least error-prone route.
+
+**Building one backfills the whole collection group**, so the `snapshots`
+index is the expensive one - it visits every snapshot document in the
+database. Create it before the engine starts writing receipts, not after, so
+the backfill runs against the smaller collection.
+
 ## Development & Linting 🧪
 
 This package includes a small `Makefile` target to run linting and formatting tools (`ruff`, `isort`, `pycln`).

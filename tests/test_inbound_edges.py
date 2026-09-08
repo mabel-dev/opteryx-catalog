@@ -45,7 +45,14 @@ class _Query:
         return _Query(self._docs, self._filters + [filter])
 
     def _matches(self, doc, f):
-        value = doc.to_dict().get(f.field_path)
+        # A field path is PARSED by the real service: a segment that is not a
+        # bare identifier arrives backticked, and the backticks are grammar
+        # rather than part of the name. Stripping them here is what makes this
+        # fake agree with the server about which document field is meant - a
+        # fake that matched the literal string would pass for a query the
+        # server refuses outright, which is how three separate modules shipped
+        # unquoted hyphenated paths (see tests/test_firestore_field_paths.py).
+        value = doc.to_dict().get(f.field_path.strip("`"))
         if f.op_string == "array_contains":
             return isinstance(value, (list, tuple)) and f.value in value
         if f.op_string == "==":
@@ -111,6 +118,7 @@ def test_a_trigger_in_another_workspace_is_an_inbound_edge():
             "last_fired_at_ms": 1788516990288,
             "last_fired_status": "enqueued",
             "suspended_at_ms": None,
+            "reads": None,
         }
     ]
 
@@ -284,3 +292,106 @@ if __name__ == "__main__":  # pragma: no cover
     import sys
 
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+def test_a_writes_edge_carries_what_the_task_reads():
+    """The hop ABOVE the edge, on the same row: "what feeds the thing that
+    writes this" costs no second query (PROVENANCE_DESIGN.md S2.3)."""
+    client = _Client().add(
+        "ops/ingest/tasks/billing_events_ingest",
+        {"name": "billing_events_ingest", "writes": [TARGET], "reads": ["ops.ingest.stdout_log"]},
+    )
+
+    rows = find_inbound_edges(client, TARGET)
+
+    assert rows[0]["kind"] == "writes"
+    assert rows[0]["reads"] == ["ops.ingest.stdout_log"]
+
+
+def test_a_task_registered_before_reads_existed_reports_an_empty_list():
+    client = _Client().add(
+        "ops/ingest/tasks/billing_events_ingest",
+        {"name": "billing_events_ingest", "writes": [TARGET]},
+    )
+
+    assert find_inbound_edges(client, TARGET)[0]["reads"] == []
+
+
+# --- the outgoing half: who READ a dataset (consumers.py)
+
+from opteryx_catalog.consumers import find_consumers  # noqa: E402
+
+SOURCE = "ops.ingest.stdout_log"
+
+
+def _receipt_doc(snapshot_id, *reads, produced_by=None, expired=False):
+    entries = [{"dataset": d, "snapshot-id": v, "resolved-by": "current"} for d, v in reads]
+    keys = sorted({d for d, _ in reads}) + [f"{d}@{v}" for d, v in reads if v is not None]
+    doc = {
+        "snapshot-id": snapshot_id,
+        "timestamp-ms": snapshot_id,
+        "read-sources": entries,
+        "read-source-keys": keys,
+    }
+    if produced_by:
+        doc["produced-by"] = produced_by
+    if expired:
+        doc["expired-at-ms"] = 1
+    return doc
+
+
+def test_a_commit_in_another_workspace_that_read_the_source_is_a_consumer():
+    client = _Client().add(
+        "platform/billing/datasets/events/snapshots/500",
+        _receipt_doc(500, (SOURCE, 42), produced_by="task:platform.billing.ingest"),
+    )
+
+    rows = find_consumers(client, SOURCE)
+
+    assert rows == [
+        {
+            "source": SOURCE,
+            "dataset": "platform.billing.events",
+            "workspace": "platform",
+            "snapshot_id": 500,
+            "committed_at_ms": 500,
+            "produced_by": "task:platform.billing.ingest",
+            "source_snapshot_ids": [42],
+            "resolved_by": ["current"],
+        }
+    ]
+
+
+def test_asking_about_a_version_finds_only_the_commits_that_read_it():
+    client = (
+        _Client()
+        .add("platform/billing/datasets/events/snapshots/500", _receipt_doc(500, (SOURCE, 42)))
+        .add("platform/billing/datasets/events/snapshots/600", _receipt_doc(600, (SOURCE, 43)))
+    )
+
+    assert [r["snapshot_id"] for r in find_consumers(client, SOURCE, 43)] == [600]
+    assert [r["snapshot_id"] for r in find_consumers(client, SOURCE)] == [600, 500]
+
+
+def test_an_expired_consumer_is_not_reported():
+    client = _Client().add(
+        "platform/billing/datasets/events/snapshots/500",
+        _receipt_doc(500, (SOURCE, 42), expired=True),
+    )
+
+    assert find_consumers(client, SOURCE) == []
+
+
+def test_a_commit_that_read_something_else_is_not_a_consumer():
+    client = _Client().add(
+        "platform/billing/datasets/events/snapshots/500",
+        _receipt_doc(500, ("ops.ingest.other", 42)),
+    )
+
+    assert find_consumers(client, SOURCE) == []
+
+
+@pytest.mark.parametrize("source", ["", "events", "billing.events"])
+def test_a_consumer_query_needs_a_fully_qualified_source(source):
+    with pytest.raises(ValueError):
+        find_consumers(_Client(), source)

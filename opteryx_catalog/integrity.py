@@ -40,6 +40,25 @@ Finding kinds:
   refreshes forever, since nothing at run time carries a hop count.
   `create_trigger` refuses to close one, but two concurrent writes can
   each read a graph that is still acyclic.
+
+Provenance (PROVENANCE_DESIGN.md S3), checked on each dataset's CURRENT
+snapshot only - one document get per dataset, where streaming every
+snapshot of a 15-minutely dataset would be the whole sweep's cost:
+
+- ``missing-receipt``: the current snapshot was committed after receipts
+  became required and carries none. A writer that was not updated, or an
+  engine older than the catalog; the commit path alerted at the time, this
+  is the standing record of it.
+- ``receipt-outside-declaration``: the current snapshot names the task or
+  view that produced it, and its receipt reads a dataset that definition
+  does not declare - a stale registration, or a read through a view that
+  was redefined. Skipped for a task with no `reads` recorded yet.
+- ``window-overrun``: the current snapshot was produced by a windowed task
+  and its receipt read the window source at a version PAST the one the fire
+  bound. A commit landed between the fire and the bind, and the next window
+  will bind those rows again. Only the forward direction is reported: a
+  receipt BEHIND the task's `last-window-to` is indistinguishable from an
+  older run's snapshot still being current.
 """
 
 from __future__ import annotations
@@ -266,6 +285,141 @@ def _check_mv_sources(
     return findings
 
 
+def _check_provenance(
+    client, workspace: str, collection_id: str, dataset_id: str, dataset_ref, data: dict[str, Any]
+) -> list[dict[str, str]]:
+    """Findings for the dataset's current snapshot's receipt (see module doc)."""
+    from .catalog.metadata import PRODUCED_BY_KEY
+    from .catalog.metadata import READ_SOURCES_KEY
+    from .catalog.provenance import RECEIPTS_REQUIRED_SINCE_MS
+    from .catalog.provenance import is_self
+
+    current = data.get("current-snapshot-id")
+    if current is None:
+        return []
+    snapshot_doc = dataset_ref.collection("snapshots").document(str(current)).get()
+    if not snapshot_doc.exists:
+        return []
+    snapshot = snapshot_doc.to_dict() or {}
+    path = f"{workspace}/{collection_id}/datasets/{dataset_id}/snapshots/{current}"
+    qualified = f"{workspace}.{collection_id}.{dataset_id}"
+    findings: list[dict[str, str]] = []
+
+    receipt = snapshot.get(READ_SOURCES_KEY)
+    if receipt is None:
+        committed = snapshot.get("timestamp-ms")
+        if committed is not None and int(committed) >= RECEIPTS_REQUIRED_SINCE_MS:
+            findings.append(
+                _finding(
+                    "missing-receipt",
+                    path,
+                    f"{snapshot.get('operation-type') or 'commit'} landed with no read-sources",
+                )
+            )
+        return findings
+
+    produced_by = snapshot.get(PRODUCED_BY_KEY) or ""
+    kind, _, producer = produced_by.partition(":")
+    read_names = [
+        entry.get("dataset")
+        for entry in receipt
+        if entry.get("dataset") and not is_self(entry["dataset"], f"{collection_id}.{dataset_id}", workspace)
+    ]
+
+    if kind == "task" and producer:
+        parts = _split_target(producer, workspace)
+        if parts is None:
+            return findings
+        task_doc = (
+            client.collection(parts[0])
+            .document(parts[1])
+            .collection(TASKS_SUBCOLLECTION)
+            .document(parts[2])
+            .get()
+        )
+        if not task_doc.exists:
+            return findings
+        task = task_doc.to_dict() or {}
+        declared = task.get("reads") or []
+        if declared:
+            for name in read_names:
+                if name not in declared:
+                    findings.append(
+                        _finding(
+                            "receipt-outside-declaration",
+                            path,
+                            f"read {name}, which task {producer} does not declare in reads",
+                        )
+                    )
+        findings.extend(_check_window_overrun(client, workspace, path, producer, task, receipt))
+    elif kind == "view" and producer:
+        declared = [
+            ".".join(target)
+            for target in (_split_target(s, workspace) for s in data.get("source-tables") or [])
+            if target is not None
+        ]
+        if declared:
+            for name in read_names:
+                if name not in declared:
+                    findings.append(
+                        _finding(
+                            "receipt-outside-declaration",
+                            path,
+                            f"read {name}, which view {qualified} does not declare in source-tables",
+                        )
+                    )
+    return findings
+
+
+def _check_window_overrun(
+    client, workspace: str, path: str, producer: str, task: dict[str, Any], receipt: list[dict]
+) -> list[dict[str, str]]:
+    """The receipt's version of the window source against the fire's."""
+    last_window_to = task.get("last-window-to")
+    pointer = task.get("trigger") or {}
+    holder = pointer.get("source") if isinstance(pointer, dict) else None
+    if last_window_to is None or not holder:
+        return []
+    holder_parts = _split_target(holder, workspace)
+    if holder_parts is None:
+        return []
+    # The window source is the trigger's OVER dataset for a task-held trigger,
+    # and the holder dataset itself for a commit trigger.
+    window_source = ".".join(holder_parts)
+    trigger_name = pointer.get("name")
+    if trigger_name:
+        for parent in ("datasets", TASKS_SUBCOLLECTION):
+            trigger_doc = (
+                client.collection(holder_parts[0])
+                .document(holder_parts[1])
+                .collection(parent)
+                .document(holder_parts[2])
+                .collection(TRIGGERS_SUBCOLLECTION)
+                .document(str(trigger_name))
+                .get()
+            )
+            if trigger_doc.exists:
+                over = (trigger_doc.to_dict() or {}).get("window-source")
+                if over:
+                    over_parts = _split_target(over, holder_parts[0])
+                    if over_parts is not None:
+                        window_source = ".".join(over_parts)
+                break
+    for entry in receipt:
+        if entry.get("dataset") != window_source or entry.get("snapshot-id") is None:
+            continue
+        if int(entry["snapshot-id"]) > int(last_window_to):
+            return [
+                _finding(
+                    "window-overrun",
+                    path,
+                    f"task {producer} read {window_source} at {entry['snapshot-id']}, past "
+                    f"the window it was fired for (last-window-to {last_window_to})",
+                )
+            ]
+    return []
+
+
 def _check_trigger_cycles(edges: dict[str, list[str]]) -> list[dict[str, str]]:
     """Findings for loops in the trigger graph.
 
@@ -370,6 +524,11 @@ def audit_workspace(client, workspace: str) -> list[dict[str, str]]:
                 findings.extend(
                     _check_mv_sources(client, workspace, collection_ref.id, dataset_ref.id, data)
                 )
+            findings.extend(
+                _check_provenance(
+                    client, workspace, collection_ref.id, dataset_ref.id, dataset_ref, data
+                )
+            )
         # Task-held triggers: the schedule or signal that fires each task. Walked
         # with `list_documents()` for the same reason datasets are - a dropped
         # task whose trigger survived is a ghost only that read can see.

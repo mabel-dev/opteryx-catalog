@@ -608,3 +608,18 @@ class PlatformIdentityOwnerRefused(CatalogError):
     resolves an owner with no billing membership to the house account, so the
     work is billed to the party that chose to do it. See `_assert_can_own`.
     """
+
+
+class ReceiptMissing(Alertable, CatalogError):
+    """A commit landed with no provenance receipt (PROVENANCE_DESIGN.md S2.4).
+
+    Never raised into a commit - the files are already on disk, and a write
+    that reported failure after landing is the worst available outcome. It is
+    REPORTED: the writer that omitted its receipt is a writer that was not
+    updated, or an engine older than this catalog, and somebody has to go and
+    fix that. The snapshot is stored with the receipt absent, and the integrity
+    sweep names it as `missing-receipt` until the chain is rewritten.
+    """
+
+    alert_severity = AlertSeverity.WARNING
+    alert_summary = "commit landed without a provenance receipt"

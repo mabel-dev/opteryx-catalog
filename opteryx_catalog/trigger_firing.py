@@ -1247,8 +1247,16 @@ def _due_schedule_triggers(client, now_ms: int) -> list[tuple[str, str, str, str
 
     query = (
         client.collection_group(TRIGGERS_SUBCOLLECTION)
-        .where(filter=FieldFilter("event-kind", "==", SCHEDULE_EVENT_KIND))
-        .where(filter=FieldFilter("next-due-at-ms", "<=", now_ms))
+        # BACKTICKS ARE LOAD-BEARING. A Firestore field path is parsed, not
+        # taken literally: an unquoted segment must match
+        # `[a-zA-Z_][a-zA-Z_0-9]*`, so a hyphenated field name is rejected with
+        # INVALID_ARGUMENT before the query is ever matched against an index.
+        # Every field name in this catalog is hyphenated, so every query on one
+        # must quote it - see the `references-*` filters in opteryx_catalog.py,
+        # and the index this pairs with, which is itself declared quoted
+        # (dispatch.opteryx README). Unquoted, this scan failed on every tick.
+        .where(filter=FieldFilter("`event-kind`", "==", SCHEDULE_EVENT_KIND))
+        .where(filter=FieldFilter("`next-due-at-ms`", "<=", now_ms))
     )
     due = []
     for doc in query.stream():

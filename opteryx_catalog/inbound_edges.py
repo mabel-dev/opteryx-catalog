@@ -38,8 +38,12 @@ a whole workspace's triggers costs. Workspaces are sibling root collections and
 their subcollections share names, so a collection group spans the database; the
 filter is on the TARGET, which is fully qualified, so it is the query itself
 that confines the answer rather than the position of a document in the tree.
-Both filters are single-field and carried by the automatic index, provided
-collection group scope has not been removed by a field exemption.
+Each filter is single-field, but Firestore's AUTOMATIC single-field indexes are
+COLLECTION-scoped: a collection-group query on one needs an index declared with
+collection-group scope, or it fails with FAILED_PRECONDITION. Neither of these
+had one, so this module raised rather than returning rows. See the index list
+in README.md; the error names the index it wants, so a new query here is
+cheapest to add by running it once and reading the message.
 
 NOTHING HERE IS AUTHORIZED. These rows are the whole catalog's answer, not the
 caller's: a source in a workspace the caller cannot see comes back like any
@@ -120,6 +124,9 @@ def _trigger_row(doc, target: str) -> dict | None:
         "last_fired_at_ms": data.get("last-fired-at-ms"),
         "last_fired_status": data.get("last-fired-status"),
         "suspended_at_ms": data.get("suspended-at-ms"),
+        # A trigger declares nothing about what its target reads; see the
+        # `writes` row, where this is the task's own declaration.
+        "reads": None,
     }
 
 
@@ -145,6 +152,11 @@ def _task_row(doc, target: str) -> dict | None:
         "last_fired_at_ms": None,
         "last_fired_status": None,
         "suspended_at_ms": None,
+        # What the task's statement reads (PROVENANCE_DESIGN.md S2.3) - the hop
+        # ABOVE this edge, carried here so "what feeds the thing that writes
+        # this" costs no second query. Names, unauthorized like everything
+        # else in the row; the caller elides each one it may not show.
+        "reads": list(data.get("reads") or []),
     }
 
 
@@ -171,7 +183,12 @@ def find_inbound_edges(client, target: str) -> list[dict]:
     # Two `where`s rather than one OR: a trigger has exactly one target and the
     # two fields are alternative spellings of it (a view's refresh, a task's
     # execution), so the queries are disjoint and their union needs no dedupe.
-    for field in ("target-view", "target-task"):
+    # Backticked because a Firestore field path is PARSED: an unquoted segment
+    # must match `[a-zA-Z_][a-zA-Z_0-9]*`, and a hyphenated name is refused
+    # with INVALID_ARGUMENT before any index is consulted. Both of this
+    # module's target fields are hyphenated, so unquoted this query never
+    # returned a trigger row at all - it raised.
+    for field in ("`target-view`", "`target-task`"):
         query = client.collection_group(TRIGGERS_SUBCOLLECTION).where(
             filter=FieldFilter(field, "==", target)
         )

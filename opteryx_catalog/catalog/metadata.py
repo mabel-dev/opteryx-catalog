@@ -14,6 +14,13 @@ from typing import Any
 # exactly as long as acting on it is possible.
 SNAPSHOT_EXPIRED_AT_KEY = "expired-at-ms"
 
+# Provenance caps (PROVENANCE_DESIGN.md S4.2, S2.2). A receipt is capped far
+# above anything a real statement reads; the dataset's standing source list is
+# deliberately short - "up to 64, most recent" is a documented property of the
+# field - and both record when the cap bit rather than truncating silently.
+MAX_READ_SOURCES = 256
+MAX_SOURCES = 64
+
 
 def snapshot_is_tombstoned(doc: dict) -> bool:
     """True when a snapshot document has been retired by expiration.
@@ -56,6 +63,18 @@ class Snapshot:
             "total-records": 0,
         }
     )
+    # THE RECEIPT (PROVENANCE_DESIGN.md S2.1): one entry per (catalog relation,
+    # snapshot) the statement that produced this commit read, as
+    # `{dataset, snapshot-id, resolved-by}`. `None` means the writer did not
+    # report - a defect, alerted and audited at commit, never a state a new
+    # commit may quietly be in. `[]` means the statement read no catalog
+    # relation, and only a caller that knows that may say it.
+    read_sources: list[dict] | None = None
+    read_sources_truncated: bool = False
+    # What made this commit: `task:<workspace.collection.name>` or
+    # `view:<workspace.collection.name>`. Absent for a hand-run statement,
+    # which is the one provenance field where absent is a state, not a bug.
+    produced_by: str | None = None
 
 
 @dataclass
@@ -144,6 +163,23 @@ class DatasetMetadata:
     # own refresh - the registration would not survive the first one.
     statement_id: str | None = None
     source_tables: list[str] = field(default_factory=list)
+    # THE STANDING SOURCE LIST (PROVENANCE_DESIGN.md S2.2): the distinct,
+    # fully-qualified names of every dataset whose data is in the CURRENT
+    # content, most recent first, at most MAX_SOURCES. Maintained by the commit
+    # path from each commit's receipt - an append adds, a rewrite replaces, a
+    # truncate clears, maintenance leaves it alone, a rollback recomputes it.
+    # Distinct from `source_tables`, which is what a materialized view is
+    # DECLARED to read; this is what its refreshes HAVE read.
+    #
+    # Carried here for the reason every other field in this block is: the
+    # dataset document is written whole with `set()`.
+    sources: list[str] = field(default_factory=list)
+    # False when the list may be missing a name: the cap dropped one, or a
+    # commit in the chain carried no receipt. True again after the next
+    # rewrite or clear, which start the list afresh. The loader sets it False
+    # for a document without the field - pre-feature history is incomplete by
+    # definition - and a fresh object with an empty list is complete.
+    sources_complete: bool = True
     # LEGACY, carried and never written. The identity a refresh executes as
     # lives on each refresh TRIGGER now, not on the view; this field survives
     # only so that a commit to a view registered under the old model does not
@@ -188,3 +224,71 @@ class DatasetMetadata:
 
 
 # Dataset terminology: TableMetadata renamed to DatasetMetadata
+
+
+# ── provenance fields on the snapshot document ──────────────────────────────
+#
+# The two functions below are the ONLY place the receipt's stored keys are
+# named. Both readers of a snapshot document (`OpteryxCatalog._snapshot_from_dict`
+# and `SimpleDataset.snapshot`'s by-id fetch) and its one writer
+# (`_snapshot_to_document`) go through them, so a key cannot be produced by
+# one side and not consumed by the other - which is how `operation-type` was
+# lost for the catalog's whole history.
+
+READ_SOURCES_KEY = "read-sources"
+READ_SOURCE_KEYS_KEY = "read-source-keys"
+READ_SOURCES_TRUNCATED_KEY = "read-sources-truncated"
+PRODUCED_BY_KEY = "produced-by"
+
+
+def read_source_keys(entries: list) -> list[str]:
+    """The receipt as `array_contains` keys: `dataset@snapshot-id` for every
+    entry AND the bare `dataset` once per name. One array answers both
+    questions a consumer walk asks - "who read version V of X" (exact key)
+    and "who reads X at all" (bare name) - and Firestore matches an array
+    element on equality only, so neither can be answered from the entries
+    themselves. Order: bare names first, then the versioned keys, both in
+    entry order."""
+    names: list[str] = []
+    versioned: list[str] = []
+    for entry in entries:
+        dataset = entry["dataset"]
+        if dataset not in names:
+            names.append(dataset)
+        snapshot_id = entry.get("snapshot-id")
+        if snapshot_id is not None:
+            versioned.append(f"{dataset}@{snapshot_id}")
+    return names + versioned
+
+
+def read_source_key(dataset: str, snapshot_id: int | None = None) -> str:
+    """The key a consumer query asks for - see `read_source_keys`."""
+    return dataset if snapshot_id is None else f"{dataset}@{int(snapshot_id)}"
+
+
+def provenance_document_fields(snapshot: Snapshot) -> dict:
+    """The receipt as stored. A key is written only when there is something to
+    say: a `None` receipt is ABSENT on the document, not null, so the stored
+    shape matches the claim (absent = not reported)."""
+    fields: dict = {}
+    read_sources = getattr(snapshot, "read_sources", None)
+    if read_sources is not None:
+        fields[READ_SOURCES_KEY] = [dict(entry) for entry in read_sources]
+        fields[READ_SOURCE_KEYS_KEY] = read_source_keys(read_sources)
+        if getattr(snapshot, "read_sources_truncated", False):
+            fields[READ_SOURCES_TRUNCATED_KEY] = True
+    produced_by = getattr(snapshot, "produced_by", None)
+    if produced_by is not None:
+        fields[PRODUCED_BY_KEY] = produced_by
+    return fields
+
+
+def provenance_fields_from_document(sd: dict) -> dict:
+    """Constructor kwargs for `Snapshot` from a stored document. A missing
+    receipt reads back as `None`; `read-source-keys` is derived and not read."""
+    read_sources = sd.get(READ_SOURCES_KEY)
+    return {
+        "read_sources": None if read_sources is None else [dict(e) for e in read_sources],
+        "read_sources_truncated": bool(sd.get(READ_SOURCES_TRUNCATED_KEY, False)),
+        "produced_by": sd.get(PRODUCED_BY_KEY),
+    }
