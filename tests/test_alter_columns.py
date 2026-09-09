@@ -187,9 +187,16 @@ def dataset():
     ds._parent_manifest_entries = lambda snap: [{"file_path": p} for p in paths]
     ds.snapshot = lambda *a, **k: type("S", (), {"manifest_list": "m", "summary": {}})()
     committed = {}
-    ds.truncate_and_add_files = lambda files, author=None, commit_message=None: committed.update(
-        files=files, author=author
-    )
+
+    # The commit is stubbed, but its PROVENANCE arguments are captured rather
+    # than swallowed: `alter_columns` has to send an empty receipt (it read
+    # this dataset's own files and nothing in the catalog) and
+    # `preserves_sources` (a column change is not a change of origin), and a
+    # stub that quietly accepted anything would let either regress unseen.
+    def _commit(files, author=None, commit_message=None, **provenance):
+        committed.update(files=files, author=author, **provenance)
+
+    ds.truncate_and_add_files = _commit
     return ds, store, catalog, paths, committed
 
 
@@ -314,8 +321,8 @@ def test_the_schema_lands_before_the_snapshot(dataset):
     ds, _store, catalog, _paths, _committed = dataset
     order = []
     real_alter = catalog.alter_dataset_schema
-    ds.truncate_and_add_files = lambda files, author=None, commit_message=None: order.append(
-        "snapshot"
+    ds.truncate_and_add_files = lambda files, author=None, commit_message=None, **provenance: (
+        order.append("snapshot")
     )
 
     def _record(*args, **kwargs):
@@ -426,3 +433,18 @@ def test_a_colliding_rename_is_refused_before_any_file_is_rewritten(dataset):
 
     assert store == before
     assert catalog.altered is None
+
+
+def test_a_column_change_keeps_the_datasets_provenance(dataset):
+    """A shape change is not a change of origin. `truncate_and_add_files` is a
+    REWRITE, and a rewrite replaces the standing source list - so without
+    `preserves_sources` a rename would delete a true record of what the data
+    was built from. The empty receipt is the other half: this read the
+    dataset's own files and no catalog relation, which is a fact worth
+    stating rather than leaving unreported."""
+    ds, _store, _catalog, _paths, committed = dataset
+
+    ds.alter_columns(rename={"label": "name"}, author="alice")
+
+    assert committed["read_sources"] == []
+    assert committed["preserves_sources"] is True
