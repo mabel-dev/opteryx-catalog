@@ -1037,6 +1037,7 @@ class SimpleDataset(Dataset):
         snap: Snapshot,
         read_sources: Iterable[Any] | None,
         produced_by: str | None,
+        preserves_sources: bool = False,
     ) -> None:
         """Put the receipt on the snapshot and apply it to the source list.
 
@@ -1066,6 +1067,14 @@ class SimpleDataset(Dataset):
             else int(total) - int(summary.get("total-deleted-records") or 0)
         )
         effect = effect_for_operation(snap.operation_type, live)
+        if preserves_sources:
+            # A rewrite that changes the SHAPE of the data and not where it came
+            # from - `alter_columns` reads this dataset's own files and writes
+            # them back under a new schema. By operation type it is a rewrite,
+            # and a rewrite REPLACES the standing source list; but nothing about
+            # the content's origin changed, so replacing it would delete a true
+            # record because a column was renamed.
+            effect = UNCHANGED
         # Validated before anything persists, as the receipt is: the field is
         # written once and never rewritten, so an unknown kind is permanent.
         snap.produced_by = normalize_produced_by(produced_by)
@@ -1411,7 +1420,17 @@ class SimpleDataset(Dataset):
         # just read, so nothing carries a stale bound from the old shape - the
         # positional remap a manifest-preserving commit would need does not
         # arise here at all.
-        self.truncate_and_add_files(new_files, author=author, commit_message=commit_message)
+        self.truncate_and_add_files(
+            new_files,
+            author=author,
+            commit_message=commit_message,
+            # It read this dataset's own files and nothing in the catalog, so
+            # the receipt is empty - and `preserves_sources` because a column
+            # change is not a change of origin: replacing the standing list
+            # here would delete a true record because a type was widened.
+            read_sources=[],
+            preserves_sources=True,
+        )
 
         emit_audit(
             "alter_columns",
@@ -1736,6 +1755,7 @@ class SimpleDataset(Dataset):
         commit_message: str | None = None,
         read_sources: Iterable[Any] | None = None,
         produced_by: str | None = None,
+        preserves_sources: bool = False,
     ):
         """Truncate dataset (logical) and set manifest to provided files.
 
@@ -1892,7 +1912,7 @@ class SimpleDataset(Dataset):
         )
 
         # Replace in-memory snapshots: append snapshot and update current id
-        self._stamp_provenance(snap, read_sources, produced_by)
+        self._stamp_provenance(snap, read_sources, produced_by, preserves_sources)
         self.metadata.snapshots.append(snap)
         self._advance_current_snapshot(snapshot_id)
 

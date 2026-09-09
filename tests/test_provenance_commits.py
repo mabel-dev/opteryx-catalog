@@ -416,3 +416,37 @@ def test_a_producer_outside_the_vocabulary_refuses_the_commit():
             produced_by="merge",
         )
     assert ds.metadata.current_snapshot_id is None
+
+
+def test_a_column_change_does_not_wipe_the_source_list(alerts, audits):
+    """`alter_columns` rewrites this dataset's own files under a new schema.
+    By operation type that is a REWRITE, and a rewrite replaces the standing
+    source list - but nothing about where the content came from changed, so
+    replacing it would delete a true record because a column was renamed."""
+    ds, storage = _seeded(read_sources=[(A, 1), (B, 2)])
+    assert ds.metadata.sources == [A, B]
+
+    ds.truncate_and_add_files(
+        [_stage(storage, "f2.parquet", [9])],
+        author="t",
+        read_sources=[],
+        preserves_sources=True,
+    )
+
+    assert ds.metadata.sources == [A, B], "a shape change is not a change of origin"
+    assert ds.metadata.sources_complete is True
+    assert alerts == []
+    # The receipt still records the truth about THAT commit: it read nothing.
+    assert ds.catalog.snapshot_docs[ds.metadata.current_snapshot_id]["read-sources"] == []
+
+
+def test_an_ordinary_rewrite_still_replaces_the_source_list():
+    """The flag is the exception, not the new rule - a real CTAS replace must
+    still drop what the old content was built from."""
+    ds, storage = _seeded(read_sources=[(A, 1)])
+
+    ds.truncate_and_add_files(
+        [_stage(storage, "f2.parquet", [9])], author="t", read_sources=[(C, 2)]
+    )
+
+    assert ds.metadata.sources == [C]
