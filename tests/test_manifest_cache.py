@@ -8,10 +8,11 @@ import io
 
 from opteryx_catalog.catalog.dataset import SimpleDataset
 from opteryx_catalog.catalog.manifest import clear_parsed_manifest_cache
-from opteryx_catalog.catalog.manifest import get_manifest_metrics
 from opteryx_catalog.catalog.manifest import get_parsed_manifest
 from opteryx_catalog.catalog.manifest import invalidate_parsed_manifest
 from opteryx_catalog.catalog.manifest import reset_manifest_metrics
+from opteryx_catalog.catalog.manifest_arrow import get_retrieval_metrics
+from opteryx_catalog.catalog.manifest_arrow import reset_retrieval_metrics
 from opteryx_catalog.catalog.metadata import DatasetMetadata
 from opteryx_catalog.catalog.metadata import Snapshot
 
@@ -27,8 +28,10 @@ class _MemInput:
 class _MemIO:
     def __init__(self, mapping: dict):
         self._mapping = mapping
+        self.reads = 0
 
     def new_input(self, path: str):
+        self.reads += 1
         return _MemInput(self._mapping[path])
 
 
@@ -64,7 +67,15 @@ def _build_manifest_bytes():
     return write_parquet(m)
 
 
-def test_parsed_manifest_cache_hits_and_invalidation():
+def test_manifest_reads_are_cached_and_invalidation_forces_a_reread():
+    """A repeat read costs no IO and no decode; invalidation restores both.
+
+    Asserted on reads through the IO layer rather than on cache counters: the
+    row dicts `get_parsed_manifest` returns are derived per call now (they
+    share the decoded cells, so caching them pinned whatever the columnar
+    budget had evicted - see test_parsed_manifest_not_retained), and what must
+    stay cached is the expensive half, the download and the parquet decode.
+    """
     manifest_bytes = _build_manifest_bytes()
     manifest_path = "mem://manifest-cache-test"
 
@@ -82,26 +93,29 @@ def test_parsed_manifest_cache_hits_and_invalidation():
     # Clear any previous state
     clear_parsed_manifest_cache()
     reset_manifest_metrics()
+    reset_retrieval_metrics()
 
-    # First read -> miss
+    # First read -> miss, one trip to storage
     rows1 = get_parsed_manifest(ds.io, manifest_path)
-    m1 = get_manifest_metrics()
-    assert m1.get("parsed_cache_misses", 0) >= 1
-    assert m1.get("parsed_cache_hits", 0) == 0
+    assert ds.io.reads == 1
+    assert get_retrieval_metrics().get("arrow_cache_misses", 0) == 1
     assert isinstance(rows1, list)
 
-    # Inner list fields should have been frozen to tuples
+    # Inner list fields are frozen to tuples: the cells are shared with the
+    # cached columns and with every other row dict built over them, and
+    # immutability is what makes that sharing safe.
     ent = rows1[0]
     assert isinstance(ent.get("column_uncompressed_sizes_in_bytes"), tuple)
     assert isinstance(ent.get("min_k_hashes"), tuple)
 
-    # Second read -> hit
-    get_parsed_manifest(ds.io, manifest_path)
-    m2 = get_manifest_metrics()
-    assert m2.get("parsed_cache_hits", 0) >= 1
+    # Second read -> hit, no further IO
+    rows2 = get_parsed_manifest(ds.io, manifest_path)
+    assert ds.io.reads == 1
+    assert get_retrieval_metrics().get("arrow_cache_hits", 0) >= 1
+    assert rows2 == rows1
 
-    # Invalidate and force re-read -> miss increments
+    # Invalidate and force re-read -> back to storage
     invalidate_parsed_manifest(manifest_path)
     get_parsed_manifest(ds.io, manifest_path)
-    m3 = get_manifest_metrics()
-    assert m3.get("parsed_cache_misses", 0) >= 2
+    assert ds.io.reads == 2
+    assert get_retrieval_metrics().get("arrow_cache_misses", 0) == 2

@@ -6,10 +6,10 @@ rather than faking the parser: what is under test is the qualification and
 exclusion applied on top of it, and a fake parser would only prove the fake.
 The engine must be importable (`PYTHONPATH=<catalog>:<opteryx-core>`).
 
-The fake Firestore is the one `test_inbound_edges` uses - documents addressed
-by path, a collection group selected by the name of the collection a document
-sits in - extended with the two things this script does that the read there
-never does: follow a task to its `statement` subcollection, and `update`.
+The fake Firestore addresses documents by path, with a collection group
+selected by the name of the collection a document sits in, extended with the
+two things this script does that a plain read never does: follow a task to
+its `statement` subcollection, and `update`.
 """
 
 from __future__ import annotations

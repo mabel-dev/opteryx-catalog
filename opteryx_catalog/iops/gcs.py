@@ -438,8 +438,8 @@ class GcsFileIO(FileIO):
     # alias
     ls = list_files
 
-    def list_files_with_age_ms(self, prefix: str) -> dict:
-        """List files under a prefix along with each object's age in ms.
+    def list_files_with_stats(self, prefix: str) -> dict:
+        """List files under a prefix with each object's age in ms and size.
 
         Used to safety-gate destructive orphan cleanup: a data file can be
         uploaded to storage moments before its snapshot's manifest commit
@@ -447,9 +447,18 @@ class GcsFileIO(FileIO):
         mid-write before it's eligible for deletion (mirrors the age check
         already applied to orphaned manifest files).
 
-        Returns {uri: age_ms}. An object whose creation time can't be
-        determined is omitted rather than guessed, so callers treat it as
-        "not provably old enough" and leave it alone.
+        The size rides along because the listing already carries it - one
+        `list_blobs` response holds both `time_created` and `size`, so the
+        bytes an expiration run reclaims cost no request they weren't already
+        making. Sizes taken here are the true on-disk size at deletion time,
+        unlike a manifest's recorded `file_size_in_bytes`, which is absent for
+        files found by physical reconciliation and can be 0 when unrecorded.
+
+        Returns {uri: (age_ms, size_bytes)}. An object whose creation time
+        can't be determined is omitted rather than guessed, so callers treat it
+        as "not provably old enough" and leave it alone; a missing size is
+        reported as 0, which understates a tally but never protects or condemns
+        a file, since only the age gates deletion.
         """
         try:
             if prefix and prefix.startswith("gs://"):
@@ -465,17 +474,26 @@ class GcsFileIO(FileIO):
                 client = storage.Client()
                 blobs = client.list_blobs(bucket_name, prefix=object_prefix)
                 now_ms = int(_time.time() * 1000)
-                ages = {}
+                stats = {}
                 for b in blobs:
                     if b.time_created is None:
                         continue
                     uri = f"gs://{bucket_name}/{b.name}"
-                    ages[uri] = now_ms - int(b.time_created.timestamp() * 1000)
-                return ages
+                    stats[uri] = (
+                        now_ms - int(b.time_created.timestamp() * 1000),
+                        int(b.size or 0),
+                    )
+                return stats
         except Exception:
             # No ages means every candidate fails its age gate and is KEPT,
             # so an empty map is the safe direction.
-            logger.warning("Could not read object ages under %s", prefix, exc_info=True)
+            logger.warning("Could not read object stats under %s", prefix, exc_info=True)
             return {}
+
+    def list_files_with_age_ms(self, prefix: str) -> dict:
+        """Ages only, for callers that don't need sizes. See
+        `list_files_with_stats`, which this reads from - one listing either
+        way."""
+        return {uri: age for uri, (age, _) in self.list_files_with_stats(prefix).items()}
 
         return {}

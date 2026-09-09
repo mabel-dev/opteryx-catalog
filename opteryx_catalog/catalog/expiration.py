@@ -446,7 +446,9 @@ class SnapshotExpiration:
                     # only path that can ever catch data files orphaned by a
                     # past event (a run where detection was skipped, etc).
                     kept_files = self._get_files_in_snapshots(snapshots_to_keep, required=True)
-                    candidate_orphans = self._find_full_orphaned_data_files(dataset, kept_files)
+                    candidate_orphans, candidate_sizes = self._find_full_orphaned_data_files(
+                        dataset, kept_files
+                    )
 
                     if not eligible and not candidate_orphans:
                         return None
@@ -472,7 +474,7 @@ class SnapshotExpiration:
                             "deleted_snapshots": [],
                             "deleted_manifests": [],
                             "deleted_files": [],
-                            "bytes_reclaimed": 0,
+                            "bytes_reclaimed": sum(candidate_sizes.get(f, 0) for f in full_orphans),
                             "orphaned_files_count": len(full_orphans),
                             "data_files_to_delete": sorted(full_orphans),
                             "orphaned_manifests_count": len(manifests_to_delete),
@@ -499,10 +501,12 @@ class SnapshotExpiration:
                             # Continue deleting what we can, but don't fail the whole op
 
                     deleted_data_files = []
+                    bytes_reclaimed = 0
                     for f in full_orphans:
                         try:
                             if self._delete_file(io, f):
                                 deleted_data_files.append(f)
+                                bytes_reclaimed += candidate_sizes.get(f, 0)
                         except Exception as e:  # noqa: BLE001 - GCS/Firestore client boundary
                             logger.error("Failed to delete orphaned data file %s: %s", f, e)
 
@@ -514,7 +518,7 @@ class SnapshotExpiration:
                         "deleted_snapshots": [],
                         "deleted_manifests": deleted,
                         "deleted_files": deleted_data_files,
-                        "bytes_reclaimed": 0,
+                        "bytes_reclaimed": bytes_reclaimed,
                         "orphaned_files_count": len(deleted_data_files),
                         "orphaned_manifests_count": len(deleted),
                         "manifests_to_delete": sorted(manifests_to_delete),
@@ -574,11 +578,18 @@ class SnapshotExpiration:
                     )
                     # Age-gated to match the execute path, so a dry run plans
                     # exactly the deletions the execute path would perform.
-                    orphaned = self._age_gate(dataset, set(deleted_file_sizes) - kept_files)
+                    orphaned, physical_sizes = self._age_gate(
+                        dataset, set(deleted_file_sizes) - kept_files
+                    )
                     # Full reconciliation catches data files orphaned by any
                     # past event, not just this run's condemned snapshots.
-                    full_orphans = self._find_full_orphaned_data_files(dataset, kept_files)
+                    full_orphans, full_sizes = self._find_full_orphaned_data_files(
+                        dataset, kept_files
+                    )
                     orphaned = orphaned | full_orphans
+                    physical_sizes.update(full_sizes)
+                    planned_sizes = dict(deleted_file_sizes)
+                    planned_sizes.update({p: n for p, n in physical_sizes.items() if n})
 
                     # Identify orphaned manifest files (storage manifests not
                     # referenced by any snapshot), plus the manifests belonging
@@ -615,10 +626,10 @@ class SnapshotExpiration:
                     summary["orphaned_manifests_count"] = len(manifests_to_delete)
                     summary["manifests_to_delete"] = sorted(manifests_to_delete)
                     # Bytes that *would* be reclaimed, so a dry run reports the
-                    # same measure the execute path does. Full-reconciliation
-                    # orphans have no known size (physical listing carries no
-                    # stats), so they contribute 0 here.
-                    summary["bytes_reclaimed"] = sum(deleted_file_sizes.get(p, 0) for p in orphaned)
+                    # same measure the execute path does - from the same
+                    # storage listing, so a reconciliation orphan is counted
+                    # here exactly as it will be when it is deleted.
+                    summary["bytes_reclaimed"] = sum(planned_sizes.get(p, 0) for p in orphaned)
 
                 return summary
 
@@ -847,13 +858,23 @@ class SnapshotExpiration:
             # so half the orphan set was deletable the instant it became
             # unreferenced - including files an in-flight commit was about to
             # claim.
-            orphaned_files = self._age_gate(dataset, set(deleted_file_sizes) - kept_files)
+            orphaned_files, physical_sizes = self._age_gate(
+                dataset, set(deleted_file_sizes) - kept_files
+            )
             orphaned_file_sizes = {p: deleted_file_sizes[p] for p in orphaned_files}
             # Full reconciliation catches data files orphaned by any past
             # event, not just this run's condemned snapshots (e.g. a prior
-            # run where orphan detection was skipped). No size info for
-            # these - orphaned_file_sizes.get() below defaults to 0.
-            orphaned_files |= self._find_full_orphaned_data_files(dataset, kept_files)
+            # run where orphan detection was skipped, or - the common case -
+            # a file whose snapshot was condemned on an earlier run and which
+            # is only now clearing quarantine).
+            full_orphans, full_sizes = self._find_full_orphaned_data_files(dataset, kept_files)
+            orphaned_files |= full_orphans
+            # Storage sizes win over the manifest's recorded ones: they are the
+            # true on-disk size, and they are the only ones that exist for a
+            # reconciliation find. A 0 from storage is treated as no answer and
+            # leaves the manifest's figure standing.
+            physical_sizes.update(full_sizes)
+            orphaned_file_sizes.update({p: n for p, n in physical_sizes.items() if n})
 
             # Orphaned manifests are gathered here, BEFORE step 2 deletes the
             # snapshot documents, so `get_orphaned_manifests` is answering a
@@ -1074,7 +1095,9 @@ class SnapshotExpiration:
         """
         return set(self._get_file_sizes_in_snapshots(snapshots, required=required))
 
-    def _find_full_orphaned_data_files(self, dataset, kept_files: set[str]) -> set[str]:
+    def _find_full_orphaned_data_files(
+        self, dataset, kept_files: set[str]
+    ) -> tuple[set[str], dict[str, int]]:
         """
         Full reconciliation: physical data files under the dataset location
         that aren't referenced by any currently-kept snapshot.
@@ -1095,7 +1118,7 @@ class SnapshotExpiration:
             kept_files: File paths referenced by all currently-retained snapshots
 
         Returns:
-            Set of file paths safe to delete
+            (file paths safe to delete, their on-disk sizes in bytes)
         """
         try:
             from .deep_clean import DatasetDeepClean
@@ -1103,7 +1126,7 @@ class SnapshotExpiration:
             cleaner = DatasetDeepClean(self.catalog)
             location = dataset.metadata.location
             if not location:
-                return set()
+                return set(), {}
 
             physical = cleaner.get_all_physical_files(location)
             candidates = {
@@ -1112,36 +1135,49 @@ class SnapshotExpiration:
             return self._age_gate(dataset, candidates)
         except Exception as e:  # noqa: BLE001 - GCS/Firestore client boundary
             logger.error("Error during full orphaned-data-file reconciliation: %s", e)
-            return set()
+            return set(), {}
 
-    def _age_gate(self, dataset, candidates: set[str]) -> set[str]:
+    def _age_gate(self, dataset, candidates: set[str]) -> tuple[set[str], dict[str, int]]:
         """
         Drop candidates that are too new, or whose age can't be determined.
 
         A file younger than DATA_FILE_ORPHAN_MIN_AGE_MS may be mid-write by an
         in-flight append or compaction whose snapshot commit hasn't landed, so
         being unreferenced right now doesn't make it garbage. An age that can't
-        be determined is treated as too new: `ages.get(f, 0)` yields 0, which
-        fails the comparison and keeps the file.
+        be determined is treated as too new: `stats.get(f)` yields no entry,
+        which fails the comparison and keeps the file.
+
+        Returns the survivors' SIZES along with the survivors, because the one
+        listing that answers "how old is this file?" answers "how big is it?"
+        in the same response. Nothing else can answer the second question at
+        the moment it matters: a file is deleted a run or more after the
+        snapshot that referenced it was condemned (the quarantine requires two
+        sightings), so by deletion time its manifest is no longer read and the
+        recorded `file_size_in_bytes` is out of reach - which is why
+        `bytes_reclaimed` reported 0 for every dataset until this carried the
+        sizes through.
 
         Args:
             dataset: Dataset object (used for its storage location)
             candidates: File paths proposed for deletion
 
         Returns:
-            The subset old enough to delete
+            (the subset old enough to delete, their on-disk sizes in bytes)
         """
         if not candidates:
-            return set()
+            return set(), {}
 
         from .deep_clean import DatasetDeepClean
 
         location = dataset.metadata.location
         if not location:
-            return set()
+            return set(), {}
 
-        ages = DatasetDeepClean(self.catalog).get_physical_file_ages_ms(location)
-        return {f for f in candidates if ages.get(f, 0) >= DATA_FILE_ORPHAN_MIN_AGE_MS}
+        stats = DatasetDeepClean(self.catalog).get_physical_file_stats(location)
+        survivors = {
+            f for f in candidates if stats.get(f, (0, 0))[0] >= DATA_FILE_ORPHAN_MIN_AGE_MS
+        }
+        return survivors, {f: stats.get(f, (0, 0))[1] for f in survivors}
 
     def _quarantine_orphans(
         self, identifier: str, candidates: set[str], dry_run: bool

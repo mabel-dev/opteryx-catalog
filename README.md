@@ -530,7 +530,7 @@ commit read; `resolved-by` is one of `current`, `version`, `previous`, `tag`,
 bit. `read-source-keys` (the bare name, and the name at each version) makes
 "which commits, anywhere, read X" and "which read version V of X" one
 collection-group `array_contains` query each over `snapshots` -
-`find_consumers` in `consumers.py`.
+`find_readers` in `impact.py`.
 
 **The standing source list** — on the dataset document, maintained by the
 commit path from the receipts:
@@ -547,9 +547,19 @@ behind the new head. The dataset is never in its own list. `sources-complete`
 is false when a name may be missing — the cap dropped one, or a commit in the
 chain carried no receipt — and true again after the next rewrite or clear.
 
+**Looking downstream** — `impact.find_impacted` answers "if I change this,
+who is affected?" from the `sources` lists, and `impact.find_readers` answers
+"whose commits have read this, and which version?" from `read-source-keys`.
+The first is about current content, so a consumer since rebuilt from
+something else is correctly absent; the second remembers it. Both cross
+workspace boundaries and name every consumer in full: an impact answer that
+will not say who is affected has not answered the question, and knowing a
+dataset exists is not being able to read it. Both cap at 64 consumers and
+say when the cap bit — past that a list is not what anyone wanted.
+
 **The declaration** — `reads` on a task document, beside `writes`: what the
-statement is declared to read, qualified, rewritten on every registration.
-`find_inbound_edges` returns it on each `writes` row. Tasks registered before
+statement is declared to read, qualified, rewritten on every registration. It
+is what the integrity sweep checks a receipt against. Tasks registered before
 the field existed get it from `scripts/backfill_task_reads.py`, which derives
 it from each task's current statement with the engine's parser (dry run by
 default; `--apply` writes only where the stored list is absent or differs).
@@ -593,10 +603,8 @@ The queries this package makes, and the index each needs:
 | query | collection group | field | index |
 |---|---|---|---|
 | `trigger_firing._due_schedule_triggers` | `triggers` | `` `event-kind` ``, `` `next-due-at-ms` `` | composite, ASC/ASC ✅ exists |
-| `inbound_edges.find_inbound_edges` | `triggers` | `` `target-view` `` | `COLLECTION_GROUP_ASC` |
-| `inbound_edges.find_inbound_edges` | `triggers` | `` `target-task` `` | `COLLECTION_GROUP_ASC` |
-| `inbound_edges.find_inbound_edges` | `tasks` | `writes` | `COLLECTION_GROUP_CONTAINS` |
-| `consumers.find_consumers` | `snapshots` | `` `read-source-keys` `` | `COLLECTION_GROUP_CONTAINS` |
+| `impact.find_impacted` | `datasets` | `sources` | `COLLECTION_GROUP_CONTAINS` ✅ exists |
+| `impact.find_readers` | `snapshots` | `` `read-source-keys` `` | `COLLECTION_GROUP_CONTAINS` ⛔ create before the engine ships |
 | `list_relationships` | `relationships` | `` `references-*` `` | composite ✅ exists |
 | listener lookups | `listeners` | `workspace`, `user` | composite ✅ exists |
 

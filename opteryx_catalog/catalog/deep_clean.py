@@ -403,9 +403,8 @@ class DatasetDeepClean:
             logger.error(f"Error listing physical files in {dataset_location}: {e}")
             return physical_files
 
-    def get_physical_file_ages_ms(self, dataset_location: str) -> dict[str, int]:
-        """
-        Get the age (in ms) of each physical file in dataset storage.
+    def get_physical_file_stats(self, dataset_location: str) -> dict[str, tuple[int, int]]:
+        """Get the age (ms) and size (bytes) of each physical file in storage.
 
         Best-effort: returns {} when the attached FileIO can't report object
         creation times, so callers must treat a missing entry as "age
@@ -415,19 +414,38 @@ class DatasetDeepClean:
             dataset_location: Base path of dataset (e.g., gs://bucket/dataset)
 
         Returns:
-            Dict of file path -> age in milliseconds
+            Dict of file path -> (age in milliseconds, size in bytes)
         """
         if dataset_location and not dataset_location.endswith("/"):
             dataset_location = dataset_location + "/"
 
         try:
             io = self.catalog.io
-            if not io or not hasattr(io, "list_files_with_age_ms"):
+            if not io or not hasattr(io, "list_files_with_stats"):
+                # A backend that reports ages but not sizes still gates
+                # deletion correctly; it just tallies 0 bytes.
+                if io and hasattr(io, "list_files_with_age_ms"):
+                    ages = io.list_files_with_age_ms(dataset_location) or {}
+                    return {path: (age, 0) for path, age in ages.items()}
                 return {}
-            return io.list_files_with_age_ms(dataset_location) or {}
+            return io.list_files_with_stats(dataset_location) or {}
         except (ValueError, OSError, AttributeError) as e:
-            logger.error(f"Error listing physical file ages in {dataset_location}: {e}")
+            logger.error(f"Error listing physical file stats in {dataset_location}: {e}")
             return {}
+
+    def get_physical_file_ages_ms(self, dataset_location: str) -> dict[str, int]:
+        """Ages only, for callers with no use for sizes. One listing either
+        way - see `get_physical_file_stats`.
+
+        Args:
+            dataset_location: Base path of dataset (e.g., gs://bucket/dataset)
+
+        Returns:
+            Dict of file path -> age in milliseconds
+        """
+        return {
+            path: age for path, (age, _) in self.get_physical_file_stats(dataset_location).items()
+        }
 
     def _execute_cleanup(self, orphaned_files: set[str], dataset, summary: dict) -> dict:
         """

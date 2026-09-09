@@ -77,6 +77,21 @@ class _MemIO:
         self._mapping.pop(path, None)
 
 
+class _StatsIO(_MemIO):
+    """A backend that reports age and size from one listing, as GCS and S3 do.
+
+    `_MemIO` deliberately stays on the older ages-only contract, so both are
+    exercised: sizes are reporting, and a backend without them must still
+    reclaim storage.
+    """
+
+    def list_files_with_stats(self, prefix):
+        return {
+            p: (self._ages.get(p, 0), len(self._mapping.get(p) or b""))
+            for p in self.list_files(prefix)
+        }
+
+
 class _FakeDoc:
     def __init__(self, store, key):
         self._store = store
@@ -199,7 +214,7 @@ def _make(referenced=LIVE, extra_files=(ORPHAN,)):
     # not what any assertion here is actually testing.
     ages = {path: 2 * DAY_MS for path in storage}
 
-    io = _MemIO(storage, ages)
+    io = _StatsIO(storage, ages)
     meta = DatasetMetadata(dataset_identifier="github.events", location=LOCATION)
     snap = Snapshot(snapshot_id=snapshot_ts, timestamp_ms=snapshot_ts, manifest_list=manifest_path)
     meta.snapshots.append(snap)
@@ -325,7 +340,7 @@ def _make_two_snapshots():
     }
     ages = {path: 2 * DAY_MS for path in storage}
 
-    io = _MemIO(storage, ages)
+    io = _StatsIO(storage, ages)
     meta = DatasetMetadata(dataset_identifier="github.events", location=LOCATION)
     meta.snapshots.append(
         Snapshot(snapshot_id=old_ts, timestamp_ms=old_ts, manifest_list=old_manifest)
@@ -405,3 +420,63 @@ def test_deletion_stalls_when_the_record_is_unavailable():
     assert result["quarantine_available"] is False
     assert result["deleted_files"] == []
     assert ORPHAN in storage
+
+
+def test_bytes_reclaimed_is_reported_on_the_run_that_deletes():
+    """The tally must come from the deleting run's storage listing.
+
+    A file is deleted at least a run after the snapshot referencing it was
+    condemned, so at deletion time its manifest is not read and the recorded
+    `file_size_in_bytes` is out of reach. Sizing the deletion from the
+    condemned snapshots' manifests therefore reported 0 for every dataset in
+    production. The size here can only have come from storage: the manifest
+    records 100 bytes for the LIVE file and says nothing at all about ORPHAN.
+    """
+    storage, catalog = _make()
+    clock = [1_000_000]
+    orphan_bytes = len(storage[ORPHAN])
+
+    sighting = _expirer(catalog, clock).expire_dataset("github.events", dry_run=False)
+    # Nothing deleted, so nothing reclaimed - the file is still on disk.
+    assert sighting["deleted_files"] == []
+    assert sighting["bytes_reclaimed"] == 0
+
+    clock[0] += DAY_MS
+    deletion = _expirer(catalog, clock).expire_dataset("github.events", dry_run=False)
+
+    assert deletion["deleted_files"] == [ORPHAN]
+    assert deletion["bytes_reclaimed"] == orphan_bytes
+
+
+def test_dry_run_reports_the_bytes_the_execute_run_would_reclaim():
+    storage, catalog = _make()
+    clock = [1_000_000]
+    orphan_bytes = len(storage[ORPHAN])
+
+    _expirer(catalog, clock).expire_dataset("github.events", dry_run=False)
+    clock[0] += DAY_MS
+
+    plan = _expirer(catalog, clock).expire_dataset("github.events", dry_run=True)
+    assert plan["bytes_reclaimed"] == orphan_bytes
+    # ... and the plan really was a plan.
+    assert ORPHAN in storage
+
+
+def test_backend_without_sizes_still_deletes_and_tallies_zero():
+    """Sizes are reporting; only the age gates deletion.
+
+    A FileIO that predates `list_files_with_stats` must keep reclaiming
+    storage, and simply understate the bytes - never hold a file back.
+    """
+    storage, catalog = _make()
+    # Drop to the older contract: ages, no sizes.
+    catalog.io.__class__ = _MemIO
+    clock = [1_000_000]
+
+    _expirer(catalog, clock).expire_dataset("github.events", dry_run=False)
+    clock[0] += DAY_MS
+    result = _expirer(catalog, clock).expire_dataset("github.events", dry_run=False)
+
+    assert result["deleted_files"] == [ORPHAN]
+    assert ORPHAN not in storage
+    assert result["bytes_reclaimed"] == 0

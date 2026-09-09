@@ -31,8 +31,7 @@ def _field_filter_paths() -> list[tuple[str, int, str]]:
     """Every literal field path handed to a `FieldFilter`, with where it is.
 
     Read off the AST rather than by regex so a path split across lines, or
-    built with an f-string around a constant, is still seen - the f-string
-    case is exactly how `consumers.py` quotes its stored key.
+    built with an f-string around a constant, is still seen.
     """
     found: list[tuple[str, int, str]] = []
     for path in sorted(PACKAGE.rglob("*.py")):
@@ -60,8 +59,7 @@ def test_the_scan_finds_the_filters_we_know_about():
     """The guard is only worth having if it is actually reading the code."""
     paths = _field_filter_paths()
     assert len(paths) >= 8, paths
-    assert any(module == "consumers.py" for module, _, _ in paths)
-    assert any(module == "inbound_edges.py" for module, _, _ in paths)
+    assert any(module == "opteryx_catalog.py" for module, _, _ in paths)
     assert any(module == "trigger_firing.py" for module, _, _ in paths)
 
 

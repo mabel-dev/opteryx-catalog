@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 import time
 from collections import Counter
-from collections import OrderedDict
 from dataclasses import dataclass
 from dataclasses import field
 from typing import Any
@@ -18,9 +17,6 @@ PYLIST_CONVERSION_CACHE = True  # Cache to_pylist() results per column
 
 # Manifest retrieval optimization
 ENABLE_LAZY_MANIFEST = True  # Use Arrow format for planning instead of converting to Python
-
-# Parsed manifest cache (LRU) for Arrow tables (faster than Python dicts)
-_arrow_manifest_cache: OrderedDict[str, Any] = OrderedDict()
 
 
 @dataclass
@@ -116,78 +112,47 @@ class ParquetManifestEntry:
 logger = logging.getLogger(__name__)
 _manifest_metrics = Counter()
 
-# Parsed-manifest cache (LRU): store parsed Python representation (list[dict])
-# to avoid repeated rugo parsing and expensive to_pylist() conversions.
-# Entries are "frozen" for memory efficiency (inner lists -> tuples).
-PARSED_MANIFEST_CACHE_SIZE: int = 32
-_parsed_manifest_cache: OrderedDict[str, list] = OrderedDict()
-
-
-def _freeze_for_cache(value):
-    """Recursively freeze lists to tuples and convert byte-like to bytes.
-
-    Keeps top-level entries as dicts (callers expect Mapping access) but
-    replaces inner mutable lists with tuples to reduce memory overhead and
-    prevent accidental mutation of cached data.
-    """
-    # Primitive/bytes
-    if isinstance(value, (bytes, bytearray, memoryview)):
-        return bytes(value)
-    if isinstance(value, (str, int, float, bool)) or value is None:
-        return value
-
-    # Lists -> tuples (recursive)
-    if isinstance(value, list):
-        return tuple(_freeze_for_cache(v) for v in value)
-
-    # Dicts -> keep as dict but freeze values
-    if isinstance(value, dict):
-        return {k: _freeze_for_cache(v) for k, v in value.items()}
-
-    # Fallback: return as-is
-    return value
+# There is no row-dict cache. Row dicts are DERIVED from the columnar cache on
+# every call (see ``get_parsed_manifest``), because they cannot be cached
+# safely: their cells are shared with the decoded columns, so a retained row
+# list retains the whole decode. A count-bounded row cache therefore held
+# manifests that the columnar cache's byte budget had already evicted and
+# stopped accounting for - 32 entries at the ~90MB a gdelt_events manifest
+# inflates to, in a 1GiB container, which is what OOMed the platform-wide
+# expiration sweep nightly from 2026-08-27. One decode, one budget, one place
+# to evict from: manifest_arrow.MANIFEST_CACHE_BYTES.
 
 
 def get_parsed_manifest(io, manifest_path: str) -> list:
-    """Return a cached Python representation (list[dict]) of the Parquet manifest.
+    """Return a Python representation (list[dict]) of the Parquet manifest.
 
-    - Uses an in-memory LRU cache keyed by `manifest_path`.
-    - Cached entries are frozen (inner lists -> tuples) to reduce memory.
+    Read through the COLUMNAR cache (manifest_arrow) rather than decoding
+    independently: that cache is the single decode, and the row dicts built
+    here are views over its (immutable) cells.
+
+    The rows themselves are NOT cached, and must not be. Sharing cells is what
+    makes building them cheap, and it is also what makes retaining them
+    expensive: a row list holds the entire decoded column set alive, so a
+    row-dict cache kept manifests resident that the columnar cache had already
+    evicted to honour its byte budget - the budget freed the bookkeeping and
+    not the bytes. Deriving them per call costs the boxing of N dicts over
+    columns already in memory; the storage read and the parquet decode stay
+    cached, which is where the real cost was.
+
+    A missing manifest propagates as FileNotFoundError: callers distinguish
+    "no manifest" from "empty manifest".
+
     - Callers MUST treat returned lists/dicts as read-only.
-    - Optimized: uses selective column reading and lazy conversion when available.
     """
 
     if not manifest_path:
         return []
 
-    # Fast path: cache hit
-    if manifest_path in _parsed_manifest_cache:
-        _parsed_manifest_cache.move_to_end(manifest_path)
-        _manifest_metrics["parsed_cache_hits"] += 1
-        return _parsed_manifest_cache[manifest_path]
-
-    # Miss: read through the COLUMNAR cache (manifest_arrow) rather than
-    # decoding independently. A worker that both commits (row dicts) and
-    # plans (columns + sketch vectors) used to hold every manifest twice,
-    # fully materialized in each shape; the columnar cache is now the single
-    # decode, and the row dicts here share its (immutable) cells - this cache
-    # adds only per-row dict overhead on top.
-    #
-    # A missing manifest propagates as FileNotFoundError: callers distinguish
-    # "no manifest" from "empty manifest", and caching a [] for a path that
-    # merely failed to read would serve that emptiness to every later caller.
     from .manifest_arrow import get_arrow_manifest
 
     manifest = get_arrow_manifest(io, manifest_path)
     rows = _rows_from_columns(manifest._columns, len(manifest))
-
-    _parsed_manifest_cache[manifest_path] = rows
-    _manifest_metrics["parsed_cache_misses"] += 1
-
-    # Evict oldest if cache exceeds size
-    if len(_parsed_manifest_cache) > PARSED_MANIFEST_CACHE_SIZE:
-        _parsed_manifest_cache.popitem(last=False)
-
+    _manifest_metrics["parsed_rows_materialized"] += len(rows)
     return rows
 
 
@@ -201,8 +166,9 @@ _NESTED_INT_LIST_COLUMNS = ("min_k_hashes", "histogram_counts")
 
 def _decode_nested_int_list_column(rows: list) -> list:
     """Decode to TUPLES of tuples, not lists: cells are shared between the
-    columnar cache and the row-dict cache (see ``get_parsed_manifest``), and
-    immutability is what makes that sharing safe."""
+    columnar cache and every row dict built over it (see
+    ``get_parsed_manifest``), and immutability is what makes that sharing
+    safe."""
 
     def _decode_cell(s):
         if isinstance(s, str):
@@ -307,28 +273,29 @@ def seed_parsed_manifest(manifest_path: str, data: bytes) -> None:
     """
     from .manifest_arrow import seed_arrow_manifest
 
-    manifest = seed_arrow_manifest(manifest_path, data)
-    rows = _rows_from_columns(manifest._columns, len(manifest))
-    _parsed_manifest_cache[manifest_path] = rows
-    _parsed_manifest_cache.move_to_end(manifest_path)
-    if len(_parsed_manifest_cache) > PARSED_MANIFEST_CACHE_SIZE:
-        _parsed_manifest_cache.popitem(last=False)
+    seed_arrow_manifest(manifest_path, data)
 
 
 def invalidate_parsed_manifest(manifest_path: str) -> None:
     """Remove a manifest from the parsed-manifest cache (if present).
 
-    Also drops the columnar entry: the two caches are views over one decode,
-    and invalidating one while the other keeps serving is a staleness bug."""
-    _parsed_manifest_cache.pop(manifest_path, None)
+    Row dicts are derived per call and hold nothing between calls, so the
+    columnar entry is the only thing there is to drop."""
     from .manifest_arrow import invalidate_arrow_manifest
 
     invalidate_arrow_manifest(manifest_path)
 
 
 def clear_parsed_manifest_cache() -> None:
-    """Clear the entire parsed-manifest cache (tests / admin use)."""
-    _parsed_manifest_cache.clear()
+    """Drop every decoded manifest (tests / admin use).
+
+    Kept under its original name: callers outside this package (opteryx-core's
+    integration tests) use it to force a re-read, and that is still exactly
+    what it does now that the columnar cache is the only one.
+    """
+    from .manifest_arrow import clear_arrow_manifest_cache
+
+    clear_arrow_manifest_cache()
 
 
 import heapq

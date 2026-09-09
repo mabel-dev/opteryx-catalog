@@ -199,14 +199,15 @@ class S3FileIO(FileIO):
     # alias
     ls = list_files
 
-    def list_files_with_age_ms(self, prefix: str) -> dict:
-        """List files under a prefix along with each object's age in ms.
+    def list_files_with_stats(self, prefix: str) -> dict:
+        """List files under a prefix with each object's age in ms and size.
 
         Used to safety-gate destructive orphan cleanup — see
-        `GcsFileIO.list_files_with_age_ms`. `list_objects_v2` already returns
-        `LastModified` per object, so this needs no extra request per file.
-        Returns {uri: age_ms}; on any failure returns {} (every candidate then
-        fails its age gate and is kept, the safe direction).
+        `GcsFileIO.list_files_with_stats`. `list_objects_v2` already returns
+        `LastModified` and `Size` per object, so this needs no extra request
+        per file. Returns {uri: (age_ms, size_bytes)}; on any failure returns
+        {} (every candidate then fails its age gate and is kept, the safe
+        direction).
         """
         try:
             if not prefix or not prefix.startswith("s3://"):
@@ -216,15 +217,24 @@ class S3FileIO(FileIO):
             bucket, key_prefix = _split_bucket_prefix(prefix)
             paginator = self._client.get_paginator("list_objects_v2")
             now_ms = int(_time.time() * 1000)
-            ages = {}
+            stats = {}
             for page in paginator.paginate(Bucket=bucket, Prefix=key_prefix):
                 for obj in page.get("Contents", []):
                     last_modified = obj.get("LastModified")
                     if last_modified is None:
                         continue
                     uri = f"s3://{bucket}/{obj['Key']}"
-                    ages[uri] = now_ms - int(last_modified.timestamp() * 1000)
-            return ages
+                    stats[uri] = (
+                        now_ms - int(last_modified.timestamp() * 1000),
+                        int(obj.get("Size") or 0),
+                    )
+            return stats
         except Exception:
-            logger.warning("Could not read object ages under %s", prefix, exc_info=True)
+            logger.warning("Could not read object stats under %s", prefix, exc_info=True)
             return {}
+
+    def list_files_with_age_ms(self, prefix: str) -> dict:
+        """Ages only, for callers that don't need sizes. See
+        `list_files_with_stats`, which this reads from - one listing either
+        way."""
+        return {uri: age for uri, (age, _) in self.list_files_with_stats(prefix).items()}

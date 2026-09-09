@@ -7,9 +7,8 @@ Usage:
     python scripts/backfill_task_reads.py <workspace> ... [--apply]
 
 WHY THIS EXISTS. `create_task` records `reads` - the catalog relations a task's
-statement reads, qualified - beside `writes`, and `find_inbound_edges` carries
-it on every `writes` row so "what feeds the thing that writes this" is one
-query (PROVENANCE_DESIGN.md S2.3). The engine derives it at registration, so a
+statement reads, qualified - beside `writes` (PROVENANCE_DESIGN.md S2.3). The
+engine derives it at registration, so a
 task registered before the field existed has no `reads` key, and one registered
 through a catalog that received `reads=None` has `[]`. Both read as "this task
 reads nothing", which is the wrong answer for almost every task in the catalog.
@@ -132,9 +131,9 @@ def _statement_of(reference, data: dict) -> str | None:
 def collect(client, workspaces=None) -> list[dict]:
     """Every task document in the catalog, or in the named workspaces.
 
-    One collection-group query, the read `find_inbound_edges` makes: tasks live
-    under their collections in every workspace, and neither the document nor
-    its fields say which, so the workspace is read off the path.
+    One collection-group query: tasks live under their collections in every
+    workspace, and neither the document nor its fields say which, so the
+    workspace is read off the path.
     """
     tasks = []
     for doc in client.collection_group(TASKS_SUBCOLLECTION).stream():

@@ -169,12 +169,12 @@ _BODIES = {
     ),
     "error": (
         "The trigger could not submit a run. {state_statement} shows the last recorded "
-        "status; the error is below."
+        "status."
     ),
     # Ran and did not succeed.
     "failed": (
         "The run was submitted and the statement failed. {definition_statement} is "
-        "what ran; the error is below."
+        "what ran."
     ),
     "denied": (
         "The run was refused on permissions. An unattended run executes as the "
@@ -261,12 +261,15 @@ def _compose(
         body = body_template.format(**fields)
 
     if detail:
+        # The promise of an error is made HERE, alongside the error itself, and
+        # not in the body templates: a caller that emits a failure without one
+        # would otherwise render a sentence pointing at nothing.
         # Fenced, not appended as prose: an engine error carries its own line
         # breaks, quoting and identifiers, and running it into the paragraph
         # above loses the boundary between what we are saying and what the
         # engine said. A fence also renders the text verbatim, so nothing in
         # an error message is read as markup.
-        body = f"{body}\n\n```\n{detail}\n```"
+        body = f"{body} The error is below.\n\n```\n{detail}\n```"
     # Clipped to the route's limit, which can cut mid-fence or mid-span. The
     # renderer closes an unterminated fence at the end of the text, so the
     # worst case is a trailing backtick shown literally - which is the right

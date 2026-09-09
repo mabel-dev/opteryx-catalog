@@ -200,6 +200,25 @@ def test_a_statement_is_a_code_span_and_an_error_is_a_fenced_block():
     assert body.endswith("```\nDatasetNotFound: ws.marts.daily\n```")
 
 
+def test_a_body_promises_an_error_only_when_it_carries_one():
+    """A failure emitted without an error text used to end on "the error is
+    below" with nothing below it - a sentence pointing at nothing."""
+    for status in ("failed", "error"):
+        _, without = tn._compose(
+            status, "ws.ops.rollup", trigger="nightly", holder="ws.raw.events", detail=""
+        )
+        _, with_detail = tn._compose(
+            status,
+            "ws.ops.rollup",
+            trigger="nightly",
+            holder="ws.raw.events",
+            detail="DatasetNotFound: ws.marts.daily",
+        )
+
+        assert "below" not in without
+        assert "The error is below." in with_detail
+
+
 def test_a_kind_with_no_statement_leaves_no_empty_backticks():
     """`_code` on nothing is nothing: a bare pair of backticks would render as
     two literal characters mid-sentence."""
