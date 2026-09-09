@@ -521,8 +521,18 @@ Two records answer "what was this built from?", with different lifetimes
   {"dataset": "opteryx.ops.stdout_log", "snapshot-id": 1788815763764, "resolved-by": "current"}
 ],
 "read-source-keys": ["opteryx.ops.stdout_log", "opteryx.ops.stdout_log@1788815763764"],
-"produced-by": "task:opteryx.ops.billing_events_ingest"   // or "view:…", or absent
+"produced-by": "task:opteryx.ops.billing_events_ingest"   // or "view:…", "upload:<channel>", or absent
 ```
+
+`produced-by` is `kind:name`, and the kind decides what the name means:
+`task:` and `view:` name a catalog object — that name is what the integrity
+sweep checks a receipt against — while `upload:` names the CHANNEL data
+arrived through (`web`, `api`, `mesos`), because there is no object to name.
+Absent means nothing registered made the commit, which is what a hand-run
+statement looks like. What a commit DID is not in here: `operation-type`
+already records that, and a second field restating it is a second field that
+can disagree with it. `SHOW LINEAGE FOR` composes the two into one readable
+`how` column ("merged, by task ops.ingest", "appended, uploaded via web").
 
 One entry per (catalog relation, snapshot) the statement that produced the
 commit read; `resolved-by` is one of `current`, `version`, `previous`, `tag`,

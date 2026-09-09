@@ -32,6 +32,7 @@ from .provenance import ReceiptMissing
 from .provenance import effect_for_operation
 from .provenance import is_self
 from .provenance import merge_sources
+from .provenance import normalize_produced_by
 from .provenance import normalize_read_sources
 
 # Stable node identifier for this process (hex-mac-hex-pid)
@@ -1065,7 +1066,9 @@ class SimpleDataset(Dataset):
             else int(total) - int(summary.get("total-deleted-records") or 0)
         )
         effect = effect_for_operation(snap.operation_type, live)
-        snap.produced_by = produced_by
+        # Validated before anything persists, as the receipt is: the field is
+        # written once and never rewritten, so an unknown kind is permanent.
+        snap.produced_by = normalize_produced_by(produced_by)
 
         if read_sources is None:
             snap.read_sources = None

@@ -71,9 +71,15 @@ class Snapshot:
     # relation, and only a caller that knows that may say it.
     read_sources: list[dict] | None = None
     read_sources_truncated: bool = False
-    # What made this commit: `task:<workspace.collection.name>` or
-    # `view:<workspace.collection.name>`. Absent for a hand-run statement,
-    # which is the one provenance field where absent is a state, not a bug.
+    # What made this commit: `task:<workspace.collection.name>`,
+    # `view:<workspace.collection.name>`, or `upload:<channel>` for data that
+    # arrived from outside the catalog. Absent for a hand-run statement, which
+    # is the one provenance field where absent is a state, not a bug.
+    #
+    # NOT what the commit DID - `operation-type` records that, and a second
+    # field restating it is a second field that can disagree with it. The
+    # vocabulary and the rule that the segment after the colon is scoped by
+    # the kind live in `provenance.PRODUCER_KINDS`.
     produced_by: str | None = None
 
 

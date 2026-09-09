@@ -382,3 +382,37 @@ def test_a_malformed_receipt_refuses_the_commit_before_anything_is_written():
     with pytest.raises(ValueError):
         ds.add_files([_stage(storage, "f1.parquet", [1])], author="t", read_sources=[("a", 1)])
     assert ds.metadata.current_snapshot_id is None
+
+
+def test_an_upload_records_an_empty_receipt_and_its_channel(alerts, audits):
+    """The two facts an upload has, said separately: nothing in the catalog
+    derived it, and the web uploader is what made it. Neither implies the
+    other - an upload that enriched from a lookup table would have a receipt
+    and still be `upload:web`."""
+    ds, _ = _dataset()
+    ds.add_files(
+        [_stage(ds.io._mapping, "f1.parquet", [1])],
+        author="t",
+        read_sources=[],
+        produced_by="upload:web",
+    )
+    doc = ds.catalog.snapshot_docs[ds.metadata.current_snapshot_id]
+
+    assert doc["read-sources"] == []
+    assert doc["produced-by"] == "upload:web"
+    assert alerts == [], "an upload that says [] is not a missing receipt"
+    assert ds.metadata.sources == []
+    assert ds.metadata.sources_complete is True
+
+
+def test_a_producer_outside_the_vocabulary_refuses_the_commit():
+    """Written once and never rewritten, so an unknown kind is permanent."""
+    ds, storage = _dataset()
+    with pytest.raises(ValueError):
+        ds.add_files(
+            [_stage(storage, "f1.parquet", [1])],
+            author="t",
+            read_sources=[],
+            produced_by="merge",
+        )
+    assert ds.metadata.current_snapshot_id is None

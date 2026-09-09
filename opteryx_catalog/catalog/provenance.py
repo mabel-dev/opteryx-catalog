@@ -54,6 +54,60 @@ MAINTENANCE_OPERATIONS = frozenset({"compact", "statistics-refresh", "expire"})
 # of the old sources survives a delete that removed every row.
 ROW_REMOVING_OPERATIONS = frozenset({"delete", "merge", "update", "delete-files"})
 
+# What KIND of thing made a commit, as the prefix of `produced-by`. The
+# vocabulary is closed so a typo cannot invent a fourth kind that every reader
+# then has to tolerate forever - receipts are never rewritten.
+#
+# The segment after the colon is scoped BY the kind, and that is deliberate:
+#
+#   task:<workspace.collection.name>  a registered task ran its statement
+#   view:<workspace.collection.name>  a materialized view populated or refreshed
+#   upload:<channel>                  data arrived from outside the catalog
+#
+# For `task` and `view` it names a catalog object, and that name is
+# load-bearing: it is what lets the integrity sweep pull the task's declared
+# `reads` and check the receipt against it. For `upload` it names a CHANNEL -
+# `web`, `api`, `mesos` - because there is no catalog object to name and no
+# declaration to check. Anything resolving the segment must branch on the kind
+# first.
+#
+# What a commit DID is not in here. `operation-type` already records that
+# (append, merge, delete, compact...), and a second field restating it is a
+# second field that can disagree with it.
+PRODUCER_KINDS = frozenset({"task", "view", "upload"})
+
+# Absent is a state for this field, not a defect: a statement somebody ran by
+# hand was made by no registered thing, and saying so is the true answer.
+
+
+def normalize_produced_by(produced_by: str | None) -> str | None:
+    """Validate `kind:name`, or None for a hand-run statement.
+
+    Refused rather than stored, and refused BEFORE the commit persists, for
+    the same reason a malformed receipt is: this is written once and never
+    rewritten, so an unknown kind is permanent and every reader downstream
+    inherits it.
+    """
+    if produced_by is None:
+        return None
+    text = str(produced_by).strip()
+    kind, separator, name = text.partition(":")
+    if kind not in PRODUCER_KINDS:
+        raise ValueError(
+            f"produced-by {produced_by!r} is not one of {sorted(PRODUCER_KINDS)}: it must be "
+            "`task:<name>`, `view:<name>` or `upload:<channel>`"
+        )
+    if kind in ("task", "view"):
+        if not separator or len(name.split(".")) < 3:
+            raise ValueError(
+                f"produced-by {produced_by!r} must name a fully-qualified "
+                "workspace.collection.name - it is what a receipt is checked against"
+            )
+    elif separator and not name:
+        raise ValueError(f"produced-by {produced_by!r} has a trailing colon and no channel")
+    return text
+
+
 # When receipts became required. A snapshot committed at or after this instant
 # with no `read-sources` is a `missing-receipt` integrity finding; one before
 # it is pre-feature history, which is permanently unrecorded and not a fault.
@@ -255,6 +309,7 @@ __all__ = [
     "effect_for_operation",
     "is_self",
     "merge_sources",
+    "normalize_produced_by",
     "normalize_read_sources",
     "read_source_key",
     "read_source_keys",

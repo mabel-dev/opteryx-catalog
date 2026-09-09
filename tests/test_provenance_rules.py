@@ -255,3 +255,49 @@ def test_recompute_excludes_the_dataset_itself():
 
 def test_recompute_of_an_empty_head_is_empty_and_complete():
     assert recompute_sources(None, _chain(), "ops.y", "ws") == ([], True)
+
+
+# ── what made a commit (PRODUCER_KINDS) ──────────────────────────────────────
+
+from opteryx_catalog.catalog.provenance import normalize_produced_by
+
+
+def test_a_hand_run_statement_has_no_producer():
+    """Absent is a STATE here, not a defect: a statement somebody ran by hand
+    was made by no registered thing, and saying so is the true answer."""
+    assert normalize_produced_by(None) is None
+
+
+@pytest.mark.parametrize(
+    "producer",
+    ["task:ws.ops.ingest", "view:ws.mart.daily", "upload:web", "upload:api", "upload"],
+)
+def test_the_three_kinds_are_accepted(producer):
+    assert normalize_produced_by(producer) == producer
+
+
+def test_an_upload_channel_is_not_a_catalog_name():
+    """The segment after the colon is scoped BY the kind. A task names an
+    object, because that name is what the receipt is checked against; an
+    upload names a channel, because there is no object and no declaration."""
+    assert normalize_produced_by("upload:mesos") == "upload:mesos"
+
+
+@pytest.mark.parametrize("producer", ["merge", "delete", "ctas", "refresh", "uplaod:web"])
+def test_a_kind_outside_the_vocabulary_is_refused(producer):
+    """`merge` and `delete` are what a commit DID, which `operation-type`
+    already records. A second field restating it is one that can disagree
+    with it."""
+    with pytest.raises(ValueError):
+        normalize_produced_by(producer)
+
+
+@pytest.mark.parametrize("producer", ["task:ops.ingest", "view:mart", "task:"])
+def test_a_task_or_view_must_be_fully_qualified(producer):
+    with pytest.raises(ValueError):
+        normalize_produced_by(producer)
+
+
+def test_a_trailing_colon_on_an_upload_is_refused():
+    with pytest.raises(ValueError):
+        normalize_produced_by("upload:")
