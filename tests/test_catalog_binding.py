@@ -207,3 +207,38 @@ def test_clear_is_honest_about_what_it_did():
 
     with pytest.raises(WorkspaceNotFound):
         clear_catalog_binding(fs, "never_existed")
+
+
+def test_postgres_binding_round_trips_with_a_stored_password():
+    """kind = "postgres" is connector-only (no metastore): `config` is the
+    PostgresConnector's constructor keywords and the password is a stored
+    credential injected at `password` — the shape worker.opteryx's allowlist
+    and scripts/bind_postgres_workspace.py both rely on."""
+    fs = _FakeFirestore()
+    config = {
+        "host": "db.example.com",
+        "port": 5432,
+        "dbname": "app",
+        "user": "reader",
+        "sslmode": "require",
+        "schema": "public",
+        "timeout_s": 30,
+    }
+    version = write_catalog_binding(
+        fs,
+        "erp_test",
+        kind="postgres",
+        config=config,
+        auth_mode=AUTH_MODE_STORED,
+        ciphertext="b64-envelope",
+        kms_key="projects/p/locations/l/keyRings/r/cryptoKeys/k",
+        inject_as="password",
+        updated_by="justin",
+    )
+    binding = read_catalog_binding(fs, "erp_test")
+    assert binding.kind == "postgres"
+    assert binding.config == config
+    assert binding.auth_mode == "stored"
+    assert binding.inject_as == "password"
+    assert binding.version == version
+    assert "password" not in binding.config  # only ever arrives via inject-as
