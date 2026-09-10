@@ -714,6 +714,19 @@ class SimpleDataset(Dataset):
     def snapshots(self) -> Iterable[Snapshot]:
         return list(self.metadata.snapshots)
 
+    def expired_snapshots(self) -> Iterable[Snapshot]:
+        """The tombstones: retired, not yet purged, and NOT readable.
+
+        Empty unless the dataset was loaded with
+        `load_dataset(..., load_history=True, include_expired=True)` - every
+        other load drops these documents on the floor, deliberately. The files
+        behind them are in the orphan quarantine or GCS soft-delete, so a row
+        here says a version existed and may still be restorable
+        (`scripts/restore_snapshot.py`), never that it can be read: reading one
+        by id is refused on every path, including `snapshot()` above.
+        """
+        return list(self.metadata.expired_snapshots)
+
     def schema(self, schema_id: str | None = None) -> RelationSchema | None:
         """Return a stored schema description.
 

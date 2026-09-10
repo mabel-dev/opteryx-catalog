@@ -20,6 +20,7 @@ from .audit import emit_audit
 from .catalog.dataset import _NO_SNAPSHOT_EXPECTATION
 from .catalog.dataset import SimpleDataset
 from .catalog.dataset import _as_int
+from .catalog.metadata import SNAPSHOT_EXPIRED_AT_KEY
 from .catalog.metadata import DatasetMetadata
 from .catalog.metadata import Snapshot
 from .catalog.metadata import provenance_document_fields
@@ -1201,7 +1202,12 @@ class OpteryxCatalog(Metastore):
         # Return SimpleDataset (attach this catalog so append() can persist)
         return SimpleDataset(identifier=identifier, _metadata=metadata, io=self.io, catalog=self)
 
-    def load_dataset(self, identifier: str, load_history: bool = False) -> SimpleDataset:
+    def load_dataset(
+        self,
+        identifier: str,
+        load_history: bool = False,
+        include_expired: bool = False,
+    ) -> SimpleDataset:
         """Load a dataset from Firestore.
 
         Args:
@@ -1210,6 +1216,12 @@ class OpteryxCatalog(Metastore):
             load_history: If True, load all snapshots from Firestore (expensive for
                 large histories). If False (default), only load the current snapshot,
                 which is sufficient for most write operations.
+            include_expired: With `load_history`, also read the TOMBSTONES -
+                snapshots expiration has retired but not yet purged - into
+                `metadata.expired_snapshots`. They are never merged into
+                `metadata.snapshots`: see the loader for the three things that
+                breaks. Off by default, and asked for only by a caller that is
+                reporting the restore window rather than reading data.
 
         Returns:
             SimpleDataset instance with metadata loaded from Firestore.
@@ -1221,7 +1233,9 @@ class OpteryxCatalog(Metastore):
         doc = self._dataset_doc_ref(collection, dataset_name).get()
         if not doc.exists:
             raise DatasetNotFound(f"Dataset not found: {identifier}")
-        return self._build_dataset(identifier, collection, dataset_name, doc, load_history)
+        return self._build_dataset(
+            identifier, collection, dataset_name, doc, load_history, include_expired
+        )
 
     def get_relation(self, identifier):
         """Catalog resolution step: resolve a relation without knowing whether
@@ -1282,6 +1296,9 @@ class OpteryxCatalog(Metastore):
             operation_type=sd.get("operation-type"),
             parent_snapshot_id=sd.get("parent-snapshot-id"),
             commit_message=sd.get("commit-message"),
+            # Absent on every live snapshot, so this reads None on every path
+            # but the tombstone-including load below.
+            expired_at_ms=sd.get(SNAPSHOT_EXPIRED_AT_KEY),
             **provenance_fields_from_document(sd),
         )
 
@@ -1332,7 +1349,13 @@ class OpteryxCatalog(Metastore):
         }
 
     def _build_dataset(
-        self, identifier, collection, dataset_name, doc, load_history: bool = False
+        self,
+        identifier,
+        collection,
+        dataset_name,
+        doc,
+        load_history: bool = False,
+        include_expired: bool = False,
     ) -> SimpleDataset:
         """Build a SimpleDataset from an already-fetched dataset doc.
 
@@ -1395,6 +1418,7 @@ class OpteryxCatalog(Metastore):
 
         if load_history:
             snaps = []
+            expired = []
             for snap_doc in self._snapshots_collection(collection, dataset_name).stream():
                 snap_data = snap_doc.to_dict() or {}
                 # Tombstoned snapshots stay out of every normal read. They are
@@ -1405,7 +1429,15 @@ class OpteryxCatalog(Metastore):
                 # own to trip MAX_SNAPSHOTS_FOR_ORPHAN_DETECTION and silently
                 # disable orphan cleanup), and their manifests would count as
                 # referenced, pinning the very files expiration just released.
+                #
+                # `include_expired` does not relax that - it collects them into
+                # a SEPARATE list. The caller asking is reporting what is still
+                # restorable (`SHOW ALL SNAPSHOTS FOR`), and the head pointer,
+                # the ancestry walks and `previous` resolution below all keep
+                # reading `snaps`, which still means live.
                 if snapshot_is_tombstoned(snap_data):
+                    if include_expired:
+                        expired.append(self._snapshot_from_dict(snap_data))
                     continue
                 snaps.append(self._snapshot_from_dict(snap_data))
             # The HEAD comes from the dataset document's pointer (stored as
@@ -1428,6 +1460,9 @@ class OpteryxCatalog(Metastore):
                     snaps, key=lambda s: (s.sequence_number or 0, s.snapshot_id or 0)
                 ).snapshot_id
             metadata.snapshots = snaps
+            # Newest first is decided by the reporting caller, not here; this
+            # keeps the stream order for the same reason `snaps` does.
+            metadata.expired_snapshots = expired
             metadata.schemas = [self._schema_entry_from_doc(s) for s in schemas_coll.stream()]
             metadata.current_schema_id = data.get("current-schema-id")
             metadata.tags, metadata.tags_loaded = self._load_tags(collection, dataset_name)

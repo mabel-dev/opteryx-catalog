@@ -49,6 +49,15 @@ class Snapshot:
     schema_id: str | None = None
     # Commit message for the snapshot
     commit_message: str | None = None
+    # When expiration retired this snapshot, in epoch ms; None for a live one.
+    # Only ever set on the tombstone-including load path
+    # (`load_dataset(..., include_expired=True)`), which puts these records in
+    # `DatasetMetadata.expired_snapshots` and never in `snapshots` - so a
+    # Snapshot reached through any normal read still cannot carry it. The
+    # storage behind an expired snapshot is not guaranteed to exist: this is a
+    # record for the restore window (SNAPSHOT_EXPIRED_AT_KEY), not a version
+    # anything may read.
+    expired_at_ms: int | None = None
     # Summary metrics (store zeros when not applicable)
     summary: dict = field(
         default_factory=lambda: {
@@ -105,6 +114,17 @@ class DatasetMetadata:
     )
     # Compaction policy lives under maintenance_policy as 'compaction-policy'
     snapshots: list[Snapshot] = field(default_factory=list)
+    # TOMBSTONES, and only when they were asked for: expiration has retired
+    # these and the files behind them are in quarantine or GCS soft-delete, so
+    # they are records of what is still restorable rather than history that can
+    # be read. Kept in a list of their own, never merged into `snapshots`,
+    # because every consumer of that field means LIVE - expiration's retention
+    # maths, the orphan-detection threshold, ancestry walks, `previous`
+    # resolution and the head-pointer fallback all break if a tombstone is in
+    # it (see the loader in opteryx_catalog.py for what each one does wrong).
+    # Empty unless `load_dataset(..., include_expired=True)` filled it, which
+    # `SHOW ALL SNAPSHOTS FOR` is the only caller of.
+    expired_snapshots: list[Snapshot] = field(default_factory=list)
     # The HEAD: the snapshot an unqualified read sees. Called "current"
     # everywhere the word is written by hand - in code, in SQL, in messages -
     # and stored under the matching key, `current-snapshot-id`.
