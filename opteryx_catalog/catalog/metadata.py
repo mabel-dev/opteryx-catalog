@@ -105,6 +105,12 @@ class DatasetMetadata:
     description: str | None = None
     describer: str | None = None
     sort_orders: list[int] = field(default_factory=list)
+    # A statistics manifest recorded on the DATASET DOCUMENT rather than on a
+    # snapshot. Only a dataset PROJECTED from an external catalog has one: it
+    # has no snapshots (nothing commits to it), so there is no version history
+    # for the usual pointer to hang off. Same file format and same reader as a
+    # snapshot's `manifest_list` - see stub_projection's `manifest-list`.
+    manifest_list: str | None = None
     # Maintenance policy: retention settings grouped under a single block
     maintenance_policy: dict = field(
         default_factory=lambda: {

@@ -1378,6 +1378,9 @@ class OpteryxCatalog(Metastore):
         metadata.annotations = data.get("annotations") or []
         metadata.refresh_frequency_mins = data.get("refresh-frequency-mins")
         metadata.next_field_id = data.get("next-field-id", 1)
+        # Only ever set on a stub (see DatasetMetadata.manifest_list); a
+        # snapshot-backed dataset carries its pointer on the snapshot.
+        metadata.manifest_list = data.get("manifest-list")
         # Load the configured sort order. Without this the value round-tripped
         # by save_dataset_metadata is silently dropped on read, so the engine's
         # compaction planner always sees an empty sort_orders and falls back to the

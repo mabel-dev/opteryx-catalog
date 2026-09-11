@@ -118,6 +118,18 @@ PROJECTED_FIELDS = {
     "timestamp_ms": "timestamp-ms",
     "sort_orders": "sort-orders",
     "partition_columns": "partition-columns",
+    # Where this dataset's statistics manifest is, spelled the way a SNAPSHOT
+    # spells it, because it is the same thing in the same format read by the
+    # same code - `Dataset.describe` resolves a snapshot's `manifest_list` and
+    # falls back to this when there is no snapshot to resolve.
+    #
+    # A stub has no snapshots: nothing commits to it, so there is no version
+    # history for a pointer to hang off. Without this field a projected
+    # dataset's per-column statistics were unreachable to everything except the
+    # engine's own connector, which computes the path itself - so OData's
+    # `Custom.Statistics.*` annotations and the Studio came back empty for a
+    # dataset whose statistics had in fact been collected and written.
+    "manifest_list": "manifest-list",
 }
 
 # A detail key meaning "I listed this table but could not look inside it this

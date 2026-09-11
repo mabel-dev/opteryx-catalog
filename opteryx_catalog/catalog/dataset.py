@@ -2739,10 +2739,23 @@ class SimpleDataset(Dataset):
         the previous `describe` per-column output).
         """
         snap = self.snapshot(snapshot_id)
-        if snap is None or not getattr(snap, "manifest_list", None):
+        manifest_path = getattr(snap, "manifest_list", None) if snap is not None else None
+        if not manifest_path:
+            # A dataset PROJECTED from an external catalog has no snapshots -
+            # nothing commits to it, so there is no version history for a
+            # pointer to hang off - but it may still carry a statistics
+            # manifest, recorded on the document itself by the refresh that
+            # wrote it (opteryx_catalog.stub_projection's `manifest-list`).
+            # Same format, same reader; only the pointer lives elsewhere.
+            #
+            # Only when no snapshot was ASKED for: `describe(snapshot_id=...)`
+            # is a question about one point in history, and answering it with a
+            # statistics file that describes the source as it is now would be a
+            # different question's answer.
+            if snapshot_id is None:
+                manifest_path = getattr(self.metadata, "manifest_list", None)
+        if not manifest_path:
             raise ValueError("No manifest available for this dataset/snapshot")
-
-        manifest_path = snap.manifest_list
 
         # Read manifest once using Arrow-native retrieval (30-50% faster)
         from .manifest_arrow import get_arrow_manifest

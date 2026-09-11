@@ -541,3 +541,13 @@ def test_a_table_that_lost_its_sort_order_loses_the_field(db):
     result = sync_stub_datasets(db, WS, [("interop", "people", {"schema": COLUMNS})])
     assert result.updated == 1
     assert "sort-orders" not in _stubs(db)[("interop", "people")]
+
+
+def test_a_stub_can_record_its_statistics_manifest():
+    """A projected dataset has no snapshots - nothing commits to it - so the
+    usual `manifest_list` pointer has nowhere to hang. Recording it on the
+    document itself is what makes those statistics reachable to
+    `Dataset.describe`, and through it to OData and the Studio."""
+    from opteryx_catalog.stub_projection import PROJECTED_FIELDS
+
+    assert PROJECTED_FIELDS["manifest_list"] == "manifest-list"
