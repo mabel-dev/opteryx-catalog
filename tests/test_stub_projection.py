@@ -551,3 +551,20 @@ def test_a_stub_can_record_its_statistics_manifest():
     from opteryx_catalog.stub_projection import PROJECTED_FIELDS
 
     assert PROJECTED_FIELDS["manifest_list"] == "manifest-list"
+
+
+def test_describe_handles_a_stub_inline_schema():
+    """A projected dataset stores its schema INLINE as a list of column dicts -
+    it has no schema history to point at - so `schema()` returns that list
+    rather than a RelationSchema. `describe()` reached straight for `.columns`
+    and died with `'list' object has no attribute 'columns'`, which is what made
+    every projected statistic unreadable to OData and the Studio."""
+    import inspect
+
+    from opteryx_catalog.catalog.dataset import SimpleDataset
+
+    source = inspect.getsource(SimpleDataset.describe)
+    # It normalises both shapes before indexing columns.
+    assert "schema_columns" in source
+    assert 'getattr(relation_schema, "columns", None)' in source
+    assert "isinstance(relation_schema, (list, tuple))" in source

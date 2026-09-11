@@ -2780,8 +2780,27 @@ class SimpleDataset(Dataset):
         if relation_schema is None:
             raise ValueError("Schema unavailable; cannot describe all columns")
 
+        # A PROJECTED dataset stores its schema INLINE on the document - a plain
+        # list of stored-spelling column dicts (stub_projection's SCHEMA_FIELD) -
+        # because it has no schema history to point at: the external catalog owns
+        # evolution and a projection of one version is all there is. `schema()`
+        # has no `current_schema_id` to resolve for one, so it returns that list
+        # verbatim, and everything below wants `.columns`. Normalise the two
+        # shapes here rather than at each use.
+        schema_columns = getattr(relation_schema, "columns", None)
+        if schema_columns is None and isinstance(relation_schema, (list, tuple)):
+            schema_columns = list(relation_schema)
+        elif schema_columns is None and isinstance(relation_schema, dict):
+            schema_columns = relation_schema.get("columns") or []
+        if not schema_columns:
+            raise ValueError("Schema unavailable; cannot describe all columns")
+
+        # Inline columns are dicts; a resolved schema's are objects.
+        def _column_name(column):
+            return column["name"] if isinstance(column, dict) else column.name
+
         # Map column name -> index for every schema column
-        col_to_idx: dict[str, int] = {c.name: i for i, c in enumerate(relation_schema.columns)}
+        col_to_idx: dict[str, int] = {_column_name(c): i for i, c in enumerate(schema_columns)}
 
         # Initialize accumulators per column
         stats: dict[str, dict] = {}
