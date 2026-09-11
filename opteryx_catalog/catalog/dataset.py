@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 import os
+import re
+import struct
 import time
 import uuid
 from collections.abc import Iterable
@@ -95,6 +97,118 @@ def _kmv_cardinality(hashes) -> tuple:
         # should be unreachable; it stays as a floor under the estimator rather
         # than letting one odd column fail a whole describe().
         return 0, False
+
+
+_ORDINAL_NULL = -(2**63)
+_U64 = (1 << 64) - 1
+_SIGN = 1 << 63
+
+_TEXT_FAMILIES = ("VARCHAR", "NVARCHAR", "CHAR", "STRING", "VARBINARY", "BLOB", "VARIANT")
+
+
+def _is_text_type(type_name: str) -> bool:
+    """Whether a stored type spelling names one of the ordinal TEXT families."""
+    return (type_name or "").upper().strip().startswith(_TEXT_FAMILIES)
+
+
+def _from_ordinal(value, type_name: str):
+    """A stored ORDINAL min/max rendered back as the column's real value.
+
+    Manifest bounds are ordinal KEYS, not values. `draken_ordinalize` maps every
+    type onto a monotonic int64 so one typed array can carry a whole relation's
+    mixed bounds, and both the catalog's own stats builder and an external
+    refresh write that encoding. Nothing reversed it, so `describe()` - and
+    through it OData's `Custom.Statistics.Min/Max` and the Studio - reported the
+    KEY: a DECIMAL(6,1) whose real maximum is 1898.0 read as 18980, a FLOAT read
+    as a 19-digit integer, and "no bound" read as -9223372036854775808.
+
+    Each inverse below is the exact algebraic inverse of the matching
+    `ordinalize_scalar_*` in `draken/ops/ordinalize.h`; that header is the
+    contract, and any change to it invalidates this function:
+
+      * widen (INTEGER, BOOLEAN, DATE/TIMESTAMP, INTERVAL, uint8/16/32) - the
+        identity, so the ordinal already IS the value.
+      * DECIMAL - the raw UNSCALED mantissa; multiplying back by 10**-scale
+        restores it. (DECIMAL128 has no ordinalize entry at all, so a manifest
+        cannot hold one of these keys for it.)
+      * UINT64 - biased by the sign bit to fit int64; XOR restores it.
+      * FLOAT32/64 - the IEEE-754 bits, with all 63 non-sign bits FLIPPED when
+        the value was negative so signed int64 order matches value order. That
+        transform is its own inverse, so applying it again and reading the bits
+        back as a double is exact.
+
+    TEXT is NOT handled here and returns None. Its key is the first eight
+    content bytes packed big-endian and right-shifted by one, so it recovers a
+    PREFIX, never the value: bytes past the eighth are gone and the eighth
+    byte's low bit went with the shift. A prefix is a sound lower bound and an
+    unsound upper one, so publishing it as `max` would be a number that is not
+    the maximum. `_ordinal_text_prefix` exposes it where a prefix is honest -
+    the cosmetic `min_display`/`max_display` channel - and nowhere else.
+
+    A value that is not an ordinal at all (a bound written before the ordinal
+    encoding, or one already stored as text) passes through untouched: this
+    only ever reinterprets an int.
+    """
+    if value is None or isinstance(value, bool) or not isinstance(value, int):
+        return value
+    # ORDINAL_NULL means "this column had no non-null value here". Never let it
+    # out as a number - as a bound it reads as a real, absurd minimum.
+    if value == _ORDINAL_NULL:
+        return None
+
+    name = (type_name or "").upper().strip()
+
+    if name.startswith("DECIMAL"):
+        scale = _decimal_scale(name)
+        return value / (10**scale) if scale else value
+
+    if name.startswith(("FLOAT", "DOUBLE", "REAL")):
+        bits = value & _U64
+        if bits & _SIGN:
+            bits = (~bits | _SIGN) & _U64
+        return struct.unpack(">d", bits.to_bytes(8, "big"))[0]
+
+    if name in ("UINT64", "UNSIGNED"):
+        return (value & _U64) ^ _SIGN
+
+    if name.startswith("BOOL"):
+        return bool(value)
+
+    if _is_text_type(name):
+        return None
+
+    # Every remaining family ordinalizes by widening, so the key is the value.
+    return value
+
+
+def _decimal_scale(name: str) -> int:
+    """The scale out of a `DECIMAL(p, s)` spelling; 0 when it carries none."""
+    match = re.search(r"\(\s*\d+\s*,\s*(\d+)\s*\)", name)
+    return int(match.group(1)) if match else 0
+
+
+def _ordinal_text_prefix(value):
+    """The leading bytes a TEXT ordinal key was built from, as a string.
+
+    Undoes `ordinalize_scalar_bytes8`: shift back left by one and read the
+    eight big-endian bytes. Seven of them are exact; the eighth lost its low
+    bit to the shift and is dropped rather than reported as a byte that may be
+    off by one. Trailing NULs are the kernel's zero-padding for a value shorter
+    than eight bytes, not content.
+
+    This is a PREFIX. It is offered only as a display hint, never as `min`/`max`
+    - see `_from_ordinal`.
+    """
+    if value is None or isinstance(value, bool) or not isinstance(value, int):
+        return None
+    if value == _ORDINAL_NULL or value < 0:
+        return None
+    prefix = ((value << 1) & _U64).to_bytes(8, "big")[:7].rstrip(b"\x00")
+    if not prefix:
+        return None
+    # A multi-byte character straddling the cut is a partial sequence; replacing
+    # it keeps a cosmetic hint cosmetic instead of costing the column a row.
+    return prefix.decode("utf-8", errors="replace")
 
 
 def _decode_minmax(v):
@@ -289,6 +403,15 @@ class SchemaColumn:
     # Stable, catalog-assigned field-id (see DatasetMetadata.next_field_id) —
     # None for schemas persisted before field-ids existed.
     id: int | None = None
+    # Whether `type` was actually STORED, or is `_stored_type_display`'s
+    # "VARCHAR" fallback for a column document that carried no type at all.
+    #
+    # The two are not the same claim, and `describe()` needs them apart: a text
+    # column's manifest bound is an ordinal key that cannot be published as a
+    # value, so it publishes none - and doing that to a column merely MISSING a
+    # type would drop bounds that older, untyped documents still carry
+    # correctly. Defaults True: every caller that names a type has declared it.
+    type_is_declared: bool = True
 
 
 @dataclass
@@ -801,6 +924,7 @@ class SimpleDataset(Dataset):
             SchemaColumn(
                 name=c.get("name"),
                 type=_stored_type_display(c),
+                type_is_declared=c.get("type") is not None,
                 element_type=c.get("element-type") or c.get("element_type"),
                 precision=c.get("precision"),
                 scale=c.get("scale"),
@@ -2802,6 +2926,21 @@ class SimpleDataset(Dataset):
         # Map column name -> index for every schema column
         col_to_idx: dict[str, int] = {_column_name(c): i for i, c in enumerate(schema_columns)}
 
+        # The stored type spelling per column, which is what turns an ordinal key
+        # back into a value. Read from the same two shapes the columns come in.
+        # An UNDECLARED type is None here, not a spelling: see
+        # `SchemaColumn.type_is_declared`. `_from_ordinal` treats None as "no
+        # reinterpretation", which is exactly the behaviour a column with no
+        # stored type had before ordinal decoding existed.
+        column_types: dict[str, str | None] = {}
+        for column in schema_columns:
+            if isinstance(column, dict):
+                column_types[column["name"]] = (
+                    _stored_type_display(column) if column.get("type") is not None else None
+                )
+            else:
+                column_types[column.name] = column.type if column.type_is_declared else None
+
         # Initialize accumulators per column
         stats: dict[str, dict] = {}
         for name in col_to_idx:
@@ -2811,8 +2950,6 @@ class SimpleDataset(Dataset):
                 "maxs": [],
                 "hashes": set(),
                 "file_hist_infos": [],
-                "min_displays": [],
-                "max_displays": [],
                 "uncompressed_bytes": 0,
                 # ARRAY only: the same sketch and bounds every column gets,
                 # computed over the flat child vector rather than the rows.
@@ -3024,13 +3161,17 @@ class SimpleDataset(Dataset):
             element_mins = [v for v in s["element_mins"] if v is not None]
             element_maxs = [v for v in s["element_maxs"] if v is not None]
 
+            # Bounds are stored as ordinal KEYS; report the values they stand
+            # for. See `_from_ordinal` - without this every non-integer column's
+            # min/max was a number that was not the answer.
+            column_type_name = column_types.get(cname)
             res = {
                 "dataset": self.identifier,
                 "description": getattr(self.metadata, "description", None),
                 "row_count": total_rows,
                 "column": cname,
-                "min": global_min,
-                "max": global_max,
+                "min": _from_ordinal(global_min, column_type_name),
+                "max": _from_ordinal(global_max, column_type_name),
                 "null_count": s["null_count"],
                 "uncompressed_bytes": s["uncompressed_bytes"],
                 "cardinality": cardinality,
@@ -3048,37 +3189,18 @@ class SimpleDataset(Dataset):
                 "element_max": max(element_maxs) if element_maxs else None,
             }
 
-            # If textual, attempt display prefixes like describe(). `_at`
-            # absorbs a schema that is None or shorter than the stats arrays,
-            # which is the only way any of this failed.
-            column = _at(getattr(relation_schema, "columns", None), cidx)
-            column_type = getattr(column, "type", None)
-            spelling = "" if column_type is None else str(column_type).lower()
-            is_text = "char" in spelling or "string" in spelling or "varchar" in spelling
-
-            if is_text:
-                # Use only textual display values collected from manifests.
-                # Decode bytes and strip truncation marker (0xFF) if present.
-                def _decode_display_raw(v):
-                    if isinstance(v, (bytes, bytearray, memoryview)):
-                        b = bytes(v)
-                        if b and b[-1] == 0xFF:
-                            b = b[:-1]
-                        # errors="replace" means this cannot raise: a display
-                        # prefix is cosmetic, so undecodable bytes become U+FFFD
-                        # rather than costing the column its whole row.
-                        return b.decode("utf-8", errors="replace")[:16]
-                    if isinstance(v, str):
-                        return v[:16]
-                    return None
-
-                min_disp = next(
-                    (d for d in map(_decode_display_raw, s.get("min_displays") or []) if d), None
-                )
-                max_disp = next(
-                    (d for d in map(_decode_display_raw, s.get("max_displays") or []) if d), None
-                )
-
+            # A TEXT column's bounds cannot be published as values (see
+            # `_from_ordinal`), but the ordinal still carries the leading bytes
+            # of each, and a prefix is exactly what a display channel is for.
+            #
+            # This channel previously read `min_displays`/`max_displays`, which
+            # nothing ever appended to - no manifest field carries a display
+            # string - so `min_display`/`max_display` were unreachable and every
+            # text column described itself with no bound at all. The accumulator
+            # went with this change; the ordinal is the source now.
+            if _is_text_type(column_type_name):
+                min_disp = _ordinal_text_prefix(global_min)
+                max_disp = _ordinal_text_prefix(global_max)
                 if min_disp is not None or max_disp is not None:
                     res["min_display"] = min_disp
                     res["max_display"] = max_disp
