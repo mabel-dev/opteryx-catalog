@@ -46,13 +46,25 @@ Block schema (kebab-case field names, matching `$properties` convention):
                                      # refresh control - see stub_projection's
                                      # module docstring for why that matters.
                                      # Absent means "never refreshed".
+      server-flavour: str            # written by `record_server_identity`, by
+      server-version: str            # whoever last CONNECTED. What answered at
+                                     # the other end - "cockroachdb" against a
+                                     # postgres binding, say - which the kind
+                                     # cannot say: `kind` is the CONNECTOR, and
+                                     # a dozen engines speak the postgres wire
+                                     # protocol. An observation, never
+                                     # authoritative: it was true when it was
+                                     # taken, the server can be replaced under
+                                     # it, and nothing may resolve code from it.
+                                     # Absent means "never connected".
 
-Writing a binding REPLACES the whole block, so the two listing fields do not
-survive it. That is the honest direction: a rebind can point the workspace at
-a different catalog entirely, and carrying an old stamp forward would report
-freshness for a listing that was taken from somewhere else. The workspace
-reads as "never refreshed" until someone runs a sync, which is what section
-6.5 of the UI design asks for after a settings change anyway.
+Writing a binding REPLACES the whole block, so the listing fields and the
+observed server identity do not survive it. That is the honest direction: a
+rebind can point the workspace at a different catalog entirely, and carrying
+an old stamp forward would report freshness for a listing - or an engine name
+for a server - that belonged to somewhere else. The workspace reads as "never
+refreshed" until someone runs a sync, which is what section 6.5 of the UI
+design asks for after a settings change anyway.
 
 The version is `max(now_ms, previous + 1, floor + 1)`, where `floor` is a
 `catalog-version-floor` field `clear_catalog_binding` leaves on the doc
@@ -103,6 +115,11 @@ class CatalogBinding:
     updated_by: str | None = None
     listing_synced_at_ms: int | None = None
     listing_count: int | None = None
+    # What answered at the other end, last time anyone connected. See the
+    # module docstring: an observation about the SERVER, not part of the
+    # binding, and never something to resolve code from.
+    server_flavour: str | None = None
+    server_version: str | None = None
 
 
 def _properties_ref(firestore_client, workspace: str):
@@ -185,6 +202,8 @@ def read_catalog_binding(firestore_client, workspace: str) -> CatalogBinding | N
         updated_by=block.get("updated-by"),
         listing_synced_at_ms=block.get("listing-synced-at-ms"),
         listing_count=block.get("listing-count"),
+        server_flavour=block.get("server-flavour"),
+        server_version=block.get("server-version"),
     )
 
 
@@ -272,6 +291,49 @@ def write_catalog_binding(
             }
         )
     return version
+
+
+def record_server_identity(
+    firestore_client,
+    workspace: str,
+    *,
+    flavour: str | None,
+    version: str | None = None,
+) -> None:
+    """Record what actually answered at the other end of this binding.
+
+    Called by whoever just CONNECTED - a connection test, a dataset-list
+    refresh - because that is the only moment anyone knows. `kind` cannot
+    carry this: it names the CONNECTOR, and a dozen engines speak the
+    PostgreSQL wire protocol well enough to be bound as `postgres`. Knowing
+    which one is what lets a UI mark the workspace honestly, and what lets a
+    caller decline to trust a statistics query the real engine answers
+    differently.
+
+    Written with targeted field paths, like `stub_projection`'s listing
+    stamp and for the same reason: it must not clobber a binding write that
+    landed between the connection and this call. It deliberately does NOT
+    bump `version` - no connector cache anywhere resolves from this, so
+    rotating every cached connector to record a display fact would be a
+    needless stampede.
+
+    A no-op for a workspace with no `$properties` doc: there is nothing to
+    annotate, and this is a side effect of someone else's operation - it must
+    never be the call that creates a document.
+    """
+    from google.cloud.firestore_v1.field_path import FieldPath
+
+    reference = _properties_ref(firestore_client, workspace)
+    snapshot = reference.get()
+    if not snapshot.exists or not (snapshot.to_dict() or {}).get("catalog"):
+        return
+
+    reference.update(
+        {
+            FieldPath("catalog", "server-flavour").to_api_repr(): flavour,
+            FieldPath("catalog", "server-version").to_api_repr(): version,
+        }
+    )
 
 
 def clear_catalog_binding(firestore_client, workspace: str) -> bool:

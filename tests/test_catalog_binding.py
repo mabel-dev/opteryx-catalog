@@ -15,6 +15,7 @@ from opteryx_catalog.binding import AUTH_MODE_STORED
 from opteryx_catalog.binding import CatalogBinding
 from opteryx_catalog.binding import clear_catalog_binding
 from opteryx_catalog.binding import read_catalog_binding
+from opteryx_catalog.binding import record_server_identity
 from opteryx_catalog.binding import write_catalog_binding
 from opteryx_catalog.exceptions import InvalidCatalogBinding
 from opteryx_catalog.exceptions import WorkspaceNotFound
@@ -242,3 +243,84 @@ def test_postgres_binding_round_trips_with_a_stored_password():
     assert binding.inject_as == "password"
     assert binding.version == version
     assert "password" not in binding.config  # only ever arrives via inject-as
+
+
+# ---------------------------------------------------------------------------
+# The observed server identity. `kind` names the CONNECTOR - a dozen engines
+# speak the PostgreSQL wire protocol - so this is the only field that can say a
+# `postgres` binding is really pointed at CockroachDB.
+# ---------------------------------------------------------------------------
+
+
+def test_the_observed_server_reads_back():
+    fs = _FakeFirestore()
+    fs.collection("ws").document("$properties").set(
+        {
+            "catalog": {
+                "kind": "postgres",
+                "config": {"host": "db.example.com"},
+                "server-flavour": "cockroachdb",
+                "server-version": "CockroachDB CCL v23.1.11",
+            }
+        }
+    )
+    binding = read_catalog_binding(fs, "ws")
+    assert binding.kind == "postgres", "the connector is still postgres"
+    assert binding.server_flavour == "cockroachdb"
+    assert binding.server_version == "CockroachDB CCL v23.1.11"
+
+
+def test_a_binding_with_no_observation_reads_as_none():
+    """Never connected, or recorded by a deployment too old to write it. Either
+    way a caller must fall back to the kind rather than assume PostgreSQL."""
+    fs = _FakeFirestore()
+    write_catalog_binding(fs, "ws", kind="postgres", config={"host": "h"}, updated_by="alice")
+    binding = read_catalog_binding(fs, "ws")
+    assert binding.server_flavour is None
+    assert binding.server_version is None
+
+
+def test_recording_the_server_targets_only_its_own_two_fields():
+    """Targeted field paths, like stub_projection's listing stamp and for the
+    same reason: a binding write may land between the connection that learned
+    this and the call that records it, and must not be clobbered."""
+    fs = _FakeFirestore()
+    fs.collection("ws").document("$properties").set({"catalog": {"kind": "postgres"}})
+
+    doc = fs.collection("ws").document("$properties")
+    seen = {}
+    doc.update = lambda fields: seen.update(fields)
+
+    record_server_identity(fs, "ws", flavour="cockroachdb", version="CockroachDB v23")
+
+    assert len(seen) == 2
+    assert all("server-" in key for key in seen), seen
+    assert set(seen.values()) == {"cockroachdb", "CockroachDB v23"}
+    assert not any("kind" in key or "config" in key for key in seen)
+
+
+def test_recording_the_server_is_a_no_op_for_an_unbound_workspace():
+    """It annotates as a side effect of someone else's operation, so it must
+    never be the call that creates a document - or that puts a catalog block on
+    a native workspace."""
+    fs = _FakeFirestore()
+    record_server_identity(fs, "nowhere", flavour="cockroachdb")
+    assert read_catalog_binding(fs, "nowhere") is None
+
+    fs.collection("native_ws").document("$properties").set({"timestamp-ms": 1})
+    record_server_identity(fs, "native_ws", flavour="cockroachdb")
+    assert fs.collection("native_ws").document("$properties").get().to_dict() == {
+        "timestamp-ms": 1
+    }
+
+
+def test_rebinding_drops_the_observation():
+    """A rebind can point the workspace at a different server entirely, and
+    carrying the old engine's name forward would mark it as something it is
+    not. Same direction the listing stamps take."""
+    fs = _FakeFirestore()
+    fs.collection("ws").document("$properties").set(
+        {"catalog": {"kind": "postgres", "server-flavour": "cockroachdb"}}
+    )
+    write_catalog_binding(fs, "ws", kind="postgres", config={"host": "other"}, updated_by="bob")
+    assert read_catalog_binding(fs, "ws").server_flavour is None
