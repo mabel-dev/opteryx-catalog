@@ -445,16 +445,17 @@ def test_two_view_registrations_in_one_millisecond_keep_both_statements():
     assert statements[second]["sequence-number"] == 2
 
 
-def test_view_schema_is_stored_inline_and_cleared_when_not_given():
-    """A view's columns are DERIVED from its statement, so every registration
-    writes the answer for the body it is registering - a redefinition whose
-    shape is no longer known must clear them rather than leave the previous
-    definition's columns standing.
+def test_view_schema_is_stored_on_the_statement_it_describes():
+    """A view's columns are DERIVED from its statement and belong to it: each
+    statement version carries its own shape, and the view's schema is whichever
+    one its current statement has.
 
-    Stored in the same column spelling a dataset's schema document uses, so a
-    reader of one reads the other.
+    Stored under `columns`, in the same spelling a dataset's schema document
+    uses, so a reader of one reads the other - and the view document itself
+    holds no schema, so a redefinition cannot leave a previous shape standing.
     """
     catalog = _catalog()
+    view_ref = catalog._view_doc_ref("mart", "daily")
 
     catalog.create_view(
         "mart.daily",
@@ -462,17 +463,24 @@ def test_view_schema_is_stored_inline_and_cleared_when_not_given():
         author="alice",
         schema={"columns": [{"name": "a", "type": "VARCHAR"}, {"name": "b", "type": "INTEGER"}]},
     )
-    stored = catalog._view_doc_ref("mart", "daily").get().to_dict()["schema"]
+    first = view_ref.get().to_dict()["statement-id"]
+    stored = view_ref.collection("statement").document(first).get().to_dict()["columns"]
     assert [c["name"] for c in stored] == ["a", "b"]
     assert [c["type"] for c in stored] == ["VARCHAR", "INTEGER"]
+    assert "schema" not in view_ref.get().to_dict()
 
     loaded = catalog.load_view("mart.daily").metadata.schema
     assert [(c.name, c.type) for c in loaded.columns] == [("a", "VARCHAR"), ("b", "INTEGER")]
 
+    # Redefined without a schema: the NEW statement records none, and the old
+    # statement keeps the shape it was registered with.
     catalog.create_view(
         "mart.daily", "SELECT * FROM src.a", author="alice", update_if_exists=True
     )
-    assert catalog._view_doc_ref("mart", "daily").get().to_dict()["schema"] is None
+    second = view_ref.get().to_dict()["statement-id"]
+    assert second != first
+    assert view_ref.collection("statement").document(second).get().to_dict()["columns"] is None
+    assert view_ref.collection("statement").document(first).get().to_dict()["columns"] == stored
     assert catalog.load_view("mart.daily").metadata.schema is None
 
 
