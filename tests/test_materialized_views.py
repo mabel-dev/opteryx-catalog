@@ -1542,3 +1542,37 @@ def test_set_trigger_minimum_interval_is_how_an_existing_trigger_acquires_a_floo
         catalog.set_trigger_minimum_interval("src.a", "t1", -5, author="olive")
     with pytest.raises(TriggerNotFound):
         catalog.set_trigger_minimum_interval("src.a", "nope", 60, author="olive")
+
+
+def test_a_view_answers_schema_like_a_dataset_does():
+    """A caller asks a relation for its schema without knowing which kind it is.
+
+    `CatalogView` had no `schema()`, so a `hasattr(ds, "schema")` probe answered
+    False for every view - and odata's per-dataset $metadata described EVERY
+    view as a single placeholder column named `id` rather than its real columns.
+    """
+    catalog = _catalog()
+    columns = [{"name": "year", "type": "INTEGER"}, {"name": "cve_count", "type": "INTEGER"}]
+
+    catalog.create_view(
+        "bastian.cve_count_by_year",
+        "SELECT year, COUNT(*) AS cve_count FROM cves GROUP BY year",
+        author="justin",
+        schema={"columns": columns},
+    )
+
+    view = catalog.load_view("bastian.cve_count_by_year")
+    assert hasattr(view, "schema")
+    assert [c.name for c in view.schema().columns] == ["year", "cve_count"]
+    assert [c.type for c in view.schema().columns] == ["INTEGER", "INTEGER"]
+
+
+def test_a_view_with_no_recorded_columns_answers_none():
+    """None is "the current statement predates columns being recorded", which is
+    what keeps the caller's placeholder reachable for exactly that case - it is
+    never "this view produces no columns", which cannot happen."""
+    catalog = _catalog()
+
+    catalog.create_view("bastian.legacy", "SELECT * FROM cves", author="justin")
+
+    assert catalog.load_view("bastian.legacy").schema() is None
