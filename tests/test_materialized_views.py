@@ -445,6 +445,47 @@ def test_two_view_registrations_in_one_millisecond_keep_both_statements():
     assert statements[second]["sequence-number"] == 2
 
 
+def test_view_schema_is_stored_inline_and_cleared_when_not_given():
+    """A view's columns are DERIVED from its statement, so every registration
+    writes the answer for the body it is registering - a redefinition whose
+    shape is no longer known must clear them rather than leave the previous
+    definition's columns standing.
+
+    Stored in the same column spelling a dataset's schema document uses, so a
+    reader of one reads the other.
+    """
+    catalog = _catalog()
+
+    catalog.create_view(
+        "mart.daily",
+        "SELECT a, b FROM src.a",
+        author="alice",
+        schema={"columns": [{"name": "a", "type": "VARCHAR"}, {"name": "b", "type": "INTEGER"}]},
+    )
+    stored = catalog._view_doc_ref("mart", "daily").get().to_dict()["schema"]
+    assert [c["name"] for c in stored] == ["a", "b"]
+    assert [c["type"] for c in stored] == ["VARCHAR", "INTEGER"]
+
+    loaded = catalog.load_view("mart.daily").metadata.schema
+    assert [(c.name, c.type) for c in loaded.columns] == [("a", "VARCHAR"), ("b", "INTEGER")]
+
+    catalog.create_view(
+        "mart.daily", "SELECT * FROM src.a", author="alice", update_if_exists=True
+    )
+    assert catalog._view_doc_ref("mart", "daily").get().to_dict()["schema"] is None
+    assert catalog.load_view("mart.daily").metadata.schema is None
+
+
+def test_view_schema_must_be_a_schema():
+    """The field describes a view's output columns, and `_schema_to_columns` is
+    the one gate on what can be stored as one - a view does not get a second,
+    looser definition of a schema."""
+    catalog = _catalog()
+
+    with pytest.raises(ValueError, match="Unsupported schema type"):
+        catalog.create_view("mart.daily", "SELECT 1", author="alice", schema="a, b")
+
+
 def test_mv_can_read_another_mv():
     """Chains are allowed: mv2 reads mv1, and picks up a trigger on it."""
     catalog = _catalog()

@@ -20,6 +20,7 @@ from .audit import emit_audit
 from .catalog.dataset import _NO_SNAPSHOT_EXPECTATION
 from .catalog.dataset import SimpleDataset
 from .catalog.dataset import _as_int
+from .catalog.dataset import relation_schema_from_stored
 from .catalog.metadata import SNAPSHOT_EXPIRED_AT_KEY
 from .catalog.metadata import DatasetMetadata
 from .catalog.metadata import Snapshot
@@ -2964,7 +2965,7 @@ class OpteryxCatalog(Metastore):
         self,
         identifier: str | tuple,
         sql: str,
-        schema: Any | None = None,
+        schema: list[str] | None = None,
         author: str | None = None,
         description: str | None = None,
         properties: dict | None = None,
@@ -2973,7 +2974,22 @@ class OpteryxCatalog(Metastore):
         """Create a view document and a statement version in the `statement` subcollection.
 
         `identifier` may be a string like 'namespace.view' or a tuple ('namespace','view').
+
+        `schema` is the view's output columns, named and typed, in any of the
+        forms `_schema_to_columns` accepts - stored INLINE on the view document
+        in the same column spelling a dataset's schema document uses, so one
+        reader serves both. It is DERIVED from `sql`, so it is written on every
+        registration and never carried from the previous one: a redefinition
+        whose shape changed must not leave the old answer standing.
+
+        It is metadata. A view is expanded by planning its statement, so
+        nothing here is consulted to answer a query, and a schema that has gone
+        stale - which an inline schema over a `SELECT *` will, as soon as a
+        source gains a column - cannot produce a wrong result, only a wrong
+        description.
         """
+        stored_schema = None if schema is None else self._schema_to_columns(schema)
+
         # Normalize identifier
         if isinstance(identifier, (tuple, list)):
             collection, view_name = identifier[0], identifier[1]
@@ -3038,6 +3054,7 @@ class OpteryxCatalog(Metastore):
                 "last-execution-data-size": None,
                 "last-execution-records": None,
                 "statement-id": statement_id,
+                "schema": stored_schema,
                 "properties": properties or {},
             }
         )
@@ -3070,7 +3087,11 @@ class OpteryxCatalog(Metastore):
         # provide convenient attributes used by docs/examples
         v.sql = sql
         v.metadata = type("M", (), {})()
-        v.metadata.schema = schema
+        v.metadata.schema = (
+            None
+            if stored_schema is None
+            else relation_schema_from_stored(f"{collection}.{view_name}", stored_schema)
+        )
         # Attach catalog and identifier for describe() method
         v._catalog = self
         v._identifier = f"{collection}.{view_name}"
@@ -3095,7 +3116,15 @@ class OpteryxCatalog(Metastore):
         """Build a CatalogView from an already-fetched view doc."""
         data = doc.to_dict() or {}
         stmt_id = data.get("statement-id")
-        schema = data.get("schema")
+        # A view registered before schemas were kept has no `schema` key, which
+        # is not the same as a view with no columns - the first is unknown, and
+        # the second cannot exist.
+        stored_schema = data.get("schema")
+        schema = (
+            None
+            if stored_schema is None
+            else relation_schema_from_stored(f"{collection}.{view_name}", stored_schema)
+        )
 
         sdoc = (
             self._view_doc_ref(collection, view_name)

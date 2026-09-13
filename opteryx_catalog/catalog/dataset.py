@@ -422,6 +422,31 @@ class RelationSchema:
     columns: list
 
 
+def relation_schema_from_stored(name: str, stored_columns) -> RelationSchema:
+    """Build a dependency-free RelationSchema from stored column documents.
+
+    One reader for the stored column spelling, shared by a dataset's schema
+    document and a view's inline schema, so the two cannot describe the same
+    persisted shape differently.
+    """
+    return RelationSchema(
+        name=name,
+        columns=[
+            SchemaColumn(
+                name=c.get("name"),
+                type=_stored_type_display(c),
+                type_is_declared=c.get("type") is not None,
+                element_type=c.get("element-type") or c.get("element_type"),
+                precision=c.get("precision"),
+                scale=c.get("scale"),
+                nullable=c.get("nullable", True),
+                id=c.get("id"),
+            )
+            for c in stored_columns or []
+        ],
+    )
+
+
 def _stored_type_display(c: dict) -> str:
     """Render a stored column's type as the canonical display string (mirrors
     ``str(opteryx ColumnType)``), without needing any opteryx-core/draken
@@ -918,22 +943,7 @@ class SimpleDataset(Dataset):
 
         # Build a dependency-free RelationSchema from the stored column
         # metadata (see SchemaColumn/RelationSchema above).
-        raw = sdict.get("columns")
-
-        columns = [
-            SchemaColumn(
-                name=c.get("name"),
-                type=_stored_type_display(c),
-                type_is_declared=c.get("type") is not None,
-                element_type=c.get("element-type") or c.get("element_type"),
-                precision=c.get("precision"),
-                scale=c.get("scale"),
-                nullable=c.get("nullable", True),
-                id=c.get("id"),
-            )
-            for c in raw
-        ]
-        return RelationSchema(name=self.identifier, columns=columns)
+        return relation_schema_from_stored(self.identifier, sdict.get("columns"))
 
     def _field_id_by_name(self) -> dict[str, int]:
         """Current schema's name->field_id mapping, for keying manifest stats.
