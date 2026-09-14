@@ -102,6 +102,12 @@ class _GcsAdapterOutputFile(OutputFile):
                     # success while the object was never created. Let it raise.
                     self._stream.close()
 
+            def abort(self):
+                # Discard what was written without creating the object. A
+                # stream that never received a write has nothing to cancel.
+                if self._stream is not None:
+                    self._stream.abort()
+
         return _Writer(self._location, self._gcs_fileio)
 
 

@@ -163,28 +163,107 @@ class _GcsInputStream(io.BytesIO):
         super().__init__(response.content)
 
 
-class _GcsOutputStream(io.BytesIO):
+# Resumable upload chunking. GCS requires every non-final chunk of a resumable
+# session to be a multiple of 256 KiB; 32 MiB keeps a 4 GB data file to ~128
+# PUTs while bounding what is held in memory between them.
+RESUMABLE_CHUNK_BYTES: int = 32 * 1024 * 1024
+_RESUMABLE_CHUNK_QUANTUM: int = 256 * 1024
+# Per-request socket timeout for an upload PUT. `requests` applies this to
+# connect and to each read, not to the whole transfer, so a 32 MiB chunk is
+# not cut off mid-flight on a slow link - only a link that goes silent is.
+UPLOAD_TIMEOUT_SECONDS: int = 120
+
+
+def _split_gs(path: str) -> tuple[str, str]:
+    path = path.removeprefix("gs://")
+    bucket = path.split("/", 1)[0]
+    return bucket, path[(len(bucket) + 1) :]
+
+
+class _GcsOutputStream:
+    """A write-then-close output that STREAMS large objects.
+
+    Writes accumulate in a buffer; once it holds RESUMABLE_CHUNK_BYTES a
+    resumable upload session is opened and full chunks are PUT as they arrive,
+    so memory is bounded by the chunk size however large the object grows. An
+    object that never reaches one chunk is uploaded in one shot on close,
+    exactly as every write did before this class streamed - manifests,
+    metadata and small data files see no change in the requests made.
+
+    Bytes leave the buffer only once GCS has acknowledged them (308 with a
+    `Range` covering them, or a 200/201 finalising the object). A chunk PUT
+    that fails on a retryable status or a transport error is re-sent from the
+    offset GCS reports it committed to, never from a guess.
+
+    `abort()` cancels an open session. A stream that raised part-way is not
+    left half-uploaded: the caller (see `Dataset.open_data_file_writer`) aborts
+    it, and an unfinished resumable session never becomes an object.
+    """
+
     def __init__(
-        self, path: str, session: requests.Session, access_token_getter: Callable[[], str]
+        self,
+        path: str,
+        session: requests.Session,
+        access_token_getter: Callable[[], str],
+        chunk_bytes: int = RESUMABLE_CHUNK_BYTES,
     ):
-        super().__init__()
+        if chunk_bytes <= 0 or chunk_bytes % _RESUMABLE_CHUNK_QUANTUM != 0:
+            raise ValueError(
+                f"chunk_bytes must be a positive multiple of {_RESUMABLE_CHUNK_QUANTUM}, "
+                f"got {chunk_bytes}"
+            )
         self._path = path
         self._session = session
         self._access_token_getter = access_token_getter
+        self._chunk_bytes = chunk_bytes
+        self._buffer = bytearray()
+        self._session_uri: str | None = None
+        self._committed = 0  # bytes GCS has acknowledged
         self._closed = False
 
-    def close(self):
+    # -- the file-like surface --------------------------------------------------
+
+    def write(self, data: bytes | bytearray | memoryview) -> int:
+        if self._closed:
+            raise ValueError(f"write to closed output '{self._path}'")
+        self._buffer.extend(data)
+        while len(self._buffer) >= self._chunk_bytes:
+            self._put_chunk(final=False)
+        return len(data)
+
+    def close(self) -> None:
         if self._closed:
             return
+        if self._session_uri is None:
+            self._single_shot_upload(bytes(self._buffer))
+        else:
+            self._put_chunk(final=True)
+        self._closed = True
+        self._buffer = bytearray()
 
-        path = self._path
-        path = path.removeprefix("gs://")
+    def abort(self) -> None:
+        """Discard everything: cancel the session if one was opened.
 
-        bucket = path.split("/", 1)[0]
+        Best-effort on the wire - the caller is already handling a failure
+        and a cancel that fails changes nothing about that. A session left
+        uncancelled expires on its own and never becomes an object.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        self._buffer = bytearray()
+        if self._session_uri is None:
+            return
+        try:
+            self._session.delete(self._session_uri, timeout=10)
+        except requests.RequestException:
+            logger.warning("Could not cancel resumable upload of '%s'", self._path)
+
+    # -- single-shot (small object) ----------------------------------------------
+
+    def _single_shot_upload(self, data: bytes) -> None:
+        bucket, object_name = _split_gs(self._path)
         url = f"https://storage.googleapis.com/upload/storage/v1/b/{bucket}/o"
-
-        data = self.getvalue()
-        object_name = path[(len(bucket) + 1) :]
 
         token = self._access_token_getter()
         headers = {
@@ -207,8 +286,162 @@ class _GcsOutputStream(io.BytesIO):
                 f"Failed to write '{self._path}' - status {response.status_code}: {response.text}"
             )
 
-        self._closed = True
-        super().close()
+    # -- resumable session -----------------------------------------------------
+
+    def _auth_headers(self) -> dict:
+        token = self._access_token_getter()
+        return {"Authorization": f"Bearer {token}"} if token else {}
+
+    def _start_session(self) -> None:
+        bucket, object_name = _split_gs(self._path)
+        url = f"https://storage.googleapis.com/upload/storage/v1/b/{bucket}/o"
+        last_response = None
+        last_error = None
+        for attempt in range(MAX_ATTEMPTS):
+            if attempt:
+                time.sleep(_backoff_seconds(last_response, attempt - 1))
+            headers = self._auth_headers()
+            headers["X-Upload-Content-Type"] = "application/octet-stream"
+            headers["Content-Length"] = "0"
+            try:
+                last_error = None
+                last_response = self._session.post(
+                    url,
+                    params={"uploadType": "resumable", "name": object_name},
+                    headers=headers,
+                    timeout=30,
+                )
+            except requests.RequestException as err:
+                last_response = None
+                last_error = err
+                continue
+            if last_response.status_code in (200, 201):
+                location = last_response.headers.get("Location")
+                if not location:
+                    raise OSError(
+                        f"Failed to start upload of '{self._path}': no session URI returned"
+                    )
+                self._session_uri = location
+                return
+            if last_response.status_code not in RETRYABLE_STATUSES:
+                break
+        if last_error is not None:
+            raise OSError(
+                f"Failed to start upload of '{self._path}' after {MAX_ATTEMPTS} attempts: "
+                f"{last_error}"
+            ) from last_error
+        raise OSError(
+            f"Failed to start upload of '{self._path}' - status "
+            f"{last_response.status_code}: {last_response.text[:500]}"
+        )
+
+    def _query_committed(self) -> int | None:
+        """Ask the session how much it holds. None means the object is finished."""
+        headers = self._auth_headers()
+        headers["Content-Range"] = "bytes */*"
+        headers["Content-Length"] = "0"
+        response = self._session.put(self._session_uri, headers=headers, timeout=30)
+        if response.status_code in (200, 201):
+            return None
+        if response.status_code != 308:
+            raise OSError(
+                f"Failed to query upload of '{self._path}' - status "
+                f"{response.status_code}: {response.text[:500]}"
+            )
+        header = response.headers.get("Range")
+        if not header:
+            return 0
+        # "bytes=0-N": N is the last byte held, inclusive.
+        return int(header.split("-", 1)[1]) + 1
+
+    def _put_chunk(self, final: bool) -> None:
+        if self._session_uri is None:
+            self._start_session()
+
+        chunk = bytes(self._buffer) if final else bytes(self._buffer[: self._chunk_bytes])
+        start = self._committed
+        end_exclusive = start + len(chunk)
+        total = str(end_exclusive) if final else "*"
+
+        last_response = None
+        last_error = None
+        for attempt in range(MAX_ATTEMPTS):
+            if attempt:
+                time.sleep(_backoff_seconds(last_response, attempt - 1))
+                # Resend only what GCS has not got. It reports the offset; we
+                # never assume the failed PUT landed nothing (or everything).
+                held = self._query_committed()
+                if held is None:
+                    self._committed = end_exclusive
+                    del self._buffer[: len(chunk)]
+                    return
+                if held < start or held > end_exclusive:
+                    raise OSError(
+                        f"Upload of '{self._path}' desynchronised: GCS holds {held} bytes, "
+                        f"this chunk spans {start}-{end_exclusive}"
+                    )
+                start = held
+
+            body = chunk[start - self._committed :]
+            headers = self._auth_headers()
+            headers["Content-Length"] = str(len(body))
+            if len(body) == 0:
+                # Only reachable on a final, empty flush (the object ended
+                # exactly on a chunk boundary, or is empty): tell the session
+                # the total and let it finalise.
+                headers["Content-Range"] = f"bytes */{total}"
+            else:
+                headers["Content-Range"] = f"bytes {start}-{end_exclusive - 1}/{total}"
+            try:
+                last_error = None
+                last_response = self._session.put(
+                    self._session_uri, headers=headers, data=body, timeout=UPLOAD_TIMEOUT_SECONDS
+                )
+            except requests.RequestException as err:
+                last_response = None
+                last_error = err
+                logger.warning(
+                    "Upload chunk of '%s' failed on attempt %d/%d: %s",
+                    self._path,
+                    attempt + 1,
+                    MAX_ATTEMPTS,
+                    err,
+                )
+                continue
+
+            status = last_response.status_code
+            if (final and status in (200, 201)) or (not final and status == 308):
+                self._committed = end_exclusive
+                del self._buffer[: len(chunk)]
+                return
+            if status not in RETRYABLE_STATUSES and status != 308:
+                break
+            if status == 308 and final:
+                # Finalising PUT answered "incomplete": the next attempt asks
+                # for the committed offset and resends the remainder.
+                logger.warning(
+                    "Final upload chunk of '%s' answered 308 on attempt %d/%d",
+                    self._path,
+                    attempt + 1,
+                    MAX_ATTEMPTS,
+                )
+                continue
+            logger.warning(
+                "Upload chunk of '%s' returned %d on attempt %d/%d",
+                self._path,
+                status,
+                attempt + 1,
+                MAX_ATTEMPTS,
+            )
+
+        if last_error is not None:
+            raise OSError(
+                f"Failed to write '{self._path}' after {MAX_ATTEMPTS} attempts: {last_error}"
+            ) from last_error
+        raise OSError(
+            f"Failed to write '{self._path}' - status {last_response.status_code}: "
+            f"{last_response.text[:500]}"
+        )
 
 
 class _GcsInputFile(InputFile):

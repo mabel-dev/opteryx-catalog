@@ -108,6 +108,11 @@ class _S3OutputStream:
 
         self._closed = True
 
+    def abort(self) -> None:
+        """Discard the buffer without uploading. Nothing has reached S3 yet."""
+        self._buffer = bytearray()
+        self._closed = True
+
 
 class _S3OutputFile(OutputFile):
     def __init__(self, location: str, client, cache: _ByteBudgetLRU | None = None):

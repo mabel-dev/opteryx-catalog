@@ -20,6 +20,7 @@ from ..exceptions import SnapshotMissingError
 from ..exceptions import SummaryInconsistencyError
 from ..resource_types import ResourceType
 from .manifest import ParquetManifestEntry
+from .manifest import ParquetManifestEntryAccumulator
 from .manifest import build_parquet_manifest_entry_from_bytes
 from .manifest import build_parquet_manifest_entry_from_morsel
 from .metadata import DatasetMetadata
@@ -543,6 +544,88 @@ class Datafile:
 # "no expectation" — distinct from None, which is a real value meaning "this
 # dataset had no current snapshot yet" (the first commit of a fresh dataset).
 _NO_SNAPSHOT_EXPECTATION = object()
+
+
+class DataFileWriter:
+    """One data file, written a row group at a time, described on close.
+
+    Produced by ``SimpleDataset.open_data_file_writer``. Each ``write_row_group``
+    encodes the morsel as one parquet row group, streams its bytes to storage
+    and folds its statistics into the manifest entry ``close`` returns - so the
+    finished file never has to be read back to be registered. Memory is one
+    row group plus the upload chunk in flight, however large the file grows.
+
+    ``uncompressed_size_in_bytes`` is the running total in the manifest's own
+    unit; a caller rolling to a new file at a target size reads it after each
+    row group. ``abort`` discards the file: no object is created and no entry
+    is returned. Neither ``close`` nor ``abort`` is called for you - a writer
+    dropped without either leaves an unfinished upload session, which storage
+    expires on its own.
+    """
+
+    def __init__(self, data_path: str, stream, writer, accumulator):
+        self._data_path = data_path
+        self._stream = stream
+        self._writer = writer
+        self._accumulator = accumulator
+        self._bytes_written = 0
+        self._done = False
+
+    # The parquet writer pushes byte chunks here; they go straight to storage.
+    def _sink(self, chunk: bytes) -> None:
+        self._bytes_written += len(chunk)
+        self._stream.write(chunk)
+
+    @property
+    def data_path(self) -> str:
+        return self._data_path
+
+    @property
+    def record_count(self) -> int:
+        return self._accumulator.record_count
+
+    @property
+    def row_group_count(self) -> int:
+        return self._accumulator.row_group_count
+
+    @property
+    def uncompressed_size_in_bytes(self) -> int:
+        return self._accumulator.uncompressed_size_in_bytes
+
+    def write_row_group(self, morsel) -> None:
+        if self._done:
+            raise ValueError(f"write_row_group on a finished writer for '{self._data_path}'")
+        # Statistics first: a column the stats kernels refuse is found before
+        # any bytes of this row group are encoded or sent.
+        self._accumulator.add(morsel)
+        self._writer.write_row_group(morsel)
+
+    def close(self) -> ParquetManifestEntry:
+        """Finish the file and return its manifest entry."""
+        if self._done:
+            raise ValueError(f"close on a finished writer for '{self._data_path}'")
+        if self._accumulator.row_group_count == 0:
+            raise ValueError(
+                f"close on '{self._data_path}' with no row groups written; abort it instead"
+            )
+        self._done = True
+        self._writer.close()  # footer, through _sink
+        self._stream.close()  # the upload succeeds or raises here
+        return self._accumulator.finish(self._data_path, self._bytes_written)
+
+    def abort(self) -> None:
+        """Discard the file. Best-effort on the wire; never raises past a caller
+        that is already handling the failure which brought it here."""
+        if self._done:
+            return
+        self._done = True
+        # The parquet writer holds no footer worth writing over a truncated
+        # file; dropping it releases its native buffers.
+        self._writer = None
+        try:
+            self._stream.abort()
+        except Exception:  # storage boundary, see docstring
+            logger.warning("Could not abort data file write of '%s'", self._data_path, exc_info=True)
 
 
 @dataclass
@@ -1357,6 +1440,55 @@ class SimpleDataset(Dataset):
             )
             return table, None, False
 
+    def field_id_by_name(self) -> dict[str, int]:
+        """Current schema's name -> field_id mapping, for keying manifest stats.
+
+        The public form of `_field_id_by_name`, for producers OUTSIDE the
+        catalog that build manifest entries as they write (the engine's
+        streaming data file writer keys its statistics with this).
+        """
+        return self._field_id_by_name()
+
+    def open_data_file_writer(
+        self,
+        sorted_by: str | None = None,
+        sorted_descending: bool = False,
+        write_options: dict | None = None,
+    ) -> DataFileWriter:
+        """Open a new data file under this dataset's location for streaming.
+
+        The writer's output is registered by handing the entry `close` returns
+        to a commit that takes entries (`compaction_commit(entries=...)`), so
+        the commit never reads the file back. Nothing about the dataset changes
+        until such a commit; a writer that is aborted leaves no object behind.
+
+        `sorted_by` / `sorted_descending` are the row-group ordering claim
+        written into the file (see rugo's write_parquet). It is the CALLER's
+        assertion about the rows it is about to write and is not verified here;
+        a false claim is a correctness bug in the caller. `write_options`
+        defaults to WRITE_PARQUET_OPTIONS; pass COMPACTION_WRITE_PARQUET_OPTIONS
+        for a rewrite that is read many times.
+        """
+        from rugo.parquet import open_parquet_writer
+
+        from ..iops.fileio import WRITE_PARQUET_OPTIONS
+
+        fname = f"{time.time_ns():x}-{self._get_node()}.parquet"
+        data_path = f"{self.metadata.location}/data/{fname}"
+
+        options = dict(WRITE_PARQUET_OPTIONS if write_options is None else write_options)
+        if sorted_by is not None:
+            options["sorted_by"] = sorted_by
+            options["sorted_descending"] = sorted_descending
+
+        stream = self.io.new_output(data_path).create()
+        accumulator = ParquetManifestEntryAccumulator(
+            field_id_by_name=self._field_id_by_name(), exact_histograms=False
+        )
+        handle = DataFileWriter(data_path, stream, None, accumulator)
+        handle._writer = open_parquet_writer(handle._sink, **options)
+        return handle
+
     def _write_table_and_build_entry(self, table: Any):
         """Write a draken Morsel to storage and return a ParquetManifestEntry.
 
@@ -1704,6 +1836,35 @@ class SimpleDataset(Dataset):
 
         self._after_commit(author, snap)
 
+    def _entries_from_prebuilt(self, entries: list, existing_paths: set[str]) -> list[dict]:
+        """Accept manifest entries a writer built as it wrote.
+
+        The same admission rules as `_build_entries_for_files` - a path already
+        in the manifest or named twice is taken once, only Parquet is accepted -
+        without the read-back, because the producer had every row in hand. An
+        entry without a path or a record count is refused: it cannot take part
+        in the row-count invariant, and registering it would hand the planner a
+        file it knows nothing about.
+        """
+        out: list[dict] = []
+        seen: set = set()
+        for entry in entries:
+            row = entry.to_dict() if isinstance(entry, ParquetManifestEntry) else entry
+            if not isinstance(row, dict):
+                raise TypeError(f"manifest entry must be a dict or ParquetManifestEntry, got {type(row).__name__}")
+            fp = row.get("file_path")
+            if not fp:
+                raise ValueError("manifest entry has no file_path")
+            if row.get("record_count") is None:
+                raise ValueError(f"manifest entry for {fp} has no record_count")
+            if fp in existing_paths or fp in seen:
+                continue
+            if not fp.lower().endswith(".parquet"):
+                continue
+            seen.add(fp)
+            out.append(row)
+        return out
+
     def _build_entries_for_files(
         self,
         files: "list[str] | None",
@@ -1775,14 +1936,21 @@ class SimpleDataset(Dataset):
 
     def add_files(
         self,
-        files: list[str],
+        files: list[str] | None = None,
         author: str | None = None,
         commit_message: str | None = None,
         footer_only: bool = False,
         read_sources: Iterable[Any] | None = None,
         produced_by: str | None = None,
+        entries: Iterable[dict] | None = None,
     ):
-        """Add filenames to the dataset manifest without writing the files.
+        """Add data files to the dataset manifest without writing the files.
+
+        The files arrive in ONE of two forms: ``entries``, manifest entry dicts
+        the writer built as it wrote (``DataFileWriter.close().to_dict()``), or
+        ``files``, paths already in storage that this method reads back and
+        decodes to describe. A producer that has the entries passes them: the
+        read-back is a full extra pass over every byte it just wrote.
 
         `read_sources` is the provenance receipt (PROVENANCE_DESIGN.md S2.1):
         every `(dataset, snapshot_id, resolved_by)` the statement that produced
@@ -1823,7 +1991,12 @@ class SimpleDataset(Dataset):
             e.get("file_path") for e in prev_entries if isinstance(e, dict) and e.get("file_path")
         }
 
-        new_entries = self._build_entries_for_files(files, existing, footer_only=footer_only)
+        if entries is not None and files:
+            raise ValueError("add_files takes entries OR files, not both")
+        if entries is not None:
+            new_entries = self._entries_from_prebuilt(list(entries), existing)
+        else:
+            new_entries = self._build_entries_for_files(files, existing, footer_only=footer_only)
 
         merged_entries = prev_entries + new_entries
 
@@ -1897,19 +2070,24 @@ class SimpleDataset(Dataset):
 
     def truncate_and_add_files(
         self,
-        files: list[str],
+        files: list[str] | None = None,
         author: str | None = None,
         commit_message: str | None = None,
         read_sources: Iterable[Any] | None = None,
         produced_by: str | None = None,
         preserves_sources: bool = False,
+        entries: Iterable[dict] | None = None,
     ):
         """Truncate dataset (logical) and set manifest to provided files.
 
-        - Writes a manifest that contains exactly the unique filenames provided.
+        - Writes a manifest that contains exactly the unique files provided,
+          given as ``entries`` (manifest rows the writer built as it wrote -
+          no read-back) or as ``files`` (paths read back and decoded here).
         - Does not delete objects from storage.
         - Useful for replace/overwrite semantics.
         """
+        if entries is not None and files:
+            raise ValueError("truncate_and_add_files takes entries OR files, not both")
         if author is None:
             raise ValueError("author must be provided when truncating/adding files")
 
@@ -1929,68 +2107,71 @@ class SimpleDataset(Dataset):
             prev_total_size = _as_int(prev.summary.get("total-files-size")) or 0
             prev_total_records = _as_int(prev.summary.get("total-records")) or 0
 
-        # Build unique new entries (ignore duplicates in input). Only accept
-        # parquet files and compute full statistics for each file.
-        new_entries = []
-        seen = set()
-        for fp in files:
-            if not fp or fp in seen:
-                continue
-            if not fp.lower().endswith(".parquet"):
-                continue
-            seen.add(fp)
+        if entries is not None:
+            new_entries = self._entries_from_prebuilt(list(entries), set())
+        else:
+            # Build unique new entries (ignore duplicates in input). Only accept
+            # parquet files and compute full statistics for each file.
+            new_entries = []
+            seen = set()
+            for fp in files or ():
+                if not fp or fp in seen:
+                    continue
+                if not fp.lower().endswith(".parquet"):
+                    continue
+                seen.add(fp)
 
-            try:
-                data = None
-                if self.io and hasattr(self.io, "new_input"):
-                    inp = self.io.new_input(fp)
-                    with inp.open() as f:
-                        data = f.read()
-                else:
-                    if (
-                        self.catalog
-                        and getattr(self.catalog, "_storage_client", None)
-                        and getattr(self.catalog, "gcs_bucket", None)
-                    ):
-                        bucket = self.catalog._storage_client.bucket(self.catalog.gcs_bucket)
-                        parsed = fp
-                        if parsed.startswith("gs://"):
-                            parsed = parsed[5 + len(self.catalog.gcs_bucket) + 1 :]
-                        blob = bucket.blob(parsed)
-                        data = blob.download_as_bytes()
+                try:
+                    data = None
+                    if self.io and hasattr(self.io, "new_input"):
+                        inp = self.io.new_input(fp)
+                        with inp.open() as f:
+                            data = f.read()
+                    else:
+                        if (
+                            self.catalog
+                            and getattr(self.catalog, "_storage_client", None)
+                            and getattr(self.catalog, "gcs_bucket", None)
+                        ):
+                            bucket = self.catalog._storage_client.bucket(self.catalog.gcs_bucket)
+                            parsed = fp
+                            if parsed.startswith("gs://"):
+                                parsed = parsed[5 + len(self.catalog.gcs_bucket) + 1 :]
+                            blob = bucket.blob(parsed)
+                            data = blob.download_as_bytes()
 
-                if data:
-                    # Compute statistics using a single read of the compressed bytes
-                    file_size = len(data)
-                    manifest_entry = build_parquet_manifest_entry_from_bytes(
-                        data, fp, file_size, field_id_by_name=self._field_id_by_name()
-                    )
-                else:
-                    # A genuinely empty object is a real state, not a failure:
-                    # it holds no rows, and a zero-row entry describes it
-                    # honestly. Only an unreadable file goes to the handler.
-                    manifest_entry = ParquetManifestEntry(
-                        file_path=fp,
-                        file_format="parquet",
-                        record_count=0,
-                        null_counts=[],
-                        file_size_in_bytes=0,
-                        uncompressed_size_in_bytes=0,
-                        column_uncompressed_sizes_in_bytes=[],
-                        min_k_hashes=[],
-                        histogram_counts=[],
-                        histogram_bins=0,
-                        min_values=[],
-                        max_values=[],
-                        min_lengths=[],
-                        max_lengths=[],
-                    )
-            except Exception as err:
-                raise AddFilesReadError(
-                    f"Cannot read {fp} to add it to {self.identifier}: {err}. "
-                    "Refusing to register a file whose statistics are unknown."
-                ) from err
-            new_entries.append(manifest_entry.to_dict())
+                    if data:
+                        # Compute statistics using a single read of the compressed bytes
+                        file_size = len(data)
+                        manifest_entry = build_parquet_manifest_entry_from_bytes(
+                            data, fp, file_size, field_id_by_name=self._field_id_by_name()
+                        )
+                    else:
+                        # A genuinely empty object is a real state, not a failure:
+                        # it holds no rows, and a zero-row entry describes it
+                        # honestly. Only an unreadable file goes to the handler.
+                        manifest_entry = ParquetManifestEntry(
+                            file_path=fp,
+                            file_format="parquet",
+                            record_count=0,
+                            null_counts=[],
+                            file_size_in_bytes=0,
+                            uncompressed_size_in_bytes=0,
+                            column_uncompressed_sizes_in_bytes=[],
+                            min_k_hashes=[],
+                            histogram_counts=[],
+                            histogram_bins=0,
+                            min_values=[],
+                            max_values=[],
+                            min_lengths=[],
+                            max_lengths=[],
+                        )
+                except Exception as err:
+                    raise AddFilesReadError(
+                        f"Cannot read {fp} to add it to {self.identifier}: {err}. "
+                        "Refusing to register a file whose statistics are unknown."
+                    ) from err
+                new_entries.append(manifest_entry.to_dict())
 
         manifest_path = None
         if self.catalog and hasattr(self.catalog, "write_parquet_manifest"):
@@ -2369,19 +2550,25 @@ class SimpleDataset(Dataset):
 
     def compaction_commit(
         self,
-        files: "Iterable[str]",
-        retired_files: "Iterable[str]",
+        files: Iterable[str] | None = None,
+        retired_files: Iterable[str] | None = None,
         author: str | None = None,
         baseline_snapshot_id: int | None = None,
         commit_message: str | None = None,
         agent: str = "opteryx-engine",
+        entries: Iterable[dict] | None = None,
     ):
         """Retire whole data files and add their replacements, in ONE snapshot.
 
-        The commit half of compaction. ``files`` are paths already written to
-        storage; ``retired_files`` are the paths they replace. Both halves land
-        together because a reader that saw either alone would see those rows
-        twice or not at all.
+        The commit half of compaction. The replacements arrive in ONE of two
+        forms: ``entries``, manifest entry dicts the writer built as it wrote
+        (``DataFileWriter.close().to_dict()``), or ``files``, paths already
+        written to storage that this method reads back and decodes to build
+        entries for. A producer that has the entries passes them: reading a
+        4 GB output back to describe it is a full extra pass over every byte
+        compaction just wrote. ``retired_files`` are the paths the outputs
+        replace. Both halves land together because a reader that saw either
+        alone would see those rows twice or not at all.
 
         WHOLE-FILE retirement, deliberately distinct from ``merge_commit``'s
         row-ordinal form. Compaction replaces files wholesale, and saying that by
@@ -2444,7 +2631,12 @@ class SimpleDataset(Dataset):
             )
 
         existing = {e.get("file_path") for e in retained if e.get("file_path")}
-        new_entries = self._build_entries_for_files(list(files), existing)
+        if entries is not None and files is not None:
+            raise ValueError("compaction_commit takes entries OR files, not both")
+        if entries is not None:
+            new_entries = self._entries_from_prebuilt(list(entries), existing)
+        else:
+            new_entries = self._build_entries_for_files(list(files or ()), existing)
         if not new_entries:
             raise CompactionInvariantError("compaction_commit wrote no readable output files")
 
@@ -2529,14 +2721,15 @@ class SimpleDataset(Dataset):
 
     def merge_commit(
         self,
-        files: "Iterable[str]",
-        positions: "dict[str, Iterable[int]]",
+        files: Iterable[str] | None = None,
+        positions: dict[str, Iterable[int]] | None = None,
         author: str | None = None,
         commit_message: str | None = None,
         footer_only: bool = False,
         operation: str = "merge",
         read_sources: Iterable[Any] | None = None,
         produced_by: str | None = None,
+        entries: Iterable[dict] | None = None,
     ) -> Snapshot:
         """Register data files AND mark row ordinals deleted, in ONE snapshot.
 
@@ -2552,7 +2745,9 @@ class SimpleDataset(Dataset):
         snapshot, which is how an insert-only MERGE bootstraps a relation that
         was created but never written to.
 
-        `files` are paths already written to storage, as `add_files` takes
+        The files to add arrive as `entries` (manifest rows the writer built
+        as it wrote - no read-back) or as `files`, paths already written to
+        storage that are read back and decoded here, as `add_files` takes
         them. `positions` maps data-file paths in the CURRENT manifest to
         file-local, zero-based ordinals in physical row order, as `delete_rows`
         takes them. Either may be empty — an insert-only merge names no
@@ -2587,7 +2782,10 @@ class SimpleDataset(Dataset):
 
         files = list(files or ())
         positions = positions or {}
-        if not files and not positions:
+        if entries is not None and files:
+            raise ValueError("merge_commit takes entries OR files, not both")
+        prebuilt = list(entries) if entries is not None else None
+        if not files and not prebuilt and not positions:
             raise ValueError("merge_commit requires files to add, positions to delete, or both")
 
         # A relation that exists but has never been committed to has NO parent
@@ -2681,7 +2879,12 @@ class SimpleDataset(Dataset):
 
         # New files carry no delete debt: nothing can have marked a row of a
         # file that did not exist until this commit.
-        added_entries = self._build_entries_for_files(files, set(by_path), footer_only=footer_only)
+        if prebuilt is not None:
+            added_entries = self._entries_from_prebuilt(prebuilt, set(by_path))
+        else:
+            added_entries = self._build_entries_for_files(
+                files, set(by_path), footer_only=footer_only
+            )
 
         if not added_entries and newly_deleted == 0 and not removed_entries:
             raise ValueError(
