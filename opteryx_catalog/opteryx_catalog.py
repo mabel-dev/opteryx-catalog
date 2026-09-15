@@ -7410,6 +7410,15 @@ class OpteryxCatalog(Metastore):
             "element_min_values": "ARRAY",
             "element_max_values": "ARRAY",
             "element_min_k_hashes": "ARRAY",
+            # Per-column distinct-value count, for a producer whose source
+            # publishes NDV as a NUMBER rather than as the hashes a KMV sketch
+            # is made of (a PostgreSQL/CockroachDB statistics refresh). Empty
+            # for everything this catalog computes itself, which has
+            # `min_k_hashes` and does not need it, and empty on every manifest
+            # written before this existed - readers must treat that as "not
+            # computed", never as "no distinct values". ESTIMATE-ONLY: readers
+            # mark it is_exact=False so it can never be taken as a BOUND.
+            "distinct_counts": "ARRAY",
             # Merge-on-read deletes: which sidecar holds this data file's
             # delete vector, and how many of its rows are deleted. NULL / 0
             # (including on every manifest written before these columns
@@ -7456,6 +7465,7 @@ class OpteryxCatalog(Metastore):
             e.setdefault("element_min_values", [])
             e.setdefault("element_max_values", [])
             e.setdefault("element_min_k_hashes", [])
+            e.setdefault("distinct_counts", [])
             # delete_file_path is a nullable VARCHAR: None IS the "no deletes"
             # value, so setdefault only ensures the key exists for the writer.
             e.setdefault("delete_file_path", None)

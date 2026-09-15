@@ -83,6 +83,23 @@ class ParquetManifestEntry:
     element_min_values: list = field(default_factory=list)
     element_max_values: list = field(default_factory=list)
     element_min_k_hashes: list[list[int]] = field(default_factory=list)
+    # Per-column distinct-value count, same order/index as every list above.
+    #
+    # OPTIONAL and ESTIMATE-ONLY, and it exists for a producer whose source
+    # publishes NDV as a NUMBER rather than as something mergeable: a
+    # PostgreSQL/CockroachDB statistics refresh reads a count (`pg_stats`'
+    # n_distinct, `SHOW STATISTICS`' distinct_count) and a count cannot be
+    # merged into the `min_k_hashes` sketch the rest of this format carries
+    # NDV in. Empty for everything this catalog computes itself, which has the
+    # sketches and does not need it.
+    #
+    # The reader marks every count it returns is_exact=False. That is the safe
+    # direction: an exact count read back as an estimate loses an optimisation,
+    # where an estimate read back as exact would lose ROWS - it would become
+    # reachable as a BOUND, which prunes files and answers DISTINCT without
+    # reading. Empty on every manifest written before this existed, which
+    # readers must treat as "not computed", never as "no distinct values".
+    distinct_counts: list[int] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -106,6 +123,7 @@ class ParquetManifestEntry:
             "element_min_values": self.element_min_values,
             "element_max_values": self.element_max_values,
             "element_min_k_hashes": self.element_min_k_hashes,
+            "distinct_counts": self.distinct_counts,
         }
 
 

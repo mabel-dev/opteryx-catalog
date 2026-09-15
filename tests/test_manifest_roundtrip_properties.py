@@ -50,6 +50,13 @@ _FLAT_INT_ARRAY_COLUMNS = (
     "max_lengths",
     "field_ids",
     "char_total_bytes",
+    # OPTIONAL and ESTIMATE-ONLY, for a producer whose source publishes NDV as
+    # a count rather than as the hashes a KMV sketch is made of (a
+    # PostgreSQL/CockroachDB statistics refresh). Listed here so the generator
+    # also covers the case that matters most for it: an entry written BEFORE
+    # the column existed, which lacks the key entirely and must fill to empty
+    # rather than raise.
+    "distinct_counts",
 )
 _NESTED_INT_ARRAY_COLUMNS = ("histogram_counts", "char_class_counts")
 _NULL_FILLED_SCALARS = ("record_count", "file_size_in_bytes", "uncompressed_size_in_bytes")
