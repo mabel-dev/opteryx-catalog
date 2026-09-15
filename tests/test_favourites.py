@@ -47,11 +47,27 @@ class _Ref:
         self.client.docs.pop(self.path, None)
         self.client.log.append(("delete", "/".join(self.path)))
 
+    def stream(self):
+        """Documents directly under this collection path."""
+        if self.client.fail:
+            raise RuntimeError("firestore hiccup")
+        self.client.stream_calls += 1
+        depth = len(self.path)
+        return [
+            _Snap(_Ref(self.client, p), True)
+            for p in self.client.docs
+            if len(p) == depth + 1 and p[:depth] == self.path
+        ]
+
 
 class _Snap:
     def __init__(self, ref, exists):
         self.reference = ref
         self.exists = exists
+
+    @property
+    def id(self):
+        return self.reference.id
 
 
 class _Client:
@@ -60,6 +76,7 @@ class _Client:
         self.log = []
         self.fail = fail
         self.get_all_calls = 0
+        self.stream_calls = 0
 
     def collection(self, name):
         return _Ref(self, (name,))
@@ -151,3 +168,40 @@ def test_input_is_deduplicated_and_blanks_are_dropped():
 def test_a_failing_read_is_an_empty_list_not_a_raise():
     db = _Client(fail=True)
     assert F.starred_workspaces(db, ["erp", "ledger"], "alice") == []
+
+
+# ---------------------------------------------------------------------------
+# The other direction: who starred this workspace
+# ---------------------------------------------------------------------------
+def test_starred_principals_lists_one_workspaces_stars_without_a_query():
+    db = _Client()
+    F.star(db, "erp", "alice")
+    F.star(db, "erp", "bob")
+    F.star(db, "ledger", "carol")  # a different workspace is not included
+
+    assert F.starred_principals(db, "erp") == ["alice", "bob"]
+    assert db.stream_calls == 1  # a plain listing, not a collection-group scan
+
+
+def test_starred_principals_is_sorted_and_empty_when_nobody_has():
+    db = _Client()
+    for who in ("zoe", "alice", "mo"):
+        F.star(db, "erp", who)
+    assert F.starred_principals(db, "erp") == ["alice", "mo", "zoe"]
+    assert F.starred_principals(db, "never-starred") == []
+
+
+def test_starred_principals_reports_what_is_on_disk_not_who_still_has_access():
+    """A revoked principal leaves their star behind. Telling that from a live
+    one needs the current grants, which only the caller has - so this returns
+    storage and control filters it. Pinned so the boundary does not drift."""
+    db = _Client()
+    F.star(db, "erp", "revoked-last-week")
+    assert F.starred_principals(db, "erp") == ["revoked-last-week"]
+
+
+def test_a_failing_listing_is_empty_not_a_partial_answer():
+    db = _Client()
+    F.star(db, "erp", "alice")
+    db.fail = True
+    assert F.starred_principals(db, "erp") == []

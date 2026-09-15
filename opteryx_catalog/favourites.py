@@ -129,6 +129,32 @@ def unstar(firestore_client, workspace: str, principal: str) -> None:
     starred_ref(firestore_client, workspace, principal).delete()
 
 
+def starred_principals(firestore_client, workspace: str) -> list[str]:
+    """Every principal who has starred `workspace`, as stored.
+
+    The OTHER direction of the edge, and the reason it is stored on the
+    workspace side at all: a plain subcollection listing on one workspace, no
+    query and no index, where a per-user model would have needed a
+    collection-group scan to answer the same thing.
+
+    Returns what is ON DISK, which is not the same as "who currently has this
+    workspace starred": a principal whose access was revoked leaves their
+    star behind, and nothing here can tell that from a live one. Filtering
+    against current grants is the caller's, because only the caller knows
+    which grants are current -- see control.opteryx's favourites route, which
+    does exactly that before it reports a count to a workspace owner.
+
+    Sorted, so a caller comparing two reads sees a stable order rather than
+    Firestore's. Fails CLOSED for the same reason `starred_workspaces` does:
+    an error is no principals, never a partial list presented as a whole one.
+    """
+    try:
+        docs = starred_collection(firestore_client, workspace).stream()
+        return sorted(doc.id for doc in docs)
+    except Exception:
+        return []
+
+
 def starred_workspaces(firestore_client, workspaces: Iterable[str], principal: str) -> list[str]:
     """Which of `workspaces` `principal` has starred, in one round trip.
 
@@ -169,6 +195,7 @@ __all__ = [
     "WILDCARD_PRINCIPAL",
     "starred_collection",
     "starred_ref",
+    "starred_principals",
     "star",
     "unstar",
     "starred_workspaces",
