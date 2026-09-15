@@ -614,20 +614,29 @@ The queries this package makes, and the index each needs:
 |---|---|---|---|
 | `trigger_firing._due_schedule_triggers` | `triggers` | `` `event-kind` ``, `` `next-due-at-ms` `` | composite, ASC/ASC ✅ exists |
 | `impact.find_impacted` | `datasets` | `sources` | `COLLECTION_GROUP_CONTAINS` ✅ exists |
-| `impact.find_readers` | `snapshots` | `` `read-source-keys` `` | `COLLECTION_GROUP_CONTAINS` ⛔ create before the engine ships |
+| `impact.find_readers` | `snapshots` | `` `read-source-keys` `` | `COLLECTION_GROUP_CONTAINS` ✅ exists |
 | `list_relationships` | `relationships` | `` `references-*` `` | composite ✅ exists |
 | listener lookups | `listeners` | `workspace`, `user` | composite ✅ exists |
 
-The single-field ones are created with `indexes fields update`, not
-`indexes composite create`:
+**Do not create these by hand.** They are declared as Terraform in
+opteryx-infra `firestore-terraform/` - both databases, one file - and that
+config is the answer to "what indexes exist". Creating one out of band is how
+the previous list drifted from production: this table claimed the `snapshots`
+index still needed creating long after it existed, and documented a
+`` `target-view` `` index on `triggers` that was never created and that nothing
+queries (every reference to that field reads it off an already-fetched
+document). Both are corrected above.
 
-```bash
-gcloud firestore indexes fields update '`target-view`' --collection-group=triggers --project=mabeldev --database=catalogs --index=order=ascending,query-scope=collection-group
-```
+Two things to know if you add one:
 
-An `array_contains` field takes `--index=array-config=contains,query-scope=collection-group`
-instead. The `FAILED_PRECONDITION` message also carries a console link that
-creates exactly the right index, which is the least error-prone route.
+- The single-field ones are `google_firestore_field` with an `index_config`
+  block, not `google_firestore_index` - the gcloud spelling is
+  `indexes fields update`, not `indexes composite create`. An `array_contains`
+  field takes `array_config = "CONTAINS"` rather than an `order`.
+- `index_config` declares a field's *entire* configuration. Listing only the
+  collection-group index strips the automatic collection-scoped ones. That has
+  already happened to `datasets.sources` and `snapshots.`` `read-source-keys` ``
+  via gcloud, which replaces the same way.
 
 **Building one backfills the whole collection group**, so the `snapshots`
 index is the expensive one - it visits every snapshot document in the

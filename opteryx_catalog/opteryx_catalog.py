@@ -14,6 +14,10 @@ from google.cloud import storage
 
 from .alerts import report as _alert
 from .audit import emit_audit
+from .billing_index import BILLING_ACCOUNT_SUBCOLLECTION
+from .billing_index import BILLING_DOC
+from .billing_index import clear_billing_index
+from .billing_index import write_billing_index
 
 # The "no expectation" sentinel for save_dataset_metadata, defined with the
 # commit paths that pass it (catalog/dataset.py).
@@ -2248,6 +2252,18 @@ class OpteryxCatalog(Metastore):
         # would add its own delivery-reliability question if it did.
         self._delete_subcollection(self._catalog_ref.document("$policies").collection("access"))
 
+        # The billing index (`$billing/billing-account`), for a sharper reason
+        # than the grants: the account listing and the storage-billing sweep
+        # are DRIVEN by it. Left behind, a dropped workspace does not merely
+        # linger as an orphan - it keeps appearing in its account's rail and
+        # keeps being attributed in billing, resurrected by the one document
+        # that says who it belonged to. Cleared before `$properties` so that a
+        # crash between the two leaves an unindexed-but-present workspace (the
+        # backfill's case) rather than an indexed-but-absent one.
+        self._delete_subcollection(
+            self._catalog_ref.document(BILLING_DOC).collection(BILLING_ACCOUNT_SUBCOLLECTION)
+        )
+
         self._catalog_ref.document("$properties").delete()
 
         send_webhook(
@@ -2302,6 +2318,13 @@ class OpteryxCatalog(Metastore):
         # reason drop_workspace clears them: left behind, they silently
         # reactivate if this workspace name is ever reused.
         self._delete_subcollection(self._catalog_ref.document("$policies").collection("access"))
+
+        # And the billing index, for the reason drop_workspace gives: it is
+        # what the account listing and billing attribution read, so a stale
+        # one resurrects the workspace rather than merely littering.
+        self._delete_subcollection(
+            self._catalog_ref.document(BILLING_DOC).collection(BILLING_ACCOUNT_SUBCOLLECTION)
+        )
 
         self._catalog_ref.document("$properties").delete()
 
@@ -2804,6 +2827,50 @@ class OpteryxCatalog(Metastore):
             resource=self.workspace,
             author=author,
             properties=sorted(properties),
+        )
+
+    def set_billing_account(self, account_id: str | None, author: str | None = None) -> None:
+        """Record which billing account this workspace bills to - or that it
+        bills to nobody - in ONE write.
+
+        Two documents say who pays: `$properties['billing-account-id']`, the
+        truth and the claim on the name, and `$billing/billing-account/current`,
+        the copy a collection-group query can reach (see `billing_index.py`).
+        They must never disagree, and they live in the same database precisely
+        so that they cannot: both go in a single Firestore batch here, and
+        either both land or neither does. Nothing else should write either one.
+
+        `account_id=None` is the unbilled state - platform, test and reserved
+        namespaces - and is legitimate: the truth reads None and the index
+        document is removed, so the workspace is absent from every account's
+        listing and unpriced in billing attribution rather than defaulted.
+
+        `set(merge=True)` on `$properties` for the reason `set_workspace_properties`
+        gives: the constructor's seeding write is best-effort, and a workspace
+        whose document never landed gets one here instead of a NotFound.
+        """
+        now_ms = int(time.time() * 1000)
+        batch = self.firestore_client.batch()
+        batch.set(
+            self._catalog_ref.document("$properties"),
+            {"billing-account-id": account_id or None, "timestamp-ms": now_ms},
+            merge=True,
+        )
+        if account_id:
+            write_billing_index(
+                self.firestore_client, self.workspace, account_id, batch=batch, now_ms=now_ms
+            )
+        else:
+            clear_billing_index(self.firestore_client, self.workspace, batch=batch)
+        batch.commit()
+
+        emit_audit(
+            "set_billing_account",
+            resource_type=ResourceType.WORKSPACE,
+            workspace=self.workspace,
+            resource=self.workspace,
+            author=author,
+            billing_account=account_id,
         )
 
     def list_datasets(self, collection: str) -> Iterable[str]:

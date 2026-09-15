@@ -377,6 +377,29 @@ def test_drop_workspace_clears_policy_opteryx_access_grants():
     assert ("delete", "grant2") in log
 
 
+def test_drop_workspace_clears_the_billing_index():
+    """`$billing/billing-account/current` is what the account listing and the
+    storage-billing sweep are driven by. Left behind, a dropped workspace is
+    not an orphan - it is resurrected: still listed under its account, still
+    attributed in billing. So it goes with the grants, and before
+    `$properties`, so a crash between the two leaves a workspace the backfill
+    can re-index rather than an index pointing at nothing."""
+    catalog, catalog_collection, _dropped, log = _catalog_with_contents(
+        props_data={"deletion_protection": False},
+        collections={},
+    )
+    index_coll = catalog_collection.document("$billing").collection("billing-account")
+    index_coll._docs["current"] = _DocRef(
+        "current", data={"account_id": "acct_1", "workspace": "ws"}, exists=True, log=log
+    )
+
+    with patch("opteryx_catalog.opteryx_catalog.send_webhook"):
+        catalog.drop_workspace(author="alice")
+
+    assert ("delete", "current") in log
+    assert log.index(("delete", "current")) < log.index(("delete", "$properties"))
+
+
 def test_drop_workspace_tolerates_a_collection_with_no_document_of_its_own():
     """A collection created only implicitly - by a dataset inside it, never
     through create_collection() - stops existing on its own once its last
