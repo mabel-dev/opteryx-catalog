@@ -377,6 +377,28 @@ def test_drop_workspace_clears_policy_opteryx_access_grants():
     assert ("delete", "grant2") in log
 
 
+def test_drop_workspace_clears_the_favourites():
+    """`$favourites/starred` is keyed by the same principal as the grants and
+    left behind it fails the same way: a later workspace created under this
+    name arrives already starred by strangers, and its owner can neither see
+    why nor clear it. Not caught by the `$`-skipping loop, so cleared by
+    name - see opteryx_catalog.favourites."""
+    catalog, catalog_collection, _dropped, log = _catalog_with_contents(
+        props_data={"deletion_protection": False},
+        collections={},
+    )
+    starred = catalog_collection.document("$favourites").collection("starred")
+    starred._docs["alice"] = _DocRef("alice", data={"starred_at_ms": 1}, exists=True, log=log)
+    starred._docs["bob"] = _DocRef("bob", data={"starred_at_ms": 2}, exists=True, log=log)
+
+    with patch("opteryx_catalog.opteryx_catalog.send_webhook"):
+        catalog.drop_workspace(author="alice")
+
+    assert ("delete", "alice") in log
+    assert ("delete", "bob") in log
+    assert log.index(("delete", "alice")) < log.index(("delete", "$properties"))
+
+
 def test_drop_workspace_clears_the_billing_index():
     """`$billing/billing-account/current` is what the account listing and the
     storage-billing sweep are driven by. Left behind, a dropped workspace is
@@ -755,6 +777,19 @@ def test_unlink_still_clears_the_access_grants():
     catalog, catalog_collection, _reached, log = _bound_catalog()
     grants = catalog_collection.document("$policies").collection("access")
     grants.document("reader@example.com")
+
+    with patch("opteryx_catalog.opteryx_catalog.send_webhook"):
+        catalog.drop_workspace(author="alice")
+
+    assert ("delete", "reader@example.com") in log
+
+
+def test_unlink_still_clears_the_favourites():
+    # Same reason it clears the grants: a star left behind reactivates on
+    # name reuse exactly as a grant does.
+    catalog, catalog_collection, _reached, log = _bound_catalog()
+    starred = catalog_collection.document("$favourites").collection("starred")
+    starred.document("reader@example.com")
 
     with patch("opteryx_catalog.opteryx_catalog.send_webhook"):
         catalog.drop_workspace(author="alice")

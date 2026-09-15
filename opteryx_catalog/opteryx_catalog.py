@@ -18,6 +18,8 @@ from .billing_index import BILLING_ACCOUNT_SUBCOLLECTION
 from .billing_index import BILLING_DOC
 from .billing_index import clear_billing_index
 from .billing_index import write_billing_index
+from .favourites import FAVOURITES_DOC
+from .favourites import STARRED_SUBCOLLECTION
 
 # The "no expectation" sentinel for save_dataset_metadata, defined with the
 # commit paths that pass it (catalog/dataset.py).
@@ -2252,6 +2254,17 @@ class OpteryxCatalog(Metastore):
         # would add its own delivery-reliability question if it did.
         self._delete_subcollection(self._catalog_ref.document("$policies").collection("access"))
 
+        # Favourites (`$favourites/starred`), for the same reason as the
+        # grants and keyed by the same principal: left behind, they silently
+        # reactivate if this workspace name is ever reused, and the next
+        # workspace created under it arrives already starred by strangers -
+        # which its owner can neither see the cause of nor clear. Not caught
+        # by the `$`-skipping loop above, so cleared by name. See
+        # favourites.py.
+        self._delete_subcollection(
+            self._catalog_ref.document(FAVOURITES_DOC).collection(STARRED_SUBCOLLECTION)
+        )
+
         # The billing index (`$billing/billing-account`), for a sharper reason
         # than the grants: the account listing and the storage-billing sweep
         # are DRIVEN by it. Left behind, a dropped workspace does not merely
@@ -2318,6 +2331,12 @@ class OpteryxCatalog(Metastore):
         # reason drop_workspace clears them: left behind, they silently
         # reactivate if this workspace name is ever reused.
         self._delete_subcollection(self._catalog_ref.document("$policies").collection("access"))
+
+        # And the favourites, for the reason drop_workspace gives: a star
+        # left behind reactivates on name reuse exactly as a grant does.
+        self._delete_subcollection(
+            self._catalog_ref.document(FAVOURITES_DOC).collection(STARRED_SUBCOLLECTION)
+        )
 
         # And the billing index, for the reason drop_workspace gives: it is
         # what the account listing and billing attribution read, so a stale
