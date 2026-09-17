@@ -111,6 +111,17 @@ class DatasetMetadata:
     # for the usual pointer to hang off. Same file format and same reader as a
     # snapshot's `manifest_list` - see stub_projection's `manifest-list`.
     manifest_list: str | None = None
+    # What the last refresh established about the relation as a WHOLE - today
+    # `row-count` and `total-file-size-bytes`. Only a dataset PROJECTED from an
+    # external catalog has one: a native relation's equivalents are derived from
+    # its snapshot and its manifest, which are the truth for it.
+    #
+    # Read back because the engine plans an external relation from this document
+    # rather than from the source, and a relation with no measured row count
+    # plans every join off a constant. The refresh knows more than the source's
+    # own bind-time estimate does - it falls back to `count(*)` where
+    # `reltuples` is -1, which is exactly the unanalysed case.
+    statistics: dict | None = None
     # Maintenance policy: retention settings grouped under a single block
     maintenance_policy: dict = field(
         default_factory=lambda: {

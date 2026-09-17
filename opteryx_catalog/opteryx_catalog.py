@@ -1290,6 +1290,77 @@ class OpteryxCatalog(Metastore):
             return "view", self._build_view(vw_collection, vw_name, vw_doc)
         return None, None
 
+    def get_relations(self, identifiers):
+        """The plural of `get_relation`: resolve many relations in ONE ``get_all``.
+
+        Returns ``{identifier: (kind, obj)}`` with kind in
+        ``{"dataset", "view", None}`` - the same answer `get_relation` gives, for
+        every name asked about, so a name the catalog does not hold is present and
+        maps to ``(None, None)``.
+
+        This exists because planning a statement resolves every relation it names,
+        and one Firestore round trip per name is the dominant cost of planning a
+        query over more than a couple of relations. Firestore's ``get_all`` takes
+        the references for all of them at once, so N names cost 2N document reads
+        in ONE round trip instead of N round trips of 2.
+
+        The mutable dataset doc is read here on every call, exactly as the singular
+        call reads it - it is the version pointer, and batching the reads does not
+        make any of them older.
+        """
+        idents = []
+        for identifier in identifiers:
+            ident = (
+                ".".join(str(p) for p in identifier)
+                if isinstance(identifier, (tuple, list))
+                else identifier
+            )
+            if ident not in idents:
+                idents.append(ident)
+
+        refs = {}
+        order = []
+        for ident in idents:
+            ds_collection, ds_name = ident.split(".", 1) if "." in ident else (ident, ident)
+            parts = ident.split(".")
+            vw_collection = ".".join(parts[:-1]) or ds_collection
+            vw_name = parts[-1]
+            ds_ref = self._dataset_doc_ref(ds_collection, ds_name)
+            vw_ref = self._view_doc_ref(vw_collection, vw_name)
+            order.append((ident, ds_collection, ds_name, vw_collection, vw_name, ds_ref, vw_ref))
+            refs[ds_ref.path] = ds_ref
+            refs[vw_ref.path] = vw_ref
+
+        docs_by_path = {}
+        try:
+            for d in self.firestore_client.get_all(list(refs.values())):
+                ref = getattr(d, "reference", None)
+                if ref is not None:
+                    docs_by_path[ref.path] = d
+        except Exception as exc:  # noqa: BLE001 - Firestore client boundary
+            # Same boundary as `get_relation`: an empty map means every name falls
+            # through to its own singular lookup below, which is the cost we had.
+            logger.debug("Batched existence lookup failed (%s)", exc)
+            docs_by_path = {}
+
+        answers = {}
+        for ident, ds_collection, ds_name, vw_collection, vw_name, ds_ref, vw_ref in order:
+            if not docs_by_path:
+                answers[ident] = self.get_relation(ident)
+                continue
+            ds_doc = docs_by_path.get(ds_ref.path)
+            vw_doc = docs_by_path.get(vw_ref.path)
+            if ds_doc is not None and ds_doc.exists:
+                answers[ident] = (
+                    "dataset",
+                    self._build_dataset(ident, ds_collection, ds_name, ds_doc),
+                )
+            elif vw_doc is not None and vw_doc.exists:
+                answers[ident] = ("view", self._build_view(vw_collection, vw_name, vw_doc))
+            else:
+                answers[ident] = (None, None)
+        return answers
+
     def _snapshot_from_dict(self, sd: dict) -> Snapshot:
         return Snapshot(
             snapshot_id=sd.get("snapshot-id"),
@@ -1388,6 +1459,9 @@ class OpteryxCatalog(Metastore):
         # Only ever set on a stub (see DatasetMetadata.manifest_list); a
         # snapshot-backed dataset carries its pointer on the snapshot.
         metadata.manifest_list = data.get("manifest-list")
+        # See DatasetMetadata.statistics: the refresh's own measurements for a
+        # projected relation. Absent for a native dataset, which has a snapshot.
+        metadata.statistics = data.get("statistics")
         # Load the configured sort order. Without this the value round-tripped
         # by save_dataset_metadata is silently dropped on read, so the engine's
         # compaction planner always sees an empty sort_orders and falls back to the
