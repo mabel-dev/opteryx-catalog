@@ -26,6 +26,7 @@ from .favourites import STARRED_SUBCOLLECTION
 from .catalog.dataset import _NO_SNAPSHOT_EXPECTATION
 from .catalog.dataset import SimpleDataset
 from .catalog.dataset import _as_int
+from .catalog.dataset import open_data_file_writer_at
 from .catalog.dataset import relation_schema_from_stored
 from .catalog.metadata import SNAPSHOT_EXPIRED_AT_KEY
 from .catalog.metadata import DatasetMetadata
@@ -1081,6 +1082,84 @@ class OpteryxCatalog(Metastore):
         for doc in coll_ref.stream():
             coll_ref.document(doc.id).delete()
 
+    def _dataset_location(self, collection: str, dataset_name: str) -> str:
+        """Where a dataset's files live. Derived from the name, never stored
+        first and read back - which is what lets `open_pending_data_file_writer`
+        write into the location a dataset is ABOUT to be created with.
+        """
+        return f"gs://{self.gcs_bucket}/{self.workspace}/{collection}/{dataset_name}"
+
+    def _initial_field_ids(self, schema: Any) -> list | None:
+        """The stable field-ids `create_dataset` will allocate to `schema`.
+
+        `1..N` in schema column order, and deliberately a pure function of the
+        schema: a writer streaming files for a dataset that does not exist yet
+        has to key its manifest statistics with the SAME ids the create will
+        persist, or the stats it wrote describe columns by ids the finished
+        dataset gives to different columns - manifest pruning would then answer
+        from another column's bounds, silently.
+
+        `None` for a schema-less dataset, which has no ids to allocate.
+        """
+        if schema is None:
+            return None
+        return list(range(1, len(self._schema_to_columns(schema)) + 1))
+
+    def open_pending_data_file_writer(
+        self,
+        identifier: str,
+        schema: Any,
+        sorted_by: str | None = None,
+        sorted_descending: bool = False,
+        write_options: dict | None = None,
+    ):
+        """Open a streaming data file for a dataset that does not exist yet.
+
+        `SimpleDataset.open_data_file_writer` needs a loaded dataset, for its
+        location and its field-ids. A CREATE TABLE ... AS SELECT has neither:
+        the engine streams every data file first and creates the dataset at the
+        end, so that all files are durable before any catalog document is
+        touched and a statement that dies mid-write leaves nothing registered.
+        Asked to load the dataset it is in the middle of creating, the catalog
+        rightly answered DatasetNotFound.
+
+        So this takes the schema the dataset is about to be created WITH and
+        derives both from it, through the very helpers `create_dataset` uses -
+        the location from the identifier, the field-ids as `1..N`. Both are
+        pure functions of inputs the caller already holds, which is the whole
+        reason this can be done without writing anything first.
+
+        Nothing here mutates the catalog. The files are registered when the
+        caller follows with `create_dataset` and a commit that takes their
+        entries; a caller that never does leaves objects nothing references,
+        and is expected to remove them (the engine's sink does).
+
+        Raises:
+            DatasetAlreadyExists: the name is taken. Refused rather than
+                written, because these files would land in the existing
+                dataset's own data/ prefix keyed by field-ids that are not
+                necessarily its own, and the `create_dataset` that was going to
+                follow cannot succeed anyway.
+        """
+        collection, dataset_name = identifier.split(".")
+        if self._dataset_doc_ref(collection, dataset_name).get().exists:
+            raise DatasetAlreadyExists(f"Dataset already exists: {identifier}")
+
+        field_ids = self._initial_field_ids(schema)
+        columns = self._schema_to_columns(schema, field_ids=field_ids)
+        field_id_by_name = {
+            column["name"]: column["id"] for column in columns if column.get("id") is not None
+        }
+
+        return open_data_file_writer_at(
+            self.io,
+            self._dataset_location(collection, dataset_name),
+            field_id_by_name,
+            sorted_by=sorted_by,
+            sorted_descending=sorted_descending,
+            write_options=write_options,
+        )
+
     def create_dataset(
         self,
         identifier: str,
@@ -1099,7 +1178,7 @@ class OpteryxCatalog(Metastore):
         self.assert_name_free(collection, dataset_name, "dataset")
 
         # Build default dataset metadata
-        location = f"gs://{self.gcs_bucket}/{self.workspace}/{collection}/{dataset_name}"
+        location = self._dataset_location(collection, dataset_name)
         metadata = DatasetMetadata(
             dataset_identifier=identifier,
             schema=schema,
@@ -1110,11 +1189,9 @@ class OpteryxCatalog(Metastore):
         # Allocate stable, never-reused field-ids for the initial schema's columns
         # up front, so they can be persisted alongside the dataset doc in the same
         # write as the rest of its metadata.
-        field_ids = None
-        if schema is not None:
-            column_count = len(self._schema_to_columns(schema))
-            field_ids = list(range(1, column_count + 1))
-            metadata.next_field_id = column_count + 1
+        field_ids = self._initial_field_ids(schema)
+        if field_ids is not None:
+            metadata.next_field_id = len(field_ids) + 1
 
         # Persist document with timestamp and author
         now_ms = int(time.time() * 1000)

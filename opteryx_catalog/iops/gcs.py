@@ -638,6 +638,73 @@ class GcsFileIO(FileIO):
             body=response.text[:500],
         )
 
+    def copy(self, source: str, destination: str) -> None:
+        """Copy one object to another location WITHOUT moving its bytes through here.
+
+        GCS's rewrite endpoint does the copy inside the storage service, so the
+        cost to this process is one request per chunk regardless of object size.
+        Reading the source and writing it back through `new_input`/`new_output`
+        would be correct but would pull every byte down and push it back up - at
+        data-file sizes, on a path whose whole job is bulk copying, that is the
+        difference between a copy that scales and one that does not.
+
+        A rewrite is not always complete in one call: for a large object the
+        service does as much as it wants to, returns `done: false` and a
+        `rewriteToken`, and expects to be called again with it. The loop is the
+        API contract, not a retry.
+        """
+        source_bucket, source_object = _split_gs(source.removeprefix("gs://"))
+        destination_bucket, destination_object = _split_gs(destination.removeprefix("gs://"))
+
+        # Invalidate any cached read of the destination - it is about to change.
+        self._read_cache.pop(destination, None)
+
+        url = (
+            f"https://storage.googleapis.com/storage/v1/b/{source_bucket}/o/"
+            f"{urllib.parse.quote(source_object, safe='')}/rewriteTo/b/{destination_bucket}/o/"
+            f"{urllib.parse.quote(destination_object, safe='')}"
+        )
+
+        rewrite_token = None
+        while True:
+            params = {"rewriteToken": rewrite_token} if rewrite_token else {}
+            response = None
+            last_error = None
+            for attempt in range(MAX_ATTEMPTS):
+                token = self.get_access_token()
+                headers = {"Content-Length": "0"}
+                if token:
+                    headers["Authorization"] = f"Bearer {token}"
+                try:
+                    response = self._session.post(url, headers=headers, params=params, timeout=60)
+                except requests.RequestException as err:  # noqa: PERF203 - retry boundary
+                    last_error = err
+                    response = None
+                if response is not None and response.status_code not in RETRYABLE_STATUSES:
+                    break
+                if attempt + 1 < MAX_ATTEMPTS:
+                    time.sleep(_backoff_seconds(response, attempt))
+            if response is None:
+                raise OSError(f"Failed to copy '{source}' to '{destination}': {last_error}")
+            if response.status_code != 200:
+                raise OSError(
+                    f"Failed to copy '{source}' to '{destination}' - "
+                    f"status {response.status_code}: {response.text[:500]}"
+                )
+
+            payload = response.json()
+            if payload.get("done"):
+                return
+            rewrite_token = payload.get("rewriteToken")
+            if not rewrite_token:
+                # Not done and nothing to continue with: the copy is incomplete
+                # and there is no way to finish it. Returning here would leave a
+                # truncated object that reads as a successful copy.
+                raise OSError(
+                    f"Copy of '{source}' to '{destination}' did not complete and "
+                    "returned no continuation token"
+                )
+
     def list_files(self, prefix: str) -> list:
         """List files under a storage prefix (gs://bucket/path).
 

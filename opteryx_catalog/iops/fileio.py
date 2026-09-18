@@ -162,6 +162,27 @@ class GcsFileIO(FileIO):
         except Exception:  # noqa: BLE001 - storage boundary; the question is boolean
             return False
 
+    def copy(self, source: str, destination: str) -> None:
+        """Copy one object to another location.
+
+        Delegates to the underlying implementation's server-side copy when it
+        has one (GCS rewrites the object inside the storage service), and falls
+        back to a read-then-write otherwise. The fallback is correct for any
+        backend but pulls the whole object through this process, so a backend
+        that copies bulk data should implement `copy` rather than rely on it.
+        """
+        if hasattr(self._impl, "copy"):
+            self._impl.copy(source, destination)
+            return
+
+        source_file = self.new_input(source)
+        with source_file.open() as stream:
+            data = stream.read()
+        output = self.new_output(destination)
+        writer = output.create()
+        writer.write(data)
+        writer.close()
+
     def list_files(self, prefix: str) -> list:
         """List files under a storage prefix.
 

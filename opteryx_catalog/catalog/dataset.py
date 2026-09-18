@@ -546,6 +546,49 @@ class Datafile:
 _NO_SNAPSHOT_EXPECTATION = object()
 
 
+def open_data_file_writer_at(
+    io,
+    location: str,
+    field_id_by_name: dict[str, int],
+    sorted_by: str | None = None,
+    sorted_descending: bool = False,
+    write_options: dict | None = None,
+) -> "DataFileWriter":
+    """Open one streaming data file under `location`, keyed by `field_id_by_name`.
+
+    The file-naming, option-merging and accumulator wiring for every streamed
+    data file, in ONE place. `SimpleDataset.open_data_file_writer` passes a
+    registered dataset's own location and field-ids; `OpteryxCatalog.
+    open_pending_data_file_writer` passes the ones a dataset that does not
+    exist yet is ABOUT to be created with. Those two derivations differ and
+    belong to their callers - everything after them is identical, and a second
+    copy of it here is how a pending file would drift into a shape no reader of
+    the finished dataset recognises.
+
+    Writes nothing to any catalog document: the file is registered only by
+    handing the entry `close` returns to a commit that takes entries.
+    """
+    from rugo.parquet import open_parquet_writer
+
+    from ..iops.fileio import WRITE_PARQUET_OPTIONS
+
+    fname = f"{time.time_ns():x}-{_NODE}.parquet"
+    data_path = f"{location}/data/{fname}"
+
+    options = dict(WRITE_PARQUET_OPTIONS if write_options is None else write_options)
+    if sorted_by is not None:
+        options["sorted_by"] = sorted_by
+        options["sorted_descending"] = sorted_descending
+
+    stream = io.new_output(data_path).create()
+    accumulator = ParquetManifestEntryAccumulator(
+        field_id_by_name=field_id_by_name, exact_histograms=False
+    )
+    handle = DataFileWriter(data_path, stream, None, accumulator)
+    handle._writer = open_parquet_writer(handle._sink, **options)
+    return handle
+
+
 class DataFileWriter:
     """One data file, written a row group at a time, described on close.
 
@@ -1469,25 +1512,14 @@ class SimpleDataset(Dataset):
         defaults to WRITE_PARQUET_OPTIONS; pass COMPACTION_WRITE_PARQUET_OPTIONS
         for a rewrite that is read many times.
         """
-        from rugo.parquet import open_parquet_writer
-
-        from ..iops.fileio import WRITE_PARQUET_OPTIONS
-
-        fname = f"{time.time_ns():x}-{self._get_node()}.parquet"
-        data_path = f"{self.metadata.location}/data/{fname}"
-
-        options = dict(WRITE_PARQUET_OPTIONS if write_options is None else write_options)
-        if sorted_by is not None:
-            options["sorted_by"] = sorted_by
-            options["sorted_descending"] = sorted_descending
-
-        stream = self.io.new_output(data_path).create()
-        accumulator = ParquetManifestEntryAccumulator(
-            field_id_by_name=self._field_id_by_name(), exact_histograms=False
+        return open_data_file_writer_at(
+            self.io,
+            self.metadata.location,
+            self._field_id_by_name(),
+            sorted_by=sorted_by,
+            sorted_descending=sorted_descending,
+            write_options=write_options,
         )
-        handle = DataFileWriter(data_path, stream, None, accumulator)
-        handle._writer = open_parquet_writer(handle._sink, **options)
-        return handle
 
     def _write_table_and_build_entry(self, table: Any):
         """Write a draken Morsel to storage and return a ParquetManifestEntry.
