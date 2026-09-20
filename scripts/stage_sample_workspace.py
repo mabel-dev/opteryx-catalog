@@ -93,9 +93,8 @@ def _schema_from(catalog, path: str, table: str):
     `FileIO.new_input` has no ranged read, so this pulls the whole file - which
     is free here, because `add_files` is about to read it again anyway.
     """
-    from rugo.parquet import read_metadata_from_memoryview
-
     from opteryx.connectors._rugo_schema import rugo_to_relation_schema
+    from rugo.parquet import read_metadata_from_memoryview
 
     with catalog.io.new_input(path).open() as handle:
         data = handle.read()
@@ -188,7 +187,7 @@ def main() -> int:
             started = time.monotonic()
             try:
                 outcome = stage_table(catalog, label, table, args.dry_run)
-            except Exception as exc:  # noqa: BLE001 - one table must not stop the run
+            except Exception as exc:
                 failures += 1
                 print(f"  {table:<10} FAILED  {type(exc).__name__}: {exc}")
                 continue

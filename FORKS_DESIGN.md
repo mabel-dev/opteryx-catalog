@@ -1,8 +1,9 @@
 # Dataset Forks — Design
 
-Status: **catalog, SQL surface and `LOAD SAMPLE` removal built** (2026-09-20).
-The `samples` workspace is NOT yet staged (step 3), so nothing is forkable on
-the hosted platform until it is - see the warning under S12.
+Status: **built and staged** (2026-09-20). The catalog, the SQL surface, the
+`LOAD SAMPLE` removal, and the `samples` workspace itself - registered at
+scale factors 0.01, 0.1 and 1, with 5 and 10 the same command away (S12).
+Forking works against real infrastructure; what it found is in S12.1.
 
 Built in opteryx-catalog (rollout step 1, S12): the ownership guard
 (`catalog/ownership.py`, `SnapshotExpiration._delete_file`), the `fork` block
@@ -593,12 +594,16 @@ is my storage not going down after that compaction" (§5.1).
 
 ## 12. Rollout
 
-> **Step 3 is now the blocker.** `LOAD SAMPLE` has been removed and the Studio
-> banner writes `CREATE COLLECTION personal.<user> CLONE samples.tpch_sf01`,
-> which fails until the `samples` workspace exists. Staging it needs a real
-> GCS write and a generator run against `gs://opteryx/tpch/` - those bundles
-> are deliberately untouched, because step 3 is what turns them into datasets.
-> Until that lands, a new account has no way to get data from the banner.
+> **Step 3 is done for the small scale factors.** The `samples` workspace is
+> real - `egress_protection` OFF, `listed` OFF, reservation marker cleared -
+> and `scripts/stage_sample_workspace.py` registers the staged bundles as
+> datasets. sf001, sf01 and sf1 are registered; sf5 and sf10 are the remaining
+> ~4.3 GB and are the same command with `--scale 5 10`.
+>
+> Registration reads each file ONCE, to build its manifest entry, and that is
+> the only time anything reads them: every fork afterwards is a manifest write.
+> The script is resumable - an already-registered dataset is skipped - so an
+> interrupted run is re-run rather than unpicked.
 
 
 Order matters, and the catalog goes first:
@@ -618,6 +623,32 @@ Order matters, and the catalog goes first:
    catalog), Studio chips and dialog. Bump the cache stamp.
 6. **docs.opteryx**: `make sql-docs`; a `CREATE TABLE … CLONE` page replaces
    `load-sample.md`; `ALTER TABLE` gains `RESYNC` / `DETACH`.
+
+## 12.1 What staging against real infrastructure found
+
+Two bugs that no fixture in this repository could have caught, because every
+double here is a SINGLE-WORKSPACE double and both were in the cross-workspace
+path - which is the only path that matters, since a fork of a sample is always
+cross-workspace:
+
+* `clone_dataset` loaded the upstream with `self.load_dataset(source_fq)`. That
+  method takes a name LOCAL to its handle's workspace, so a three-part name
+  naming another workspace was read as `collection.dataset` and raised
+  `DatasetNotFound`. Fixed with `_catalog_for` / `_load_qualified`, which route
+  to the owning workspace's handle - a real handle, not a document ref, because
+  a clone needs the source's manifests, history and FileIO. Cached per
+  workspace, since a collection clone asks for the same one eight times.
+* All three of `clone_dataset`, `resync_fork` and `detach_fork` called
+  `save_dataset_metadata(metadata)`, which takes `(identifier, metadata)`.
+
+Both are now covered by tests that assert the SHAPE of the call rather than its
+effect, since the shape is what was wrong.
+
+Also confirmed live, which is the point of having done it: a fork's manifest
+names the staged file at `gs://opteryx/tpch/...` while the fork's own location
+is under `gs://opteryx_data/...`, so the borrowed bytes are outside anything
+that could reclaim them; the upstream's `pinned_snapshot_ids` reports the
+fork's base; and dropping a forked upstream is refused by name.
 
 ## 13. Open questions
 
