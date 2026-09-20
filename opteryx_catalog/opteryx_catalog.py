@@ -957,6 +957,13 @@ class OpteryxCatalog(Metastore):
         self.firestore_client = firestore.Client(
             project=firestore_project, database=firestore_database
         )
+        # Kept so a handle can build a SIBLING handle for another workspace -
+        # see `_catalog_for`. Without them the only cross-workspace reach is a
+        # raw document ref, which is enough to read a `$properties` flag and
+        # not enough to load a dataset with its manifests and history.
+        self._firestore_project = firestore_project
+        self._firestore_database = firestore_database
+        self._sibling_catalogs: dict[str, "OpteryxCatalog"] = {}
         self._catalog_ref = self.firestore_client.collection(workspace)
         # Gate construction on the workspace existing. The $properties doc
         # records metadata for the workspace such as 'timestamp-ms',
@@ -6340,6 +6347,46 @@ class OpteryxCatalog(Metastore):
         """
         return fork_identifier.replace(".", ":")
 
+    def _catalog_for(self, workspace: str) -> "OpteryxCatalog":
+        """A handle bound to `workspace`, reusing this one's connection settings.
+
+        For the questions a raw document ref cannot answer. `_foreign_properties_ref`
+        reaches across workspaces to read ONE flag and deliberately avoids
+        constructing a second catalog, because an egress check asks about
+        workspaces whose own gates would refuse it. Loading a dataset is the
+        opposite case: a clone genuinely needs the source's manifests, history
+        and FileIO, and if the source workspace does not exist the clone SHOULD
+        fail on that - which is exactly what the constructor's gate says.
+
+        Cached per workspace, because a collection-level clone asks for the same
+        one once per dataset and each construction is a Firestore read.
+        """
+        if workspace == self.workspace:
+            return self
+        handle = self._sibling_catalogs.get(workspace)
+        if handle is None:
+            handle = OpteryxCatalog(
+                workspace=workspace,
+                firestore_project=self._firestore_project,
+                firestore_database=self._firestore_database,
+                gcs_bucket=self.gcs_bucket,
+            )
+            self._sibling_catalogs[workspace] = handle
+        return handle
+
+    def _load_qualified(self, identifier: str, load_history: bool = False):
+        """Load a dataset by FULLY QUALIFIED name, from whichever workspace owns it.
+
+        `load_dataset` takes a name local to this handle's workspace, so a
+        three-part name naming another workspace is not something it can answer
+        - it reads the first segment as a collection. This routes to the owning
+        workspace's handle first.
+        """
+        workspace, collection, dataset_name = self._split_qualified(self._qualify(identifier))
+        return self._catalog_for(workspace).load_dataset(
+            f"{collection}.{dataset_name}", load_history=load_history
+        )
+
     def _foreign_dataset_doc_ref(self, identifier: str):
         """The dataset document for any fully-qualified name in this database.
 
@@ -6490,7 +6537,7 @@ class OpteryxCatalog(Metastore):
         if self._dataset_doc_ref(collection, dataset_name).get().exists:
             raise DatasetAlreadyExists(f"Dataset already exists: {target_fq}")
 
-        upstream = self.load_dataset(source_fq, load_history=True)
+        upstream = self._load_qualified(source_fq, load_history=True)
         if upstream is None:
             raise DatasetNotFound(f"Dataset not found: {source_fq}")
         snapshot, entries = self._upstream_entries(upstream, snapshot_id)
@@ -6670,7 +6717,7 @@ class OpteryxCatalog(Metastore):
                 "nothing to resync it to."
             )
 
-        upstream = self.load_dataset(fork.source.dataset, load_history=True)
+        upstream = self._load_qualified(fork.source.dataset, load_history=True)
         if upstream is None:
             raise DatasetNotFound(
                 f"Cannot resync {fork_fq}: its upstream {fork.source.dataset} no longer exists."
