@@ -18,8 +18,6 @@ from .billing_index import BILLING_ACCOUNT_SUBCOLLECTION
 from .billing_index import BILLING_DOC
 from .billing_index import clear_billing_index
 from .billing_index import write_billing_index
-from .favourites import FAVOURITES_DOC
-from .favourites import STARRED_SUBCOLLECTION
 
 # The "no expectation" sentinel for save_dataset_metadata, defined with the
 # commit paths that pass it (catalog/dataset.py).
@@ -28,14 +26,19 @@ from .catalog.dataset import SimpleDataset
 from .catalog.dataset import _as_int
 from .catalog.dataset import open_data_file_writer_at
 from .catalog.dataset import relation_schema_from_stored
+from .catalog.deletes import DELETE_FILE_PATH_KEY
 from .catalog.metadata import SNAPSHOT_EXPIRED_AT_KEY
 from .catalog.metadata import DatasetMetadata
+from .catalog.metadata import Fork
+from .catalog.metadata import ForkSource
+from .catalog.metadata import ForkTarget
 from .catalog.metadata import Snapshot
 from .catalog.metadata import provenance_document_fields
 from .catalog.metadata import provenance_fields_from_document
 from .catalog.metadata import snapshot_is_tombstoned
 from .catalog.metastore import Metastore
 from .catalog.orphan_quarantine import MAINTENANCE_SUBCOLLECTION
+from .catalog.ownership import is_own_path
 from .catalog.view import View as CatalogView
 from .exceptions import CollectionAlreadyExists
 from .exceptions import CollectionLocked
@@ -46,6 +49,7 @@ from .exceptions import DatasetAlreadyExists
 from .exceptions import DatasetLocked
 from .exceptions import DatasetNotFound
 from .exceptions import EgressRestricted
+from .exceptions import ForkError
 from .exceptions import ListenerAlreadyExists
 from .exceptions import ListenerNotFound
 from .exceptions import MaterializedViewError
@@ -64,6 +68,8 @@ from .exceptions import ViewNotFound
 from .exceptions import WorkspaceDeletionProtected
 from .exceptions import WorkspaceNotFound
 from .exceptions import WorkspaceStorageReclaimFailed
+from .favourites import FAVOURITES_DOC
+from .favourites import STARRED_SUBCOLLECTION
 from .iops.base import FileIO
 from .resource_types import ResourceType
 from .schedules import next_due_ms
@@ -219,6 +225,22 @@ RELATIONSHIP_SUPPRESSIONS_SUBCOLLECTION = "relationship-suppressions"
 # stale. Tags here are never in that blast radius, and a tag write never
 # contends with a commit.
 TAGS_SUBCOLLECTION = "tags"
+
+# Subcollection under a dataset document holding the FORKS TAKEN OF IT - one
+# document per live fork (FORKS_DESIGN.md S3.2), keyed by the fork's fully
+# qualified name with dots replaced, so registering is idempotent and looking
+# one up is a document get rather than a query.
+#
+# It lives on the UPSTREAM, which is the side with the obligations: expiration
+# reads it to learn which snapshots it may not retire, and drop/rename read it
+# to learn they must refuse. A record kept only on the fork would put those
+# facts in a document the upstream has no reason to open.
+#
+# Like `tags`, a subcollection rather than a field, because
+# `save_dataset_metadata` writes the dataset document whole with `set()`: a
+# field `DatasetMetadata` does not carry is DESTROYED by the next commit. An
+# upstream's ordinary commits must never be able to release a fork's pin.
+FORKS_SUBCOLLECTION = "forks"
 
 # Tasks sit beside `datasets` and `views` under a collection, not inside a
 # dataset: a task is a named catalog object addressed as
@@ -488,6 +510,26 @@ SECURE_OBJECTS_PROPERTY = "secure_objects"
 
 # Workspace `$properties` flag: when on, the workspace itself cannot be deleted.
 DELETION_PROTECTION_PROPERTY = "deletion_protection"
+
+# Workspace `$properties` flag: whether this workspace appears in dataset
+# LISTINGS - the OData service document, and through it every catalog tree and
+# picker drawn from it. Off means "readable, but not worth putting in front of
+# everyone": a library namespace like `samples`, whose five scale factors of
+# TPC-H would otherwise be forty datasets in the catalog of every account on
+# the platform, forever, to be forked once.
+#
+# IT IS NOT A PERMISSION, and the difference matters because someone will
+# reach for it as one. Nothing here changes who may read a dataset: an unlisted
+# workspace is queryable by name, appears in `information_schema`, and is named
+# in provenance and fork relationships exactly as any other. Access is decided
+# by grants, in opteryx-access, and only there.
+#
+# Default ON, like the two guards above, but for the opposite reason. Theirs is
+# fail-closed: unset means protect. This one fails toward the STATUS QUO -
+# listing is what every workspace has always done, and the failure modes are
+# not symmetric. An unlisted workspace that shows up is clutter; a listed one
+# that vanishes is a person's data disappearing out of their catalog.
+LISTED_PROPERTY = "listed"
 
 
 @dataclass(frozen=True)
@@ -1569,6 +1611,11 @@ class OpteryxCatalog(Metastore):
         metadata.sources = list(data.get("sources") or [])
         metadata.sources_complete = bool(data.get("sources-complete", False))
         metadata.runs_as = data.get("runs-as")
+        # The fork block (FORKS_DESIGN.md S3.1). None for a dataset that is
+        # not a fork, which is the overwhelming majority - `Fork.from_dict`
+        # reads a malformed or half-written block as "not a fork" rather than
+        # as a fork missing an anchor.
+        metadata.fork = Fork.from_dict(data.get("fork"))
         metadata.suspended_at_ms = data.get("suspended-at-ms")
         metadata.suspended_by = data.get("suspended-by")
         metadata.last_refreshed_at_ms = data.get("last-refreshed-at-ms")
@@ -1771,6 +1818,39 @@ class OpteryxCatalog(Metastore):
                 f"{', '.join(sorted(dependents))}. Drop those first."
             )
 
+        # Refuse to drop a dataset that forks are standing on (FORKS_DESIGN.md
+        # S5.3). Their manifests name THIS dataset's files, and its storage is
+        # reclaimed by reconciliation once the catalog stops claiming the
+        # location - so the drop would not merely orphan the relationship, it
+        # would eventually delete the bytes those forks are reading. Same shape
+        # and same reason as the materialized-view refusal above.
+        #
+        # Read before anything is deleted, and an unreadable registry refuses
+        # the drop rather than permitting it: "no forks" is the answer that
+        # destroys other people's data.
+        try:
+            forks = self.list_forks(identifier)
+        except Exception as exc:  # noqa: BLE001 - Firestore boundary
+            raise ForkError(
+                f"Cannot establish whether {identifier} has forks ({exc}). Refusing to "
+                "drop it while that is unknown."
+            ) from exc
+        if forks:
+            names = sorted(row.get("fork") or "?" for row in forks)
+            raise ForkError(
+                f"Cannot drop {identifier}: it is the upstream of {len(names)} fork(s) "
+                f"({', '.join(names)}), whose data is its data. Detach them first "
+                f"(ALTER TABLE <fork> DETACH), or drop them."
+            )
+
+        # A fork being dropped releases its pins. Before its own document goes,
+        # so that a failure here leaves the fork - and therefore the pin's
+        # justification - still in existence, rather than a pin nothing
+        # explains holding an upstream's snapshot forever.
+        fork_block = Fork.from_dict(data.get("fork"))
+        if fork_block is not None:
+            self.deregister_fork(fork_block.source.dataset, self._qualify(identifier))
+
         location = data.get("location")
 
         # A dropped dataset takes its own triggers with it. If it is itself a
@@ -1968,6 +2048,34 @@ class OpteryxCatalog(Metastore):
         if any(True for _ in self._triggers_collection(collection, dataset_name).stream()):
             raise MaterializedViewError(
                 f"Cannot rename a dataset with triggers attached: {identifier}"
+            )
+
+        # v1: a dataset in a fork relationship, either end, cannot be renamed
+        # (FORKS_DESIGN.md S5.3). Both sides record the other BY NAME, because
+        # this catalog has no stable dataset id, so a rename has to rewrite the
+        # other end - and the other end is very often in another workspace, on
+        # a document `save_dataset_metadata` writes whole with `set()`. A
+        # read-modify-write against a document that may be committing at that
+        # moment can destroy the commit, which is a far worse outcome than a
+        # refusal. Detach the fork (ALTER TABLE <fork> DETACH) and rename, or
+        # rename before forking.
+        try:
+            forks = self.list_forks(identifier)
+        except Exception as exc:  # noqa: BLE001 - Firestore boundary
+            raise ForkError(
+                f"Cannot establish whether {identifier} has forks ({exc}). Refusing to "
+                "rename it while that is unknown."
+            ) from exc
+        if forks:
+            names = sorted(row.get("fork") or "?" for row in forks)
+            raise ForkError(
+                f"Cannot rename {identifier}: {len(names)} fork(s) record it by name "
+                f"({', '.join(names)}). Detach them first (ALTER TABLE <fork> DETACH)."
+            )
+        if Fork.from_dict(data.get("fork")) is not None:
+            raise ForkError(
+                f"Cannot rename {identifier}: it is a fork, and its upstream records it "
+                "by name. Detach it first (ALTER TABLE <fork> DETACH)."
             )
 
         new_doc_ref = self._dataset_doc_ref(new_collection, new_dataset_name)
@@ -2632,6 +2740,28 @@ class OpteryxCatalog(Metastore):
         if workspace == self.workspace:
             return self._catalog_ref.document("$properties")
         return self.firestore_client.collection(workspace).document("$properties")
+
+    def is_listed(self, workspace: str | None = None) -> bool:
+        """Whether `workspace` (default: this one) appears in dataset listings.
+
+        **On by default** (see `_guard_is_on`, whose "unset means the
+        conventional answer" rule this shares): a workspace nobody has decided
+        about is listed, and an unreadable `$properties` reads as listed too.
+        That direction is deliberate - see `LISTED_PROPERTY`. Hiding a
+        workspace whose owner did not ask for it hidden is the worse mistake.
+
+        NOT A PERMISSION. This decides what a listing shows, never what a
+        caller may read; see `LISTED_PROPERTY`.
+
+        Read fresh every time, for the same reason `is_egress_restricted` is: a
+        cached answer would keep publishing a workspace that has since asked
+        to be left out.
+        """
+        workspace = workspace or self.workspace
+        doc = self._foreign_properties_ref(workspace).get()
+        if not doc.exists:
+            return True
+        return _guard_is_on(doc.to_dict() or {}, LISTED_PROPERTY)
 
     def is_egress_restricted(self, workspace: str | None = None) -> bool:
         """Whether `workspace` (default: this one) restricts egress.
@@ -6188,6 +6318,518 @@ class OpteryxCatalog(Metastore):
         )
 
     # ------------------------------------------------------------------
+    # Fork registry (FORKS_DESIGN.md S3.2)
+    # ------------------------------------------------------------------
+    #
+    # Every method here addresses an UPSTREAM, which is very often in another
+    # workspace - a fork of `samples.tpch_sf1.lineitem` into `personal.justin`
+    # registers on the sample, not on the fork. So these take FULLY QUALIFIED
+    # names and resolve their own document refs, rather than going through
+    # `_local_parts` like the tag methods beside them, which would refuse the
+    # common case.
+
+    @staticmethod
+    def fork_registry_id(fork_identifier: str) -> str:
+        """The registry document id for a fork, from its fully qualified name.
+
+        The name IS the id (with `.` as `:`, which Firestore document ids may
+        not contain): registering twice writes the same document twice rather
+        than creating a second row, and dropping a fork deletes by id without
+        a query. `:` rather than `_` because a dataset name may contain `_`,
+        and two different forks must never collide onto one id.
+        """
+        return fork_identifier.replace(".", ":")
+
+    def _foreign_dataset_doc_ref(self, identifier: str):
+        """The dataset document for any fully-qualified name in this database.
+
+        Workspaces are sibling root collections (see `_foreign_properties_ref`,
+        which reaches across for the same reason): a handle bound to one
+        workspace can read another's dataset documents without constructing a
+        second catalog, which would re-run the constructor's existence and
+        soft-delete gates.
+        """
+        workspace, collection, dataset_name = self._split_qualified(self._qualify(identifier))
+        if workspace == self.workspace:
+            return self._dataset_doc_ref(collection, dataset_name)
+        return (
+            self.firestore_client.collection(workspace)
+            .document(collection)
+            .collection("datasets")
+            .document(dataset_name)
+        )
+
+    def _forks_collection(self, upstream_identifier: str):
+        return self._foreign_dataset_doc_ref(upstream_identifier).collection(
+            FORKS_SUBCOLLECTION
+        )
+
+    def register_fork(
+        self,
+        upstream_identifier: str,
+        fork_identifier: str,
+        pinned_snapshot_id: int,
+        author: str | None = None,
+    ) -> None:
+        """Record on the upstream that `fork_identifier` rests on one of its snapshots.
+
+        WRITTEN BEFORE THE FORK EXISTS, and moved before the old pin is
+        released on a resync. The ordering is the safety property: from the
+        moment this returns, `pinned_snapshot_ids` reports the snapshot and
+        expiration will not retire it, so a fork's manifest can never come to
+        name a file that has been deleted. The reverse order has a window in
+        which it can.
+
+        Idempotent - the id is the fork's name - so a retried clone re-writes
+        one document rather than accruing registrations that each pin a
+        snapshot forever.
+        """
+        payload = {
+            "fork": fork_identifier,
+            "pinned-snapshot": int(pinned_snapshot_id),
+            "created-at-ms": int(time.time() * 1000),
+        }
+        if author is not None:
+            payload["created-by"] = author
+        self._forks_collection(upstream_identifier).document(
+            self.fork_registry_id(fork_identifier)
+        ).set(payload, merge=True)
+
+    def deregister_fork(self, upstream_identifier: str, fork_identifier: str) -> None:
+        """Release this fork's pin on `upstream_identifier`.
+
+        Deleting an absent document is not an error in Firestore, which is the
+        behaviour wanted: dropping a fork deregisters from every upstream it
+        was pinned on, and a registration that was never written (or was
+        already cleaned up) must not stop the drop.
+        """
+        self._forks_collection(upstream_identifier).document(
+            self.fork_registry_id(fork_identifier)
+        ).delete()
+
+    def list_forks(self, upstream_identifier: str) -> list[dict]:
+        """Every fork registered against `upstream_identifier`, as plain dicts.
+
+        A PROTECTED INPUT, in the same sense `list_tags` is one: expiration
+        reads these rows to learn which snapshots it may not retire, and
+        `drop_dataset` reads them to learn it must refuse. A caller that cannot
+        read this must not proceed as though the answer were "none" - see
+        `pinned_snapshot_ids`, which turns a failure here into
+        `ManifestProtectionError` rather than an empty set.
+        """
+        rows = []
+        for doc in self._forks_collection(upstream_identifier).stream():
+            data = doc.to_dict() or {}
+            data.setdefault("fork", doc.id.replace(":", "."))
+            rows.append(data)
+        return sorted(rows, key=lambda row: row.get("fork") or "")
+
+    # ------------------------------------------------------------------
+    # Clone and resync (FORKS_DESIGN.md S4, S7)
+    # ------------------------------------------------------------------
+
+    def _upstream_entries(self, upstream, snapshot_id: int | None):
+        """(snapshot, entries) for the upstream snapshot a fork will rest on.
+
+        The entries are taken VERBATIM - statistics, delete-vector columns and
+        all. Nothing here recomputes anything: every number in them was
+        computed once, by the writer that had the bytes in memory, and reading
+        4 GB back to rediscover it is the cost this whole design exists to
+        remove.
+        """
+        snapshot = upstream.snapshot(snapshot_id)
+        if snapshot is None:
+            raise ForkError(
+                f"{upstream.identifier} has no snapshot "
+                f"{snapshot_id if snapshot_id is not None else '(it has no commits yet)'}."
+            )
+        if not getattr(snapshot, "manifest_list", None):
+            raise ForkError(
+                f"Cannot clone {upstream.identifier} at version {snapshot.snapshot_id}: "
+                "that snapshot has no manifest. A dataset projected from an external "
+                "catalog has no manifest to borrow - copy it with CREATE TABLE AS SELECT."
+            )
+        return snapshot, upstream._parent_manifest_entries(snapshot)
+
+    def clone_dataset(
+        self,
+        source_identifier: str,
+        target_identifier: str,
+        author: str | None = None,
+        snapshot_id: int | None = None,
+    ):
+        """Create `target` as a fork of `source`, moving no bytes.
+
+        The target's first manifest lists the same files the source's manifest
+        listed. Nothing is copied, nothing is decoded, and the cost is one
+        manifest object and a handful of Firestore writes whether the source is
+        3 MB or 3 TB.
+
+        ORDER IS THE SAFETY PROPERTY. The registration on the upstream is
+        written BEFORE the target exists, so from the moment the fork's
+        manifest names those files, expiration is already refusing to retire
+        the snapshot that keeps them. The reverse order has a window in which a
+        sweep between the two steps deletes the files the fork is about to
+        claim. A registration whose target then fails to be created is
+        harmless: it pins a snapshot the upstream was retaining anyway, and the
+        integrity sweep reports it.
+
+        Egress is NOT checked here. The catalog executes; the engine decides
+        (see `assert_egress_allowed`, called from the binder) - the same split
+        every other cross-workspace write in this codebase uses.
+        """
+        if author is None:
+            raise ValueError("author must be provided when cloning a dataset")
+
+        source_fq = self._qualify(source_identifier)
+        target_fq = self._qualify(target_identifier)
+        if source_fq == target_fq:
+            raise ForkError(f"Cannot clone {source_fq} onto itself.")
+
+        collection, dataset_name = self._local_parts(target_identifier)
+        if self._dataset_doc_ref(collection, dataset_name).get().exists:
+            raise DatasetAlreadyExists(f"Dataset already exists: {target_fq}")
+
+        upstream = self.load_dataset(source_fq, load_history=True)
+        if upstream is None:
+            raise DatasetNotFound(f"Dataset not found: {source_fq}")
+        snapshot, entries = self._upstream_entries(upstream, snapshot_id)
+
+        # 1. Pin, before anything can reference it.
+        self.register_fork(source_fq, target_fq, snapshot.snapshot_id, author=author)
+
+        # 2. Create with the upstream's schema. A fork IS the upstream's
+        #    content, so it is the upstream's schema too - reading it from the
+        #    entries instead would rediscover what the catalog already knows.
+        dataset = self.create_dataset(
+            f"{collection}.{dataset_name}", upstream.metadata.schema, author=author
+        )
+
+        # 3. Commit the borrowed entries. `truncate_and_add_files` rather than
+        #    `add_files` because "the content IS that content" is a rewrite,
+        #    not an addition - which is also what makes the standing source
+        #    list come out as exactly [upstream] rather than accumulating.
+        sequence_number = int(getattr(snapshot, "sequence_number", 0) or 0)
+        dataset.truncate_and_add_files(
+            entries=entries,
+            author=author,
+            commit_message=f"CLONE {source_fq} AT VERSION {snapshot.snapshot_id}",
+            read_sources=[(source_fq, snapshot.snapshot_id, "version")],
+        )
+
+        # 4. Record the relationship. Last, because it is the only step that
+        #    cannot leave anything dangerous behind if it fails - a dataset
+        #    holding borrowed entries without a fork block is a dataset whose
+        #    upstream is still pinning them.
+        now_ms = int(time.time() * 1000)
+        dataset.metadata.fork = Fork(
+            source=ForkSource(
+                dataset=source_fq,
+                snapshot_id=int(snapshot.snapshot_id),
+                sequence_number=sequence_number,
+            ),
+            target=ForkTarget(
+                sequence_number=dataset.current_sequence_number(),
+                last_sync_ms=now_ms,
+            ),
+            forked_at_ms=now_ms,
+            forked_by=author,
+        )
+        self.save_dataset_metadata(dataset.metadata)
+
+        emit_audit(
+            "clone_dataset",
+            resource_type=ResourceType.DATASET,
+            workspace=self.workspace,
+            collection=collection,
+            resource=dataset_name,
+            author=author,
+            upstream=source_fq,
+            base_snapshot=int(snapshot.snapshot_id),
+        )
+        return self.load_dataset(f"{collection}.{dataset_name}", load_history=True)
+
+    def clone_collection(
+        self,
+        source_collection: str,
+        target_collection: str,
+        author: str | None = None,
+    ) -> int:
+        """Fork every dataset in `source_collection` into `target_collection`.
+
+        The table-level clone, applied across a collection - which is what makes
+        "give me a copy of that sample" one statement rather than one per table.
+
+        REFUSED WHOLESALE IF ANY ONE WOULD BE REFUSED. The membership is read
+        and every target name checked for a collision BEFORE the first fork is
+        created, because a half-cloned collection is the state nobody can act
+        on: re-running collides on what already landed, and the caller cannot
+        tell which datasets are theirs. The check is not a transaction - a
+        dataset appearing in the source between the check and the copy is
+        simply not copied - but it removes the failure that a person would
+        actually hit, which is a name that was already taken.
+
+        Views are not cloned. A view is a query over datasets whose names it
+        records, and copying one into a collection where those names mean
+        something else - or nothing - produces a view that silently reads the
+        wrong data. Cloning is about bytes; a view has none.
+        """
+        if author is None:
+            raise ValueError("author must be provided when cloning a collection")
+
+        source_fq = self._qualify_collection(source_collection)
+        target_collection_name = self._local_collection(target_collection)
+
+        datasets = sorted(self._foreign_list_datasets(source_fq))
+        if not datasets:
+            raise ForkError(
+                f"{source_fq} holds no datasets to clone."
+            )
+
+        for name in datasets:
+            if self._dataset_doc_ref(target_collection_name, name).get().exists:
+                raise DatasetAlreadyExists(
+                    f"Cannot clone {source_fq} into {self.workspace}.{target_collection_name}: "
+                    f"{self.workspace}.{target_collection_name}.{name} already exists."
+                )
+
+        for name in datasets:
+            self.clone_dataset(
+                f"{source_fq}.{name}",
+                f"{target_collection_name}.{name}",
+                author=author,
+            )
+        return len(datasets)
+
+    def _qualify_collection(self, collection: str) -> str:
+        """`workspace.collection` for a collection name, inferring this workspace."""
+        parts = str(collection).split(".")
+        if len(parts) == 2:
+            return f"{parts[0]}.{parts[1]}"
+        if len(parts) == 1:
+            return f"{self.workspace}.{parts[0]}"
+        raise ValueError(f"A collection is named <workspace>.<collection> (got {collection})")
+
+    def _local_collection(self, collection: str) -> str:
+        """The collection part of a name that must live in THIS workspace."""
+        qualified = self._qualify_collection(collection)
+        workspace, name = qualified.split(".", 1)
+        if workspace != self.workspace:
+            raise ValueError(
+                f"{collection} belongs to workspace {workspace}, not {self.workspace}; "
+                "this catalog handle cannot write it"
+            )
+        return name
+
+    def _foreign_list_datasets(self, collection_fq: str):
+        """Dataset names in any collection in this database, by qualified name."""
+        workspace, collection = collection_fq.split(".", 1)
+        if workspace == self.workspace:
+            return list(self.list_datasets(collection))
+        return [
+            doc.id
+            for doc in self.firestore_client.collection(workspace)
+            .document(collection)
+            .collection("datasets")
+            .stream()
+        ]
+
+    def resync_fork(
+        self,
+        fork_identifier: str,
+        author: str | None = None,
+        force: bool = False,
+    ) -> dict:
+        """Make a fork equal its upstream's current content again.
+
+        Refuses when the fork has commits of its own since it was last in sync,
+        unless `force` - those commits are what would be superseded, and
+        silently dropping someone's edits is not a refresh. `force` discards
+        nothing physically: every prior snapshot is still there, so
+        `VERSION AS OF PREVIOUS` reads the pre-resync content until the fork's
+        own retention retires it, and the fork's own files are then reclaimed
+        by the fork's own sweep - which S5.2 permits, because they are its own.
+
+        Refuses when there is nothing to do. A no-op resync that committed
+        anyway would put a lie in the history: a snapshot saying the content
+        changed, on a day it did not.
+        """
+        if author is None:
+            raise ValueError("author must be provided when resyncing a fork")
+
+        collection, dataset_name = self._local_parts(fork_identifier)
+        fork_fq = self._qualify(fork_identifier)
+        dataset = self.load_dataset(f"{collection}.{dataset_name}", load_history=True)
+        if dataset is None:
+            raise DatasetNotFound(f"Dataset not found: {fork_fq}")
+
+        fork = dataset.metadata.fork
+        if fork is None:
+            raise ForkError(
+                f"{fork_fq} is not a fork - it was not created by CLONE, so there is "
+                "nothing to resync it to."
+            )
+
+        upstream = self.load_dataset(fork.source.dataset, load_history=True)
+        if upstream is None:
+            raise DatasetNotFound(
+                f"Cannot resync {fork_fq}: its upstream {fork.source.dataset} no longer exists."
+            )
+
+        state = dataset.fork_state(upstream=upstream)
+        if state["revisions_ahead"] and not force:
+            raise ForkError(
+                f"{fork_fq} has been edited since it was forked (at most "
+                f"{state['revisions_ahead']} revision(s) of its own). Resyncing would "
+                f"replace its contents with {fork.source.dataset}'s. Re-run with FORCE "
+                "to do that - the superseded commits stay readable through time travel "
+                "until they expire."
+            )
+        if not state["revisions_behind"]:
+            raise ForkError(
+                f"{fork_fq} is already up to date with {fork.source.dataset}."
+            )
+
+        snapshot, entries = self._upstream_entries(upstream, None)
+
+        # New pin first, old pin released after - the same ordering, and for
+        # the same reason, as the clone.
+        self.register_fork(fork.source.dataset, fork_fq, snapshot.snapshot_id, author=author)
+
+        dataset.truncate_and_add_files(
+            entries=entries,
+            author=author,
+            commit_message=(
+                f"RESYNC {fork_fq} FROM {fork.source.dataset} "
+                f"AT VERSION {snapshot.snapshot_id}"
+            ),
+            read_sources=[(fork.source.dataset, snapshot.snapshot_id, "version")],
+        )
+
+        now_ms = int(time.time() * 1000)
+        dataset.metadata.fork = Fork(
+            source=ForkSource(
+                dataset=fork.source.dataset,
+                snapshot_id=int(snapshot.snapshot_id),
+                sequence_number=int(getattr(snapshot, "sequence_number", 0) or 0),
+            ),
+            target=ForkTarget(
+                sequence_number=dataset.current_sequence_number(),
+                last_sync_ms=now_ms,
+            ),
+            forked_at_ms=fork.forked_at_ms,
+            forked_by=fork.forked_by,
+        )
+        # The upstream's schema comes with its content: a resync is "become
+        # the upstream again", and a fork left describing columns its manifest
+        # no longer has would read as corrupt.
+        dataset.metadata.schema = upstream.metadata.schema
+        self.save_dataset_metadata(dataset.metadata)
+
+        emit_audit(
+            "resync_fork",
+            resource_type=ResourceType.DATASET,
+            workspace=self.workspace,
+            collection=collection,
+            resource=dataset_name,
+            author=author,
+            upstream=fork.source.dataset,
+            base_snapshot=int(snapshot.snapshot_id),
+            forced=bool(force),
+        )
+        return {
+            "fork": fork_fq,
+            "upstream": fork.source.dataset,
+            "base_snapshot": int(snapshot.snapshot_id),
+            "previous_base_snapshot": int(fork.source.snapshot_id),
+            "forced": bool(force),
+        }
+
+    def detach_fork(self, fork_identifier: str, author: str | None = None) -> dict:
+        """Turn a fork into an ordinary dataset by copying what it borrowed.
+
+        THE ONE OPERATION HERE THAT MOVES BYTES, which is why it is its own
+        statement and nobody's default. Every borrowed file is copied into this
+        dataset's own location (server-side, so the bytes do not travel through
+        this process), the manifest is rewritten to name the copies, and the
+        fork block and its registrations go.
+
+        It is the escape hatch the drop and rename refusals point at: once
+        nothing is borrowed, the upstream owes this dataset nothing and may be
+        renamed or dropped.
+
+        Only the CURRENT snapshot's entries are copied. Older snapshots of this
+        fork keep naming the upstream's paths, and they must: rewriting history
+        would mean copying every file every snapshot ever borrowed, to make
+        readable a past this dataset is about to expire anyway. The pin is
+        released regardless, so those older snapshots become time-travel reads
+        that may stop resolving once the upstream moves on - which is the
+        trade DETACH makes, and the reason it is not automatic.
+        """
+        if author is None:
+            raise ValueError("author must be provided when detaching a fork")
+
+        collection, dataset_name = self._local_parts(fork_identifier)
+        fork_fq = self._qualify(fork_identifier)
+        dataset = self.load_dataset(f"{collection}.{dataset_name}", load_history=True)
+        if dataset is None:
+            raise DatasetNotFound(f"Dataset not found: {fork_fq}")
+
+        fork = dataset.metadata.fork
+        if fork is None:
+            raise ForkError(f"{fork_fq} is not a fork; there is nothing to detach.")
+
+        snapshot = dataset.snapshot(None)
+        entries = dataset._parent_manifest_entries(snapshot) if snapshot else []
+        location = dataset.metadata.location
+
+        copied = 0
+        rewritten = []
+        for entry in entries:
+            row = dict(entry)
+            source_path = row.get("file_path")
+            if not source_path or is_own_path(location, source_path):
+                rewritten.append(row)
+                continue
+            target_path = f"{location}/data/{source_path.rsplit('/', 1)[-1]}"
+            self._copy_object(source_path, target_path)
+            row["file_path"] = target_path
+            # A borrowed delete vector is borrowed too, and by the same rule.
+            sidecar = row.get(DELETE_FILE_PATH_KEY)
+            if sidecar and not is_own_path(location, sidecar):
+                sidecar_target = f"{location}/deletes/{sidecar.rsplit('/', 1)[-1]}"
+                self._copy_object(sidecar, sidecar_target)
+                row[DELETE_FILE_PATH_KEY] = sidecar_target
+            rewritten.append(row)
+            copied += 1
+
+        if copied:
+            dataset.truncate_and_add_files(
+                entries=rewritten,
+                author=author,
+                commit_message=f"DETACH {fork_fq} FROM {fork.source.dataset}",
+                read_sources=[],
+            )
+
+        # The block goes before the pin: a dataset that still says it is a fork
+        # while nothing pins its upstream is the dangerous half of this pair.
+        dataset.metadata.fork = None
+        self.save_dataset_metadata(dataset.metadata)
+        self.deregister_fork(fork.source.dataset, fork_fq)
+
+        emit_audit(
+            "detach_fork",
+            resource_type=ResourceType.DATASET,
+            workspace=self.workspace,
+            collection=collection,
+            resource=dataset_name,
+            author=author,
+            upstream=fork.source.dataset,
+            files_copied=copied,
+        )
+        return {"fork": fork_fq, "upstream": fork.source.dataset, "files_copied": copied}
+
+    # ------------------------------------------------------------------
     # Snapshot tags
     # ------------------------------------------------------------------
 
@@ -7894,6 +8536,12 @@ class OpteryxCatalog(Metastore):
         # document without one is left without one.
         if metadata.runs_as is not None:
             document["runs-as"] = metadata.runs_as
+        # Written only when there is one, so a plain dataset's document carries
+        # no `fork` key at all rather than a null. Same reason `runs-as` is
+        # conditional: absent and null are different answers to "is this a
+        # fork", and only one of them is the truth for a dataset nobody cloned.
+        if metadata.fork is not None:
+            document["fork"] = metadata.fork.to_dict()
         doc_ref.set(document)
 
         # Metadata persisted in primary `datasets` collection only.

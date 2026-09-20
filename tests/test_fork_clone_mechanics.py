@@ -1,0 +1,290 @@
+"""Cloning moves no bytes, and the fork reads the upstream's files.
+
+`FORKS_DESIGN.md` S4, S6. The catalog-level `clone_dataset` needs Firestore;
+what is driven here is the mechanism underneath it against real manifests and
+real storage - the upstream's entries committed verbatim onto a second dataset
+in a different location.
+
+The assertion that matters is the negative one: after a clone, storage holds
+exactly the data files it held before. If that ever fails, something has
+started copying, and the whole point of the design has gone.
+"""
+
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.dirname(__file__))
+
+from rugo.parquet import write_parquet
+from test_provenance_commits import _DocumentStore
+from test_provenance_commits import _MemIO
+from test_provenance_commits import _morsel
+
+from opteryx_catalog.catalog.dataset import SimpleDataset
+from opteryx_catalog.catalog.expiration import SnapshotExpiration
+from opteryx_catalog.catalog.manifest import clear_parsed_manifest_cache
+from opteryx_catalog.catalog.metadata import DatasetMetadata
+from opteryx_catalog.catalog.metadata import Fork
+from opteryx_catalog.catalog.metadata import ForkSource
+from opteryx_catalog.catalog.metadata import ForkTarget
+
+UPSTREAM = "samples.tpch_sf1.lineitem"
+UPSTREAM_LOCATION = "mem://samples/tpch_sf1/lineitem"
+FORK = "personal.justin.lineitem"
+FORK_LOCATION = "mem://personal/justin/lineitem"
+
+
+def _world():
+    """One storage map, two datasets in different locations."""
+    clear_parsed_manifest_cache()
+    storage: dict[str, bytes] = {}
+    mem_io = _MemIO(storage)
+
+    def _make(identifier, location):
+        meta = DatasetMetadata(
+            dataset_identifier=identifier, location=location, schema=None, properties={}
+        )
+        ds = SimpleDataset(identifier=identifier, _metadata=meta)
+        ds.io = mem_io
+        ds.catalog = _DocumentStore(mem_io)
+        return ds
+
+    return storage, _make(UPSTREAM, UPSTREAM_LOCATION), _make(FORK, FORK_LOCATION)
+
+
+def _stage(storage, location, name, values):
+    path = f"{location}/data/{name}"
+    storage[path] = write_parquet(_morsel(list(values)), compression="zstd")
+    return path
+
+
+def _data_files(storage):
+    return {p for p in storage if p.endswith(".parquet") and "/data/" in p}
+
+
+def _entries(dataset):
+    return dataset._parent_manifest_entries(dataset.snapshot(None))
+
+
+def _clone(upstream, fork, author="justin"):
+    """What `clone_dataset` does to the fork, minus the Firestore half."""
+    snapshot = upstream.snapshot(None)
+    fork.truncate_and_add_files(
+        entries=upstream._parent_manifest_entries(snapshot),
+        author=author,
+        commit_message=f"CLONE {UPSTREAM} AT VERSION {snapshot.snapshot_id}",
+        read_sources=[(UPSTREAM, snapshot.snapshot_id, "version")],
+    )
+    fork.metadata.fork = Fork(
+        source=ForkSource(
+            dataset=UPSTREAM,
+            snapshot_id=snapshot.snapshot_id,
+            sequence_number=int(snapshot.sequence_number or 0),
+        ),
+        target=ForkTarget(sequence_number=fork.current_sequence_number(), last_sync_ms=1),
+        forked_at_ms=1,
+        forked_by=author,
+    )
+    return fork
+
+
+# --------------------------------------------------------------------------
+# 1. No bytes move
+# --------------------------------------------------------------------------
+
+
+def test_a_clone_copies_no_data_files():
+    storage, upstream, fork = _world()
+    upstream.add_files(
+        [_stage(storage, UPSTREAM_LOCATION, "part-00000.parquet", [1, 2, 3])],
+        author="gen",
+        read_sources=[],
+    )
+    before = _data_files(storage)
+
+    _clone(upstream, fork)
+
+    assert _data_files(storage) == before, "cloning copied data files; it must not"
+
+
+def test_the_fork_manifest_names_the_upstreams_paths():
+    storage, upstream, fork = _world()
+    path = _stage(storage, UPSTREAM_LOCATION, "part-00000.parquet", [1, 2, 3])
+    upstream.add_files([path], author="gen", read_sources=[])
+
+    _clone(upstream, fork)
+
+    assert [e["file_path"] for e in _entries(fork)] == [path]
+    assert path.startswith(UPSTREAM_LOCATION), "the borrowed path is the upstream's"
+
+
+def test_the_fork_carries_the_upstreams_statistics_verbatim():
+    # The whole cost the design removes: these numbers were computed once, by
+    # the writer that had the bytes. A clone that recomputed them would be the
+    # copy path wearing a different name.
+    storage, upstream, fork = _world()
+    upstream.add_files(
+        [_stage(storage, UPSTREAM_LOCATION, "part-00000.parquet", [1, 2, 3, 4])],
+        author="gen",
+        read_sources=[],
+    )
+
+    _clone(upstream, fork)
+
+    assert _entries(fork) == _entries(upstream)
+
+
+def test_the_fork_reports_the_upstreams_row_count():
+    storage, upstream, fork = _world()
+    upstream.add_files(
+        [_stage(storage, UPSTREAM_LOCATION, "part-00000.parquet", [1, 2, 3, 4, 5])],
+        author="gen",
+        read_sources=[],
+    )
+
+    _clone(upstream, fork)
+
+    assert fork.snapshot(None).summary["total-records"] == 5
+
+
+def test_the_clone_receipt_names_the_upstream_snapshot():
+    storage, upstream, fork = _world()
+    upstream.add_files(
+        [_stage(storage, UPSTREAM_LOCATION, "part-00000.parquet", [1])],
+        author="gen",
+        read_sources=[],
+    )
+    base = upstream.snapshot(None).snapshot_id
+
+    _clone(upstream, fork)
+
+    receipt = fork.snapshot(None).read_sources
+    assert receipt == [{"dataset": UPSTREAM, "snapshot-id": base, "resolved-by": "version"}]
+    # And the standing source list is exactly the upstream, not an accumulation:
+    # "the content IS that content" is a rewrite.
+    assert fork.metadata.sources == [UPSTREAM]
+
+
+# --------------------------------------------------------------------------
+# 2. Sync state
+# --------------------------------------------------------------------------
+
+
+def test_a_fresh_fork_is_in_sync_both_ways():
+    storage, upstream, fork = _world()
+    upstream.add_files(
+        [_stage(storage, UPSTREAM_LOCATION, "part-00000.parquet", [1])],
+        author="gen",
+        read_sources=[],
+    )
+    _clone(upstream, fork)
+
+    state = fork.fork_state(upstream=upstream)
+
+    assert state["revisions_behind"] == 0
+    assert state["revisions_ahead"] == 0
+    assert state["upstream"] == UPSTREAM
+
+
+def test_a_commit_on_the_upstream_puts_the_fork_behind():
+    storage, upstream, fork = _world()
+    upstream.add_files(
+        [_stage(storage, UPSTREAM_LOCATION, "part-00000.parquet", [1])],
+        author="gen",
+        read_sources=[],
+    )
+    _clone(upstream, fork)
+
+    upstream.add_files(
+        [_stage(storage, UPSTREAM_LOCATION, "part-00001.parquet", [2])],
+        author="gen",
+        read_sources=[],
+    )
+
+    state = fork.fork_state(upstream=upstream)
+    assert state["revisions_behind"] == 1
+    assert state["revisions_ahead"] == 0
+
+
+def test_a_commit_on_the_fork_is_drift():
+    storage, upstream, fork = _world()
+    upstream.add_files(
+        [_stage(storage, UPSTREAM_LOCATION, "part-00000.parquet", [1])],
+        author="gen",
+        read_sources=[],
+    )
+    _clone(upstream, fork)
+
+    fork.add_files(
+        [_stage(storage, FORK_LOCATION, "own-00000.parquet", [9])],
+        author="justin",
+        read_sources=[],
+    )
+
+    state = fork.fork_state(upstream=upstream)
+    assert state["revisions_ahead"] == 1
+    assert state["revisions_behind"] == 0
+
+
+def test_both_sides_can_move_at_once():
+    storage, upstream, fork = _world()
+    upstream.add_files(
+        [_stage(storage, UPSTREAM_LOCATION, "part-00000.parquet", [1])],
+        author="gen",
+        read_sources=[],
+    )
+    _clone(upstream, fork)
+    upstream.add_files(
+        [_stage(storage, UPSTREAM_LOCATION, "part-00001.parquet", [2])],
+        author="gen",
+        read_sources=[],
+    )
+    fork.add_files(
+        [_stage(storage, FORK_LOCATION, "own-00000.parquet", [9])],
+        author="justin",
+        read_sources=[],
+    )
+
+    state = fork.fork_state(upstream=upstream)
+    assert state["revisions_behind"] == 1
+    assert state["revisions_ahead"] == 1
+
+
+def test_a_plain_dataset_has_no_fork_state():
+    storage, upstream, _fork = _world()
+    upstream.add_files(
+        [_stage(storage, UPSTREAM_LOCATION, "part-00000.parquet", [1])],
+        author="gen",
+        read_sources=[],
+    )
+
+    assert upstream.fork_state() is None
+
+
+# --------------------------------------------------------------------------
+# 3. A fork's own GC never touches what it borrowed
+# --------------------------------------------------------------------------
+
+
+def test_the_forks_expiration_will_not_delete_the_upstreams_files():
+    # The fork drifts, so its clone snapshot is superseded and the borrowed
+    # files stop being referenced by its head. Its own orphan sweep will
+    # propose them - and must refuse to delete them (S5.2).
+    storage, upstream, fork = _world()
+    borrowed = _stage(storage, UPSTREAM_LOCATION, "part-00000.parquet", [1])
+    upstream.add_files([borrowed], author="gen", read_sources=[])
+    _clone(upstream, fork)
+
+    deleted = []
+
+    class _IO:
+        def delete(self, path):
+            deleted.append(path)
+
+    expirer = SnapshotExpiration(catalog=None)
+    own = _stage(storage, FORK_LOCATION, "own-00000.parquet", [9])
+
+    assert expirer._delete_file(_IO(), borrowed, FORK_LOCATION) is False
+    assert expirer._delete_file(_IO(), own, FORK_LOCATION) is True
+    assert borrowed not in deleted

@@ -728,6 +728,80 @@ class SimpleDataset(Dataset):
         ]
         return max(known) + 1 if known else 1
 
+    def current_sequence_number(self) -> int:
+        """This dataset's highest sequence number, or 0 when it has none.
+
+        The anchor comparison in `fork_state` is against this. Deliberately
+        NOT `_next_sequence_number() - 1`: that method invents a number for a
+        dataset with no snapshots at all, and here the honest answer for one
+        is zero rather than a hypothetical.
+        """
+        current = self.snapshot()
+        seq = _as_int(getattr(current, "sequence_number", None))
+        if seq is not None:
+            return seq
+        known = [
+            number
+            for number in (
+                _as_int(getattr(snap, "sequence_number", None))
+                for snap in (self.metadata.snapshots or ())
+            )
+            if number is not None
+        ]
+        return max(known) if known else 0
+
+    def fork_state(self, upstream: SimpleDataset | None = None) -> dict | None:
+        """How far this fork has diverged from its upstream, both ways.
+
+        `None` for a dataset that is not a fork. Otherwise
+        `{upstream, base_snapshot, revisions_behind, revisions_ahead,
+        last_sync_ms}` (FORKS_DESIGN.md S6).
+
+        BOTH NUMBERS ARE UPPER BOUNDS, and every caller must word them that
+        way - "at most 3 revisions behind", never "3 commits behind". Sequence
+        numbers advance on EVERY commit, maintenance included, so a difference
+        of 3 may be three inserts or it may be two compactions and a statistics
+        refresh that changed not one row. Zero is the exact answer, and it is
+        the one that matters and the one the common case gets: nothing
+        whatsoever has happened on that side.
+
+        Costs one integer comparison per side. `revisions_ahead` needs nothing
+        beyond this dataset, which is already loaded; `revisions_behind` needs
+        the upstream's current sequence, so an `upstream` already in hand is
+        used and otherwise one is loaded. A caller that only wants drift can
+        pass nothing and read `revisions_ahead`.
+        """
+        fork = getattr(self.metadata, "fork", None)
+        if fork is None:
+            return None
+
+        ahead = max(0, self.current_sequence_number() - fork.target.sequence_number)
+
+        behind = 0
+        if upstream is None and self.catalog is not None:
+            try:
+                upstream = self.catalog.load_dataset(fork.source.dataset)
+            except Exception:  # noqa: BLE001 - catalog boundary; see below
+                # Best-effort, and only for the BEHIND half. An upstream that
+                # cannot be loaded right now is a display problem, not a
+                # correctness one: nothing is deleted or written on the
+                # strength of this number. The pin (S5.1) and the drop/rename
+                # refusals (S5.3) are what actually protect the relationship,
+                # and none of them read this.
+                upstream = None
+        if upstream is not None:
+            behind = max(
+                0, upstream.current_sequence_number() - fork.source.sequence_number
+            )
+
+        return {
+            "upstream": fork.source.dataset,
+            "base_snapshot": fork.source.snapshot_id,
+            "revisions_behind": behind,
+            "revisions_ahead": ahead,
+            "last_sync_ms": fork.target.last_sync_ms,
+        }
+
     def snapshot(self, snapshot_id: int | None = None, user_only: bool = False) -> Snapshot | None:
         """Return a Snapshot.
 

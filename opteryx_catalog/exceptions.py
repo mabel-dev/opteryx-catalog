@@ -239,6 +239,20 @@ class DatasetLocked(CatalogError):
     """Raised by `drop_dataset` when the dataset's `locked-by` field is set."""
 
 
+class ForkError(CatalogError):
+    """A fork operation that cannot be performed as asked.
+
+    Covers the whole family (FORKS_DESIGN.md): cloning something that cannot be
+    cloned, resyncing a dataset that is not a fork or has nothing to resync to,
+    and resyncing over local edits without `FORCE`. One class because every one
+    of them is answered the same way - by the person, changing what they asked
+    for - and none of them is a permissions problem or a storage failure.
+
+    NOT used for the drop and rename refusals that protect a fork's upstream.
+    Those raise from the operation being refused, not from a fork operation.
+    """
+
+
 class WorkspaceNotFound(KeyError, CatalogError):
     """Raised by `OpteryxCatalog.__init__` when the workspace has no
     `$properties` document and `create_if_missing` was not passed.

@@ -92,6 +92,119 @@ class Snapshot:
     produced_by: str | None = None
 
 
+# --------------------------------------------------------------------------
+# Forks (FORKS_DESIGN.md S3.1)
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class ForkSource:
+    """Where a fork was taken from, and the anchor it is measured against.
+
+    `snapshot_id` is THE PIN: the upstream's `forks/` registry mirrors it, and
+    expiration reads that registry to know which of its snapshots it may not
+    retire. `sequence_number` is the same snapshot expressed as a comparator,
+    stored so "is the upstream ahead of me?" is one integer against another
+    rather than a walk back through its history.
+
+    `dataset` is a NAME, fully qualified. This catalog has no stable dataset
+    id - identity is the identifier - so a rename of the upstream has to
+    follow this reference.
+    """
+
+    dataset: str
+    snapshot_id: int
+    sequence_number: int
+
+    def to_dict(self) -> dict:
+        return {
+            "dataset": self.dataset,
+            "snapshot-id": self.snapshot_id,
+            "sequence-number": self.sequence_number,
+        }
+
+
+@dataclass
+class ForkTarget:
+    """The fork's own anchor: the commit that last made it equal its upstream.
+
+    Set by the clone, moved by each RESYNC, and by nothing else - which is what
+    makes "have I been edited since?" the same one-integer comparison on this
+    side as `ForkSource` makes it on the other.
+    """
+
+    sequence_number: int
+    last_sync_ms: int
+
+    def to_dict(self) -> dict:
+        return {
+            "sequence-number": self.sequence_number,
+            "last-sync-ms": self.last_sync_ms,
+        }
+
+
+@dataclass
+class Fork:
+    """A dataset's standing relationship with the dataset it was cloned from.
+
+    Two anchors, one per side (`source`, `target`), because each side's state
+    is its own current sequence against its own anchor. Everything else here is
+    the audit record of how the relationship came to exist.
+
+    DISTINCT FROM PROVENANCE, deliberately. The clone's receipt says what that
+    one commit read; `sources` says what the current content is built from, is
+    capped, and is replaced by an overwrite. This says the fork is still a fork
+    - an obligation on the upstream (it may not expire the pinned snapshot, be
+    dropped, or be renamed away) that outlives any particular commit.
+    """
+
+    source: ForkSource
+    target: ForkTarget
+    forked_at_ms: int
+    forked_by: str
+
+    def to_dict(self) -> dict:
+        return {
+            "source": self.source.to_dict(),
+            "target": self.target.to_dict(),
+            "forked-at-ms": self.forked_at_ms,
+            "forked-by": self.forked_by,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict | None) -> "Fork | None":
+        """Read a stored fork block, or None for a dataset that is not a fork.
+
+        A block missing either anchor is read as NOT A FORK rather than as a
+        half fork. Every consumer - the pin, the sync state, the drop and
+        rename rules - needs both to mean anything, and a partially-read fork
+        would have them disagree about whether this dataset has an upstream.
+        """
+        if not isinstance(data, dict):
+            return None
+        source = data.get("source")
+        target = data.get("target")
+        if not isinstance(source, dict) or not isinstance(target, dict):
+            return None
+        dataset = source.get("dataset")
+        snapshot_id = source.get("snapshot-id")
+        if not dataset or snapshot_id is None:
+            return None
+        return cls(
+            source=ForkSource(
+                dataset=str(dataset),
+                snapshot_id=int(snapshot_id),
+                sequence_number=int(source.get("sequence-number") or 0),
+            ),
+            target=ForkTarget(
+                sequence_number=int(target.get("sequence-number") or 0),
+                last_sync_ms=int(target.get("last-sync-ms") or 0),
+            ),
+            forked_at_ms=int(data.get("forked-at-ms") or 0),
+            forked_by=str(data.get("forked-by") or ""),
+        )
+
+
 @dataclass
 class DatasetMetadata:
     dataset_identifier: str
@@ -229,6 +342,16 @@ class DatasetMetadata:
     # destroy the value before `scripts/backfill_refresh_trigger_identity.py`
     # has copied it onto the triggers. Retired with that script's last run.
     runs_as: str | None = None
+    # THE FORK BLOCK (FORKS_DESIGN.md S3.1). None on a dataset that was not
+    # cloned from another - which is almost all of them, and why this is read
+    # as a whole object rather than as four loose fields.
+    #
+    # Carried here for the reason every field in this block is carried:
+    # `save_dataset_metadata` writes the document whole with `set()`, so a
+    # field it does not know about is DESTROYED by the fork's next commit -
+    # and a fork that forgets its upstream is a fork whose pin the upstream is
+    # still honouring forever.
+    fork: "Fork | None" = None
     # Refresh suspended by an operator. On the VIEW rather than on its triggers:
     # a view with four sources has four triggers, and suspending three of
     # them would not suspend the view, it would refresh from a subset of its

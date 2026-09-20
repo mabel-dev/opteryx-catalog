@@ -47,6 +47,7 @@ from .metadata import SNAPSHOT_EXPIRED_AT_KEY
 from .metadata import Snapshot
 from .metadata import snapshot_is_tombstoned
 from .orphan_quarantine import OrphanQuarantine
+from .ownership import is_own_path as _is_own_path
 
 logger = logging.getLogger(__name__)
 
@@ -89,11 +90,31 @@ DATA_FILE_ORPHAN_MIN_AGE_MS = MANIFEST_ORPHAN_MIN_AGE_MS
 
 
 def pinned_snapshot_ids(catalog, identifier: str, metadata) -> set[int]:
-    """Snapshot ids held alive by a tag.
+    """Snapshot ids held alive by a tag or by a fork.
 
     A tag pins its snapshot from expiry until the tag is dropped
-    (SNAPSHOT_TAGS_DESIGN.md S4), so this set is a PROTECTED input: it decides
-    what may not be touched.
+    (SNAPSHOT_TAGS_DESIGN.md S4); a fork pins the snapshot it was taken from
+    until it resyncs forward or goes away (FORKS_DESIGN.md S5.1). This set is a
+    PROTECTED input: it decides what may not be touched.
+
+    Both kinds are the same statement - "something outside this dataset's own
+    history is standing on these files" - so they are one set, and every
+    consumer downstream is already written to honour it. A pinned snapshot is
+    retained, so its files never enter the orphan sweep, which is the whole of
+    "GC does not delete a file a fork references".
+
+    NEITHER SOURCE MAY FAIL SOFT. An unreadable tag set or fork registry is
+    raised as `ManifestProtectionError` and aborts the run, because the
+    alternative reading - an empty set - is the one that deletes exactly the
+    data the pin exists to keep.
+    """
+    return _tag_pinned_snapshot_ids(catalog, identifier, metadata) | _fork_pinned_snapshot_ids(
+        catalog, identifier
+    )
+
+
+def _tag_pinned_snapshot_ids(catalog, identifier: str, metadata) -> set[int]:
+    """The tag half of `pinned_snapshot_ids`.
 
     Two sources, in order, because pinning must not depend on how the caller
     happened to load the dataset - a tag that pins only sometimes is not a pin:
@@ -126,6 +147,39 @@ def pinned_snapshot_ids(catalog, identifier: str, metadata) -> set[int]:
             "anything for this dataset while it is unknown which snapshots are pinned."
         ) from exc
     return {int(tag["snapshot-id"]) for tag in tags if tag.get("snapshot-id") is not None}
+
+
+def _fork_pinned_snapshot_ids(catalog, identifier: str) -> set[int]:
+    """The fork half of `pinned_snapshot_ids`: every registered fork's base.
+
+    Read from the registry subcollection on THIS dataset (it is the upstream in
+    every row), never from the forks themselves - a fork may live in another
+    workspace, and an upstream cannot be made to enumerate the catalog looking
+    for datasets that might point at it.
+
+    A catalog with no `list_forks` at all reads as UNPINNED, unlike the tag
+    half's missing `list_tags`. The two are not the same situation: every real
+    catalog has tags, and a handle that cannot list them is a broken handle,
+    whereas `list_forks` is new and the test doubles in this suite predate it.
+    A catalog that HAS the method and fails to answer is still fatal - that is
+    the case where forks may exist and are unreadable.
+    """
+    lister = getattr(catalog, "list_forks", None)
+    if lister is None:
+        return set()
+    try:
+        forks = lister(identifier)
+    except Exception as exc:
+        raise ManifestProtectionError(
+            f"Cannot read the fork registry of {identifier}: {exc}. Refusing to expire "
+            "anything for this dataset while it is unknown which snapshots its forks "
+            "are standing on."
+        ) from exc
+    return {
+        int(row["pinned-snapshot"])
+        for row in (forks or ())
+        if isinstance(row, dict) and row.get("pinned-snapshot") is not None
+    }
 
 
 class SnapshotExpiration:
@@ -490,7 +544,7 @@ class SnapshotExpiration:
                     io = self.catalog.io or dataset.io
                     for m in manifests_to_delete:
                         try:
-                            res = self._delete_file(io, m)
+                            res = self._delete_file(io, m, dataset.metadata.location)
                             if res:
                                 deleted.append(m)
                         except Exception as exc:  # noqa: BLE001 - GCS client boundary
@@ -504,7 +558,7 @@ class SnapshotExpiration:
                     bytes_reclaimed = 0
                     for f in full_orphans:
                         try:
-                            if self._delete_file(io, f):
+                            if self._delete_file(io, f, dataset.metadata.location):
                                 deleted_data_files.append(f)
                                 bytes_reclaimed += candidate_sizes.get(f, 0)
                         except Exception as e:  # noqa: BLE001 - GCS/Firestore client boundary
@@ -649,7 +703,7 @@ class SnapshotExpiration:
                         io = self.catalog.io or dataset.io
                         for m in manifests_to_delete:
                             try:
-                                if self._delete_file(io, m):
+                                if self._delete_file(io, m, dataset.metadata.location):
                                     deleted.append(m)
                             except Exception as exc:  # noqa: BLE001 - GCS client boundary, see above
                                 # Continue deleting what we can
@@ -980,7 +1034,7 @@ class SnapshotExpiration:
         # established before step 2 ran; this only performs the deletions.
         for m in sorted(orphaned_manifests):
             try:
-                if self._delete_file(self.catalog.io or dataset.io, m):
+                if self._delete_file(self.catalog.io or dataset.io, m, dataset.metadata.location):
                     summary["deleted_manifests"].append(m)
                     logger.info("Deleted orphaned manifest %s", m)
             except Exception as e:  # noqa: BLE001 - GCS/Firestore client boundary
@@ -991,7 +1045,7 @@ class SnapshotExpiration:
             for file_path in orphaned_files:
                 try:
                     io = self.catalog.io or dataset.io
-                    if self._delete_file(io, file_path):
+                    if self._delete_file(io, file_path, dataset.metadata.location):
                         summary["deleted_files"].append(file_path)
                         summary["bytes_reclaimed"] += orphaned_file_sizes.get(file_path, 0)
                         logger.info("Deleted orphaned file %s", file_path)
@@ -1284,17 +1338,34 @@ class SnapshotExpiration:
         )
         return to_delete & data_candidates, to_delete & manifest_candidates, fields
 
-    def _delete_file(self, io, file_path: str) -> bool:
+    def _delete_file(self, io, file_path: str, location: str | None) -> bool:
         """
-        Delete a file from storage.
+        Delete a file from storage, if this dataset is the one that owns it.
+
+        `location` is the dataset's own storage prefix and is REQUIRED - not
+        defaulted - so that a new call site has to answer the question rather
+        than inherit a permissive answer by omission. See `_is_own_path` for
+        what it decides and why this is the layer that decides it.
 
         Args:
             io: FileIO instance
             file_path: Path to file to delete
+            location: the dataset's own storage prefix (`metadata.location`)
 
         Returns:
             True if successful, False otherwise
         """
+        if not _is_own_path(location, file_path):
+            # Not a failure: the caller correctly identified a file no
+            # retained snapshot references, and dropping it from the manifest
+            # was the whole of the delete. The bytes belong to another dataset,
+            # whose own sweep will reclaim them when ITS manifests stop naming
+            # them. Debug, not warning - on a fork this is the normal case and
+            # happens for every borrowed file.
+            logger.debug(
+                "Not deleting %s: outside this dataset's own location %s", file_path, location
+            )
+            return False
         try:
             # Attempt to delete via FileIO
             # Note: Not all FileIO implementations support delete
