@@ -1,9 +1,11 @@
 # Dataset Forks — Design
 
-Status: **built and staged** (2026-09-20). The catalog, the SQL surface, the
-`LOAD SAMPLE` removal, and the `samples` workspace itself - registered at
-scale factors 0.01, 0.1 and 1, with 5 and 10 the same command away (S12).
-Forking works against real infrastructure; what it found is in S12.1.
+Status: **DEPLOYED** (2026-09-20). The catalog, the SQL surface, the
+`LOAD SAMPLE` removal, and the `samples` workspace - all five scale factors,
+152.4M rows. Verified against production: cloning all eight tables of
+`tpch_sf10` (94.6M rows over a 2.9 GB upstream) took 54 seconds and wrote
+0.06 MB, which is the manifests and nothing else. What staging found on the
+way is in S12.1.
 
 Built in opteryx-catalog (rollout step 1, S12): the ownership guard
 (`catalog/ownership.py`, `SnapshotExpiration._delete_file`), the `fork` block
@@ -560,22 +562,48 @@ subcollection read, the fork side a document get.
 
 ### 10.2 OData `$metadata`
 
-New `Custom.*` annotations beside `Custom.Sources` and `Custom.Consumers`
-(odata.opteryx, read by `odata-metadata.js`): `Custom.Fork.Upstream`,
-`Custom.Fork.BaseSnapshot`, `Custom.Fork.RevisionsBehind`, `Custom.Fork.RevisionsAhead`,
-and on any dataset `Custom.Forks.Count`. Studio reads its dataset metadata from
-one `$metadata` fetch and this keeps it that way.
+BUILT, as ONE term rather than five. `Custom.Fork` is a single Record beside
+`Custom.Sources` and `Custom.Consumers` carrying `Upstream`, `RevisionsBehind`,
+`RevisionsAhead`, `BaseSnapshot`, `LastSyncMs` and `ForkedBy` - one annotation,
+because they are one fact and five terms would be five things a client has to
+find and keep in agreement. The service OMITS it entirely for a dataset nobody
+cloned, so an absent term means "not a fork"; there is no companion
+completeness flag, because there is no "older service" state to separate it
+from.
+
+Read by `odata-metadata.js`'s `readODataFork`, off the same `$metadata` fetch
+everything else on the page comes from. The fork's divergence is part of the
+metadata cache key - without it a resync would keep serving "at most 3
+revisions behind" after it had become zero.
+
+NOT built: `Custom.Forks.Count` on an upstream.
 
 ### 10.3 Studio
 
-- **manage-dataset.html**, in the page-header title beside the kind chip: a
-  fork chip — `Forked from samples.tpch_sf1.lineitem` — with the state as its
-  detail: `up to date`, `at most 3 revisions behind`, `at most 2 revisions
-  ahead`, or both. `Resync`
-  is an action on the chip when behind and not drifted; when drifted it opens
-  the same dialog with the `FORCE` consequence spelled out (which commits are
-  superseded, that they remain in history until they expire). On an upstream:
-  `4 forks`, linking to the `information_schema.forks` view filtered to it.
+- **manage-dataset.html** — BUILT, as a LINE under the title and the version
+  picker rather than a chip beside them, with the drift as DIFF COUNTS:
+  `Forked from samples.tpch_sf1.lineitem  --3:++1` — red behind, green ahead,
+  the way every tool that compares two refs shows it. The prose it replaced
+  ("at most 3 revisions behind, edited here (at most 1 revision)") said the
+  same thing in twelve words and had to be READ; this is scanned. The long
+  form, with its "at most", moves to the `title`/`aria-label`, where a reader
+  who does not know the convention can find it.
+
+  A side that is zero is OMITTED rather than shown as `--0`, which reads as a
+  quantity and is not one — so an in-sync fork shows just the name. "Up to
+  date" is the unremarkable case, and saying it on every page is noise on a
+  line whose job is to say something happened. The upstream is a link: a
+  citation nobody can follow is most of the way to no provenance at all.
+
+  Beside the title it did not work. The line carries a full dataset name of its
+  own and competed with the name above it for the same row, which the title
+  lost — `personal.bastian.lineitem` ellipsised to `perso…`. Neither name may
+  be elided to make room for the other, so the two now stack:
+  `.page-header-identity` is a column holding the title row and this line,
+  inside a `.page-header` that is a flex row ending in the close button.
+
+  NOT built: a `Resync` action on the line, and `4 forks` on an upstream
+  linking to `information_schema.forks`. The data for both is live.
 - **The Load-sample dialog** (`load-sample.js`) drops its hardcoded inventory
   and lists the `samples` workspace's collections from OData; the statement it
   writes into the editor becomes `CREATE COLLECTION personal.justin CLONE
@@ -641,8 +669,18 @@ cross-workspace:
 * All three of `clone_dataset`, `resync_fork` and `detach_fork` called
   `save_dataset_metadata(metadata)`, which takes `(identifier, metadata)`.
 
-Both are now covered by tests that assert the SHAPE of the call rather than its
-effect, since the shape is what was wrong.
+A third arrived later, from a user's own fork rather than a test: `load_dataset`
+does NOT hydrate `metadata.schema` - it resolves `current_schema_id` and leaves
+the object alone - so `clone_dataset` passed None to `create_dataset` and made
+forks with six million rows, a correct manifest, a correct fork block, and NO
+SCHEMA. Everything that describes a dataset showed blank. `_stored_schema_of`
+now copies the upstream's stored column documents verbatim: the round trip
+through this catalog's dependency-free `RelationSchema` is lossy in exactly
+this direction, and a fork's schema is not merely similar to its upstream's -
+it IS its upstream's.
+
+All three are now covered by tests that assert the SHAPE of the call rather than
+its effect, since the shape is what was wrong each time.
 
 Also confirmed live, which is the point of having done it: a fork's manifest
 names the staged file at `gs://opteryx/tpch/...` while the fork's own location

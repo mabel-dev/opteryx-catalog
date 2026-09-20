@@ -16,6 +16,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.dirname(__file__))
 
+import pytest
 from rugo.parquet import write_parquet
 from test_provenance_commits import _DocumentStore
 from test_provenance_commits import _MemIO
@@ -288,3 +289,103 @@ def test_the_forks_expiration_will_not_delete_the_upstreams_files():
     assert expirer._delete_file(_IO(), borrowed, FORK_LOCATION) is False
     assert expirer._delete_file(_IO(), own, FORK_LOCATION) is True
     assert borrowed not in deleted
+
+
+# --------------------------------------------------------------------------
+# 4. A fork carries its upstream's schema
+# --------------------------------------------------------------------------
+#
+# Found in production, on a real user's fork: the dataset had six million rows,
+# a correct manifest and a correct fork block, and NO SCHEMA - so every page
+# that describes it showed nothing at all.
+#
+# The cause is a trap this catalog sets in several places: `load_dataset`
+# resolves `current_schema_id` and leaves `metadata.schema` as None. Reading
+# `upstream.metadata.schema` after a load therefore gets None, and passing that
+# to `create_dataset` makes a dataset with no schema document rather than
+# failing. Both halves are held here - that the schema is carried, and that a
+# missing one is refused rather than silently produced.
+
+
+class _StoredSchemaCatalog:
+    """Just enough catalog to drive `_stored_schema_of`'s contract."""
+
+    def __init__(self, schema_id, columns):
+        self.workspace = "samples"
+        self._schema_id = schema_id
+        self._columns = columns
+
+    def _qualify(self, name):
+        return name if name.count(".") >= 2 else f"{self.workspace}.{name}"
+
+    def _split_qualified(self, name):
+        return tuple(name.split(".", 2))
+
+    def _catalog_for(self, workspace):
+        return self
+
+    def _dataset_doc_ref(self, collection, dataset_name):
+        outer = self
+
+        class _Schemas:
+            def document(self, _id):
+                class _D:
+                    def get(self_inner):
+                        return type(
+                            "Doc", (), {"to_dict": lambda _s: {"columns": outer._columns}}
+                        )()
+
+                return _D()
+
+        class _Ref:
+            def get(self_inner):
+                return type(
+                    "Doc",
+                    (),
+                    {"to_dict": lambda _s: {"current-schema-id": outer._schema_id}},
+                )()
+
+            def collection(self_inner, _name):
+                return _Schemas()
+
+        return _Ref()
+
+
+COLUMNS = [
+    {"name": "n_nationkey", "type": "INT32"},
+    {"name": "n_name", "type": "VARCHAR"},
+]
+
+
+def test_the_upstreams_stored_columns_are_carried_across_verbatim():
+    from opteryx_catalog.opteryx_catalog import OpteryxCatalog
+
+    catalog = _StoredSchemaCatalog("sid-1", COLUMNS)
+
+    stored = OpteryxCatalog._stored_schema_of(catalog, "samples.tpch_sf1.nation")
+
+    # The stored spelling, which `create_dataset` accepts directly - NOT a
+    # RelationSchema, whose round trip is lossy in exactly this direction.
+    assert stored == {"columns": COLUMNS}
+
+
+def test_an_upstream_with_no_current_schema_is_refused():
+    from opteryx_catalog.exceptions import ForkError
+    from opteryx_catalog.opteryx_catalog import OpteryxCatalog
+
+    catalog = _StoredSchemaCatalog(None, COLUMNS)
+
+    with pytest.raises(ForkError, match="no current schema"):
+        OpteryxCatalog._stored_schema_of(catalog, "samples.tpch_sf1.nation")
+
+
+def test_an_empty_schema_document_is_refused():
+    # The failure that actually happened, seen from the other side: rather than
+    # creating a fork with nothing able to describe it, refuse.
+    from opteryx_catalog.exceptions import ForkError
+    from opteryx_catalog.opteryx_catalog import OpteryxCatalog
+
+    catalog = _StoredSchemaCatalog("sid-1", [])
+
+    with pytest.raises(ForkError, match="missing or empty"):
+        OpteryxCatalog._stored_schema_of(catalog, "samples.tpch_sf1.nation")

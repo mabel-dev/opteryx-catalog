@@ -6498,6 +6498,45 @@ class OpteryxCatalog(Metastore):
             )
         return snapshot, upstream._parent_manifest_entries(snapshot)
 
+    def _stored_schema_of(self, identifier: str) -> dict:
+        """The STORED column documents of a dataset's current schema.
+
+        Returned in the stored spelling - `{"columns": [{"name", "type", ...}]}` -
+        which `create_dataset` accepts directly, so a clone carries its
+        upstream's schema across verbatim rather than through a conversion.
+        That matters twice over: the round trip through this catalog's
+        dependency-free `RelationSchema` is LOSSY in the direction needed here
+        (it produces a display `type` string, while `_schema_to_columns` wants a
+        core `column_type` object), and a fork's schema is not merely similar to
+        its upstream's - it IS its upstream's, and copying the bytes is the only
+        way to say that without a translation table in between.
+
+        `load_dataset` does NOT hydrate `metadata.schema` - it resolves the id
+        and leaves the object alone - so reading `upstream.metadata.schema`
+        after a load gets None. A clone that passed that None created a dataset
+        with rows, a manifest, and nothing able to say what its columns were.
+
+        Raises rather than returning None. A fork with no schema is not a
+        degraded fork, it is a broken one, and it must not be created.
+        """
+        workspace, collection, dataset_name = self._split_qualified(self._qualify(identifier))
+        catalog = self._catalog_for(workspace)
+        doc_ref = catalog._dataset_doc_ref(collection, dataset_name)
+        schema_id = (doc_ref.get().to_dict() or {}).get("current-schema-id")
+        if not schema_id:
+            raise ForkError(
+                f"{identifier} has no current schema, so there is nothing to clone its "
+                "shape from."
+            )
+        stored = (
+            doc_ref.collection("schemas").document(str(schema_id)).get().to_dict() or {}
+        ).get("columns")
+        if not stored:
+            raise ForkError(
+                f"{identifier}'s schema document {schema_id} is missing or empty."
+            )
+        return {"columns": stored}
+
     def clone_dataset(
         self,
         source_identifier: str,
@@ -6549,7 +6588,7 @@ class OpteryxCatalog(Metastore):
         #    content, so it is the upstream's schema too - reading it from the
         #    entries instead would rediscover what the catalog already knows.
         dataset = self.create_dataset(
-            f"{collection}.{dataset_name}", upstream.metadata.schema, author=author
+            f"{collection}.{dataset_name}", self._stored_schema_of(source_fq), author=author
         )
 
         # 3. Commit the borrowed entries. `truncate_and_add_files` rather than
@@ -6770,7 +6809,7 @@ class OpteryxCatalog(Metastore):
         # The upstream's schema comes with its content: a resync is "become
         # the upstream again", and a fork left describing columns its manifest
         # no longer has would read as corrupt.
-        dataset.metadata.schema = upstream.metadata.schema
+        dataset.metadata.schema = self._stored_schema_of(fork.source.dataset)
         self.save_dataset_metadata(f"{collection}.{dataset_name}", dataset.metadata)
 
         emit_audit(
