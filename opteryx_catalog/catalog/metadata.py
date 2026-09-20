@@ -235,6 +235,13 @@ class DatasetMetadata:
     # own bind-time estimate does - it falls back to `count(*)` where
     # `reltuples` is -1, which is exactly the unanalysed case.
     statistics: dict | None = None
+    # True for a dataset PROJECTED from an external catalog - a stub written by
+    # a binding refresh (stub_projection's `external-catalog` marker) rather
+    # than a dataset this catalog owns. Read back because a stub is a dataset
+    # document in every other respect, so nothing else distinguishes one; the
+    # things that cannot apply to it - a clone borrowing its manifest, say -
+    # have no other way to know what they are looking at.
+    external_catalog: bool = False
     # Maintenance policy: retention settings grouped under a single block
     maintenance_policy: dict = field(
         default_factory=lambda: {

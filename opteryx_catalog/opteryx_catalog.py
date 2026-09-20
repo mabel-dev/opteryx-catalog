@@ -75,6 +75,7 @@ from .resource_types import ResourceType
 from .schedules import next_due_ms
 from .schedules import occurrences_between
 from .schedules import validate_schedule
+from .stub_projection import STUB_MARKER
 from .webhooks import send_webhook
 from .webhooks.events import dataset_created_payload
 from .webhooks.events import dataset_deleted_payload
@@ -936,6 +937,12 @@ class OpteryxCatalog(Metastore):
     explicit - pass `create_if_missing=True`.
     """
 
+    # This is the store whose snapshot mechanics forking is built on: manifest
+    # entries to borrow, and a fork registry that pins the snapshot they came
+    # from against expiration. See `Metastore.supports_forking` for why no
+    # external store may claim it.
+    supports_forking: bool = True
+
     def __init__(
         self,
         workspace: str,
@@ -1588,6 +1595,9 @@ class OpteryxCatalog(Metastore):
         # See DatasetMetadata.statistics: the refresh's own measurements for a
         # projected relation. Absent for a native dataset, which has a snapshot.
         metadata.statistics = data.get("statistics")
+        # See DatasetMetadata.external_catalog: the marker that says this
+        # document is a projection of a relation some other catalog owns.
+        metadata.external_catalog = bool(data.get(STUB_MARKER))
         # Load the configured sort order. Without this the value round-tripped
         # by save_dataset_metadata is silently dropped on read, so the engine's
         # compaction planner always sees an empty sort_orders and falls back to the
@@ -6484,6 +6494,27 @@ class OpteryxCatalog(Metastore):
         4 GB back to rediscover it is the cost this whole design exists to
         remove.
         """
+        # A projection of a relation another catalog owns is not forkable, and
+        # it is checked BEFORE the snapshot is asked for: a stub has no
+        # snapshots at all - nothing commits to one - so the test below would
+        # report it as a dataset with no commits yet, which reads as "come back
+        # once you have written something" when the truth is that this dataset
+        # can never be cloned. Iceberg and Postgres relations are governed by
+        # their own catalogs; there is no manifest of ours to borrow and no way
+        # for our fork registry to stop the files moving underneath it.
+        #
+        # opteryx-core refuses the same statement at BIND time, off the source
+        # metastore's `supports_forking` (which is how it also catches a
+        # workspace resolved live to a non-native metastore, with no stub
+        # document in this catalog at all). This is the backstop for a caller
+        # driving the catalog API directly.
+        if upstream.metadata.external_catalog:
+            raise ForkError(
+                f"{upstream.identifier} is projected from an external catalog, so it has "
+                "no manifest of ours to borrow and cannot be cloned - copy it with "
+                "CREATE TABLE ... AS SELECT instead."
+            )
+
         snapshot = upstream.snapshot(snapshot_id)
         if snapshot is None:
             raise ForkError(

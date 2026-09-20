@@ -15,6 +15,25 @@ class Metastore:
     implementations to ease future compatibility.
     """
 
+    # Whether a dataset held by this metastore can be FORKED - that is, whether
+    # `CREATE TABLE ... CLONE` may create a new dataset whose first manifest
+    # lists this one's files.
+    #
+    # True ONLY for the native Opteryx metastore. A fork borrows a snapshot's
+    # manifest entries verbatim and pins that snapshot against expiration on
+    # the upstream; both are Opteryx snapshot-store mechanics, and neither has
+    # an equivalent in an external store. An Iceberg table's files are governed
+    # by the Iceberg catalog's own expiry, which knows nothing of our forks; a
+    # Postgres relation has no manifest to borrow at all. A clone of either
+    # would be a fork resting on files nothing has promised to keep.
+    #
+    # False by default, so an implementation that has not thought about it -
+    # or a duck-typed metastore that does not derive from this class at all,
+    # which reads as False at the asking site - is refused rather than
+    # silently forked. Opting in is a positive act by a store that really does
+    # provide the snapshot mechanics.
+    supports_forking: bool = False
+
     def load_dataset(self, identifier: str) -> Dataset:
         raise NotImplementedError()
 

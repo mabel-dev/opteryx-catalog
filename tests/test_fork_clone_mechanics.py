@@ -389,3 +389,53 @@ def test_an_empty_schema_document_is_refused():
 
     with pytest.raises(ForkError, match="missing or empty"):
         OpteryxCatalog._stored_schema_of(catalog, "samples.tpch_sf1.nation")
+
+
+# --- what may be forked at all ------------------------------------------
+
+
+class _Upstream:
+    """The two things `_upstream_entries` asks an upstream about."""
+
+    def __init__(self, identifier, external_catalog, snapshot=None):
+        self.identifier = identifier
+        self.metadata = DatasetMetadata(
+            dataset_identifier=identifier, location="mem://x", schema=None, properties={}
+        )
+        self.metadata.external_catalog = external_catalog
+        self._snapshot = snapshot
+
+    def snapshot(self, snapshot_id=None):
+        return self._snapshot
+
+    def _parent_manifest_entries(self, snapshot):
+        return []
+
+
+def test_a_dataset_projected_from_an_external_catalog_cannot_be_cloned():
+    """An Iceberg or Postgres relation reaches this catalog as a stub: a
+    dataset document with no snapshots, because nothing commits to one. There
+    is no manifest of ours to borrow and no fork registry that can stop its
+    files moving, so it is refused - and refused for THAT reason, which is the
+    point of checking before the snapshot is asked for."""
+    from opteryx_catalog.exceptions import ForkError
+    from opteryx_catalog.opteryx_catalog import OpteryxCatalog
+
+    upstream = _Upstream("google.public_data.nyc_taxicab_2021", external_catalog=True)
+
+    with pytest.raises(ForkError, match="projected from an external catalog"):
+        OpteryxCatalog._upstream_entries(None, upstream, None)
+
+
+def test_a_native_dataset_with_nothing_committed_still_says_so():
+    """The reason the check above exists is that this message was given for
+    both cases. A native dataset really can have no commits yet, and that
+    caller is being told something true and actionable - come back after
+    writing to it - so the two answers must stay distinct."""
+    from opteryx_catalog.exceptions import ForkError
+    from opteryx_catalog.opteryx_catalog import OpteryxCatalog
+
+    upstream = _Upstream("personal.justin.fresh", external_catalog=False)
+
+    with pytest.raises(ForkError, match="no commits yet"):
+        OpteryxCatalog._upstream_entries(None, upstream, None)
