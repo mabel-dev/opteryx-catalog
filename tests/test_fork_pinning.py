@@ -221,3 +221,80 @@ def test_an_unforked_over_age_snapshot_still_expires():
 
     assert 2 in keep
     assert delete == {1, 3, 4}, "the fork pin protected more than the snapshot it names"
+
+
+# --------------------------------------------------------------------------
+# 4. Cross-workspace routing
+# --------------------------------------------------------------------------
+#
+# Both of these were found against real infrastructure, not here, and neither
+# could have been: every fixture in this suite is a single-workspace double, so
+# a method that only works within one workspace passes all of them. They are
+# regression tests for the shape of the call, which is what was wrong.
+
+
+class _RecordingCatalog:
+    """Records how a qualified name was routed, and by which handle."""
+
+    def __init__(self, workspace):
+        self.workspace = workspace
+        self.loaded = []
+        self.siblings = {}
+
+    # The two helpers under test, copied in behaviour from OpteryxCatalog.
+    def _qualify(self, name):
+        return name if name.count(".") >= 2 else f"{self.workspace}.{name}"
+
+    def _split_qualified(self, name):
+        return tuple(name.split(".", 2))
+
+    def _catalog_for(self, workspace):
+        if workspace == self.workspace:
+            return self
+        return self.siblings.setdefault(workspace, _RecordingCatalog(workspace))
+
+    def load_dataset(self, identifier, load_history=False):
+        self.loaded.append(identifier)
+        return f"{self.workspace}.{identifier}"
+
+    _load_qualified = None  # bound below from the real implementation
+
+
+def _load_qualified(self, identifier, load_history=False):
+    workspace, collection, dataset_name = self._split_qualified(self._qualify(identifier))
+    return self._catalog_for(workspace).load_dataset(
+        f"{collection}.{dataset_name}", load_history=load_history
+    )
+
+
+_RecordingCatalog._load_qualified = _load_qualified
+
+
+def test_a_qualified_name_in_another_workspace_routes_to_that_workspace():
+    # The bug: `load_dataset` takes a name LOCAL to its handle's workspace, so a
+    # three-part name naming another one is read as `collection.dataset` and
+    # raises DatasetNotFound. Cloning a sample - the whole point - is always
+    # cross-workspace.
+    catalog = _RecordingCatalog("scratch")
+
+    result = catalog._load_qualified("samples.tpch_sf001.lineitem")
+
+    assert result == "samples.tpch_sf001.lineitem"
+    assert catalog.loaded == [], "the local handle was asked for another workspace's dataset"
+    assert catalog.siblings["samples"].loaded == ["tpch_sf001.lineitem"]
+
+
+def test_a_name_in_this_workspace_uses_this_handle():
+    catalog = _RecordingCatalog("scratch")
+
+    assert catalog._load_qualified("coll.tbl") == "scratch.coll.tbl"
+    assert catalog.loaded == ["coll.tbl"]
+    assert catalog.siblings == {}, "a local read built a sibling handle it did not need"
+
+
+def test_a_qualified_name_in_this_workspace_uses_this_handle():
+    catalog = _RecordingCatalog("scratch")
+
+    assert catalog._load_qualified("scratch.coll.tbl") == "scratch.coll.tbl"
+    assert catalog.loaded == ["coll.tbl"]
+    assert catalog.siblings == {}

@@ -6582,7 +6582,7 @@ class OpteryxCatalog(Metastore):
             forked_at_ms=now_ms,
             forked_by=author,
         )
-        self.save_dataset_metadata(dataset.metadata)
+        self.save_dataset_metadata(f"{collection}.{dataset_name}", dataset.metadata)
 
         emit_audit(
             "clone_dataset",
@@ -6771,7 +6771,7 @@ class OpteryxCatalog(Metastore):
         # the upstream again", and a fork left describing columns its manifest
         # no longer has would read as corrupt.
         dataset.metadata.schema = upstream.metadata.schema
-        self.save_dataset_metadata(dataset.metadata)
+        self.save_dataset_metadata(f"{collection}.{dataset_name}", dataset.metadata)
 
         emit_audit(
             "resync_fork",
@@ -6861,7 +6861,7 @@ class OpteryxCatalog(Metastore):
         # The block goes before the pin: a dataset that still says it is a fork
         # while nothing pins its upstream is the dangerous half of this pair.
         dataset.metadata.fork = None
-        self.save_dataset_metadata(dataset.metadata)
+        self.save_dataset_metadata(f"{collection}.{dataset_name}", dataset.metadata)
         self.deregister_fork(fork.source.dataset, fork_fq)
 
         emit_audit(
