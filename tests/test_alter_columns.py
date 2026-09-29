@@ -111,7 +111,7 @@ class _FakeCatalog:
 # --- fixtures -----------------------------------------------------------------
 
 
-def _write_source(rows=200):
+def _write_source(rows=200, bloom_filters=True):
     """A real multi-column parquet file, written by rugo's own writer."""
     from draken.interop.vector_sequence import vector_from_sequence
     from draken.morsels.morsel import Morsel
@@ -125,7 +125,7 @@ def _write_source(rows=200):
             vector_from_sequence([f"r{i % 7}" for i in range(rows)], dtype="VARCHAR"),
         ],
     )
-    return write_parquet(morsel, compression="zstd")
+    return write_parquet(morsel, compression="zstd", bloom_filters=bloom_filters)
 
 
 def _donor(name, value, sql_type):
@@ -220,6 +220,11 @@ def test_drop_does_not_carry_the_dropped_columns_pages(dataset):
     """Dropping the LAST column leaves the earlier chunks exactly where they
     were, so the new page region is a byte-for-byte PREFIX of the old."""
     ds, store, _catalog, paths, committed = dataset
+    # Bloom filters are written AFTER the column chunks, one per column, so
+    # dropping a column also drops its bloom filter from the middle of that
+    # tail and the region is no longer a prefix. The prefix property is about
+    # the chunks, so the source is written without them.
+    store[paths[0]] = _write_source(bloom_filters=False)
     before = _pages(store[paths[0]])
 
     ds.alter_columns(drop=["label"], author="alice")
