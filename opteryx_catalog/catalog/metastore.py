@@ -90,6 +90,27 @@ class Dataset:
     # silently wrong for half the implementations.
     bounds_are_ordinal: Optional[bool] = None
 
+    # Whether `manifest_bytes()` hands over each snapshot's manifest as the
+    # opteryx manifest parquet (the format catalog/manifest.py writes), which
+    # opteryx-core decodes natively for planning. False for a backend whose
+    # manifests are some other format (opteryx-iceberg: Iceberg's own Avro
+    # manifests), which serves planning through `scan()` rows instead. None is
+    # undeclared, and readers must refuse it rather than guess.
+    has_opteryx_manifest: Optional[bool] = None
+
+    def manifest_bytes(self, snapshot_id: int | None = None) -> bytes | None:
+        """The raw bytes of a snapshot's manifest parquet (see
+        `has_opteryx_manifest`), or None when the snapshot carries no manifest
+        - an empty dataset. A manifest that exists but cannot be read raises."""
+        raise NotImplementedError()
+
+    def delete_vectors_for(self, entries: Iterable[Any]) -> dict[str, list[int]]:
+        """``{data_file_path: sorted deleted row ordinals}`` for manifest rows the
+        caller already holds (each with file_path, delete_file_path and
+        deleted_record_count), without re-reading the manifest. Raises when a
+        referenced sidecar is unreadable or holds no vector for a file."""
+        raise NotImplementedError()
+
     @property
     def metadata(self) -> Any:
         raise NotImplementedError()

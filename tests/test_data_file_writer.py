@@ -491,3 +491,72 @@ def test_merge_commit_with_entries_adds_and_deletes_in_one_snapshot():
         ds.merge_commit(files=[src], entries=[entry], positions={}, author="tester", read_sources=[])
     with pytest.raises(ValueError, match="requires files to add"):
         ds.merge_commit(entries=[], positions={}, author="tester", read_sources=[])
+
+
+# ---------------------------------------------------------------------------
+# 5. A writer that describes its own files: statistics=False, and commits that
+#    take the new files as a manifest (opteryx-core computes every statistic
+#    natively and hands the rows over in the manifest format itself)
+# ---------------------------------------------------------------------------
+
+
+def _manifest_bytes_of(entries):
+    """The manifest parquet of `entries`, through this package's own writer."""
+    storage: dict = {}
+    catalog = _FakeCatalog(_MemIO(storage))
+    path = catalog.write_parquet_manifest(1, entries, "mem://manifests")
+    return storage[path]
+
+
+def test_a_writer_without_statistics_describes_nothing_but_where_and_how_much():
+    from opteryx_catalog.catalog.dataset import WrittenDataFile
+
+    src = f"{LOCATION}/data/f1.parquet"
+    ds, storage, _mem_io = _seed_dataset({src: [1, 2, 3]})
+
+    writer = ds.open_data_file_writer(statistics=False)
+    assert writer.field_id_by_name == ds._field_id_by_name()
+    writer.write_row_group(_morsel([1, 2, 3]))
+    writer.write_row_group(_morsel([4, 5]))
+    assert writer.record_count == 5
+    with pytest.raises(ValueError, match="statistics=False"):
+        _ = writer.uncompressed_size_in_bytes
+    written = writer.close()
+
+    assert isinstance(written, WrittenDataFile)
+    assert written.record_count == 5
+    assert written.row_group_count == 2
+    assert written.file_size_in_bytes == len(storage[written.file_path])
+    assert _row_group_count(storage[written.file_path]) == 2
+
+
+def test_commits_take_the_new_files_as_a_manifest():
+    """The manifest form is the entries form, read out of the manifest format:
+    the same snapshot either way, and never both at once."""
+    src = f"{LOCATION}/data/f1.parquet"
+
+    ds_entries, _s1, _m1 = _seed_dataset({src: list(range(10))})
+    entry = _streamed(ds_entries, list(range(10)))
+    ds_entries.compaction_commit(entries=[entry], retired_files=[src], author="tester")
+
+    ds_manifest, _s2, mem_io = _seed_dataset({src: list(range(10))})
+    entry = _streamed(ds_manifest, list(range(10)))
+    manifest = _manifest_bytes_of([entry])
+    mem_io.reads.clear()
+    ds_manifest.compaction_commit(manifest=manifest, retired_files=[src], author="tester")
+
+    assert entry["file_path"] not in mem_io.reads
+    (via_entries,) = _current_entries(ds_entries)
+    (via_manifest,) = _current_entries(ds_manifest)
+    for key in ("record_count", "min_values", "max_values", "null_counts", "min_k_hashes", "field_ids"):
+        assert via_manifest[key] == via_entries[key], key
+    assert ds_manifest.snapshot(None).summary["total-records"] == 10
+
+    for commit in (
+        lambda: ds_manifest.add_files(entries=[entry], manifest=manifest, author="tester", read_sources=[]),
+        lambda: ds_manifest.truncate_and_add_files(entries=[entry], manifest=manifest, author="tester", read_sources=[]),
+        lambda: ds_manifest.merge_commit(entries=[entry], manifest=manifest, positions={}, author="tester", read_sources=[]),
+        lambda: ds_manifest.compaction_commit(entries=[entry], manifest=manifest, retired_files=[], author="tester"),
+    ):
+        with pytest.raises(ValueError, match="entries OR manifest"):
+            commit()

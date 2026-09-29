@@ -553,6 +553,7 @@ def open_data_file_writer_at(
     sorted_by: str | None = None,
     sorted_descending: bool = False,
     write_options: dict | None = None,
+    statistics: bool = True,
 ) -> "DataFileWriter":
     """Open one streaming data file under `location`, keyed by `field_id_by_name`.
 
@@ -567,6 +568,11 @@ def open_data_file_writer_at(
 
     Writes nothing to any catalog document: the file is registered only by
     handing the entry `close` returns to a commit that takes entries.
+
+    `statistics=False` is for a writer that describes its own files (opteryx-
+    core computes the manifest's statistics natively and commits them as a
+    manifest): nothing is accumulated, and `close` returns a `WrittenDataFile`
+    - where the file landed and its counts - instead of an entry.
     """
     from rugo.parquet import open_parquet_writer
 
@@ -581,12 +587,25 @@ def open_data_file_writer_at(
         options["sorted_descending"] = sorted_descending
 
     stream = io.new_output(data_path).create()
-    accumulator = ParquetManifestEntryAccumulator(
-        field_id_by_name=field_id_by_name, exact_histograms=False
+    accumulator = (
+        ParquetManifestEntryAccumulator(field_id_by_name=field_id_by_name, exact_histograms=False)
+        if statistics
+        else None
     )
-    handle = DataFileWriter(data_path, stream, None, accumulator)
+    handle = DataFileWriter(data_path, stream, None, accumulator, field_id_by_name)
     handle._writer = open_parquet_writer(handle._sink, **options)
     return handle
+
+
+@dataclass(frozen=True)
+class WrittenDataFile:
+    """A finished data file a statistics=False writer produced: where it landed
+    and its counts. Its manifest row is the caller's to build."""
+
+    file_path: str
+    file_size_in_bytes: int
+    record_count: int
+    row_group_count: int
 
 
 class DataFileWriter:
@@ -606,11 +625,15 @@ class DataFileWriter:
     expires on its own.
     """
 
-    def __init__(self, data_path: str, stream, writer, accumulator):
+    def __init__(self, data_path: str, stream, writer, accumulator, field_id_by_name: dict[str, int]):
         self._data_path = data_path
         self._stream = stream
         self._writer = writer
+        # None: the caller describes the file itself (statistics=False)
         self._accumulator = accumulator
+        self._field_id_by_name = dict(field_id_by_name)
+        self._records = 0
+        self._row_groups = 0
         self._bytes_written = 0
         self._done = False
 
@@ -624,15 +647,26 @@ class DataFileWriter:
         return self._data_path
 
     @property
+    def field_id_by_name(self) -> dict[str, int]:
+        """The field-ids this file's statistics are keyed by - the dataset's,
+        or for a pending dataset the ones it is about to be created with."""
+        return dict(self._field_id_by_name)
+
+    @property
     def record_count(self) -> int:
-        return self._accumulator.record_count
+        return self._records
 
     @property
     def row_group_count(self) -> int:
-        return self._accumulator.row_group_count
+        return self._row_groups
 
     @property
     def uncompressed_size_in_bytes(self) -> int:
+        if self._accumulator is None:
+            raise ValueError(
+                "a writer opened with statistics=False does not measure its file; "
+                "the caller that describes it does"
+            )
         return self._accumulator.uncompressed_size_in_bytes
 
     def write_row_group(self, morsel) -> None:
@@ -640,20 +674,28 @@ class DataFileWriter:
             raise ValueError(f"write_row_group on a finished writer for '{self._data_path}'")
         # Statistics first: a column the stats kernels refuse is found before
         # any bytes of this row group are encoded or sent.
-        self._accumulator.add(morsel)
+        if self._accumulator is not None:
+            self._accumulator.add(morsel)
         self._writer.write_row_group(morsel)
+        self._records += int(morsel.num_rows)
+        self._row_groups += 1
 
-    def close(self) -> ParquetManifestEntry:
-        """Finish the file and return its manifest entry."""
+    def close(self) -> "ParquetManifestEntry | WrittenDataFile":
+        """Finish the file and return its manifest entry - or, for a writer
+        opened with statistics=False, where it landed and its counts."""
         if self._done:
             raise ValueError(f"close on a finished writer for '{self._data_path}'")
-        if self._accumulator.row_group_count == 0:
+        if self._row_groups == 0:
             raise ValueError(
                 f"close on '{self._data_path}' with no row groups written; abort it instead"
             )
         self._done = True
         self._writer.close()  # footer, through _sink
         self._stream.close()  # the upload succeeds or raises here
+        if self._accumulator is None:
+            return WrittenDataFile(
+                self._data_path, self._bytes_written, self._records, self._row_groups
+            )
         return self._accumulator.finish(self._data_path, self._bytes_written)
 
     def abort(self) -> None:
@@ -677,6 +719,9 @@ class SimpleDataset(Dataset):
     # catalog/manifest.py's compressible-categories note, and the contract
     # on `Dataset.bounds_are_ordinal`.
     bounds_are_ordinal = True
+    # Its snapshots' manifests are the opteryx manifest parquet this package
+    # writes - see `Dataset.has_opteryx_manifest`.
+    has_opteryx_manifest = True
 
     identifier: str
     _metadata: DatasetMetadata
@@ -1571,6 +1616,7 @@ class SimpleDataset(Dataset):
         sorted_by: str | None = None,
         sorted_descending: bool = False,
         write_options: dict | None = None,
+        statistics: bool = True,
     ) -> DataFileWriter:
         """Open a new data file under this dataset's location for streaming.
 
@@ -1593,6 +1639,7 @@ class SimpleDataset(Dataset):
             sorted_by=sorted_by,
             sorted_descending=sorted_descending,
             write_options=write_options,
+            statistics=statistics,
         )
 
     def _write_table_and_build_entry(self, table: Any):
@@ -1942,6 +1989,20 @@ class SimpleDataset(Dataset):
 
         self._after_commit(author, snap)
 
+    @staticmethod
+    def _manifest_entries(entries, manifest: bytes | None, operation: str):
+        """A commit's prebuilt new entries: `entries` as given, or the rows of
+        `manifest` - the new files' manifest parquet, built by the writer
+        (opteryx-core computes every statistic natively and hands its files
+        over in the manifest format itself). One or the other, never both."""
+        if manifest is None:
+            return entries
+        if entries is not None:
+            raise ValueError(f"{operation} takes entries OR manifest, not both")
+        from .manifest import read_manifest_rows
+
+        return read_manifest_rows(manifest)
+
     def _entries_from_prebuilt(self, entries: list, existing_paths: set[str]) -> list[dict]:
         """Accept manifest entries a writer built as it wrote.
 
@@ -2049,6 +2110,7 @@ class SimpleDataset(Dataset):
         read_sources: Iterable[Any] | None = None,
         produced_by: str | None = None,
         entries: Iterable[dict] | None = None,
+        manifest: bytes | None = None,
     ):
         """Add data files to the dataset manifest without writing the files.
 
@@ -2079,6 +2141,7 @@ class SimpleDataset(Dataset):
           (there's no ranged/partial-read path in `FileIO` yet) — it saves
           decode CPU, not network transfer.
         """
+        entries = self._manifest_entries(entries, manifest, "add_files")
         if author is None:
             raise ValueError("author must be provided when adding files to a dataset")
 
@@ -2183,6 +2246,7 @@ class SimpleDataset(Dataset):
         produced_by: str | None = None,
         preserves_sources: bool = False,
         entries: Iterable[dict] | None = None,
+        manifest: bytes | None = None,
     ):
         """Truncate dataset (logical) and set manifest to provided files.
 
@@ -2192,6 +2256,7 @@ class SimpleDataset(Dataset):
         - Does not delete objects from storage.
         - Useful for replace/overwrite semantics.
         """
+        entries = self._manifest_entries(entries, manifest, "truncate_and_add_files")
         if entries is not None and files:
             raise ValueError("truncate_and_add_files takes entries OR files, not both")
         if author is None:
@@ -2663,6 +2728,7 @@ class SimpleDataset(Dataset):
         commit_message: str | None = None,
         agent: str = "opteryx-engine",
         entries: Iterable[dict] | None = None,
+        manifest: bytes | None = None,
     ):
         """Retire whole data files and add their replacements, in ONE snapshot.
 
@@ -2697,6 +2763,7 @@ class SimpleDataset(Dataset):
         silent None would leave them orphaned, which is exactly how the previous
         compactor leaked one output per timed-out pass.
         """
+        entries = self._manifest_entries(entries, manifest, "compaction_commit")
         from opteryx_catalog.exceptions import CompactionInvariantError
 
         if author is None:
@@ -2836,6 +2903,7 @@ class SimpleDataset(Dataset):
         read_sources: Iterable[Any] | None = None,
         produced_by: str | None = None,
         entries: Iterable[dict] | None = None,
+        manifest: bytes | None = None,
     ) -> Snapshot:
         """Register data files AND mark row ordinals deleted, in ONE snapshot.
 
@@ -2874,6 +2942,7 @@ class SimpleDataset(Dataset):
         source, and reach here through this same method — only what the history
         says ran.
         """
+        entries = self._manifest_entries(entries, manifest, "merge_commit")
         if operation not in self.MERGE_OPERATIONS:
             raise ValueError(
                 f"merge_commit: operation must be one of {self.MERGE_OPERATIONS}, got {operation!r}"
@@ -3135,6 +3204,26 @@ class SimpleDataset(Dataset):
 
         entries = get_parsed_manifest(self.io, snap.manifest_list)
         return read_delete_vectors_for_entries(self.io, entries)
+
+    def delete_vectors_for(self, entries: Iterable[Any]) -> dict[str, list[int]]:
+        """The delete state of manifest rows the caller already holds - see
+        `Dataset.delete_vectors_for`. The planner decodes the manifest itself
+        (`manifest_bytes`), so resolving deletes must not parse it again."""
+        from .deletes import read_delete_vectors_for_entries
+
+        return read_delete_vectors_for_entries(self.io, entries)
+
+    def manifest_bytes(self, snapshot_id: int | None = None) -> bytes | None:
+        """The raw manifest parquet of a snapshot - see `Dataset.manifest_bytes`.
+
+        Read through `self.io`, so a caller that wraps the FileIO with a cache
+        (opteryx-core's CachingFileIO) serves it from there. Nothing is parsed
+        here: the reader decodes it."""
+        snap = self.snapshot(snapshot_id)
+        if snap is None or not getattr(snap, "manifest_list", None):
+            return None
+        with self.io.new_input(snap.manifest_list).open() as f:
+            return f.read()
 
     def scan(self, row_filter=None, snapshot_id: int | None = None) -> Iterable[Datafile]:
         """Return Datafile objects for the given snapshot.

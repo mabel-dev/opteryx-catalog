@@ -1168,6 +1168,7 @@ class OpteryxCatalog(Metastore):
         sorted_by: str | None = None,
         sorted_descending: bool = False,
         write_options: dict | None = None,
+        statistics: bool = True,
     ):
         """Open a streaming data file for a dataset that does not exist yet.
 
@@ -1214,6 +1215,7 @@ class OpteryxCatalog(Metastore):
             sorted_by=sorted_by,
             sorted_descending=sorted_descending,
             write_options=write_options,
+            statistics=statistics,
         )
 
     def create_dataset(
