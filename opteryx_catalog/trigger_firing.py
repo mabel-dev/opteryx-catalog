@@ -528,7 +528,7 @@ def _fire_refresh(
     # than only in whatever they remember pausing.
     if mv.get("suspended-at-ms"):
         catalog.mark_trigger_fired(dataset_identifier, trigger["name"], status="suspended")
-        return
+        return "suspended", None
 
     # Re-checked here and not only at creation: a source workspace can take the
     # egress lock long after the view was registered, and every refresh writes
@@ -619,6 +619,7 @@ def _fire_refresh(
             "author": author,
         }
     )
+    return outcome, execution_id
 
 
 def _holder_kwargs(holder_kind: str) -> dict:
@@ -933,6 +934,8 @@ def _dispatch(
     fire,
     note: str,
     author: str | None,
+    *,
+    enforce_floor: bool = True,
 ) -> tuple[str, str | None, str | None]:
     """Run one trigger's fire under the contract every event shares.
 
@@ -965,7 +968,14 @@ def _dispatch(
         # error, not alerted, but visible where someone looks for the run
         # they expected. A record with no floor is never claimed, so a
         # trigger that predates the field costs exactly what it did.
-        if _minimum_interval_seconds(trigger) > 0:
+        #
+        # A MANUAL fire (`enforce_floor=False`) skips the floor entirely: it
+        # neither claims nor is refused. The floor exists to damp a burst of
+        # commits; a person asking for one run is not a burst, and a click
+        # answered "throttled" would be the page refusing the thing it offered.
+        # Not claiming also means a manual fire does not silence the next
+        # commit's fire inside the interval.
+        if enforce_floor and _minimum_interval_seconds(trigger) > 0:
             claim = catalog.claim_trigger_fire(holder, name, **holder_args)
             if not claim.granted:
                 catalog.mark_trigger_fired(holder, name, status="throttled", **holder_args)
@@ -1121,6 +1131,105 @@ def fire_triggers(
         # the same target must not fire in its place.
         seen_targets.add(target_view)
         _dispatch(catalog, dataset_identifier, DATASET_HOLDER, trigger, target_view, fire, note, author)
+
+
+# --- Firing by hand ---------------------------------------------------------
+#
+# "Run now" on a commit trigger: fire it as though its source had just taken
+# a commit, without one. dispatch.opteryx calls this after checking the caller
+# holds AUTOMATE on the trigger (owner); like `fire_signal`, it trusts the name
+# it is handed.
+
+
+def fire_trigger(catalog, dataset_identifier: str, trigger_name: str, caller: str) -> dict:
+    """Fire one commit trigger on `dataset_identifier` because `caller` asked.
+
+    The same fire a commit makes - suspension, `runs-as`, egress, the job
+    submission and the `last-fired-*` stamp all go through `_dispatch` - with
+    two differences, both because there is no commit:
+
+    - THE FLOOR IS NOT TAKEN. See `_dispatch`: a manual fire is never
+      throttled and does not claim the interval.
+    - THE WINDOW is the source's head against the task's `last-window-to`
+      rather than one commit: everything since the last successful run, the
+      batch form a signal windowed OVER a dataset already uses. A task that
+      has never succeeded takes everything up to the head; one with nothing
+      new is `superseded`. A refresh has no window; the head is provenance.
+
+    The caller is recorded as `fired_by`; the run carries the trigger's
+    `runs-as`, exactly as a commit-fired run does.
+
+    Never raises for a fire that failed - that is recorded on the trigger,
+    alerted, and returned as the status. Raises `TriggerNotFound` when the
+    dataset carries no commit trigger of that name, which is the caller's to
+    see as a 404.
+    """
+    trigger = next(
+        (t for t in catalog.list_triggers(dataset_identifier) if t.get("name") == trigger_name),
+        None,
+    )
+    if trigger is None:
+        raise TriggerNotFound(f"no trigger {trigger_name} on {dataset_identifier}")
+    if (trigger.get("event-kind") or COMMIT_EVENT_KIND) != COMMIT_EVENT_KIND:
+        raise TriggerNotFound(
+            f"trigger {trigger_name} on {dataset_identifier} is a "
+            f"{trigger.get('event-kind')} trigger, not a commit trigger"
+        )
+
+    head = catalog.head_snapshot_id(dataset_identifier)
+    kind = trigger.get("kind")
+    if kind == "materialized_view_refresh":
+        target = trigger.get("target-view")
+        fire = lambda: _fire_refresh(catalog, dataset_identifier, trigger, caller, head)
+        note = "manual materialized view refresh NOT enqueued"
+    elif kind == TASK_TRIGGER_KIND:
+        target = trigger.get("target-task")
+        # A source nothing has landed in has nothing to consume. Answered
+        # here, without firing: `_fire_task` binds the head as an integer,
+        # and a fire that raised on None would be stamped on the trigger as a
+        # failure it is not.
+        if head is None:
+            return {
+                "status": "superseded",
+                "execution_id": None,
+                "trigger": trigger_name,
+                "dataset": dataset_identifier,
+                "target": target,
+                "detail": f"{dataset_identifier} has no snapshot; nothing to consume",
+            }
+        # The parent bound is the last successful run's `current_version`;
+        # `_fire_task` treats None as the first-commit floor. The window guard
+        # there then supersedes a head already consumed.
+        last = catalog.get_task(target).get("last-window-to")
+        fire = lambda: _fire_task(
+            catalog, dataset_identifier, trigger, caller, head, None if last is None else int(last)
+        )
+        note = "manual task run NOT enqueued"
+    else:
+        raise TriggerNotFound(
+            f"trigger {trigger_name} on {dataset_identifier} is a {kind} trigger; "
+            "only refresh and task triggers can be fired"
+        )
+
+    status, execution_id, detail = _dispatch(
+        catalog,
+        dataset_identifier,
+        DATASET_HOLDER,
+        trigger,
+        target,
+        fire,
+        note,
+        caller,
+        enforce_floor=False,
+    )
+    return {
+        "status": status,
+        "execution_id": execution_id,
+        "trigger": trigger_name,
+        "dataset": dataset_identifier,
+        "target": target,
+        "detail": detail,
+    }
 
 
 # --- Firing from the clock and from a signal ------------------------------------

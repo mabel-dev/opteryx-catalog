@@ -348,3 +348,183 @@ def test_after_commit_never_breaks_the_commit():
     ):
         dataset._after_commit("alice", _snapshot(user_created=True))
     assert alert.call_count == 1
+
+
+# --- fire_trigger (manual "Run now") ----------------------------------------
+
+
+def _task_trigger(name="task__mart__rollup", target="mart.rollup", interval=None):
+    trigger = {
+        "name": name,
+        "kind": trigger_firing.TASK_TRIGGER_KIND,
+        "target-task": target,
+        "runs-as": "olive",
+    }
+    if interval is not None:
+        trigger["minimum-interval-seconds"] = interval
+    return trigger
+
+
+def _task_catalog(trigger, last_window_to=None, head=500):
+    catalog = _catalog_stub(triggers=[trigger])
+    catalog.head_snapshot_id.return_value = head
+    task = {
+        "identifier": "ws.mart.rollup",
+        "sql": "INSERT INTO ws.mart.out SELECT * FROM ws.src.a "
+        "WHERE v > :parent_version AND v <= :current_version",
+        "writes": [],
+    }
+    if last_window_to is not None:
+        task["last-window-to"] = last_window_to
+    catalog.get_task.return_value = task
+    return catalog
+
+
+def test_manual_refresh_fires_as_the_trigger_with_the_caller_recorded():
+    catalog = _catalog_stub(triggers=[_refresh_trigger()])
+    catalog.head_snapshot_id.return_value = 777
+
+    with patch.object(
+        trigger_firing, "_submit_refresh_job", return_value=("exec-9", "enqueued")
+    ) as submit:
+        result = trigger_firing.fire_trigger(catalog, "src.a", "refresh__mart__daily", "bob")
+
+    assert result["status"] == "enqueued"
+    assert result["execution_id"] == "exec-9"
+    kwargs = submit.call_args.kwargs
+    assert kwargs["sql_text"] == "REFRESH MATERIALIZED VIEW ws.mart.daily"
+    assert kwargs["fired_by"] == "bob"
+    assert kwargs["snapshot_id"] == 777
+    catalog.mark_trigger_fired.assert_called_once_with(
+        "src.a", "refresh__mart__daily", status="enqueued"
+    )
+
+
+def test_manual_fire_ignores_the_minimum_interval():
+    """The floor damps bursts of commits. A person asking for one run is not a
+    burst: the fire is neither refused nor does it claim the interval, so the
+    next commit's fire is not silenced by it."""
+    trigger = _refresh_trigger()
+    trigger["minimum-interval-seconds"] = 3600
+    catalog = _catalog_stub(triggers=[trigger])
+    catalog.head_snapshot_id.return_value = 777
+
+    with patch.object(trigger_firing, "_submit_refresh_job", return_value=("exec-9", "enqueued")):
+        result = trigger_firing.fire_trigger(catalog, "src.a", "refresh__mart__daily", "bob")
+
+    assert result["status"] == "enqueued"
+    catalog.claim_trigger_fire.assert_not_called()
+
+
+def test_the_commit_path_still_takes_the_floor():
+    trigger = _refresh_trigger()
+    trigger["minimum-interval-seconds"] = 3600
+    catalog = _catalog_stub(triggers=[trigger])
+    catalog.claim_trigger_fire.return_value = MagicMock(granted=False, interval_seconds=3600, at_ms=1)
+
+    with (
+        patch.object(trigger_firing, "_submit_refresh_job") as submit,
+        patch.object(trigger_firing, "_submit_throttled_record"),
+        patch.object(trigger_firing, "write_audit_record"),
+    ):
+        fire_triggers(catalog, "src.a", author="alice", snapshot_id=123)
+
+    submit.assert_not_called()
+    catalog.mark_trigger_fired.assert_called_once_with(
+        "src.a", "refresh__mart__daily", status="throttled"
+    )
+
+
+def test_manual_refresh_of_a_suspended_view_says_so():
+    mv = dict(_catalog_stub().get_materialized_view.return_value)
+    mv["suspended-at-ms"] = 1
+    catalog = _catalog_stub(triggers=[_refresh_trigger()], mv=mv)
+    catalog.head_snapshot_id.return_value = 777
+
+    with patch.object(trigger_firing, "_submit_refresh_job") as submit:
+        result = trigger_firing.fire_trigger(catalog, "src.a", "refresh__mart__daily", "bob")
+
+    submit.assert_not_called()
+    assert result["status"] == "suspended"
+
+
+def test_manual_task_run_windows_everything_since_the_last_success():
+    catalog = _task_catalog(_task_trigger(interval=3600), last_window_to=300, head=500)
+
+    with patch.object(
+        trigger_firing, "_submit_task_job", return_value=("exec-7", "enqueued")
+    ) as submit:
+        result = trigger_firing.fire_trigger(catalog, "src.a", "task__mart__rollup", "bob")
+
+    assert result["status"] == "enqueued"
+    kwargs = submit.call_args.kwargs
+    assert kwargs["sql_text"] == (
+        "EXECUTE ws.mart.rollup USING 300 AS parent_version, 500 AS current_version"
+    )
+    assert kwargs["fired_by"] == "bob"
+    catalog.claim_trigger_fire.assert_not_called()
+
+
+def test_manual_task_run_that_never_succeeded_takes_everything():
+    catalog = _task_catalog(_task_trigger(), last_window_to=None, head=500)
+
+    with patch.object(
+        trigger_firing, "_submit_task_job", return_value=("exec-7", "enqueued")
+    ) as submit:
+        trigger_firing.fire_trigger(catalog, "src.a", "task__mart__rollup", "bob")
+
+    assert submit.call_args.kwargs["sql_text"] == (
+        f"EXECUTE ws.mart.rollup USING {trigger_firing.NO_PARENT_VERSION_FLOOR} "
+        "AS parent_version, 500 AS current_version"
+    )
+
+
+def test_manual_task_run_with_nothing_new_is_superseded():
+    catalog = _task_catalog(_task_trigger(), last_window_to=500, head=500)
+
+    with patch.object(trigger_firing, "_submit_task_job") as submit:
+        result = trigger_firing.fire_trigger(catalog, "src.a", "task__mart__rollup", "bob")
+
+    submit.assert_not_called()
+    assert result["status"] == "superseded"
+
+
+def test_manual_task_run_on_an_empty_source_fires_nothing():
+    catalog = _task_catalog(_task_trigger(), head=None)
+
+    with patch.object(trigger_firing, "_submit_task_job") as submit:
+        result = trigger_firing.fire_trigger(catalog, "src.a", "task__mart__rollup", "bob")
+
+    submit.assert_not_called()
+    assert result["status"] == "superseded"
+    catalog.mark_trigger_fired.assert_not_called()
+
+
+def test_manual_fire_of_an_unknown_trigger_is_not_found():
+    from opteryx_catalog.exceptions import TriggerNotFound
+
+    catalog = _catalog_stub(triggers=[_refresh_trigger()])
+    with pytest.raises(TriggerNotFound):
+        trigger_firing.fire_trigger(catalog, "src.a", "nope", "bob")
+
+
+def test_manual_fire_refuses_a_non_commit_trigger():
+    from opteryx_catalog.exceptions import TriggerNotFound
+
+    trigger = _refresh_trigger()
+    trigger["event-kind"] = trigger_firing.SCHEDULE_EVENT_KIND
+    catalog = _catalog_stub(triggers=[trigger])
+    with pytest.raises(TriggerNotFound):
+        trigger_firing.fire_trigger(catalog, "src.a", "refresh__mart__daily", "bob")
+
+
+def test_manual_fire_failure_is_returned_not_raised():
+    catalog = _catalog_stub(triggers=[_refresh_trigger(runs_as=None)])
+    catalog.head_snapshot_id.return_value = 777
+
+    with patch.object(trigger_firing, "_alert"), patch.object(trigger_firing, "_submit_refresh_job") as submit:
+        result = trigger_firing.fire_trigger(catalog, "src.a", "refresh__mart__daily", "bob")
+
+    submit.assert_not_called()
+    assert result["status"] == "owner-missing"
+    assert "no runs-as identity" in result["detail"]
