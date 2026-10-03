@@ -20,6 +20,7 @@ class ResourceType(str, Enum):
     COLLECTION = "collection"
     WORKSPACE = "workspace"
     MATERIALIZED_VIEW = "materialized_view"
+    SECRET = "secret"
 
     # `str(member)` must be the wire value. Without this, pre-3.12 Pythons
     # render "ResourceType.DATASET" from f-strings, which would corrupt any

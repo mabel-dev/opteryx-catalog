@@ -75,6 +75,7 @@ from .resource_types import ResourceType
 from .schedules import next_due_ms
 from .schedules import occurrences_between
 from .schedules import validate_schedule
+from .secrets.store import SecretsMixin
 from .stub_projection import STUB_MARKER
 from .webhooks import send_webhook
 from .webhooks.events import dataset_created_payload
@@ -921,7 +922,7 @@ def _require_parquet_engine() -> None:
         raise ImportError(f"{_PARQUET_ENGINE_HELP}\n\nImport failed with: {err!r}") from err
 
 
-class OpteryxCatalog(Metastore):
+class OpteryxCatalog(SecretsMixin, Metastore):
     """Firestore-backed Metastore implementation.
 
     Terminology: catalog -> workspace -> collection -> dataset|view
