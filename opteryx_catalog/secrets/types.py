@@ -60,6 +60,9 @@ _AWS_REGION = re.compile(r"^[a-z]{2}(-[a-z]+)+-\d+$")
 # GCS bucket names; S3's are a subset of this shape for our purposes.
 _BUCKET = re.compile(r"^[a-z0-9][a-z0-9._-]{1,220}[a-z0-9]$")
 _GLOB_CHARS = frozenset("*?[]{}")
+_GOOGLE_TOKEN_URIS = frozenset(
+    {"https://oauth2.googleapis.com/token", "https://accounts.google.com/o/oauth2/token"}
+)
 
 
 @dataclass(frozen=True)
@@ -261,6 +264,11 @@ def _validate_gcs_service_account(options: dict) -> ValidatedSecret:
     for field in ("client_email", "private_key", "token_uri"):
         if not isinstance(key.get(field), str) or not key[field]:
             raise SecretInvalid(f"gcs_service_account KEY is missing {field}")
+    # Refreshing a service-account credential POSTs a signed assertion to the
+    # key's own token_uri. Any endpoint but Google's would make every use of
+    # this secret a request from our process to a URL the creator chose.
+    if key["token_uri"] not in _GOOGLE_TOKEN_URIS:
+        raise SecretInvalid("gcs_service_account KEY must name Google's token endpoint as token_uri")
     payload = {"key": key}
     if _payload_size(payload) > _MAX_OBJECT_STORE_PAYLOAD:
         raise SecretInvalid("gcs_service_account secret exceeds 16 KiB")

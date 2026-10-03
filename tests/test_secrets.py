@@ -340,6 +340,7 @@ def test_a_sealed_record_does_not_open_at_another_address():
         ("gcs_service_account", {"KEY": "not json", "SCOPE": "gs://bkt1/"}, "not valid JSON"),
         ("gcs_service_account", {"KEY": '{"type": "user"}', "SCOPE": "gs://bkt1/"}, "service_account"),
         ("gcs_service_account", {"KEY": SA_KEY, "SCOPE": "s3://bkt1/"}, "gs://"),
+        ("gcs_service_account", {"KEY": SA_KEY.replace("https://oauth2.googleapis.com/token", "https://attacker.example/token"), "SCOPE": "gs://bkt1/"}, "token endpoint"),
         ("gcs_service_account", {"KEY": SA_KEY, "SCOPE": "gs://bkt1/*.parquet"}, "not a glob"),
         ("gcs_service_account", {"KEY": SA_KEY, "SCOPE": "gs://bkt1/../x"}, "segments"),
         ("aws_access_key", {"ACCESS_KEY_ID": "nope", "SECRET_ACCESS_KEY": AWS_SECRET, "SCOPE": "s3://bkt1/"}, "shape"),

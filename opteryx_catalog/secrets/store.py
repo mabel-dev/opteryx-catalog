@@ -338,7 +338,9 @@ class SecretsMixin:
                     f"{scheme + '://' if scheme else 'local'} paths"
                 )
             if not scope or not scope_admits(scope, path):
-                raise SecretRefused(f"the path is outside secret {reference}'s SCOPE ({scope})")
+                # The scope itself is not echoed: a refusal names nothing from a
+                # secret but its name (§9.1).
+                raise SecretRefused(f"the path is outside the SCOPE of secret {reference}")
 
         try:
             self._stamp_secret_use(doc_ref)
