@@ -705,6 +705,75 @@ class GcsFileIO(FileIO):
                     "returned no continuation token"
                 )
 
+    # -- resumable sessions handed to native code, and compose ----------------------
+    #
+    # A native writer streaming an object too large for memory (the vector index's
+    # vectors file, opteryx-core docs/VECTOR_INDEX_DESIGN.md) PUTs its bytes straight to a
+    # resumable session URI. Opening the session needs credentials, so it happens here;
+    # the URI is then its own credential, and no bytes pass through Python.
+
+    def open_upload_session(self, location: str) -> str:
+        """Open a resumable upload session for `location` and return its session URI.
+        The object exists only once a writer finishes the session."""
+        self._read_cache.pop(location, None)
+        stream = _GcsOutputStream(location, self._session, self.get_access_token)
+        stream._start_session()
+        return stream._session_uri
+
+    def cancel_upload_session(self, session_uri: str) -> None:
+        """Cancel an unfinished session (best effort - an abandoned session expires
+        on its own and never becomes an object)."""
+        try:
+            self._session.delete(session_uri, timeout=10)
+        except requests.RequestException:
+            logger.warning("Could not cancel a resumable upload session")
+
+    def compose(self, sources: list[str], destination: str) -> None:
+        """Concatenate `sources`, in order, into `destination`, inside GCS (no bytes
+        move through here). GCS composes 1 to 32 objects of ONE bucket per call."""
+        if not 1 <= len(sources) <= 32:
+            raise ValueError(f"compose takes 1 to 32 source objects, got {len(sources)}")
+        bucket, destination_object = _split_gs(destination.removeprefix("gs://"))
+        names = []
+        for source in sources:
+            source_bucket, source_object = _split_gs(source.removeprefix("gs://"))
+            if source_bucket != bucket:
+                raise ValueError(
+                    f"compose sources must be in the destination's bucket '{bucket}', "
+                    f"not '{source_bucket}'"
+                )
+            names.append({"name": source_object})
+        self._read_cache.pop(destination, None)
+        url = (
+            f"https://storage.googleapis.com/storage/v1/b/{bucket}/o/"
+            f"{urllib.parse.quote(destination_object, safe='')}/compose"
+        )
+        body = {
+            "sourceObjects": names,
+            "destination": {"contentType": "application/octet-stream"},
+        }
+        response = None
+        last_error = None
+        for attempt in range(MAX_ATTEMPTS):
+            headers = {"Authorization": f"Bearer {self.get_access_token()}"}
+            try:
+                last_error = None
+                response = self._session.post(url, headers=headers, json=body, timeout=60)
+            except requests.RequestException as err:  # noqa: PERF203 - retry boundary
+                last_error = err
+                response = None
+            if response is not None and response.status_code not in RETRYABLE_STATUSES:
+                break
+            if attempt + 1 < MAX_ATTEMPTS:
+                time.sleep(_backoff_seconds(response, attempt))
+        if response is None:
+            raise OSError(f"Failed to compose '{destination}': {last_error}")
+        if response.status_code != 200:
+            raise OSError(
+                f"Failed to compose '{destination}' - status {response.status_code}: "
+                f"{response.text[:500]}"
+            )
+
     def list_files(self, prefix: str) -> list:
         """List files under a storage prefix (gs://bucket/path).
 

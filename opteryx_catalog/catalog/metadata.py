@@ -70,6 +70,9 @@ class Snapshot:
             "total-data-files": 0,
             "total-files-size": 0,
             "total-records": 0,
+            "total-index-files": 0,
+            "total-index-size": 0,
+            "total-index-data-size": 0,
         }
     )
     # THE RECEIPT (PROVENANCE_DESIGN.md S2.1): one entry per (catalog relation,

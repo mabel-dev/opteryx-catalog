@@ -280,6 +280,30 @@ def test_create_reports_the_bytes_it_pins():
     assert record["created-by"] == "alice"
 
 
+def test_create_reports_the_index_bytes_it_pins(capsys):
+    """Index files are pinned with the snapshot and reported apart from data, logical
+    first, as the summary and the bill keep them (VECTOR_INDEX_DESIGN §5.5)."""
+    catalog = _catalog()
+    identifier = _dataset(catalog)
+    coll, name = identifier.split(".", 1)
+    catalog._snapshots_collection(coll, name).document("1").set({
+        "snapshot-id": 1,
+        "timestamp-ms": int(time.time() * 1000),
+        "summary": {
+            "total-files-size": 4096, "total-data-size": 16384,
+            "total-index-size": 512, "total-index-data-size": 2048,
+        },
+    })
+
+    record = catalog.create_tag(identifier, "with_index", 1, author="alice")
+
+    assert record["pinned-bytes"] == 16384                    # data figures untouched
+    assert record["pinned-index-bytes"] == 2048
+    assert record["pinned-index-bytes-on-disk"] == 512
+    (event,) = [e for e in _audit(capsys) if e["action"] == "create_tag"]
+    assert event["detail"]["pinned_index_bytes"] == 2048
+
+
 def test_a_tag_cannot_be_repointed():
     """Immutability: re-creating a name is refused, not silently rebound."""
     catalog = _catalog()

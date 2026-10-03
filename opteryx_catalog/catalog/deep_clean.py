@@ -322,6 +322,7 @@ class DatasetDeepClean:
             try:
                 io = self.catalog.io
                 from .manifest import get_parsed_manifest
+                from .vector_indexes import referenced_index_files
 
                 entries = get_parsed_manifest(io, snapshot.manifest_list)
 
@@ -336,6 +337,10 @@ class DatasetDeepClean:
                     delete_file = entry.get("delete_file_path")
                     if delete_file:
                         manifest_files.add(delete_file)
+                    # Vector-index sidecars (catalog/vector_indexes.py): live index
+                    # data for this file. Missing them here would quarantine and
+                    # then delete a live index.
+                    manifest_files.update(referenced_index_files(entry))
 
                 logger.debug(f"Read manifest {snapshot.manifest_list}: {len(entries)} files")
             except Exception as e:

@@ -189,6 +189,32 @@ class ListenerNotFound(ListenerError):
     """
 
 
+class VectorIndexError(CatalogError):
+    """Base for vector-index failures (docs/VECTOR_INDEX_DESIGN.md in opteryx-core)."""
+
+
+class VectorIndexNotFound(KeyError, VectorIndexError):
+    pass
+
+
+class VectorIndexAlreadyExists(VectorIndexError):
+    """An index of that name already exists on the dataset."""
+
+
+class MaintenanceLeaseError(CatalogError):
+    """Base for maintenance-lease failures (VECTOR_INDEX_DESIGN §5.7 in opteryx-core)."""
+
+
+class MaintenanceLeaseHeld(MaintenanceLeaseError):
+    """Another maintenance operation holds the dataset's lease. Refused loudly, never
+    queued: the work it would have done is picked up by the next fire or run."""
+
+
+class MaintenanceLeaseLost(MaintenanceLeaseError):
+    """This claim no longer holds the lease (it expired and was claimed again, or was
+    released). The holder must stop; anything it has not committed is an orphan."""
+
+
 class TagError(CatalogError):
     """Base for snapshot-tag failures."""
 
@@ -366,6 +392,19 @@ class AddFilesReadError(CatalogError):
     undercounted by however many rows the file actually held, and no signal
     was emitted anywhere. Refusing leaves the dataset exactly as it was, which
     is a state the caller can retry from.
+    """
+
+
+class ForeignFilePathError(ValueError, CatalogError):
+    """A commit named a file outside the dataset's own location.
+
+    Scans read every manifest entry with the engine's storage credentials, so
+    registering `gs://elsewhere/...` would turn the dataset into a way to read
+    whatever those credentials can reach. Refused BEFORE the file is read: the
+    read-back would itself copy the foreign file's statistics (min/max values)
+    into the manifest. See `ownership.is_admissible_path`.
+
+    A caller error, so deliberately not `Alertable`; nothing is committed.
     """
 
 

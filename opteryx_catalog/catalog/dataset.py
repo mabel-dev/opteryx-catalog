@@ -14,6 +14,7 @@ from typing import Any
 from ..alerts import report as _alert
 from ..audit import emit_audit
 from ..exceptions import AddFilesReadError
+from ..exceptions import ForeignFilePathError
 from ..exceptions import ManifestReadError
 from ..exceptions import SnapshotAncestryTooDeep
 from ..exceptions import SnapshotMissingError
@@ -28,6 +29,7 @@ from .metadata import Snapshot
 from .metadata import provenance_fields_from_document
 from .metadata import snapshot_is_tombstoned
 from .metastore import Dataset
+from .ownership import is_admissible_path
 from .provenance import CLEAR
 from .provenance import REWRITE
 from .provenance import UNCHANGED
@@ -37,6 +39,13 @@ from .provenance import is_self
 from .provenance import merge_sources
 from .provenance import normalize_produced_by
 from .provenance import normalize_read_sources
+from .vector_indexes import IndexBuildTask
+from .vector_indexes import IndexFiles
+from .vector_indexes import index_files
+from .vector_indexes import index_files as index_files_record
+from .vector_indexes import index_refs
+from .vector_indexes import index_totals
+from .vector_indexes import with_index_refs
 
 # Stable node identifier for this process (hex-mac-hex-pid)
 _NODE = f"{uuid.getnode():x}-{os.getpid():x}"
@@ -1371,6 +1380,7 @@ class SimpleDataset(Dataset):
             "total-files-size": total_files_size,
             "total-data-size": total_data_size,
             "total-records": total_records,
+            **index_totals(entries),
         }
 
     def _warn_if_summary_disagrees(self, snapshot, entries: list[dict]) -> None:
@@ -1517,18 +1527,36 @@ class SimpleDataset(Dataset):
             self.metadata.sources_complete = False
 
     def _after_commit(self, author: str | None, snapshot: Snapshot) -> None:
-        """Fire this dataset's triggers for a just-landed commit.
+        """Fire this dataset's triggers, and its async vector indexes' refreshes, for a
+        just-landed commit.
 
-        Only user-created snapshots fire - `refresh_manifest`, compaction and
+        Index refreshes fire for every commit that added data files (see
+        `fire_index_refreshes`). Triggers fire only for user-created snapshots - `refresh_manifest`, compaction and
         expiration also land snapshots, and a housekeeping pass must not
         re-run every materialized view (`user_created` is authoritative, see
         `snapshot()`). Never raises into the commit path: `fire_triggers`
         alerts and audits its own failures, and this guard catches anything
         above it.
         """
-        if getattr(snapshot, "user_created", None) is not True:
-            return
         if self.catalog is None:
+            return
+        # Vector index refreshes fire on ANY commit that added data files - a
+        # compaction's outputs included - before the user-created gate below.
+        if int((snapshot.summary or {}).get("added-data-files") or 0) > 0:
+            try:
+                from ..trigger_firing import fire_index_refreshes
+
+                fire_index_refreshes(
+                    self.catalog, self.identifier, author=author, snapshot_id=snapshot.snapshot_id
+                )
+            except Exception as exc:  # noqa: BLE001 - the commit already landed
+                _alert(
+                    exc,
+                    note="index refresh firing failed after commit",
+                    fingerprint=("after-commit-index-firing", self.identifier),
+                    context={"dataset": self.identifier},
+                )
+        if getattr(snapshot, "user_created", None) is not True:
             return
         try:
             from ..trigger_firing import fire_triggers
@@ -1954,6 +1982,7 @@ class SimpleDataset(Dataset):
             "total-files-size": total_files_size,
             "total-data-size": total_data_size,
             "total-records": total_records,
+            **index_totals(new_entries),
         }
 
         # sequence number
@@ -2003,15 +2032,37 @@ class SimpleDataset(Dataset):
 
         return read_manifest_rows(manifest)
 
-    def _entries_from_prebuilt(self, entries: list, existing_paths: set[str]) -> list[dict]:
+    def _refuse_foreign_path(self, path, borrowed_paths=frozenset(), kind: str = "data file") -> None:
+        """Refuse a path this commit may not register (`is_admissible_path`).
+
+        `borrowed_paths` are the exception: files a fork's clone or resync took
+        VERBATIM from the upstream manifest the catalog itself read and pinned.
+        They are never caller-supplied.
+        """
+        if path in borrowed_paths or is_admissible_path(self.metadata.location, path):
+            return
+        raise ForeignFilePathError(
+            f"Refusing to register {kind} {path!r} in {self.identifier}: it is not "
+            f"under the dataset's location {self.metadata.location!r}. A dataset may "
+            "only reference its own files."
+        )
+
+    def _entries_from_prebuilt(
+        self,
+        entries: list,
+        existing_paths: set[str],
+        borrowed_paths: "frozenset[str] | set[str]" = frozenset(),
+    ) -> list[dict]:
         """Accept manifest entries a writer built as it wrote.
 
         The same admission rules as `_build_entries_for_files` - a path already
-        in the manifest or named twice is taken once, only Parquet is accepted -
-        without the read-back, because the producer had every row in hand. An
-        entry without a path or a record count is refused: it cannot take part
-        in the row-count invariant, and registering it would hand the planner a
-        file it knows nothing about.
+        in the manifest or named twice is taken once, only Parquet is accepted,
+        a path outside the dataset's location is refused - without the
+        read-back, because the producer had every row in hand. An entry without
+        a path or a record count is refused: it cannot take part in the
+        row-count invariant, and registering it would hand the planner a file
+        it knows nothing about. Its delete-vector sidecar is held to the same
+        location rule as its data file: scans read that too.
         """
         out: list[dict] = []
         seen: set = set()
@@ -2028,6 +2079,9 @@ class SimpleDataset(Dataset):
                 continue
             if not fp.lower().endswith(".parquet"):
                 continue
+            self._refuse_foreign_path(fp, borrowed_paths)
+            if row.get("delete_file_path"):
+                self._refuse_foreign_path(row["delete_file_path"], borrowed_paths, "delete file")
             seen.add(fp)
             out.append(row)
         return out
@@ -2044,7 +2098,8 @@ class SimpleDataset(Dataset):
         their snapshot carries but not in how a data file becomes an entry.
 
         Skips anything already in `existing_paths` (a re-added file must not
-        appear twice in one manifest) and anything that is not Parquet. A file
+        appear twice in one manifest) and anything that is not Parquet. A path
+        outside the dataset's location is refused before it is opened. A file
         that cannot be read stops the commit: registering an entry whose
         statistics are unknown would hand the planner fabricated pruning data.
         """
@@ -2056,6 +2111,7 @@ class SimpleDataset(Dataset):
             if not fp.lower().endswith(".parquet"):
                 # only accept parquet files
                 continue
+            self._refuse_foreign_path(fp)
             seen.add(fp)
 
             # Read file and compute statistics (full, or footer-only — see docstring)
@@ -2111,8 +2167,13 @@ class SimpleDataset(Dataset):
         produced_by: str | None = None,
         entries: Iterable[dict] | None = None,
         manifest: bytes | None = None,
+        index_files: dict | None = None,
     ):
         """Add data files to the dataset manifest without writing the files.
+
+        ``index_files`` (``{new file path: {index id: IndexFiles}}``) are a sync vector
+        index's files for the new files, built before this call and referenced in the
+        same snapshot (design §10, D-7).
 
         The files arrive in ONE of two forms: ``entries``, manifest entry dicts
         the writer built as it wrote (``DataFileWriter.close().to_dict()``), or
@@ -2166,6 +2227,7 @@ class SimpleDataset(Dataset):
             new_entries = self._entries_from_prebuilt(list(entries), existing)
         else:
             new_entries = self._build_entries_for_files(files, existing, footer_only=footer_only)
+        new_entries = self._attach_new_index_files(new_entries, index_files)
 
         merged_entries = prev_entries + new_entries
 
@@ -2247,15 +2309,24 @@ class SimpleDataset(Dataset):
         preserves_sources: bool = False,
         entries: Iterable[dict] | None = None,
         manifest: bytes | None = None,
+        borrowed_paths: Iterable[str] | None = None,
+        index_files: dict | None = None,
     ):
         """Truncate dataset (logical) and set manifest to provided files.
+
+        ``index_files``: a sync vector index's files for the new files (see add_files).
 
         - Writes a manifest that contains exactly the unique files provided,
           given as ``entries`` (manifest rows the writer built as it wrote -
           no read-back) or as ``files`` (paths read back and decoded here).
         - Does not delete objects from storage.
         - Useful for replace/overwrite semantics.
+        - Refuses any file outside this dataset's location, except
+          ``borrowed_paths``: CATALOG-INTERNAL, for a fork's clone/resync, the
+          paths the catalog itself read from the pinned upstream manifest.
+          Never pass caller-supplied paths there.
         """
+        borrowed = frozenset(borrowed_paths or ())
         entries = self._manifest_entries(entries, manifest, "truncate_and_add_files")
         if entries is not None and files:
             raise ValueError("truncate_and_add_files takes entries OR files, not both")
@@ -2279,7 +2350,7 @@ class SimpleDataset(Dataset):
             prev_total_records = _as_int(prev.summary.get("total-records")) or 0
 
         if entries is not None:
-            new_entries = self._entries_from_prebuilt(list(entries), set())
+            new_entries = self._entries_from_prebuilt(list(entries), set(), borrowed)
         else:
             # Build unique new entries (ignore duplicates in input). Only accept
             # parquet files and compute full statistics for each file.
@@ -2290,6 +2361,7 @@ class SimpleDataset(Dataset):
                     continue
                 if not fp.lower().endswith(".parquet"):
                     continue
+                self._refuse_foreign_path(fp, borrowed)
                 seen.add(fp)
 
                 try:
@@ -2343,6 +2415,7 @@ class SimpleDataset(Dataset):
                         "Refusing to register a file whose statistics are unknown."
                     ) from err
                 new_entries.append(manifest_entry.to_dict())
+        new_entries = self._attach_new_index_files(new_entries, index_files)
 
         manifest_path = None
         if self.catalog and hasattr(self.catalog, "write_parquet_manifest"):
@@ -2386,6 +2459,7 @@ class SimpleDataset(Dataset):
             "total-files-size": total_files_size,
             "total-data-size": total_data_size,
             "total-records": total_records,
+            **index_totals(new_entries),
         }
 
         # Sequence number
@@ -2729,8 +2803,16 @@ class SimpleDataset(Dataset):
         agent: str = "opteryx-engine",
         entries: Iterable[dict] | None = None,
         manifest: bytes | None = None,
+        index_files: dict | None = None,
     ):
         """Retire whole data files and add their replacements, in ONE snapshot.
+
+        VECTOR INDEXES (design §5.6, D-14): compaction only merges files with the SAME
+        index coverage, and never embeds. When the retired files are indexed, every
+        output must arrive with its CARRIED index files for exactly that coverage, in
+        ``index_files`` (``{output path: {index id: IndexFiles}}``), so a compacted file
+        is never unindexed in a window where its inputs were indexed. Unindexed inputs
+        give unindexed outputs (``index_files`` empty). Anything else is refused.
 
         The commit half of compaction. The replacements arrive in ONE of two
         forms: ``entries``, manifest entry dicts the writer built as it wrote
@@ -2813,6 +2895,8 @@ class SimpleDataset(Dataset):
         if not new_entries:
             raise CompactionInvariantError("compaction_commit wrote no readable output files")
 
+        new_entries = self._attach_carried_index_files(replaced, new_entries, index_files)
+
         live_in = sum(
             int(e.get("record_count") or 0) - int(e.get("deleted_record_count") or 0)
             for e in replaced
@@ -2892,6 +2976,80 @@ class SimpleDataset(Dataset):
         self._after_commit(author, snap)
         return snap
 
+    def _attach_new_index_files(self, new_entries, index_files):
+        """Reference a sync index's files from the files this commit adds. Every key must
+        be one of them; every value an IndexFiles with its sizes."""
+        if not index_files:
+            return new_entries
+        added = {e.get("file_path") for e in new_entries}
+        unknown = sorted(set(index_files) - added)
+        if unknown:
+            raise ValueError(
+                f"{self.identifier}: index files given for files this commit does not add: {unknown}"
+            )
+        out = []
+        for entry in new_entries:
+            given = index_files.get(entry.get("file_path"))
+            if not given:
+                out.append(entry)
+                continue
+            refs = {}
+            for index_id, f in given.items():
+                if type(f) is not IndexFiles:
+                    raise ValueError(
+                        f"{self.identifier}: index {index_id} for {entry.get('file_path')} must be "
+                        "IndexFiles - paths AND the sizes the builder wrote."
+                    )
+                refs[index_id] = index_files_record(
+                    f.vectors, f.centroids, vectors_bytes=f.vectors_bytes,
+                    centroids_bytes=f.centroids_bytes, logical_bytes=f.logical_bytes,
+                )
+            out.append(with_index_refs(dict(entry), refs))
+        return out
+
+    def _attach_carried_index_files(self, replaced, new_entries, carried_files):
+        """Compaction's index rule (§5.6): one coverage in, the same coverage out."""
+        from opteryx_catalog.exceptions import CompactionInvariantError
+
+        coverages = {frozenset(index_refs(e)) for e in replaced}
+        if len(coverages) > 1:
+            raise CompactionInvariantError(
+                f"{self.identifier}: compaction may only merge files with the same vector index "
+                f"coverage; these inputs have {sorted(sorted(c) for c in coverages)}"
+            )
+        coverage = coverages.pop() if coverages else frozenset()
+        carried_files = dict(carried_files or {})
+        outputs = {e.get("file_path") for e in new_entries}
+        unknown = sorted(set(carried_files) - outputs)
+        if unknown:
+            raise CompactionInvariantError(
+                f"{self.identifier}: index files given for files this compaction does not write: {unknown}"
+            )
+        attached = []
+        for entry in new_entries:
+            carried = dict(carried_files.get(entry.get("file_path")) or {})
+            if set(carried) != coverage:
+                raise CompactionInvariantError(
+                    f"{self.identifier}: output {entry.get('file_path')} carries index files for "
+                    f"{sorted(carried)} but its inputs are indexed by {sorted(coverage)}; a "
+                    "compacted file must keep exactly its inputs' index coverage."
+                )
+            for index_id, f in carried.items():
+                if type(f) is not IndexFiles:
+                    raise ValueError(
+                        f"{self.identifier}: carried index {index_id} for {entry.get('file_path')} "
+                        "must be IndexFiles - paths AND the sizes the builder wrote."
+                    )
+            refs = {
+                index_id: index_files(
+                    f.vectors, f.centroids, vectors_bytes=f.vectors_bytes,
+                    centroids_bytes=f.centroids_bytes, logical_bytes=f.logical_bytes,
+                )
+                for index_id, f in carried.items()
+            }
+            attached.append(with_index_refs(dict(entry), refs) if refs else entry)
+        return attached
+
     def merge_commit(
         self,
         files: Iterable[str] | None = None,
@@ -2904,8 +3062,11 @@ class SimpleDataset(Dataset):
         produced_by: str | None = None,
         entries: Iterable[dict] | None = None,
         manifest: bytes | None = None,
+        index_files: dict | None = None,
     ) -> Snapshot:
         """Register data files AND mark row ordinals deleted, in ONE snapshot.
+
+        ``index_files``: a sync vector index's files for the new files (see add_files).
 
         This is `add_files` and `delete_rows` fused, and the fusion is the
         point rather than a convenience: MERGE replaces a row by marking the
@@ -3060,6 +3221,7 @@ class SimpleDataset(Dataset):
             added_entries = self._build_entries_for_files(
                 files, set(by_path), footer_only=footer_only
             )
+        added_entries = self._attach_new_index_files(added_entries, index_files)
 
         if not added_entries and newly_deleted == 0 and not removed_entries:
             raise ValueError(
@@ -3697,6 +3859,9 @@ class SimpleDataset(Dataset):
                 for key in ("delete_file_path", "deleted_record_count"):
                     if ent.get(key):
                         dent[key] = ent.get(key)
+                # Likewise its vector-index sidecars: the data file is unchanged,
+                # so its index still describes it exactly.
+                dent = with_index_refs(dent, index_refs(ent))
             except Exception as exc:  # noqa: BLE001 - collected, then raised below
                 # Collect and keep going: a bad batch write or bucket issue
                 # usually affects many files at once, and surfacing them one
@@ -3739,6 +3904,7 @@ class SimpleDataset(Dataset):
             "total-files-size": total_size,
             "total-data-size": total_data_size,
             "total-records": total_records,
+            **index_totals(entries),
         }
 
         # sequence number
@@ -3787,6 +3953,213 @@ class SimpleDataset(Dataset):
             self.catalog.save_snapshot(self.identifier, snap)
         self._persist_metadata()
 
+        return snapshot_id
+
+    # ------------------------------------------------------------------
+    # Vector-index sidecar commits (catalog/vector_indexes.py)
+    # ------------------------------------------------------------------
+
+    def commit_vector_index_files(
+        self,
+        index_id: str,
+        files: dict[str, IndexFiles],
+        *,
+        author: str,
+        agent: str,
+    ) -> int:
+        """Attach built sidecars to data files: one snapshot, operation `index-build`.
+
+        `files` maps a data file path to its IndexFiles - both paths and the sizes the
+        builder wrote - written BEFORE this call. A missing or non-positive size is
+        refused: no index file is ever referenced without its recorded size (§5.3). A file's existing sidecars for this index are replaced; every
+        other column and every other index is carried unchanged. A data file that is no
+        longer in the current manifest is refused: the build was planned against a
+        snapshot that has since retired it, and must be re-planned.
+
+        Conditional on the parent like every commit, so a build that raced another commit
+        is refused (SnapshotRaceError) and leaves only orphans for the sweeps.
+        """
+        if not files:
+            raise ValueError("commit_vector_index_files needs at least one data file")
+        for path, f in files.items():
+            if type(f) is not IndexFiles:
+                raise ValueError(
+                    f"{self.identifier}: index files for {path} must be IndexFiles - both paths "
+                    "AND the sizes the builder wrote; an index file is never referenced "
+                    "without its recorded size."
+                )
+        files = {
+            path: index_files(
+                f.vectors, f.centroids, vectors_bytes=f.vectors_bytes,
+                centroids_bytes=f.centroids_bytes, logical_bytes=f.logical_bytes,
+            )
+            for path, f in files.items()
+        }
+        prev = self.snapshot(None)
+        if prev is None or not getattr(prev, "manifest_list", None):
+            raise ValueError(f"{self.identifier} has no current manifest to index")
+        entries = [dict(e) for e in self._parent_manifest_entries(prev)]
+        present = {e.get("file_path") for e in entries}
+        missing = sorted(set(files) - present)
+        if missing:
+            raise ValueError(
+                f"{self.identifier}: cannot attach index {index_id} to files that are not in "
+                f"the current snapshot (retired since the build was planned): {missing}"
+            )
+        updated = []
+        for entry in entries:
+            sidecars = files.get(entry.get("file_path"))
+            if sidecars is not None:
+                refs = index_refs(entry)
+                refs[index_id] = sidecars
+                entry = with_index_refs(entry, refs)
+            updated.append(entry)
+        return self._commit_manifest_rewrite(
+            updated, prev, operation="index-build", author=author, agent=agent,
+            message=f"vector index {index_id}: {len(files)} file(s) indexed",
+        )
+
+    def vector_index_coverage(self, snapshot_id: int | None = None) -> dict[str, frozenset]:
+        """{data file path: the index ids covering it} at a snapshot (the current one by
+        default) - what compaction groups its inputs by (§5.6: only files with the same
+        coverage are merged)."""
+        snap = self.snapshot(snapshot_id)
+        if snap is None or not getattr(snap, "manifest_list", None):
+            return {}
+        return {
+            e["file_path"]: frozenset(index_refs(e)) for e in self._parent_manifest_entries(snap)
+        }
+
+    def vector_index_files(self, index_id: str, snapshot_id: int | None = None) -> dict[str, IndexFiles]:
+        """{data file path: IndexFiles} for one index at a snapshot (the current one by
+        default): the files it covers, with their index files and sizes - what a search
+        reads. A live file absent here is not covered yet."""
+        snap = self.snapshot(snapshot_id)
+        if snap is None or not getattr(snap, "manifest_list", None):
+            return {}
+        out = {}
+        for entry in self._parent_manifest_entries(snap):
+            refs = index_refs(entry)
+            if index_id in refs:
+                out[entry["file_path"]] = refs[index_id]
+        return out
+
+    def compaction_carry_inputs(self, files, snapshot_id: int) -> dict[str, tuple]:
+        """What carrying a compaction's vectors needs of each retired file, at the snapshot
+        the compaction read: `{path: ({index id: IndexFiles}, deleted ordinals)}`."""
+        snap = self.snapshot(snapshot_id)
+        if snap is None or not getattr(snap, "manifest_list", None):
+            raise ValueError(f"{self.identifier} has no snapshot {snapshot_id}")
+        wanted = set(files)
+        entries = [e for e in self._parent_manifest_entries(snap) if e.get("file_path") in wanted]
+        missing = sorted(wanted - {e.get("file_path") for e in entries})
+        if missing:
+            raise ValueError(f"{self.identifier}: snapshot {snapshot_id} holds no {missing}")
+        deletes = self.delete_vectors_for(entries)
+        return {e["file_path"]: (index_refs(e), tuple(deletes.get(e["file_path"], ()))) for e in entries}
+
+    def vector_index_build_plan(self, index_id: str) -> list[IndexBuildTask]:
+        """The live data files index `index_id` does not cover, in manifest order - the
+        work of one `REFRESH INDEX` (D-16). Empty when the index is up to date.
+
+        Each task carries the file's size, its deleted ordinals at the current snapshot and
+        new paths for its two index files. Building and committing are the caller's: the
+        commit (`commit_vector_index_files`) refuses any file retired in the meantime."""
+        from .vector_indexes import vector_index_paths
+
+        prev = self.snapshot(None)
+        if prev is None or not getattr(prev, "manifest_list", None):
+            return []
+        pending = [
+            e for e in self._parent_manifest_entries(prev) if index_id not in index_refs(e)
+        ]
+        deletes = self.delete_vectors_for(pending)
+        tasks = []
+        for entry in pending:
+            path = entry["file_path"]
+            size = entry.get("file_size_in_bytes")
+            if type(size) is not int or size <= 0:
+                raise ValueError(f"{self.identifier}: manifest entry {path!r} has no file size")
+            vectors, centroids = vector_index_paths(self.metadata.location, index_id, path)
+            tasks.append(IndexBuildTask(
+                data_file=path, data_bytes=size, deleted=tuple(deletes.get(path, ())),
+                vectors=vectors, centroids=centroids,
+            ))
+        return tasks
+
+    def remove_vector_index_files(self, index_id: str, *, author: str) -> int | None:
+        """Detach every sidecar of one index: operation `index-drop`. Returns the new
+        snapshot id, or None when no current file references the index (nothing to
+        commit - a retried DROP INDEX lands here). Older snapshots keep their references,
+        so the files stay until those snapshots expire."""
+        prev = self.snapshot(None)
+        if prev is None or not getattr(prev, "manifest_list", None):
+            return None
+        entries = [dict(e) for e in self._parent_manifest_entries(prev)]
+        changed = False
+        updated = []
+        for entry in entries:
+            refs = index_refs(entry)
+            if index_id in refs:
+                del refs[index_id]
+                entry = with_index_refs(entry, refs)
+                changed = True
+            updated.append(entry)
+        if not changed:
+            return None
+        return self._commit_manifest_rewrite(
+            updated, prev, operation="index-drop", author=author, agent="drop-vector-index",
+            message=f"vector index {index_id} dropped",
+        )
+
+    def _commit_manifest_rewrite(
+        self, entries: list[dict], prev, *, operation: str, author: str, agent: str, message: str
+    ) -> int:
+        """Commit a manifest that changes no data files - only per-file metadata.
+
+        Adds and deletes nothing, so the summary's added/deleted counters are zero and the
+        totals are derived from the entries; reads nothing, so the provenance receipt is
+        empty and `sources` is untouched."""
+        if not author:
+            raise ValueError(f"author must be provided for an {operation} commit")
+        snapshot_id = self._allocate_snapshot_id()
+        manifest_path = self.catalog.write_parquet_manifest(
+            snapshot_id, entries, self.metadata.location
+        )
+        summary = {
+            "added-data-files": 0,
+            "added-files-size": 0,
+            "added-data-size": 0,
+            "added-records": 0,
+            "deleted-data-files": 0,
+            "deleted-files-size": 0,
+            "deleted-data-size": 0,
+            "deleted-records": 0,
+            **self._totals_from_entries(entries),
+            "agent-committer": {
+                "timestamp": int(time.time() * 1000),
+                "action": operation,
+                "agent": agent,
+            },
+        }
+        snap = Snapshot(
+            snapshot_id=snapshot_id,
+            timestamp_ms=int(time.time() * 1000),
+            author=author,
+            sequence_number=self._next_sequence_number(),
+            user_created=False,
+            operation_type=operation,
+            parent_snapshot_id=self.metadata.current_snapshot_id,
+            manifest_list=manifest_path,
+            schema_id=self.metadata.current_schema_id,
+            commit_message=message,
+            summary=summary,
+        )
+        self._stamp_provenance(snap, [], None)
+        self.metadata.snapshots.append(snap)
+        self._advance_current_snapshot(snapshot_id)
+        self.catalog.save_snapshot(self.identifier, snap)
+        self._persist_metadata()
         return snapshot_id
 
     def truncate(
@@ -3897,6 +4270,7 @@ class SimpleDataset(Dataset):
             "total-files-size": 0,
             "total-data-size": 0,
             "total-records": 0,
+            **index_totals([]),
         }
 
         # Sequence number

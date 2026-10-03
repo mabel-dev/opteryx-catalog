@@ -29,6 +29,7 @@ from opteryx_catalog.catalog.metadata import DatasetMetadata
 from opteryx_catalog.catalog.metadata import Fork
 from opteryx_catalog.catalog.metadata import ForkSource
 from opteryx_catalog.catalog.metadata import ForkTarget
+from opteryx_catalog.opteryx_catalog import _borrowed_paths
 
 UPSTREAM = "samples.tpch_sf1.lineitem"
 UPSTREAM_LOCATION = "mem://samples/tpch_sf1/lineitem"
@@ -71,8 +72,10 @@ def _entries(dataset):
 def _clone(upstream, fork, author="justin"):
     """What `clone_dataset` does to the fork, minus the Firestore half."""
     snapshot = upstream.snapshot(None)
+    entries = upstream._parent_manifest_entries(snapshot)
     fork.truncate_and_add_files(
-        entries=upstream._parent_manifest_entries(snapshot),
+        entries=entries,
+        borrowed_paths=_borrowed_paths(entries),
         author=author,
         commit_message=f"CLONE {UPSTREAM} AT VERSION {snapshot.snapshot_id}",
         read_sources=[(UPSTREAM, snapshot.snapshot_id, "version")],

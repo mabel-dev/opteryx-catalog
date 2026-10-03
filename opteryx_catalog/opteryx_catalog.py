@@ -5,6 +5,7 @@ import logging
 import re
 import secrets
 import time
+import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
@@ -27,6 +28,12 @@ from .catalog.dataset import _as_int
 from .catalog.dataset import open_data_file_writer_at
 from .catalog.dataset import relation_schema_from_stored
 from .catalog.deletes import DELETE_FILE_PATH_KEY
+from .catalog.vector_indexes import BUILD_MODES
+from .catalog.vector_indexes import INDEXES_SUBCOLLECTION
+from .catalog.vector_indexes import index_refs
+from .catalog.vector_indexes import new_index_definition
+from .catalog.vector_indexes import normalize_index_name
+from .catalog.vector_indexes import with_index_refs
 from .catalog.metadata import SNAPSHOT_EXPIRED_AT_KEY
 from .catalog.metadata import DatasetMetadata
 from .catalog.metadata import Fork
@@ -37,6 +44,10 @@ from .catalog.metadata import provenance_document_fields
 from .catalog.metadata import provenance_fields_from_document
 from .catalog.metadata import snapshot_is_tombstoned
 from .catalog.metastore import Metastore
+from .catalog.maintenance_lease import LEASE_DOCUMENT
+from .catalog.maintenance_lease import MaintenanceLease
+from .catalog.maintenance_lease import describe_holder
+from .catalog.maintenance_lease import validate_lease_request
 from .catalog.orphan_quarantine import MAINTENANCE_SUBCOLLECTION
 from .catalog.ownership import is_own_path
 from .catalog.view import View as CatalogView
@@ -52,6 +63,8 @@ from .exceptions import EgressRestricted
 from .exceptions import ForkError
 from .exceptions import ListenerAlreadyExists
 from .exceptions import ListenerNotFound
+from .exceptions import MaintenanceLeaseHeld
+from .exceptions import MaintenanceLeaseLost
 from .exceptions import MaterializedViewError
 from .exceptions import NameInUse
 from .exceptions import PlatformIdentityOwnerRefused
@@ -60,6 +73,8 @@ from .exceptions import SnapshotMissingError
 from .exceptions import TagAlreadyExists
 from .exceptions import TagLimitExceeded
 from .exceptions import TagNotFound
+from .exceptions import VectorIndexAlreadyExists
+from .exceptions import VectorIndexNotFound
 from .exceptions import TaskAlreadyExists
 from .exceptions import TaskNotFound
 from .exceptions import TriggerNotFound
@@ -613,6 +628,22 @@ def _guard_is_on(properties: dict, name: str) -> bool:
     return bool(value)
 
 
+def _borrowed_paths(entries) -> frozenset:
+    """Every file a fork's borrowed entries name - data files and delete vectors.
+
+    The exemption a clone or resync hands `truncate_and_add_files`: these are
+    outside the fork's own location by design (FORKS_DESIGN.md S5.2), and they
+    are safe to admit because they came from the upstream manifest this catalog
+    read and pinned, not from a caller.
+    """
+    paths = set()
+    for entry in entries:
+        for key in ("file_path", "delete_file_path"):
+            if entry.get(key):
+                paths.add(entry[key])
+    return frozenset(paths)
+
+
 def _core_type_to_stored(column_type: Any) -> tuple:
     """Map an Opteryx ``ColumnType`` to ``(type_name, element_type, precision, scale)``.
 
@@ -821,6 +852,9 @@ _SNAPSHOT_SUMMARY_KEYS = (
     "total-data-files",
     "total-files-size",
     "total-records",
+    "total-index-files",
+    "total-index-size",
+    "total-index-data-size",
 )
 
 
@@ -1922,6 +1956,7 @@ class OpteryxCatalog(SecretsMixin, Metastore):
 
         self._delete_subcollection(self._snapshots_collection(collection, dataset_name))
         self._delete_subcollection(self._tags_collection(collection, dataset_name))
+        self._delete_subcollection(self._indexes_collection(collection, dataset_name))
         self._delete_subcollection(doc_ref.collection("schemas"))
         self._delete_subcollection(doc_ref.collection(MAINTENANCE_SUBCOLLECTION))
         self._delete_subcollection(doc_ref.collection("statement"))
@@ -2141,17 +2176,32 @@ class OpteryxCatalog(SecretsMixin, Metastore):
             if old_location and manifest_path.startswith(old_location + "/"):
                 vacated_paths.add(manifest_path)
 
+            def _move(path):
+                """The path this object has after the rename. Copied once however many
+                manifests name it; EVERY row naming it is rewritten (a file shared by
+                several snapshots must be renamed in all of their manifests, or the
+                later ones keep the old path, which is then reclaimed below)."""
+                target = _remap(path)
+                if target != path and target not in copied_paths:
+                    self._copy_object(path, target)
+                    copied_paths.add(target)
+                    vacated_paths.add(path)
+                return target
+
             for row in rows:
-                source_path = row.get("file_path")
-                if not source_path:
-                    continue
-                target_path = _remap(source_path)
-                if target_path == source_path or target_path in copied_paths:
-                    continue
-                self._copy_object(source_path, target_path)
-                copied_paths.add(target_path)
-                vacated_paths.add(source_path)
-                row["file_path"] = target_path
+                if row.get("file_path"):
+                    row["file_path"] = _move(row["file_path"])
+                # The merge-on-read delete vector moves with its data file: left under
+                # the old location, every row it deletes would resurrect once that
+                # location is reclaimed.
+                if row.get(DELETE_FILE_PATH_KEY):
+                    row[DELETE_FILE_PATH_KEY] = _move(row[DELETE_FILE_PATH_KEY])
+                # Vector-index files move too: they key the data file by ordinal, which
+                # the copy preserves.
+                row.update(with_index_refs(row, {
+                    index_id: files._replace(vectors=_move(files.vectors), centroids=_move(files.centroids))
+                    for index_id, files in index_refs(row).items()
+                }))
 
             snapshot_id = snapshot_data.get("snapshot-id")
             new_manifest_path = self.write_parquet_manifest(snapshot_id, rows, new_location)
@@ -2182,6 +2232,12 @@ class OpteryxCatalog(SecretsMixin, Metastore):
         new_tags = self._tags_collection(new_collection, new_dataset_name)
         for tag_doc in self._tags_collection(collection, dataset_name).stream():
             new_tags.document(tag_doc.id).set(tag_doc.to_dict() or {})
+
+        # Vector-index definitions travel too: their index ids key the index files
+        # the manifests above now reference at the new location.
+        new_indexes = self._indexes_collection(new_collection, new_dataset_name)
+        for index_doc in self._indexes_collection(collection, dataset_name).stream():
+            new_indexes.document(index_doc.id).set(index_doc.to_dict() or {})
 
         # Relationships travel with the dataset for the same reason tags do:
         # they are its own metadata, keyed under it, and a rename that left them
@@ -2273,6 +2329,7 @@ class OpteryxCatalog(SecretsMixin, Metastore):
         # clean record and its files each need two fresh sightings.
         self._delete_subcollection(self._snapshots_collection(collection, dataset_name))
         self._delete_subcollection(self._tags_collection(collection, dataset_name))
+        self._delete_subcollection(self._indexes_collection(collection, dataset_name))
         self._delete_subcollection(doc_ref.collection("schemas"))
         self._delete_subcollection(doc_ref.collection(MAINTENANCE_SUBCOLLECTION))
         self._delete_subcollection(doc_ref.collection(RELATIONSHIPS_SUBCOLLECTION))
@@ -6632,6 +6689,7 @@ class OpteryxCatalog(SecretsMixin, Metastore):
         sequence_number = int(getattr(snapshot, "sequence_number", 0) or 0)
         dataset.truncate_and_add_files(
             entries=entries,
+            borrowed_paths=_borrowed_paths(entries),
             author=author,
             commit_message=f"CLONE {source_fq} AT VERSION {snapshot.snapshot_id}",
             read_sources=[(source_fq, snapshot.snapshot_id, "version")],
@@ -6818,6 +6876,7 @@ class OpteryxCatalog(SecretsMixin, Metastore):
 
         dataset.truncate_and_add_files(
             entries=entries,
+            borrowed_paths=_borrowed_paths(entries),
             author=author,
             commit_message=(
                 f"RESYNC {fork_fq} FROM {fork.source.dataset} "
@@ -6920,6 +6979,21 @@ class OpteryxCatalog(SecretsMixin, Metastore):
                 sidecar_target = f"{location}/deletes/{sidecar.rsplit('/', 1)[-1]}"
                 self._copy_object(sidecar, sidecar_target)
                 row[DELETE_FILE_PATH_KEY] = sidecar_target
+            # Its vector-index sidecars too. Index definitions are NOT copied by a
+            # fork, so these are kept only as files; the fork re-defines indexes.
+            # A copy is byte-identical, so the recorded sizes carry unchanged.
+            copied_refs = {}
+            for index_id, files in index_refs(row).items():
+                targets = []
+                for path in (files.vectors, files.centroids):
+                    if is_own_path(location, path):
+                        targets.append(path)
+                        continue
+                    target = f"{location}/index/{index_id}/{path.rsplit('/', 1)[-1]}"
+                    self._copy_object(path, target)
+                    targets.append(target)
+                copied_refs[index_id] = files._replace(vectors=targets[0], centroids=targets[1])
+            row = with_index_refs(row, copied_refs)
             rewritten.append(row)
             copied += 1
 
@@ -7087,6 +7161,10 @@ class OpteryxCatalog(SecretsMixin, Metastore):
             # cost. The physical size is carried alongside, never as the answer.
             record["pinned-bytes"] = _as_int(summary.get("total-data-size")) or 0
             record["pinned-bytes-on-disk"] = _as_int(summary.get("total-files-size")) or 0
+            # Index files are pinned with the snapshot too, reported apart from data
+            # exactly as the summary and the bill keep them (VECTOR_INDEX_DESIGN §5.5).
+            record["pinned-index-bytes"] = _as_int(summary.get("total-index-data-size")) or 0
+            record["pinned-index-bytes-on-disk"] = _as_int(summary.get("total-index-size")) or 0
             return record
 
         record = _create(self.firestore_client.transaction())
@@ -7102,6 +7180,8 @@ class OpteryxCatalog(SecretsMixin, Metastore):
             snapshot_id=snapshot_id,
             pinned_bytes=record["pinned-bytes"],
             pinned_bytes_on_disk=record["pinned-bytes-on-disk"],
+            pinned_index_bytes=record["pinned-index-bytes"],
+            pinned_index_bytes_on_disk=record["pinned-index-bytes-on-disk"],
         )
         return record
 
@@ -7164,6 +7244,246 @@ class OpteryxCatalog(SecretsMixin, Metastore):
             data.setdefault("name", doc.id)
             tags.append(data)
         return sorted(tags, key=lambda tag: tag["name"])
+
+    # ------------------------------------------------------------------
+    # Vector indexes (catalog/vector_indexes.py)
+    # ------------------------------------------------------------------
+
+    def _indexes_collection(self, collection: str, dataset_name: str):
+        return self._dataset_doc_ref(collection, dataset_name).collection(INDEXES_SUBCOLLECTION)
+
+    def create_vector_index(
+        self,
+        dataset_identifier: str,
+        name: str,
+        column: str,
+        *,
+        embedding_identity: str,
+        dimensions: int,
+        author: str,
+        method: str = "ivf",
+        metric: str = "cosine",
+        build: str | None = None,
+        clusters: int = 0,
+    ) -> dict:
+        """Define a vector index on a dataset. Builds nothing: sidecars arrive through
+        `commit_vector_index_files` (sync builds at write, async ones in maintenance).
+
+        The existence check and the create are ONE transaction, so two concurrent
+        CREATE INDEX of the same name cannot both succeed."""
+        record = new_index_definition(
+            name=name, column=column, method=method, metric=metric, build=build,
+            clusters=clusters, embedding_identity=embedding_identity,
+            dimensions=dimensions, author=author, created_at_ms=int(time.time() * 1000),
+        )
+        collection, dataset_name = self._local_parts(dataset_identifier)
+        dataset_ref = self._dataset_doc_ref(collection, dataset_name)
+        index_ref = self._indexes_collection(collection, dataset_name).document(record["name"])
+        qualified = f"{collection}.{dataset_name}"
+
+        @firestore.transactional
+        def _create(transaction) -> None:
+            dataset_doc = dataset_ref.get(transaction=transaction)
+            existing = index_ref.get(transaction=transaction)
+            if not dataset_doc.exists:
+                raise DatasetNotFound(f"Dataset not found: {qualified}")
+            if existing.exists:
+                raise VectorIndexAlreadyExists(
+                    f"Index {record['name']} already exists on {qualified}. Drop it first to "
+                    "redefine it."
+                )
+            transaction.set(index_ref, record)
+
+        _create(self.firestore_client.transaction())
+        emit_audit(
+            "create_vector_index",
+            resource_type=ResourceType.DATASET,
+            workspace=self.workspace,
+            collection=collection,
+            resource=dataset_name,
+            author=author,
+            index=record["name"],
+            index_id=record["index-id"],
+            column=column,
+            build=record["build"],
+        )
+        # An async index covers none of the dataset's existing files: fire its REFRESH
+        # (D-16). Never raises - a failed fire is alerted, and a hand-run REFRESH INDEX
+        # or the next commit's fire catches up. A sync index was built by the CREATE.
+        if record["build"] == "async":
+            from .trigger_firing import fire_index_refreshes
+
+            fire_index_refreshes(self, f"{collection}.{dataset_name}", author=author, only=record["name"])
+        return dict(record)
+
+    def get_vector_index(self, dataset_identifier: str, name: str) -> dict:
+        collection, dataset_name = self._local_parts(dataset_identifier)
+        index_name = normalize_index_name(name)
+        doc = self._indexes_collection(collection, dataset_name).document(index_name).get()
+        if not doc.exists:
+            raise VectorIndexNotFound(f"Index not found: {index_name} on {collection}.{dataset_name}")
+        return doc.to_dict() or {}
+
+    def list_vector_indexes(self, dataset_identifier: str) -> list[dict]:
+        """Every index defined on a dataset, ordered by name. One subcollection read."""
+        collection, dataset_name = self._local_parts(dataset_identifier)
+        indexes = [doc.to_dict() or {} for doc in self._indexes_collection(collection, dataset_name).stream()]
+        return sorted(indexes, key=lambda index: index["name"])
+
+    def alter_vector_index(self, dataset_identifier: str, name: str, *, build: str, author: str) -> dict:
+        """Change an index's build mode (ruled 2026-10-02). Applies from the next commit:
+        files written while the index was async stay unindexed until a maintenance build."""
+        if not author:
+            raise ValueError("author must be provided when altering an index")
+        if build not in BUILD_MODES:
+            raise ValueError(f"Unknown build mode '{build}'; supported: {sorted(BUILD_MODES)}.")
+        collection, dataset_name = self._local_parts(dataset_identifier)
+        index_name = normalize_index_name(name)
+        index_ref = self._indexes_collection(collection, dataset_name).document(index_name)
+        qualified = f"{collection}.{dataset_name}"
+
+        @firestore.transactional
+        def _alter(transaction) -> dict:
+            existing = index_ref.get(transaction=transaction)
+            if not existing.exists:
+                raise VectorIndexNotFound(f"Index not found: {index_name} on {qualified}")
+            record = existing.to_dict() or {}
+            record["build"] = build
+            transaction.set(index_ref, record)
+            return record
+
+        record = _alter(self.firestore_client.transaction())
+        emit_audit(
+            "alter_vector_index",
+            resource_type=ResourceType.DATASET,
+            workspace=self.workspace,
+            collection=collection,
+            resource=dataset_name,
+            author=author,
+            index=index_name,
+            index_id=record["index-id"],
+            build=build,
+        )
+        return dict(record)
+
+    def drop_vector_index(self, dataset_identifier: str, name: str, *, author: str) -> None:
+        """Remove an index: first a commit that drops its sidecar references from the
+        manifest (older snapshots keep theirs until expiry, so time travel still works),
+        then the definition. In that order, a failure between the two leaves an index
+        with no files - which a retried DROP completes - never files with no index."""
+        if not author:
+            raise ValueError("author must be provided when dropping an index")
+        record = self.get_vector_index(dataset_identifier, name)
+        collection, dataset_name = self._local_parts(dataset_identifier)
+        dataset = self.load_dataset(f"{collection}.{dataset_name}")
+        dataset.remove_vector_index_files(record["index-id"], author=author)
+        self._indexes_collection(collection, dataset_name).document(record["name"]).delete()
+        emit_audit(
+            "drop_vector_index",
+            resource_type=ResourceType.DATASET,
+            workspace=self.workspace,
+            collection=collection,
+            resource=dataset_name,
+            author=author,
+            index=record["name"],
+            index_id=record["index-id"],
+        )
+
+    # ------------------------------------------------------------------
+    # Maintenance lease (catalog/maintenance_lease.py, VECTOR_INDEX_DESIGN §5.7)
+    # ------------------------------------------------------------------
+
+    def _lease_ref(self, collection: str, dataset_name: str):
+        return (
+            self._dataset_doc_ref(collection, dataset_name)
+            .collection(MAINTENANCE_SUBCOLLECTION)
+            .document(LEASE_DOCUMENT)
+        )
+
+    def claim_maintenance_lease(
+        self, dataset_identifier: str, *, holder: str, operation: str, ttl_seconds: int
+    ) -> MaintenanceLease:
+        """Claim the dataset's maintenance lease, or refuse loudly.
+
+        Read, check free-or-expired and set are ONE transaction, so of two concurrent
+        claims exactly one is granted. A refusal (MaintenanceLeaseHeld) names the holder;
+        nothing is queued. An expired lease is claimable: its holder crashed or overran,
+        and its uncommitted files are orphans for deep clean."""
+        validate_lease_request(holder, operation, ttl_seconds)
+        collection, dataset_name = self._local_parts(dataset_identifier)
+        dataset_ref = self._dataset_doc_ref(collection, dataset_name)
+        lease_ref = self._lease_ref(collection, dataset_name)
+        qualified = f"{collection}.{dataset_name}"
+
+        @firestore.transactional
+        def _claim(transaction) -> MaintenanceLease:
+            dataset_doc = dataset_ref.get(transaction=transaction)
+            current = lease_ref.get(transaction=transaction)
+            if not dataset_doc.exists:
+                raise DatasetNotFound(f"Dataset not found: {qualified}")
+            now_ms = int(time.time() * 1000)
+            if current.exists:
+                held = current.to_dict() or {}
+                if int(held.get("expires-at-ms") or 0) > now_ms:
+                    raise MaintenanceLeaseHeld(
+                        f"{qualified} is held for maintenance: {describe_holder(held)}. "
+                        f"Compaction and index builds never run at the same time on a table; "
+                        f"this {operation} was not started."
+                    )
+            lease = MaintenanceLease(
+                dataset=qualified, claim_id=uuid.uuid4().hex, holder=holder, operation=operation,
+                claimed_at_ms=now_ms, expires_at_ms=now_ms + ttl_seconds * 1000,
+            )
+            transaction.set(lease_ref, lease.to_document())
+            return lease
+
+        return _claim(self.firestore_client.transaction())
+
+    def renew_maintenance_lease(self, lease: MaintenanceLease, *, ttl_seconds: int) -> MaintenanceLease:
+        """Extend a held lease. MaintenanceLeaseLost if this claim no longer holds it -
+        the holder must stop: someone else may now be compacting or building."""
+        validate_lease_request(lease.holder, lease.operation, ttl_seconds)
+        collection, dataset_name = self._local_parts(lease.dataset)
+        lease_ref = self._lease_ref(collection, dataset_name)
+
+        @firestore.transactional
+        def _renew(transaction) -> MaintenanceLease:
+            current = lease_ref.get(transaction=transaction)
+            held = (current.to_dict() or {}) if current.exists else {}
+            now_ms = int(time.time() * 1000)
+            if held.get("claim-id") != lease.claim_id or int(held.get("expires-at-ms") or 0) <= now_ms:
+                raise MaintenanceLeaseLost(
+                    f"The {lease.operation} lease on {lease.dataset} claimed by {lease.holder} "
+                    f"at {lease.claimed_at_ms} is no longer held"
+                    + (f"; it is now held for {describe_holder(held)}" if held else "")
+                    + ". Stop: anything not yet committed is an orphan for deep clean."
+                )
+            renewed = MaintenanceLease(
+                dataset=lease.dataset, claim_id=lease.claim_id, holder=lease.holder,
+                operation=lease.operation, claimed_at_ms=lease.claimed_at_ms,
+                expires_at_ms=now_ms + ttl_seconds * 1000,
+            )
+            transaction.set(lease_ref, renewed.to_document())
+            return renewed
+
+        return _renew(self.firestore_client.transaction())
+
+    def release_maintenance_lease(self, lease: MaintenanceLease) -> bool:
+        """Release a lease after its holder's commit. Only THIS claim is ever removed: a
+        release that runs after the lease expired and was claimed again leaves the new
+        claim alone and returns False, so the caller can report that it overran."""
+        collection, dataset_name = self._local_parts(lease.dataset)
+        lease_ref = self._lease_ref(collection, dataset_name)
+
+        @firestore.transactional
+        def _release(transaction) -> bool:
+            current = lease_ref.get(transaction=transaction)
+            if not current.exists or (current.to_dict() or {}).get("claim-id") != lease.claim_id:
+                return False
+            transaction.delete(lease_ref)
+            return True
+
+        return _release(self.firestore_client.transaction())
 
     def virtual_tags(
         self, dataset_identifier: str, dataset: SimpleDataset | None = None
@@ -8427,6 +8747,17 @@ class OpteryxCatalog(SecretsMixin, Metastore):
             # catalog/deletes.py and MOR_DELETES_DESIGN.md.
             "delete_file_path": "VARCHAR",
             "deleted_record_count": "INTEGER",
+            # Vector-index sidecars of this data file, as six parallel arrays
+            # ordered by index id (catalog/vector_indexes.py): the paths, then
+            # the sizes the builder wrote (on disk, and logical = billed).
+            # Empty - including on every manifest written before these columns
+            # existed - means "not indexed": the engine searches that file exactly.
+            "vector_index_ids": "ARRAY",
+            "vector_index_vectors": "ARRAY",
+            "vector_index_centroids": "ARRAY",
+            "vector_index_vectors_bytes": "ARRAY",
+            "vector_index_centroids_bytes": "ARRAY",
+            "vector_index_logical_bytes": "ARRAY",
         }
 
         # Normalize entries to match the column set above:
@@ -8468,6 +8799,8 @@ class OpteryxCatalog(SecretsMixin, Metastore):
             # delete_file_path is a nullable VARCHAR: None IS the "no deletes"
             # value, so setdefault only ensures the key exists for the writer.
             e.setdefault("delete_file_path", None)
+            # Cells read back as tuples; the writer takes lists. Validated parallel.
+            e.update(with_index_refs(e, index_refs(e)))
 
             # min/max values are stored as compressed int64 values
             mv = e.get("min_values") or []
@@ -8560,20 +8893,26 @@ class OpteryxCatalog(SecretsMixin, Metastore):
         snaps = self._snapshots_collection(namespace, dataset_name)
         snaps.document(str(snapshot.snapshot_id)).set(_snapshot_to_document(snapshot))
 
-    def _refuse_if_pointer_moved(self, doc_ref, identifier: str, expected) -> None:
-        """Refuse the commit if another writer already moved the pointer.
+    def _set_if_pointer_unmoved(self, doc_ref, identifier: str, expected, document) -> None:
+        """Write `document` only if the pointer still reads `expected` — atomically.
 
-        Read and compare inside a Firestore transaction so the check binds the
-        write that follows it. Firestore refuses a read that follows a write in
+        The read, the comparison and the write are ONE Firestore transaction: the
+        write is staged on the transaction, so if another writer moves the pointer
+        between the read and the commit, Firestore aborts and retries this function,
+        whose re-read then refuses. Firestore refuses a read that follows a write in
         the same transaction, so the read comes first - the same ordering
         `create_dataset` uses.
+
+        (This previously checked in its own transaction and wrote AFTER it, outside
+        any transaction, so two writers could both pass the check and the later
+        `set()` silently replaced the earlier commit.)
         """
         from google.cloud import firestore
 
         from .exceptions import SnapshotRaceError
 
         @firestore.transactional
-        def _check(transaction) -> None:
+        def _check_and_set(transaction) -> None:
             doc = doc_ref.get(transaction=transaction)
             stored = doc.to_dict().get("current-snapshot-id") if doc.exists else None
             if stored != expected:
@@ -8585,8 +8924,9 @@ class OpteryxCatalog(SecretsMixin, Metastore):
                     "Re-read the dataset and rebuild the commit against its current "
                     "snapshot."
                 )
+            transaction.set(doc_ref, document)
 
-        _check(self.firestore_client.transaction())
+        _check_and_set(self.firestore_client.transaction())
 
     def save_dataset_metadata(
         self,
@@ -8610,9 +8950,6 @@ class OpteryxCatalog(SecretsMixin, Metastore):
         """
         collection, dataset_name = identifier.split(".")
         doc_ref = self._dataset_doc_ref(collection, dataset_name)
-
-        if expected_current_snapshot_id is not _NO_SNAPSHOT_EXPECTATION:
-            self._refuse_if_pointer_moved(doc_ref, identifier, expected_current_snapshot_id)
 
         document = {
             "name": dataset_name,
@@ -8662,7 +8999,10 @@ class OpteryxCatalog(SecretsMixin, Metastore):
         # fork", and only one of them is the truth for a dataset nobody cloned.
         if metadata.fork is not None:
             document["fork"] = metadata.fork.to_dict()
-        doc_ref.set(document)
+        if expected_current_snapshot_id is _NO_SNAPSHOT_EXPECTATION:
+            doc_ref.set(document)
+        else:
+            self._set_if_pointer_unmoved(doc_ref, identifier, expected_current_snapshot_id, document)
 
         # Metadata persisted in primary `datasets` collection only.
 

@@ -528,3 +528,85 @@ def test_manual_fire_failure_is_returned_not_raised():
     submit.assert_not_called()
     assert result["status"] == "owner-missing"
     assert "no runs-as identity" in result["detail"]
+
+
+# --- vector index refreshes (D-16; fired runs as the index creator, ruled 2026-10-03) --
+
+
+def _index_catalog(indexes):
+    catalog = MagicMock()
+    catalog.workspace = "ws"
+    catalog.list_vector_indexes.return_value = indexes
+    return catalog
+
+
+def _index(name, build):
+    return {"name": name, "build": build, "index-id": "a" * 32, "created-by": "olive"}
+
+
+def test_index_refresh_fires_for_each_async_index_through_jobs():
+    catalog = _index_catalog([_index("a_idx", "async"), _index("s_idx", "sync"), _index("b_idx", "async")])
+    with (
+        patch.object(trigger_firing, "_post_job", return_value={"execution_id": "x"}) as post,
+        patch.object(trigger_firing, "write_audit_record") as audit,
+    ):
+        submitted = trigger_firing.fire_index_refreshes(catalog, "src.a", author="alice", snapshot_id=7)
+
+    assert submitted == [("a_idx", "x"), ("b_idx", "x")]          # sync indexes build in the write
+    payloads = [c.args[0] for c in post.call_args_list]
+    assert [p["sql_text"] for p in payloads] == [
+        "REFRESH INDEX a_idx ON ws.src.a", "REFRESH INDEX b_idx ON ws.src.a",
+    ]
+    # Provenance only - who the run acts as and who pays are jobs' to resolve.
+    assert payloads[0]["client_info"] == {
+        "index_refresh": {
+            "source_dataset": "ws.src.a", "index_name": "a_idx", "snapshot_id": 7, "fired_by": "alice",
+        }
+    }
+    assert [c.args[0]["event"] for c in audit.call_args_list] == ["index_refresh.fired"] * 2
+
+
+def test_index_refresh_failure_is_alerted_and_audited_and_the_rest_still_fire():
+    catalog = _index_catalog([_index("a_idx", "async"), _index("b_idx", "async")])
+    with (
+        patch.object(
+            trigger_firing, "_post_job",
+            side_effect=[RuntimeError("jobs down"), {"execution_id": "y"}],
+        ),
+        patch.object(trigger_firing, "_alert") as alert,
+        patch.object(trigger_firing, "write_audit_record") as audit,
+    ):
+        submitted = trigger_firing.fire_index_refreshes(catalog, "src.a", author="alice")
+
+    assert submitted == [("b_idx", "y")]
+    assert alert.call_count == 1
+    assert [c.args[0]["event"] for c in audit.call_args_list] == [
+        "index_refresh.fire_failed", "index_refresh.fired",
+    ]
+
+
+def test_index_refresh_kill_switch(monkeypatch):
+    monkeypatch.setenv("OPTERYX_TRIGGER_FIRING", "0")
+    catalog = _index_catalog([_index("a_idx", "async")])
+    assert trigger_firing.fire_index_refreshes(catalog, "src.a", author="alice") == []
+    catalog.list_vector_indexes.assert_not_called()
+
+
+def _snapshot_adding(files, user_created):
+    snap = _snapshot(user_created=user_created)
+    snap.summary = {"added-data-files": files}
+    return snap
+
+
+def test_after_commit_fires_index_refreshes_for_any_commit_that_added_files():
+    """A compaction is housekeeping (no MV re-runs) but its unindexed outputs are
+    exactly what an async index's refresh catches up."""
+    dataset = _dataset_with_catalog()
+    with (
+        patch.object(trigger_firing, "fire_index_refreshes") as fire_indexes,
+        patch.object(trigger_firing, "fire_triggers") as fire,
+    ):
+        dataset._after_commit("alice", _snapshot_adding(2, user_created=False))
+        dataset._after_commit("alice", _snapshot_adding(0, user_created=True))
+    fire_indexes.assert_called_once_with(dataset.catalog, "src.a", author="alice", snapshot_id=123)
+    fire.assert_called_once()                                     # only the user commit

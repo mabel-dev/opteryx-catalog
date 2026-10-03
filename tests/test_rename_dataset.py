@@ -399,3 +399,84 @@ def test_unauthenticated_records_no_author(monkeypatch, capsys):
 
     record = next(r for r in _emitted(capsys) if r["action"] == "rename_dataset")
     assert record["author"] is None
+
+
+def test_vector_index_files_and_definitions_move_with_the_dataset(monkeypatch, capsys):
+    """Index files move like data files - remapped in EVERY manifest that names them,
+    copied once - and the definitions whose ids key them move too."""
+    from opteryx_catalog.catalog.vector_indexes import index_files
+    from opteryx_catalog.catalog.vector_indexes import index_refs
+    from opteryx_catalog.catalog.vector_indexes import with_index_refs
+
+    index_id = "a" * 32
+    old = index_files(
+        f"{_OLD_LOC}/index/{index_id}/a-01.vectors.skene",
+        f"{_OLD_LOC}/index/{index_id}/a-01.centroids.skene",
+        vectors_bytes=10, centroids_bytes=2, logical_bytes=30,
+    )
+    shared = [with_index_refs({"file_path": f"{_OLD_LOC}/data/a.parquet"}, {index_id: old})]
+    snapshots = {
+        1: {"snapshot-id": 1, "manifest": f"{_OLD_LOC}/metadata/manifest-1.parquet"},
+        2: {"snapshot-id": 2, "manifest": f"{_OLD_LOC}/metadata/manifest-2.parquet"},
+    }
+    catalog, source, target = _catalog(snapshots=snapshots, manifest_rows=shared)
+    catalog.io.objects[old.vectors] = b"v"
+    catalog.io.objects[old.centroids] = b"c"
+    source.collection("indexes").document("idx").set({"name": "idx", "index-id": index_id})
+    _patch_manifest_io(catalog, monkeypatch, {"manifest-1": shared, "manifest-2": shared})
+
+    catalog.rename_dataset("coll.tbl", "newcoll.newtbl", author="alice")
+
+    expected = old._replace(
+        vectors=f"{_NEW_LOC}/index/{index_id}/a-01.vectors.skene",
+        centroids=f"{_NEW_LOC}/index/{index_id}/a-01.centroids.skene",
+    )
+    assert len(catalog._captured_manifests) == 2
+    for _path, entries in catalog._captured_manifests:
+        assert index_refs(entries[0]) == {index_id: expected}
+    assert catalog.io.objects[expected.vectors] == b"v"
+    assert catalog.io.objects[expected.centroids] == b"c"
+    assert old.vectors not in catalog.io.objects               # vacated by exact path
+    moved = target.collection("indexes").document("idx").get().to_dict()
+    assert moved["index-id"] == index_id
+
+
+def test_a_file_shared_by_two_snapshots_is_renamed_in_both_manifests(monkeypatch, capsys):
+    """Copied once, but EVERY manifest naming it is rewritten. The later manifest used to
+    keep the old path - which the rename then reclaimed, breaking that snapshot."""
+    shared = [{"file_path": f"{_OLD_LOC}/data/a.parquet"}]
+    snapshots = {
+        1: {"snapshot-id": 1, "manifest": f"{_OLD_LOC}/metadata/manifest-1.parquet"},
+        2: {"snapshot-id": 2, "manifest": f"{_OLD_LOC}/metadata/manifest-2.parquet"},
+    }
+    catalog, _source, _target = _catalog(snapshots=snapshots, manifest_rows=shared)
+    _patch_manifest_io(catalog, monkeypatch, {"manifest-1": shared, "manifest-2": shared})
+
+    catalog.rename_dataset("coll.tbl", "newcoll.newtbl", author="alice")
+
+    assert [entries[0]["file_path"] for _path, entries in catalog._captured_manifests] == [
+        f"{_NEW_LOC}/data/a.parquet",
+        f"{_NEW_LOC}/data/a.parquet",
+    ]
+
+
+def test_delete_vectors_move_with_their_data_file(monkeypatch, capsys):
+    """A delete vector left under the old location is reclaimed with it, and every row it
+    deleted would come back. It moves, in every manifest, like the data file."""
+    deletes = f"{_OLD_LOC}/deletes/deletes-7.parquet"
+    shared = [{"file_path": f"{_OLD_LOC}/data/a.parquet", "delete_file_path": deletes}]
+    snapshots = {
+        1: {"snapshot-id": 1, "manifest": f"{_OLD_LOC}/metadata/manifest-1.parquet"},
+        2: {"snapshot-id": 2, "manifest": f"{_OLD_LOC}/metadata/manifest-2.parquet"},
+    }
+    catalog, _source, _target = _catalog(snapshots=snapshots, manifest_rows=shared)
+    catalog.io.objects[deletes] = b"bitmap"
+    _patch_manifest_io(catalog, monkeypatch, {"manifest-1": shared, "manifest-2": shared})
+
+    catalog.rename_dataset("coll.tbl", "newcoll.newtbl", author="alice")
+
+    moved = f"{_NEW_LOC}/deletes/deletes-7.parquet"
+    for _path, entries in catalog._captured_manifests:
+        assert entries[0]["delete_file_path"] == moved
+    assert catalog.io.objects[moved] == b"bitmap"
+    assert deletes not in catalog.io.objects

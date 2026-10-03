@@ -1133,6 +1133,104 @@ def fire_triggers(
         _dispatch(catalog, dataset_identifier, DATASET_HOLDER, trigger, target_view, fire, note, author)
 
 
+# --- Vector index refreshes (docs/VECTOR_INDEX_DESIGN.md §10, D-16) ---------
+#
+# Every commit that ADDS data files fires `REFRESH INDEX <name> ON <dataset>` for each
+# `async` index on the dataset, so new files are indexed without a schedule. Not only
+# user commits: a compaction adds files too, and its unindexed outputs are what the
+# refresh exists to catch up. Fired through jobs like a materialized view refresh; jobs
+# runs it as the index's CREATOR, who pays (ruled 2026-10-03) - never as whoever's
+# write fired it. The same never-raise contract as `fire_triggers`.
+
+INDEX_REFRESH_PROVENANCE = "index_refresh"
+
+
+def fire_index_refreshes(
+    catalog,
+    dataset_identifier: str,
+    author: str | None,
+    snapshot_id: Any | None = None,
+    only: str | None = None,
+) -> list[tuple[str, str | None]]:
+    """Submit REFRESH INDEX for every async index on a dataset that just took files - or,
+    with `only`, for that one index (an async CREATE INDEX, whose existing files the new
+    index does not cover yet).
+
+    Returns `[(index name, execution id or None)]` for what was submitted. Never
+    raises: a failure is alerted and audited per index, and the commit stands. A missed
+    fire leaves files searched exactly until the next commit's fire, or a hand-run
+    REFRESH INDEX, catches them up."""
+    if not firing_enabled():
+        return []
+    try:
+        indexes = catalog.list_vector_indexes(dataset_identifier)
+    except Exception as exc:  # noqa: BLE001 - commit path must survive
+        _alert(
+            exc,
+            note="reading vector indexes failed - index refreshes NOT fired",
+            fingerprint=("index-list-failed", dataset_identifier),
+            context={"dataset": dataset_identifier},
+        )
+        return []
+
+    qualified = _qualified_source(catalog, dataset_identifier)
+    submitted = []
+    for index in indexes:
+        if index.get("build") != "async" or (only is not None and index.get("name") != only):
+            continue
+        name = index.get("name")
+        try:
+            body = _post_job(
+                {
+                    "sql_text": f"REFRESH INDEX {name} ON {qualified}",
+                    "client_info": {
+                        INDEX_REFRESH_PROVENANCE: {
+                            "source_dataset": qualified,
+                            "index_name": name,
+                            "snapshot_id": snapshot_id,
+                            "fired_by": author,
+                        }
+                    },
+                }
+            )
+            execution_id = body.get("execution_id")
+            if not execution_id:
+                raise RuntimeError(
+                    f"jobs accepted REFRESH INDEX {name} ON {qualified} but returned no execution_id"
+                )
+        except Exception as exc:  # noqa: BLE001 - commit path must survive
+            _alert(
+                exc,
+                note="vector index refresh NOT enqueued - new files stay unindexed until the next fire",
+                fingerprint=("index-refresh-fire-failed", dataset_identifier, name),
+                context={"dataset": dataset_identifier, "index": name},
+            )
+            write_audit_record(
+                {
+                    "event": "index_refresh.fire_failed",
+                    "workspace": catalog.workspace,
+                    "dataset": dataset_identifier,
+                    "index": name,
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "author": author,
+                }
+            )
+            continue
+        write_audit_record(
+            {
+                "event": "index_refresh.fired",
+                "workspace": catalog.workspace,
+                "dataset": dataset_identifier,
+                "index": name,
+                "execution_id": execution_id,
+                "snapshot_id": snapshot_id,
+                "author": author,
+            }
+        )
+        submitted.append((name, execution_id))
+    return submitted
+
+
 # --- Firing by hand ---------------------------------------------------------
 #
 # "Run now" on a commit trigger: fire it as though its source had just taken

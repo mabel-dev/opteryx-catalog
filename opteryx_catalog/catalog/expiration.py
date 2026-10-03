@@ -46,6 +46,7 @@ from .dataset import visible_history
 from .metadata import SNAPSHOT_EXPIRED_AT_KEY
 from .metadata import Snapshot
 from .metadata import snapshot_is_tombstoned
+from .vector_indexes import referenced_index_files
 from .orphan_quarantine import OrphanQuarantine
 from .ownership import is_own_path as _is_own_path
 
@@ -1122,6 +1123,11 @@ class SnapshotExpiration:
                     delete_file = entry.get("delete_file_path")
                     if delete_file and delete_file not in files:
                         files[delete_file] = 0
+                    # Vector-index sidecars (catalog/vector_indexes.py), protected by
+                    # the same rule: referenced by a retained snapshot = kept. Their
+                    # on-disk sizes ARE recorded on the entry, so they count.
+                    for index_file, size in referenced_index_files(entry).items():
+                        files[index_file] = size
             except Exception as e:
                 # Broad on purpose: a corrupt/unreadable manifest (including
                 # native-decoder errors like RuntimeError) must be handled here

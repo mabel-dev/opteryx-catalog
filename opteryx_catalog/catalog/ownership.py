@@ -61,3 +61,41 @@ def is_own_path(location: str | None, path: str | None) -> bool:
     if not location:
         return False
     return path.startswith(location.rstrip("/") + "/")
+
+
+def is_admissible_path(location: str | None, path: str | None) -> bool:
+    """Whether a commit may register `path` as one of `location`'s files.
+
+    The read-side twin of `is_own_path`, and stricter. Scans read every file a
+    manifest names with the engine's own storage credentials, so a manifest is
+    a capability: an entry naming `gs://other-bucket/secret.parquet` would let
+    a dataset read anything those credentials reach (confused deputy). A
+    commit therefore admits only:
+
+    * an absolute path under `location` - the dataset's own files, whether the
+      location is a URI or (a local catalog) a local absolute path;
+    * a bare file name with no directory part, the test-fixture spelling
+      `_looks_absolute` describes. A relative path WITH a directory is
+      refused: the GCS IO reads its first segment as a bucket name.
+
+    Any `.` or `..` segment is refused outright, whatever the prefix: the
+    comparison here is textual, and a reader that normalised the path would
+    resolve it somewhere the comparison never looked.
+
+    Files legitimately borrowed from another dataset (a fork's clone/resync)
+    are not admitted by this test - the commit is handed them separately, as
+    paths the catalog itself read from the pinned upstream manifest.
+    """
+    if not path:
+        return False
+    body = path.split("://", 1)[-1]
+    if any(segment in (".", "..") for segment in body.split("/")):
+        return False
+    if path.startswith("/"):
+        # A local absolute path (a local catalog's own files): admissible only under a
+        # location spelled the same way. `_looks_absolute` sees only URIs, so without
+        # this a local dataset could not register a single file of its own.
+        return bool(location) and path.startswith(location.rstrip("/") + "/")
+    if not _looks_absolute(path):
+        return "/" not in path and "\\" not in path
+    return is_own_path(location, path)
