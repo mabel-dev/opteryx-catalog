@@ -246,6 +246,11 @@ class DatasetMetadata:
     # have no other way to know what they are looking at.
     external_catalog: bool = False
     # Maintenance policy: retention settings grouped under a single block
+    # Vector index definitions (catalog/vector_indexes.py), ordered by name, as the
+    # dataset document held them when this was loaded. READ-ONLY: a commit never writes
+    # them from here - save_dataset_metadata carries the document's own map inside its
+    # transaction - so a stale copy can never overwrite a newer definition.
+    vector_indexes: list[dict] = field(default_factory=list)
     maintenance_policy: dict = field(
         default_factory=lambda: {
             "retained-snapshot-age-days": None,

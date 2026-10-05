@@ -410,35 +410,31 @@ def test_vector_index_files_and_definitions_move_with_the_dataset(monkeypatch, c
 
     index_id = "a" * 32
     old = index_files(
-        f"{_OLD_LOC}/index/{index_id}/a-01.vectors.skene",
-        f"{_OLD_LOC}/index/{index_id}/a-01.centroids.skene",
-        vectors_bytes=10, centroids_bytes=2, logical_bytes=30,
+        f"{_OLD_LOC}/index/{index_id}/a-01.vidx", file_bytes=30, footer_bytes=2, logical_bytes=30,
     )
     shared = [with_index_refs({"file_path": f"{_OLD_LOC}/data/a.parquet"}, {index_id: old})]
     snapshots = {
         1: {"snapshot-id": 1, "manifest": f"{_OLD_LOC}/metadata/manifest-1.parquet"},
         2: {"snapshot-id": 2, "manifest": f"{_OLD_LOC}/metadata/manifest-2.parquet"},
     }
-    catalog, source, target = _catalog(snapshots=snapshots, manifest_rows=shared)
-    catalog.io.objects[old.vectors] = b"v"
-    catalog.io.objects[old.centroids] = b"c"
-    source.collection("indexes").document("idx").set({"name": "idx", "index-id": index_id})
+    definition = {"name": "idx", "index-id": index_id}
+    catalog, source, target = _catalog(
+        snapshots=snapshots, manifest_rows=shared,
+        dataset_data={"location": _OLD_LOC, "vector-indexes": {"idx": definition}},
+    )
+    catalog.io.objects[old.path] = b"v"
     _patch_manifest_io(catalog, monkeypatch, {"manifest-1": shared, "manifest-2": shared})
 
     catalog.rename_dataset("coll.tbl", "newcoll.newtbl", author="alice")
 
-    expected = old._replace(
-        vectors=f"{_NEW_LOC}/index/{index_id}/a-01.vectors.skene",
-        centroids=f"{_NEW_LOC}/index/{index_id}/a-01.centroids.skene",
-    )
+    expected = old._replace(path=f"{_NEW_LOC}/index/{index_id}/a-01.vidx")
     assert len(catalog._captured_manifests) == 2
     for _path, entries in catalog._captured_manifests:
         assert index_refs(entries[0]) == {index_id: expected}
-    assert catalog.io.objects[expected.vectors] == b"v"
-    assert catalog.io.objects[expected.centroids] == b"c"
-    assert old.vectors not in catalog.io.objects               # vacated by exact path
-    moved = target.collection("indexes").document("idx").get().to_dict()
-    assert moved["index-id"] == index_id
+    assert catalog.io.objects[expected.path] == b"v"
+    assert old.path not in catalog.io.objects                  # vacated by exact path
+    # The definitions ride on the dataset document, so they move with it.
+    assert target.get().to_dict()["vector-indexes"] == {"idx": definition}
 
 
 def test_a_file_shared_by_two_snapshots_is_renamed_in_both_manifests(monkeypatch, capsys):

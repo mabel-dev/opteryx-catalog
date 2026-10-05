@@ -18,6 +18,8 @@ tests hold the schema half to it.
 
 from __future__ import annotations
 
+import types
+
 from opteryx_catalog.catalog.metadata import DatasetMetadata
 from opteryx_catalog.opteryx_catalog import OpteryxCatalog
 
@@ -38,7 +40,7 @@ class _DocRef:
         self.deleted = False
         self._subcollections = {}
 
-    def get(self):
+    def get(self, transaction=None):
         return self._doc
 
     def set(self, data):
@@ -72,6 +74,35 @@ class _Collection:
         return self._docs
 
 
+class _SetTransaction:
+    """Enough of a Firestore transaction for the document write: it reads live and
+    applies its staged `set()` at commit."""
+
+    _read_only = False
+    _max_attempts = 1
+    _id = b"fake-txn"
+
+    def __init__(self):
+        self.writes = []
+
+    def _clean_up(self):
+        self.writes = []
+
+    def _begin(self, retry_id=None):
+        return None
+
+    def _rollback(self):
+        self.writes = []
+
+    def set(self, ref, data, merge=False):
+        self.writes.append((ref, data))
+
+    def _commit(self):
+        for ref, data in self.writes:
+            ref.set(data)
+        return []
+
+
 def _schema_entry(sid, seq, columns):
     return {
         "schema_id": sid,
@@ -93,6 +124,7 @@ def _catalog_with_schema_history():
     catalog = object.__new__(OpteryxCatalog)
     catalog.workspace = "ws"
     catalog._dataset_doc_ref = lambda c, n: dataset_ref
+    catalog.firestore_client = types.SimpleNamespace(transaction=_SetTransaction)
     catalog._snapshots_collection = lambda c, n: _Collection()
     return catalog, dataset_ref, schemas
 

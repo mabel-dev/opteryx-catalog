@@ -728,9 +728,6 @@ class SimpleDataset(Dataset):
     # catalog/manifest.py's compressible-categories note, and the contract
     # on `Dataset.bounds_are_ordinal`.
     bounds_are_ordinal = True
-    # Its snapshots' manifests are the opteryx manifest parquet this package
-    # writes - see `Dataset.has_opteryx_manifest`.
-    has_opteryx_manifest = True
 
     identifier: str
     _metadata: DatasetMetadata
@@ -3001,8 +2998,8 @@ class SimpleDataset(Dataset):
                         "IndexFiles - paths AND the sizes the builder wrote."
                     )
                 refs[index_id] = index_files_record(
-                    f.vectors, f.centroids, vectors_bytes=f.vectors_bytes,
-                    centroids_bytes=f.centroids_bytes, logical_bytes=f.logical_bytes,
+                    f.path, file_bytes=f.file_bytes, footer_bytes=f.footer_bytes,
+                    logical_bytes=f.logical_bytes,
                 )
             out.append(with_index_refs(dict(entry), refs))
         return out
@@ -3042,8 +3039,8 @@ class SimpleDataset(Dataset):
                     )
             refs = {
                 index_id: index_files(
-                    f.vectors, f.centroids, vectors_bytes=f.vectors_bytes,
-                    centroids_bytes=f.centroids_bytes, logical_bytes=f.logical_bytes,
+                    f.path, file_bytes=f.file_bytes, footer_bytes=f.footer_bytes,
+                    logical_bytes=f.logical_bytes,
                 )
                 for index_id, f in carried.items()
             }
@@ -3966,8 +3963,13 @@ class SimpleDataset(Dataset):
         *,
         author: str,
         agent: str,
+        index_name: str | None = None,
     ) -> int:
         """Attach built sidecars to data files: one snapshot, operation `index-build`.
+
+        `index_name` names the index in the commit message, which readers see as the
+        snapshot's description; without it the name is looked up from the definition,
+        and the id stands in only if that fails.
 
         `files` maps a data file path to its IndexFiles - both paths and the sizes the
         builder wrote - written BEFORE this call. A missing or non-positive size is
@@ -3990,8 +3992,8 @@ class SimpleDataset(Dataset):
                 )
         files = {
             path: index_files(
-                f.vectors, f.centroids, vectors_bytes=f.vectors_bytes,
-                centroids_bytes=f.centroids_bytes, logical_bytes=f.logical_bytes,
+                f.path, file_bytes=f.file_bytes, footer_bytes=f.footer_bytes,
+                logical_bytes=f.logical_bytes,
             )
             for path, f in files.items()
         }
@@ -4016,8 +4018,22 @@ class SimpleDataset(Dataset):
             updated.append(entry)
         return self._commit_manifest_rewrite(
             updated, prev, operation="index-build", author=author, agent=agent,
-            message=f"vector index {index_id}: {len(files)} file(s) indexed",
+            message=self._index_build_message(index_id, index_name, len(files)),
         )
+
+    def _index_build_message(self, index_id: str, index_name: str | None, count: int) -> str:
+        """`Indexed 1 file for vector index body_idx` - the commit message of an
+        index-build snapshot. It is shown to people as the latest commit's description,
+        so it names the index rather than its 32-hex id wherever the name can be found."""
+        if not index_name and self.catalog is not None:
+            try:
+                for definition in self.catalog.list_vector_indexes(self.identifier):
+                    if definition.get("index-id") == index_id:
+                        index_name = definition.get("name")
+                        break
+            except Exception:
+                index_name = None
+        return f"Indexed {count} file{'' if count == 1 else 's'} for vector index {index_name or index_id}"
 
     def vector_index_coverage(self, snapshot_id: int | None = None) -> dict[str, frozenset]:
         """{data file path: the index ids covering it} at a snapshot (the current one by
@@ -4063,9 +4079,9 @@ class SimpleDataset(Dataset):
         work of one `REFRESH INDEX` (D-16). Empty when the index is up to date.
 
         Each task carries the file's size, its deleted ordinals at the current snapshot and
-        new paths for its two index files. Building and committing are the caller's: the
+        a new path for its index file. Building and committing are the caller's: the
         commit (`commit_vector_index_files`) refuses any file retired in the meantime."""
-        from .vector_indexes import vector_index_paths
+        from .vector_indexes import vector_index_path
 
         prev = self.snapshot(None)
         if prev is None or not getattr(prev, "manifest_list", None):
@@ -4080,10 +4096,9 @@ class SimpleDataset(Dataset):
             size = entry.get("file_size_in_bytes")
             if type(size) is not int or size <= 0:
                 raise ValueError(f"{self.identifier}: manifest entry {path!r} has no file size")
-            vectors, centroids = vector_index_paths(self.metadata.location, index_id, path)
             tasks.append(IndexBuildTask(
                 data_file=path, data_bytes=size, deleted=tuple(deletes.get(path, ())),
-                vectors=vectors, centroids=centroids,
+                path=vector_index_path(self.metadata.location, index_id, path),
             ))
         return tasks
 

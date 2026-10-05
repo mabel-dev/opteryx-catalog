@@ -29,7 +29,7 @@ from .catalog.dataset import open_data_file_writer_at
 from .catalog.dataset import relation_schema_from_stored
 from .catalog.deletes import DELETE_FILE_PATH_KEY
 from .catalog.vector_indexes import BUILD_MODES
-from .catalog.vector_indexes import INDEXES_SUBCOLLECTION
+from .catalog.vector_indexes import VECTOR_INDEXES_FIELD
 from .catalog.vector_indexes import index_refs
 from .catalog.vector_indexes import new_index_definition
 from .catalog.vector_indexes import normalize_index_name
@@ -956,6 +956,16 @@ def _require_parquet_engine() -> None:
         raise ImportError(f"{_PARQUET_ENGINE_HELP}\n\nImport failed with: {err!r}") from err
 
 
+def _carry_vector_indexes(stored_doc, document: dict) -> dict:
+    """`document` with the vector index definitions the stored dataset document holds
+    (read in the writer's own transaction) - a whole-document write must never drop or
+    roll back a definition (catalog/vector_indexes.py)."""
+    stored = (stored_doc.to_dict() or {}).get(VECTOR_INDEXES_FIELD) if stored_doc.exists else None
+    if not stored:
+        return document
+    return {**document, VECTOR_INDEXES_FIELD: stored}
+
+
 class OpteryxCatalog(SecretsMixin, Metastore):
     """Firestore-backed Metastore implementation.
 
@@ -1650,6 +1660,11 @@ class OpteryxCatalog(SecretsMixin, Metastore):
         stored_maintenance_policy = data.get("maintenance-policy")
         if stored_maintenance_policy:
             metadata.maintenance_policy = stored_maintenance_policy
+        # Vector index definitions ride on the document (see vector_indexes.py), so the
+        # engine plans an index search from this load with no read of its own.
+        metadata.vector_indexes = sorted(
+            (data.get(VECTOR_INDEXES_FIELD) or {}).values(), key=lambda index: index["name"]
+        )
         # Absent on plain datasets; "materialized_view" on an MV's backing
         # table. Read back so callers can distinguish the two from a dataset
         # they already hold, without a second catalog round trip - and, with
@@ -1956,7 +1971,6 @@ class OpteryxCatalog(SecretsMixin, Metastore):
 
         self._delete_subcollection(self._snapshots_collection(collection, dataset_name))
         self._delete_subcollection(self._tags_collection(collection, dataset_name))
-        self._delete_subcollection(self._indexes_collection(collection, dataset_name))
         self._delete_subcollection(doc_ref.collection("schemas"))
         self._delete_subcollection(doc_ref.collection(MAINTENANCE_SUBCOLLECTION))
         self._delete_subcollection(doc_ref.collection("statement"))
@@ -2199,7 +2213,7 @@ class OpteryxCatalog(SecretsMixin, Metastore):
                 # Vector-index files move too: they key the data file by ordinal, which
                 # the copy preserves.
                 row.update(with_index_refs(row, {
-                    index_id: files._replace(vectors=_move(files.vectors), centroids=_move(files.centroids))
+                    index_id: files._replace(path=_move(files.path))
                     for index_id, files in index_refs(row).items()
                 }))
 
@@ -2233,11 +2247,8 @@ class OpteryxCatalog(SecretsMixin, Metastore):
         for tag_doc in self._tags_collection(collection, dataset_name).stream():
             new_tags.document(tag_doc.id).set(tag_doc.to_dict() or {})
 
-        # Vector-index definitions travel too: their index ids key the index files
-        # the manifests above now reference at the new location.
-        new_indexes = self._indexes_collection(new_collection, new_dataset_name)
-        for index_doc in self._indexes_collection(collection, dataset_name).stream():
-            new_indexes.document(index_doc.id).set(index_doc.to_dict() or {})
+        # Vector-index definitions travel in `data` (the document's own map): their index
+        # ids key the index files the manifests above now reference at the new location.
 
         # Relationships travel with the dataset for the same reason tags do:
         # they are its own metadata, keyed under it, and a rename that left them
@@ -2329,7 +2340,6 @@ class OpteryxCatalog(SecretsMixin, Metastore):
         # clean record and its files each need two fresh sightings.
         self._delete_subcollection(self._snapshots_collection(collection, dataset_name))
         self._delete_subcollection(self._tags_collection(collection, dataset_name))
-        self._delete_subcollection(self._indexes_collection(collection, dataset_name))
         self._delete_subcollection(doc_ref.collection("schemas"))
         self._delete_subcollection(doc_ref.collection(MAINTENANCE_SUBCOLLECTION))
         self._delete_subcollection(doc_ref.collection(RELATIONSHIPS_SUBCOLLECTION))
@@ -6984,15 +6994,12 @@ class OpteryxCatalog(SecretsMixin, Metastore):
             # A copy is byte-identical, so the recorded sizes carry unchanged.
             copied_refs = {}
             for index_id, files in index_refs(row).items():
-                targets = []
-                for path in (files.vectors, files.centroids):
-                    if is_own_path(location, path):
-                        targets.append(path)
-                        continue
-                    target = f"{location}/index/{index_id}/{path.rsplit('/', 1)[-1]}"
-                    self._copy_object(path, target)
-                    targets.append(target)
-                copied_refs[index_id] = files._replace(vectors=targets[0], centroids=targets[1])
+                if is_own_path(location, files.path):
+                    copied_refs[index_id] = files
+                    continue
+                target = f"{location}/index/{index_id}/{files.path.rsplit('/', 1)[-1]}"
+                self._copy_object(files.path, target)
+                copied_refs[index_id] = files._replace(path=target)
             row = with_index_refs(row, copied_refs)
             rewritten.append(row)
             copied += 1
@@ -7249,8 +7256,13 @@ class OpteryxCatalog(SecretsMixin, Metastore):
     # Vector indexes (catalog/vector_indexes.py)
     # ------------------------------------------------------------------
 
-    def _indexes_collection(self, collection: str, dataset_name: str):
-        return self._dataset_doc_ref(collection, dataset_name).collection(INDEXES_SUBCOLLECTION)
+    def _index_definitions(self, collection: str, dataset_name: str, transaction=None) -> dict:
+        """The dataset document's {name: definition} map; DatasetNotFound when there is
+        no such dataset."""
+        doc = self._dataset_doc_ref(collection, dataset_name).get(transaction=transaction)
+        if not doc.exists:
+            raise DatasetNotFound(f"Dataset not found: {collection}.{dataset_name}")
+        return dict((doc.to_dict() or {}).get(VECTOR_INDEXES_FIELD) or {})
 
     def create_vector_index(
         self,
@@ -7278,21 +7290,18 @@ class OpteryxCatalog(SecretsMixin, Metastore):
         )
         collection, dataset_name = self._local_parts(dataset_identifier)
         dataset_ref = self._dataset_doc_ref(collection, dataset_name)
-        index_ref = self._indexes_collection(collection, dataset_name).document(record["name"])
         qualified = f"{collection}.{dataset_name}"
 
         @firestore.transactional
         def _create(transaction) -> None:
-            dataset_doc = dataset_ref.get(transaction=transaction)
-            existing = index_ref.get(transaction=transaction)
-            if not dataset_doc.exists:
-                raise DatasetNotFound(f"Dataset not found: {qualified}")
-            if existing.exists:
+            definitions = self._index_definitions(collection, dataset_name, transaction)
+            if record["name"] in definitions:
                 raise VectorIndexAlreadyExists(
                     f"Index {record['name']} already exists on {qualified}. Drop it first to "
                     "redefine it."
                 )
-            transaction.set(index_ref, record)
+            definitions[record["name"]] = record
+            transaction.update(dataset_ref, {VECTOR_INDEXES_FIELD: definitions})
 
         _create(self.firestore_client.transaction())
         emit_audit(
@@ -7319,15 +7328,16 @@ class OpteryxCatalog(SecretsMixin, Metastore):
     def get_vector_index(self, dataset_identifier: str, name: str) -> dict:
         collection, dataset_name = self._local_parts(dataset_identifier)
         index_name = normalize_index_name(name)
-        doc = self._indexes_collection(collection, dataset_name).document(index_name).get()
-        if not doc.exists:
+        definition = self._index_definitions(collection, dataset_name).get(index_name)
+        if definition is None:
             raise VectorIndexNotFound(f"Index not found: {index_name} on {collection}.{dataset_name}")
-        return doc.to_dict() or {}
+        return dict(definition)
 
     def list_vector_indexes(self, dataset_identifier: str) -> list[dict]:
-        """Every index defined on a dataset, ordered by name. One subcollection read."""
+        """Every index defined on a dataset, ordered by name: one read of the dataset
+        document. (A query has them already, on the dataset it loaded.)"""
         collection, dataset_name = self._local_parts(dataset_identifier)
-        indexes = [doc.to_dict() or {} for doc in self._indexes_collection(collection, dataset_name).stream()]
+        indexes = self._index_definitions(collection, dataset_name).values()
         return sorted(indexes, key=lambda index: index["name"])
 
     def alter_vector_index(self, dataset_identifier: str, name: str, *, build: str, author: str) -> dict:
@@ -7339,17 +7349,18 @@ class OpteryxCatalog(SecretsMixin, Metastore):
             raise ValueError(f"Unknown build mode '{build}'; supported: {sorted(BUILD_MODES)}.")
         collection, dataset_name = self._local_parts(dataset_identifier)
         index_name = normalize_index_name(name)
-        index_ref = self._indexes_collection(collection, dataset_name).document(index_name)
+        dataset_ref = self._dataset_doc_ref(collection, dataset_name)
         qualified = f"{collection}.{dataset_name}"
 
         @firestore.transactional
         def _alter(transaction) -> dict:
-            existing = index_ref.get(transaction=transaction)
-            if not existing.exists:
+            definitions = self._index_definitions(collection, dataset_name, transaction)
+            if index_name not in definitions:
                 raise VectorIndexNotFound(f"Index not found: {index_name} on {qualified}")
-            record = existing.to_dict() or {}
+            record = dict(definitions[index_name])
             record["build"] = build
-            transaction.set(index_ref, record)
+            definitions[index_name] = record
+            transaction.update(dataset_ref, {VECTOR_INDEXES_FIELD: definitions})
             return record
 
         record = _alter(self.firestore_client.transaction())
@@ -7377,7 +7388,19 @@ class OpteryxCatalog(SecretsMixin, Metastore):
         collection, dataset_name = self._local_parts(dataset_identifier)
         dataset = self.load_dataset(f"{collection}.{dataset_name}")
         dataset.remove_vector_index_files(record["index-id"], author=author)
-        self._indexes_collection(collection, dataset_name).document(record["name"]).delete()
+        from google.cloud import firestore
+
+        dataset_ref = self._dataset_doc_ref(collection, dataset_name)
+
+        @firestore.transactional
+        def _drop(transaction) -> None:
+            definitions = self._index_definitions(collection, dataset_name, transaction)
+            # The same index (by id): a concurrent DROP + CREATE of the name is left alone.
+            if definitions.get(record["name"], {}).get("index-id") == record["index-id"]:
+                del definitions[record["name"]]
+                transaction.update(dataset_ref, {VECTOR_INDEXES_FIELD: definitions})
+
+        _drop(self.firestore_client.transaction())
         emit_audit(
             "drop_vector_index",
             resource_type=ResourceType.DATASET,
@@ -8657,11 +8680,7 @@ class OpteryxCatalog(SecretsMixin, Metastore):
         Entries should be plain dicts. The manifest will be written to
         <dataset_location>/metadata/manifest-<snapshot_id>.parquet
         """
-        from draken.interop.vector_sequence import vector_from_sequence
-        from draken.morsels.morsel import Morsel
-        from rugo.parquet import write_parquet
-
-        from .iops.fileio import WRITE_PARQUET_OPTIONS
+        from .catalog.manifest import encode_parquet_manifest
 
         # If entries is None we skip writing; if entries is empty list, write
         # an empty Parquet manifest (represents an empty dataset for this
@@ -8684,186 +8703,7 @@ class OpteryxCatalog(SecretsMixin, Metastore):
         # Use provided FileIO if it supports writing; otherwise write to GCS.
         # Nothing below is recoverable - see the note on out.close() - so this
         # runs unguarded and lets failures reach the caller.
-        #
-        # Explicit dtype per column (especially the nested-list stats
-        # columns) so rugo's writer gets a consistent shape regardless of
-        # what individual entries happen to carry.
-        columns = {
-            "file_path": "VARCHAR",
-            "file_format": "VARCHAR",
-            "record_count": "INTEGER",
-            "file_size_in_bytes": "INTEGER",
-            "uncompressed_size_in_bytes": "INTEGER",
-            "column_uncompressed_sizes_in_bytes": "ARRAY",
-            "null_counts": "ARRAY",
-            "min_k_hashes": "ARRAY",
-            "histogram_counts": "ARRAY",
-            "histogram_bins": "INTEGER",
-            "min_values": "ARRAY",
-            "max_values": "ARRAY",
-            "min_lengths": "ARRAY",
-            "max_lengths": "ARRAY",
-            # Stable per-column field-id, same order/index as every other
-            # per-column stats array above (min_values[i] is field_ids[i]'s
-            # min, etc.) — lets readers key stats by a schema-stable id
-            # instead of assuming today's array position equals a column's
-            # position in some other schema snapshot. Empty for manifest
-            # rows written before this existed; readers must fall back to
-            # positional indexing in that case.
-            "field_ids": "ARRAY",
-            # Per-column byte-class histogram (8 fixed classes) and total
-            # byte count, VARCHAR/NVARCHAR/VARBINARY columns only (empty
-            # list / 0 elsewhere) — backs the LIKE '%needle%' selectivity
-            # char-class estimator. See catalog/manifest.py's
-            # _compute_column_stats / Vector.char_class_stats().
-            "char_class_counts": "ARRAY",
-            "char_total_bytes": "ARRAY",
-            # ARRAY columns only: statistics over the flat CHILD vector, i.e.
-            # the elements pooled across every row's list. An ARRAY has no
-            # ordinal encoding of its own, so min_values/histogram_counts are
-            # the sentinel/empty for it and it can be pruned on nothing; its
-            # elements are an ordinary vector and take the ordinary kernels.
-            # See catalog/manifest.py's _compute_column_stats. Empty for
-            # manifest rows written before this existed, which readers must
-            # treat as "not computed", not "no elements".
-            "element_min_values": "ARRAY",
-            "element_max_values": "ARRAY",
-            "element_min_k_hashes": "ARRAY",
-            # Per-column distinct-value count, for a producer whose source
-            # publishes NDV as a NUMBER rather than as the hashes a KMV sketch
-            # is made of (a PostgreSQL/CockroachDB statistics refresh). Empty
-            # for everything this catalog computes itself, which has
-            # `min_k_hashes` and does not need it, and empty on every manifest
-            # written before this existed - readers must treat that as "not
-            # computed", never as "no distinct values". ESTIMATE-ONLY: readers
-            # mark it is_exact=False so it can never be taken as a BOUND.
-            "distinct_counts": "ARRAY",
-            # Merge-on-read deletes: which sidecar holds this data file's
-            # delete vector, and how many of its rows are deleted. NULL / 0
-            # (including on every manifest written before these columns
-            # existed) means "no deletes" — readers must treat absence and
-            # zero identically. record_count above stays PHYSICAL rows;
-            # live rows are record_count - deleted_record_count. See
-            # catalog/deletes.py and MOR_DELETES_DESIGN.md.
-            "delete_file_path": "VARCHAR",
-            "deleted_record_count": "INTEGER",
-            # Vector-index sidecars of this data file, as six parallel arrays
-            # ordered by index id (catalog/vector_indexes.py): the paths, then
-            # the sizes the builder wrote (on disk, and logical = billed).
-            # Empty - including on every manifest written before these columns
-            # existed - means "not indexed": the engine searches that file exactly.
-            "vector_index_ids": "ARRAY",
-            "vector_index_vectors": "ARRAY",
-            "vector_index_centroids": "ARRAY",
-            "vector_index_vectors_bytes": "ARRAY",
-            "vector_index_centroids_bytes": "ARRAY",
-            "vector_index_logical_bytes": "ARRAY",
-        }
-
-        # Normalize entries to match the column set above:
-        normalized = []
-        for ent in entries:
-            if not isinstance(ent, dict):
-                continue
-            e = dict(ent)
-            # Ensure the numeric scalars exist AND are non-None: every
-            # column below is written for every row, so a key an entry
-            # didn't carry lands as SQL NULL and reads back as None, not
-            # as the 0 that `entry.get(col, 0)` readers assume. That is
-            # how manifests grew NULL sizes that later raised
-            # `'<' not supported between instances of 'NoneType' and 'int'`
-            # inside compaction's size comparisons.
-            for _numeric in (
-                "record_count",
-                "file_size_in_bytes",
-                "uncompressed_size_in_bytes",
-                "deleted_record_count",
-            ):
-                if e.get(_numeric) is None:
-                    e[_numeric] = 0
-            # Ensure list fields exist
-            e.setdefault("min_k_hashes", [])
-            e.setdefault("histogram_counts", [])
-            e.setdefault("histogram_bins", 0)
-            e.setdefault("column_uncompressed_sizes_in_bytes", [])
-            e.setdefault("null_counts", [])
-            e.setdefault("min_lengths", [])
-            e.setdefault("max_lengths", [])
-            e.setdefault("field_ids", [])
-            e.setdefault("char_class_counts", [])
-            e.setdefault("char_total_bytes", [])
-            e.setdefault("element_min_values", [])
-            e.setdefault("element_max_values", [])
-            e.setdefault("element_min_k_hashes", [])
-            e.setdefault("distinct_counts", [])
-            # delete_file_path is a nullable VARCHAR: None IS the "no deletes"
-            # value, so setdefault only ensures the key exists for the writer.
-            e.setdefault("delete_file_path", None)
-            # Cells read back as tuples; the writer takes lists. Validated parallel.
-            e.update(with_index_refs(e, index_refs(e)))
-
-            # min/max values are stored as compressed int64 values
-            mv = e.get("min_values") or []
-            xv = e.get("max_values") or []
-
-            # Ensure int64 values are properly typed for min/max
-            e["min_values"] = [int(v) if v is not None else None for v in mv]
-            e["max_values"] = [int(v) if v is not None else None for v in xv]
-            # Element bounds are the same int64 ordinals, over the child vector.
-            e["element_min_values"] = [
-                int(v) if v is not None else None for v in (e.get("element_min_values") or [])
-            ]
-            e["element_max_values"] = [
-                int(v) if v is not None else None for v in (e.get("element_max_values") or [])
-            ]
-
-            # min_k_hashes / histogram_counts are per-column lists of ints,
-            # so each entry is list[list[int]] and the column is a native
-            # nested ARRAY<ARRAY<...>> (rugo's writer emits the 2-level LIST
-            # encoding; read_manifest_columns reads it straight back). No
-            # string encoding — min_k_hashes are full-range xxhash uint64,
-            # stored with an unsigned leaf so values above INT64_MAX survive.
-            normalized.append(e)
-
-        from draken import draken_native as _dn
-
-        morsel = Morsel()
-        for name, dtype in columns.items():
-            values = [e.get(name) for e in normalized]
-            if name == "min_k_hashes":
-                # UINT64 leaf: xxhash values span the full unsigned range; a
-                # signed leaf would read back negative above INT64_MAX and
-                # corrupt min-k ordering.
-                #
-                # Entries reach here in mixed forms during migration: freshly
-                # computed (int hashes), decoded from a legacy comma-joined
-                # manifest (int hashes, possibly NEGATIVE where a uint64 was
-                # stored signed), a per-hash decimal-string list, or a single
-                # comma-joined string per column. Normalize every hash to its
-                # unsigned 64-bit value: a hash is a 64-bit identifier, not an
-                # arithmetic quantity, so `int(h) & mask` recovers the true
-                # uint64 (no-op for correct values, fixes legacy negatives)
-                # and draken's UINT64 factory then accepts it.
-                def _norm_col(col):
-                    if col is None:
-                        return None
-                    if isinstance(col, str):  # legacy comma-joined column
-                        col = col.split(",") if col else []
-                    return [None if h is None else (int(h) & 0xFFFFFFFFFFFFFFFF) for h in col]
-
-                values = [
-                    None if entry is None else [_norm_col(col) for col in entry] for entry in values
-                ]
-                morsel.append_vector(
-                    name,
-                    _dn.vector_array_from_sequence(
-                        values, element_type=_dn.DrakenType.UINT64.value, nesting_depth=2
-                    ),
-                )
-            else:
-                morsel.append_vector(name, vector_from_sequence(values, dtype=dtype))
-
-        data = write_parquet(morsel, **WRITE_PARQUET_OPTIONS)
+        data = encode_parquet_manifest(entries)
 
         if self.io:
             out = self.io.new_output(parquet_path).create()
@@ -8893,6 +8733,17 @@ class OpteryxCatalog(SecretsMixin, Metastore):
         snaps = self._snapshots_collection(namespace, dataset_name)
         snaps.document(str(snapshot.snapshot_id)).set(_snapshot_to_document(snapshot))
 
+    def _set_carrying_vector_indexes(self, doc_ref, document) -> None:
+        """Write the dataset document whole, carrying its vector index definitions from
+        a read in the SAME transaction (see catalog/vector_indexes.py)."""
+        from google.cloud import firestore
+
+        @firestore.transactional
+        def _carry_and_set(transaction) -> None:
+            transaction.set(doc_ref, _carry_vector_indexes(doc_ref.get(transaction=transaction), document))
+
+        _carry_and_set(self.firestore_client.transaction())
+
     def _set_if_pointer_unmoved(self, doc_ref, identifier: str, expected, document) -> None:
         """Write `document` only if the pointer still reads `expected` — atomically.
 
@@ -8915,6 +8766,7 @@ class OpteryxCatalog(SecretsMixin, Metastore):
         def _check_and_set(transaction) -> None:
             doc = doc_ref.get(transaction=transaction)
             stored = doc.to_dict().get("current-snapshot-id") if doc.exists else None
+            carried = _carry_vector_indexes(doc, document)
             if stored != expected:
                 raise SnapshotRaceError(
                     f"{identifier} moved while this commit was being built: it was "
@@ -8924,7 +8776,7 @@ class OpteryxCatalog(SecretsMixin, Metastore):
                     "Re-read the dataset and rebuild the commit against its current "
                     "snapshot."
                 )
-            transaction.set(doc_ref, document)
+            transaction.set(doc_ref, carried)
 
         _check_and_set(self.firestore_client.transaction())
 
@@ -9000,7 +8852,7 @@ class OpteryxCatalog(SecretsMixin, Metastore):
         if metadata.fork is not None:
             document["fork"] = metadata.fork.to_dict()
         if expected_current_snapshot_id is _NO_SNAPSHOT_EXPECTATION:
-            doc_ref.set(document)
+            self._set_carrying_vector_indexes(doc_ref, document)
         else:
             self._set_if_pointer_unmoved(doc_ref, identifier, expected_current_snapshot_id, document)
 

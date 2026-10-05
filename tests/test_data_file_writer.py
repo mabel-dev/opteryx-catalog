@@ -220,9 +220,13 @@ _EXACT_FIELDS = (
 
 @pytest.mark.parametrize("exact", [True, False])
 def test_row_group_accumulation_matches_the_whole_morsel_builder(exact):
+    from rugo.parquet import write_parquet
+
     groups = _row_groups()
+    # The written file's bytes: the entry counts its row groups from the footer.
+    data = write_parquet(_concat(groups), max_rows_per_row_group=0)
     whole = build_parquet_manifest_entry_from_morsel(
-        _concat(groups), b"", "mem://f.parquet", 0, {"i": 1, "s": 2, "b": 3}
+        _concat(groups), data, "mem://f.parquet", 0, {"i": 1, "s": 2, "b": 3}
     ).to_dict()
 
     acc = ParquetManifestEntryAccumulator(
@@ -235,6 +239,9 @@ def test_row_group_accumulation_matches_the_whole_morsel_builder(exact):
     for field in _EXACT_FIELDS:
         assert streamed[field] == whole[field], field
     assert acc.row_group_count == 3
+    # Each counted from what it saw: the accumulator three row groups, the whole
+    # morsel's file (written as one row group) one.
+    assert streamed["row_group_count"] == 3 and whole["row_group_count"] == 1
     _assert_sizes_match_up_to_bitmap_padding(streamed, whole, row_groups=3)
 
     # BOOL is exact in both modes: its domain is fixed, no range to discover.

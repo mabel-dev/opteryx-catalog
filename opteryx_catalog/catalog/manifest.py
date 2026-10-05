@@ -100,6 +100,10 @@ class ParquetManifestEntry:
     # reading. Empty on every manifest written before this existed, which
     # readers must treat as "not computed", never as "no distinct values".
     distinct_counts: list[int] = field(default_factory=list)
+    # How many row groups the data file holds - from its footer, or counted as they are
+    # written. None on entries built before this existed: readers treat that as
+    # unknown, never as zero (the engine's vector index cost model estimates it then).
+    row_group_count: int | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -124,6 +128,7 @@ class ParquetManifestEntry:
             "element_max_values": self.element_max_values,
             "element_min_k_hashes": self.element_min_k_hashes,
             "distinct_counts": self.distinct_counts,
+            "row_group_count": self.row_group_count,
         }
 
 
@@ -769,10 +774,13 @@ def build_parquet_manifest_entry_from_morsel(
         column_uncompressed.append(col_bytes)
         uncompressed_size += col_bytes
 
+    from rugo.parquet import read_metadata_from_memoryview
+
     entry = ParquetManifestEntry(
         file_path=file_path,
         file_format="parquet",
         record_count=int(morsel.num_rows),
+        row_group_count=int(read_metadata_from_memoryview(memoryview(data_bytes)).num_row_groups),
         file_size_in_bytes=int(file_size_in_bytes or len(data_bytes)),
         uncompressed_size_in_bytes=uncompressed_size,
         column_uncompressed_sizes_in_bytes=column_uncompressed,
@@ -1164,6 +1172,8 @@ class ParquetManifestEntryAccumulator:
             file_path=file_path,
             file_format="parquet",
             record_count=int(self._record_count),
+            # One add_row_group per row group written (or re-read): exact.
+            row_group_count=int(self._row_group_count),
             file_size_in_bytes=int(file_size_in_bytes),
             uncompressed_size_in_bytes=self._uncompressed,
             column_uncompressed_sizes_in_bytes=column_uncompressed,
@@ -1237,6 +1247,7 @@ def build_parquet_manifest_entry_from_bytes(
             file_path=file_path,
             file_format="parquet",
             record_count=int(meta.num_rows),
+            row_group_count=int(meta.num_row_groups),
             file_size_in_bytes=int(file_size_in_bytes or len(data_bytes)),
             uncompressed_size_in_bytes=0,
             column_uncompressed_sizes_in_bytes=[],
@@ -1284,6 +1295,203 @@ def build_parquet_manifest_entry_from_bytes(
         time.perf_counter() - t_start,
     )
     return entry
+
+
+def encode_parquet_manifest(entries: list[dict]) -> bytes:
+    """The manifest parquet for `entries` (plain dicts, one per data file) - the
+    one encoder of the opteryx manifest format, which opteryx-core decodes
+    natively for planning. Bounds are `Vector.ordinalize()` int64 keys. Writes
+    nothing: the caller decides where the bytes go."""
+    from draken import draken_native as _dn
+    from draken.interop.vector_sequence import vector_from_sequence
+    from draken.morsels.morsel import Morsel
+    from rugo.parquet import write_parquet
+
+    from ..iops.fileio import WRITE_PARQUET_OPTIONS
+    from .vector_indexes import index_refs
+    from .vector_indexes import with_index_refs
+
+    # Explicit dtype per column (especially the nested-list stats
+    # columns) so rugo's writer gets a consistent shape regardless of
+    # what individual entries happen to carry.
+    columns = {
+        "file_path": "VARCHAR",
+        "file_format": "VARCHAR",
+        "record_count": "INTEGER",
+        "file_size_in_bytes": "INTEGER",
+        "uncompressed_size_in_bytes": "INTEGER",
+        "column_uncompressed_sizes_in_bytes": "ARRAY",
+        "null_counts": "ARRAY",
+        "min_k_hashes": "ARRAY",
+        "histogram_counts": "ARRAY",
+        "histogram_bins": "INTEGER",
+        "min_values": "ARRAY",
+        "max_values": "ARRAY",
+        "min_lengths": "ARRAY",
+        "max_lengths": "ARRAY",
+        # Stable per-column field-id, same order/index as every other
+        # per-column stats array above (min_values[i] is field_ids[i]'s
+        # min, etc.) — lets readers key stats by a schema-stable id
+        # instead of assuming today's array position equals a column's
+        # position in some other schema snapshot. Empty for manifest
+        # rows written before this existed; readers must fall back to
+        # positional indexing in that case.
+        "field_ids": "ARRAY",
+        # Per-column byte-class histogram (8 fixed classes) and total
+        # byte count, VARCHAR/NVARCHAR/VARBINARY columns only (empty
+        # list / 0 elsewhere) — backs the LIKE '%needle%' selectivity
+        # char-class estimator. See catalog/manifest.py's
+        # _compute_column_stats / Vector.char_class_stats().
+        "char_class_counts": "ARRAY",
+        "char_total_bytes": "ARRAY",
+        # ARRAY columns only: statistics over the flat CHILD vector, i.e.
+        # the elements pooled across every row's list. An ARRAY has no
+        # ordinal encoding of its own, so min_values/histogram_counts are
+        # the sentinel/empty for it and it can be pruned on nothing; its
+        # elements are an ordinary vector and take the ordinary kernels.
+        # See catalog/manifest.py's _compute_column_stats. Empty for
+        # manifest rows written before this existed, which readers must
+        # treat as "not computed", not "no elements".
+        "element_min_values": "ARRAY",
+        "element_max_values": "ARRAY",
+        "element_min_k_hashes": "ARRAY",
+        # Per-column distinct-value count, for a producer whose source
+        # publishes NDV as a NUMBER rather than as the hashes a KMV sketch
+        # is made of (a PostgreSQL/CockroachDB statistics refresh). Empty
+        # for everything this catalog computes itself, which has
+        # `min_k_hashes` and does not need it, and empty on every manifest
+        # written before this existed - readers must treat that as "not
+        # computed", never as "no distinct values". ESTIMATE-ONLY: readers
+        # mark it is_exact=False so it can never be taken as a BOUND.
+        "distinct_counts": "ARRAY",
+        # Merge-on-read deletes: which sidecar holds this data file's
+        # delete vector, and how many of its rows are deleted. NULL / 0
+        # (including on every manifest written before these columns
+        # existed) means "no deletes" — readers must treat absence and
+        # zero identically. record_count above stays PHYSICAL rows;
+        # live rows are record_count - deleted_record_count. See
+        # catalog/deletes.py and MOR_DELETES_DESIGN.md.
+        "delete_file_path": "VARCHAR",
+        "deleted_record_count": "INTEGER",
+        # How many row groups the data file holds. NULL - including on every
+        # manifest written before this column existed - is UNKNOWN, never zero.
+        "row_group_count": "INTEGER",
+        # Vector-index sidecars of this data file, as five parallel arrays
+        # ordered by index id (catalog/vector_indexes.py): the path, then the
+        # sizes the builder wrote (the file, its footer, and logical = billed).
+        # Empty - including on every manifest written before these columns
+        # existed - means "not indexed": the engine searches that file exactly.
+        "vidx_ids": "ARRAY",
+        "vidx_paths": "ARRAY",
+        "vidx_bytes": "ARRAY",
+        "vidx_footer_bytes": "ARRAY",
+        "vidx_logical_bytes": "ARRAY",
+    }
+
+    # Normalize entries to match the column set above:
+    normalized = []
+    for ent in entries:
+        if not isinstance(ent, dict):
+            continue
+        e = dict(ent)
+        # Ensure the numeric scalars exist AND are non-None: every
+        # column below is written for every row, so a key an entry
+        # didn't carry lands as SQL NULL and reads back as None, not
+        # as the 0 that `entry.get(col, 0)` readers assume. That is
+        # how manifests grew NULL sizes that later raised
+        # `'<' not supported between instances of 'NoneType' and 'int'`
+        # inside compaction's size comparisons.
+        for _numeric in (
+            "record_count",
+            "file_size_in_bytes",
+            "uncompressed_size_in_bytes",
+            "deleted_record_count",
+        ):
+            if e.get(_numeric) is None:
+                e[_numeric] = 0
+        # Ensure list fields exist
+        e.setdefault("min_k_hashes", [])
+        e.setdefault("histogram_counts", [])
+        e.setdefault("histogram_bins", 0)
+        e.setdefault("column_uncompressed_sizes_in_bytes", [])
+        e.setdefault("null_counts", [])
+        e.setdefault("min_lengths", [])
+        e.setdefault("max_lengths", [])
+        e.setdefault("field_ids", [])
+        e.setdefault("char_class_counts", [])
+        e.setdefault("char_total_bytes", [])
+        e.setdefault("element_min_values", [])
+        e.setdefault("element_max_values", [])
+        e.setdefault("element_min_k_hashes", [])
+        e.setdefault("distinct_counts", [])
+        # delete_file_path is a nullable VARCHAR: None IS the "no deletes"
+        # value, so setdefault only ensures the key exists for the writer.
+        e.setdefault("delete_file_path", None)
+        # Unknown stays NULL (never 0): see the column above.
+        e.setdefault("row_group_count", None)
+        # Cells read back as tuples; the writer takes lists. Validated parallel.
+        e.update(with_index_refs(e, index_refs(e)))
+
+        # min/max values are stored as compressed int64 values
+        mv = e.get("min_values") or []
+        xv = e.get("max_values") or []
+
+        # Ensure int64 values are properly typed for min/max
+        e["min_values"] = [int(v) if v is not None else None for v in mv]
+        e["max_values"] = [int(v) if v is not None else None for v in xv]
+        # Element bounds are the same int64 ordinals, over the child vector.
+        e["element_min_values"] = [
+            int(v) if v is not None else None for v in (e.get("element_min_values") or [])
+        ]
+        e["element_max_values"] = [
+            int(v) if v is not None else None for v in (e.get("element_max_values") or [])
+        ]
+
+        # min_k_hashes / histogram_counts are per-column lists of ints,
+        # so each entry is list[list[int]] and the column is a native
+        # nested ARRAY<ARRAY<...>> (rugo's writer emits the 2-level LIST
+        # encoding; read_manifest_columns reads it straight back). No
+        # string encoding — min_k_hashes are full-range xxhash uint64,
+        # stored with an unsigned leaf so values above INT64_MAX survive.
+        normalized.append(e)
+
+    morsel = Morsel()
+    for name, dtype in columns.items():
+        values = [e.get(name) for e in normalized]
+        if name == "min_k_hashes":
+            # UINT64 leaf: xxhash values span the full unsigned range; a
+            # signed leaf would read back negative above INT64_MAX and
+            # corrupt min-k ordering.
+            #
+            # Entries reach here in mixed forms during migration: freshly
+            # computed (int hashes), decoded from a legacy comma-joined
+            # manifest (int hashes, possibly NEGATIVE where a uint64 was
+            # stored signed), a per-hash decimal-string list, or a single
+            # comma-joined string per column. Normalize every hash to its
+            # unsigned 64-bit value: a hash is a 64-bit identifier, not an
+            # arithmetic quantity, so `int(h) & mask` recovers the true
+            # uint64 (no-op for correct values, fixes legacy negatives)
+            # and draken's UINT64 factory then accepts it.
+            def _norm_col(col):
+                if col is None:
+                    return None
+                if isinstance(col, str):  # legacy comma-joined column
+                    col = col.split(",") if col else []
+                return [None if h is None else (int(h) & 0xFFFFFFFFFFFFFFFF) for h in col]
+
+            values = [
+                None if entry is None else [_norm_col(col) for col in entry] for entry in values
+            ]
+            morsel.append_vector(
+                name,
+                _dn.vector_array_from_sequence(
+                    values, element_type=_dn.DrakenType.UINT64.value, nesting_depth=2
+                ),
+            )
+        else:
+            morsel.append_vector(name, vector_from_sequence(values, dtype=dtype))
+
+    return write_parquet(morsel, **WRITE_PARQUET_OPTIONS)
 
 
 def get_manifest_metrics() -> dict:

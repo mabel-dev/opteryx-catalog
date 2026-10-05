@@ -62,15 +62,15 @@ class Dataset:
     list snapshots, append data, and produce a data scan object.
     """
 
-    # How `scan()` encodes the per-file `min_values`/`max_values` it yields.
+    # How `manifest_bytes()` and `scan()` encode the per-file
+    # `min_values`/`max_values`.
     #
     #   True  - `Vector.ordinalize()` int64 ordinal keys (what this package's
-    #           own stats builder writes; see catalog/manifest.py's
+    #           own stats builder writes, and what opteryx-iceberg converts
+    #           Iceberg's lower/upper bounds to; see catalog/manifest.py's
     #           compressible-categories note).
-    #   False - real decoded values: a `str` for a VARCHAR column, a `float`
-    #           for a DOUBLE, and so on (what an external catalog's manifest
-    #           carries -- e.g. opteryx-iceberg decodes Iceberg's lower/upper
-    #           bounds with `pyiceberg.conversions.from_bytes`).
+    #   False - real decoded values. The manifest parquet holds a real value
+    #           only for an integer, temporal or float column.
     #
     # It is a property of WHOEVER PRODUCED THE BOUNDS, not of the connector
     # reading them, which is why it is declared here rather than assumed by
@@ -90,18 +90,16 @@ class Dataset:
     # silently wrong for half the implementations.
     bounds_are_ordinal: Optional[bool] = None
 
-    # Whether `manifest_bytes()` hands over each snapshot's manifest as the
-    # opteryx manifest parquet (the format catalog/manifest.py writes), which
-    # opteryx-core decodes natively for planning. False for a backend whose
-    # manifests are some other format (opteryx-iceberg: Iceberg's own Avro
-    # manifests), which serves planning through `scan()` rows instead. None is
-    # undeclared, and readers must refuse it rather than guess.
-    has_opteryx_manifest: Optional[bool] = None
-
     def manifest_bytes(self, snapshot_id: int | None = None) -> bytes | None:
-        """The raw bytes of a snapshot's manifest parquet (see
-        `has_opteryx_manifest`), or None when the snapshot carries no manifest
-        - an empty dataset. A manifest that exists but cannot be read raises."""
+        """The bytes of a snapshot's manifest as the opteryx manifest parquet
+        (`catalog.manifest.encode_parquet_manifest`), which opteryx-core decodes
+        natively for planning - every backend serves this format, whatever its
+        own manifests are. None when the snapshot carries no manifest - an empty
+        dataset. A manifest that exists but cannot be read raises.
+
+        opteryx-core caches the decoded manifest by the snapshot's
+        `manifest_list`, so it must name exactly one payload for the life of the
+        snapshot."""
         raise NotImplementedError()
 
     def delete_vectors_for(self, entries: Iterable[Any]) -> dict[str, list[int]]:
