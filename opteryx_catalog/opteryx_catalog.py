@@ -988,6 +988,10 @@ class OpteryxCatalog(SecretsMixin, Metastore):
     # external store may claim it.
     supports_forking: bool = True
 
+    # The workspace catalog entry IS this store, so its record of a relation is
+    # the dataset itself. See `Metastore.serves_catalog_records`.
+    serves_catalog_records: bool = True
+
     def __init__(
         self,
         workspace: str,
@@ -1622,11 +1626,19 @@ class OpteryxCatalog(SecretsMixin, Metastore):
         get_all().
         """
         data = doc.to_dict() or {}
+        # A document's inline `schema` is the STORED column list (a stub's
+        # columns - it has no schema id). Built into a RelationSchema here, where
+        # it enters, so `SimpleDataset.schema()` hands back a schema rather than
+        # the raw list: a reader taking `.columns` off that list saw a relation
+        # with no columns (2026-10-12, every Iceberg SELECT in production).
+        stored_schema = data.get("schema")
         metadata = DatasetMetadata(
             dataset_identifier=identifier,
             location=data.get("location")
             or f"gs://{self.gcs_bucket}/{self.workspace}/{collection}/{dataset_name}",
-            schema=data.get("schema"),
+            schema=None
+            if stored_schema is None
+            else relation_schema_from_stored(identifier, stored_schema),
             properties=data.get("properties") or {},
         )
         metadata.timestamp_ms = data.get("timestamp-ms")

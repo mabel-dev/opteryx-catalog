@@ -34,6 +34,25 @@ class Metastore:
     # provide the snapshot mechanics.
     supports_forking: bool = False
 
+    # Whether the workspace catalog's RECORD of a relation can be read as the
+    # relation itself - i.e. whether the dataset object relation resolution
+    # prefetched from the workspace's opteryx catalog entry (opteryx-core's
+    # `resolve_relation`, handed on as `prefetched_table`) is something this
+    # metastore's reads can be served from.
+    #
+    # True ONLY for the native Opteryx metastore, where that record IS the
+    # dataset: its snapshot, schema and manifest. For an externally-bound
+    # workspace the catalog entry is a LISTING - the relation's name and
+    # columns, so it can be listed and described - with no snapshot and no
+    # file list; the data lives in the external store. Reading that listing as
+    # the relation binds an empty relation, a wrong answer reported as success
+    # (2026-10-12: every Iceberg SELECT in production).
+    #
+    # False by default, the safe direction: the reader loads the relation from
+    # this metastore, at the cost of one lookup, rather than trusting a record
+    # it cannot vouch for.
+    serves_catalog_records: bool = False
+
     def load_dataset(self, identifier: str) -> Dataset:
         raise NotImplementedError()
 

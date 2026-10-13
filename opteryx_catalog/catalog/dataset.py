@@ -1155,10 +1155,12 @@ class SimpleDataset(Dataset):
                 if last.get("schema_id") == sid:
                     sdict = last
             else:
-                # If a raw schema is stored directly on metadata, use it.
+                # A schema stored directly on the metadata is already a
+                # RelationSchema - the document load builds it where it enters
+                # (OpteryxCatalog._build_dataset) - so it is the answer.
                 raw = getattr(self.metadata, "schema", None)
                 if raw is not None:
-                    sdict = {"schema_id": sid, "columns": raw}
+                    return raw
 
         # If not the current schema, or cached current not present,
         # prefer to load the schema document from the backend (O(1) doc get).
