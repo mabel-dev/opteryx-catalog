@@ -422,6 +422,13 @@ class SchemaColumn:
     # type would drop bounds that older, untyped documents still carry
     # correctly. Defaults True: every caller that names a type has declared it.
     type_is_declared: bool = True
+    # The column's type OID on the SOURCE server, for a relation projected from
+    # an external database (stored as `remote-type` by the workspace catalog
+    # refresh). The engine type cannot say which server type the wire will carry
+    # - several bind to one engine type - and the wire decoder is chosen by OID,
+    # so the engine's PostgreSQL reader refuses a column without it. None for
+    # every native column, and for an entry written before it was recorded.
+    remote_type: int | None = None
 
 
 @dataclass
@@ -451,6 +458,7 @@ def relation_schema_from_stored(name: str, stored_columns) -> RelationSchema:
                 scale=c.get("scale"),
                 nullable=c.get("nullable", True),
                 id=c.get("id"),
+                remote_type=c.get("remote-type"),
             )
             for c in stored_columns or []
         ],
