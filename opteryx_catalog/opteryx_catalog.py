@@ -1420,6 +1420,10 @@ class OpteryxCatalog(SecretsMixin, Metastore):
         Raises:
             DatasetNotFound: If the dataset does not exist in Firestore.
         """
+        if "." not in identifier:
+            raise DatasetNotFound(
+                f"Dataset not found: {identifier!r} is not a 'collection.dataset' name"
+            )
         collection, dataset_name = identifier.split(".", 1)
         doc = self._dataset_doc_ref(collection, dataset_name).get()
         if not doc.exists:
