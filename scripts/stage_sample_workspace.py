@@ -58,7 +58,7 @@ TABLES = (
 
 # Staged scale-factor labels, smallest first. The label is what appears in the
 # path and in the collection name; `sf001` is scale factor 0.01.
-SCALES = ("001", "01", "1", "5", "10")
+SCALES = ("001", "01", "1", "5", "10", "100")
 
 AUTHOR = "xb500"  # a platform identity - the only principal that may write here
 
@@ -80,7 +80,7 @@ def _catalog():
 
 def _staged_files(catalog, label: str, table: str) -> list[str]:
     """The parquet files staged for one table at one scale factor."""
-    prefix = f"{SAMPLE_ROOT}/sf{label}/{table}"
+    prefix = f"{SAMPLE_ROOT}/sf{label}/{table}/"
     return sorted(p for p in catalog.io.list_files(prefix) if p.endswith(".parquet"))
 
 
