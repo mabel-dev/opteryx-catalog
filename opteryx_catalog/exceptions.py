@@ -265,6 +265,15 @@ class DatasetLocked(CatalogError):
     """Raised by `drop_dataset` when the dataset's `locked-by` field is set."""
 
 
+class DatasetLocationReusable(CatalogError):
+    """Raised by `rename_dataset` when the dataset's document records no location.
+
+    A rename moves no bytes, so the dataset keeps its stored location under the
+    new name; with none stored there is nothing to carry, and one is never
+    guessed from a name.
+    """
+
+
 class ForkError(CatalogError):
     """A fork operation that cannot be performed as asked.
 

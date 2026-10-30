@@ -1,172 +1,219 @@
+"""RENAME is metadata only: one Firestore transaction, no storage I/O.
+
+See RENAME_METADATA_ONLY_DESIGN.md. Everything here runs against an in-memory
+Firestore keyed by document path, so "nothing left under the old path" and
+"the whole rename or none of it" are real assertions rather than mock calls.
+"""
+
 from __future__ import annotations
 
 import json
+import logging
 
 import pytest
 
 from opteryx_catalog.exceptions import DatasetAlreadyExists
+from opteryx_catalog.exceptions import DatasetLocationReusable
 from opteryx_catalog.exceptions import DatasetLocked
 from opteryx_catalog.exceptions import DatasetNotFound
+from opteryx_catalog.exceptions import ForkError
+from opteryx_catalog.exceptions import MaterializedViewError
+from opteryx_catalog.exceptions import NameInUse
 from opteryx_catalog.opteryx_catalog import OpteryxCatalog
 
+# A minted location (`OpteryxCatalog._mint_location`): not derivable from any name.
+LOCATION = "gs://bucket/ws/3f2a9c1e5b7d4a608c1d2e3f4a5b6c7d"
+LEGACY_LOCATION = "gs://bucket/ws/coll/tbl"
 
-class _Doc:
-    def __init__(self, data=None, exists=True, doc_id=None):
-        self.exists = exists
-        self._data = data or {}
-        self.id = doc_id
+OLD = ("ws", "coll", "datasets", "tbl")
+NEW = ("ws", "newcoll", "datasets", "newtbl")
+
+
+class _Snap:
+    def __init__(self, ref, data):
+        self.reference = ref
+        self.id = ref.path[-1]
+        self.exists = data is not None
+        self._data = data
 
     def to_dict(self):
-        return self._data
+        return None if self._data is None else dict(self._data)
 
 
-class _DocRef:
-    def __init__(self, data=None, exists=True, subcollections=None, doc_id=None):
-        self._doc = _Doc(data, exists, doc_id)
-        self.id = doc_id
-        self._subcollections = subcollections or {}
-        self.written = None
-        self.deleted = False
+class _Ref:
+    def __init__(self, client, path):
+        self._client = client
+        self.path = path
 
-    def get(self):
-        return self._doc
+    def get(self, transaction=None):
+        if transaction is not None:
+            transaction.check_read()
+        return _Snap(self, self._client.docs.get(self.path))
 
     def set(self, data, merge=False):
-        self.written = data
-        self._doc._data = {**self._doc._data, **data} if merge else dict(data)
-        self._doc.exists = True
+        self._client.docs[self.path] = (
+            {**self._client.docs.get(self.path, {}), **data} if merge else dict(data)
+        )
 
     def update(self, data):
-        self._doc._data = {**self._doc._data, **data}
+        self._client.docs[self.path] = {**self._client.docs[self.path], **data}
 
     def delete(self):
-        self.deleted = True
-        self._doc.exists = False
+        self._client.docs.pop(self.path, None)
 
     def collection(self, name):
-        return self._subcollections.setdefault(name, _Collection())
+        return _Coll(self._client, self.path + (name,))
 
 
-class _Collection:
-    def __init__(self, docs=None):
-        self._docs = dict(docs or {})
+class _Coll:
+    def __init__(self, client, path):
+        self._client = client
+        self.path = path
 
     def document(self, doc_id):
-        if doc_id not in self._docs:
-            self._docs[doc_id] = _DocRef(exists=False, doc_id=doc_id)
-        return self._docs[doc_id]
+        return _Ref(self._client, self.path + (doc_id,))
 
-    def stream(self):
-        return [d.get() for d in self._docs.values() if d.get().exists]
-
-
-class _FakeIO:
-    """In-memory object store standing in for GCS."""
-
-    def __init__(self, objects=None):
-        self.objects = dict(objects or {})
-
-    def new_input(self, location):
-        objects = self.objects
-
-        class _In:
-            def open(self):
-                class _H:
-                    def read(self_inner):
-                        return objects[location]
-
-                    def __enter__(self_inner):
-                        return self_inner
-
-                    def __exit__(self_inner, *a):
-                        return False
-
-                return _H()
-
-        return _In()
-
-    def new_output(self, location):
-        objects = self.objects
-
-        class _Out:
-            def create(self):
-                class _W:
-                    def write(self_inner, data):
-                        objects[location] = data
-
-                    def close(self_inner):
-                        pass
-
-                return _W()
-
-        return _Out()
-
-    def delete(self, location):
-        self.objects.pop(location, None)
+    def stream(self, transaction=None):
+        if transaction is not None:
+            transaction.check_read()
+        if self.path in self._client.broken_streams:
+            raise RuntimeError("firestore unavailable")
+        n = len(self.path)
+        return [
+            _Snap(_Ref(self._client, p), d)
+            for p, d in sorted(self._client.docs.items())
+            if len(p) == n + 1 and p[:n] == self.path
+        ]
 
 
-_OLD_LOC = "gs://bucket/ws/coll/tbl"
-_NEW_LOC = "gs://bucket/ws/newcoll/newtbl"
+class _Txn:
+    """Enough of a Firestore transaction for `@firestore.transactional`.
+
+    Writes buffer until commit. A read after a write raises, as Firestore does,
+    so the ordering rule is tested rather than assumed.
+    """
+
+    _read_only = False
+    _max_attempts = 1
+    _id = b"fake-txn"
+
+    def __init__(self, client):
+        self._client = client
+        self.writes = []
+
+    def check_read(self):
+        assert not self.writes, "read after write in a Firestore transaction"
+
+    def _clean_up(self):
+        self.writes = []
+
+    def _begin(self, retry_id=None):
+        return None
+
+    def _rollback(self):
+        self.writes = []
+
+    def _commit(self):
+        if self._client.fail_commit:
+            raise RuntimeError("commit failed")
+        for kind, ref, data in self.writes:
+            if kind == "set":
+                ref.set(data)
+            else:
+                ref.delete()
+        return []
+
+    def set(self, ref, data):
+        self.writes.append(("set", ref, dict(data)))
+
+    def delete(self, ref):
+        self.writes.append(("delete", ref, None))
 
 
-def _catalog(
-    dataset_data=None,
-    snapshots=None,
-    manifest_rows=None,
-    target_exists=False,
-):
-    """A catalog whose only dataset is coll.tbl, with `snapshots` history."""
-    data = {"name": "tbl", "collection": "coll", "location": _OLD_LOC, "locked-by": None}
-    data.update(dataset_data or {})
+class _Client:
+    def __init__(self):
+        self.docs = {}
+        self.fail_commit = False
+        self.broken_streams = set()
 
-    schemas = _Collection({"sc1": _DocRef(data={"columns": [{"name": "id"}]}, doc_id="sc1")})
-    snapshot_docs = {
-        str(sid): _DocRef(data=sdata, doc_id=str(sid)) for sid, sdata in (snapshots or {}).items()
-    }
-    source_ref = _DocRef(
-        data=data,
-        subcollections={"schemas": schemas, "snapshots": _Collection(snapshot_docs)},
-        doc_id="tbl",
-    )
-    target_ref = _DocRef(exists=target_exists, doc_id="newtbl")
+    def collection(self, name):
+        return _Coll(self, (name,))
 
-    refs = {("coll", "tbl"): source_ref, ("newcoll", "newtbl"): target_ref}
+    def transaction(self):
+        return _Txn(self)
 
+
+class _NoStorage:
+    """Any touch of storage fails the test: a rename moves no bytes."""
+
+    def __getattr__(self, name):
+        raise AssertionError(f"rename touched storage: io.{name}")
+
+
+def _catalog(*, dataset=None, extra=None):
+    """A catalog whose only dataset is coll.tbl at an id-bearing location."""
+    client = _Client()
     catalog = object.__new__(OpteryxCatalog)
     catalog.workspace = "ws"
     catalog.gcs_bucket = "bucket"
-    catalog._storage_client = None  # force the FileIO copy path
-    catalog.io = _FakeIO()
-    catalog._dataset_doc_ref = lambda c, n: refs[(c, n)]
-    catalog._snapshots_collection = lambda c, n: refs[(c, n)].collection("snapshots")
+    catalog.firestore_client = client
+    catalog._catalog_ref = client.collection("ws")
+    catalog.io = _NoStorage()
+    catalog._storage_client = None
+    catalog._copy_object = _forbid("_copy_object")
+    catalog._reclaim_paths = _forbid("_reclaim_paths")
+    # The inbound sweep is a collection group query (covered where relationships are
+    # tested); here it is a recorded no-op unless a test replaces it.
+    catalog._repoint_inbound_relationships = lambda *args, **kwargs: []
 
-    # Manifests are read as parquet bytes; stub the decode so these tests stay
-    # about the move, not about rugo's parquet round-trip.
-    catalog._captured_manifests = []
+    client.docs[OLD] = {
+        "name": "tbl",
+        "collection": "coll",
+        "workspace": "ws",
+        "location": LOCATION,
+        "locked-by": None,
+        "properties": {"k": "v"},
+        "vector-indexes": {"idx": {"name": "idx", "index-id": "a" * 32}},
+        "current-snapshot-id": 2,
+        **(dataset or {}),
+    }
+    client.docs[OLD + ("schemas", "sc1")] = {"columns": [{"name": "id", "id": 1}]}
+    client.docs[OLD + ("snapshots", "1")] = {
+        "snapshot-id": 1,
+        "manifest": f"{LOCATION}/metadata/manifest-1.parquet",
+    }
+    client.docs[OLD + ("snapshots", "2")] = {
+        "snapshot-id": 2,
+        "manifest": f"{LOCATION}/metadata/manifest-2.parquet",
+    }
+    client.docs[OLD + ("tags", "release")] = {"snapshot-id": 1}
+    client.docs[OLD + ("relationships", "r1")] = {
+        "name": "r1",
+        "collection": "coll",
+        "dataset": "tbl",
+        "references-dataset": "other",
+    }
+    client.docs[OLD + ("relationship-suppressions", "s1")] = {
+        "collection": "coll",
+        "dataset": "tbl",
+    }
+    client.docs[OLD + ("maintenance", "orphan-quarantine")] = {
+        "entries": {f"{LOCATION}/data/stray.parquet": 123}
+    }
+    client.docs[OLD + ("maintenance", "lease")] = {"claim-id": "c1", "holder": "compactor"}
+    client.docs.update(extra or {})
+    return catalog, client
 
-    for sid, sdata in (snapshots or {}).items():
-        catalog.io.objects[sdata["manifest"]] = f"manifest-{sid}".encode()
-    for row in manifest_rows or []:
-        catalog.io.objects[row["file_path"]] = b"data"
 
-    return catalog, source_ref, target_ref
+def _forbid(name):
+    def _refuse(*args, **kwargs):
+        raise AssertionError(f"rename called {name}")
+
+    return _refuse
 
 
-def _patch_manifest_io(catalog, monkeypatch, rows_by_manifest):
-    """Route manifest decode/encode through plain dicts."""
-    import opteryx_catalog.catalog.manifest as manifest_module
-
-    def _read_manifest_rows(data: bytes):
-        return [dict(r) for r in rows_by_manifest[data.decode()]]
-
-    monkeypatch.setattr(manifest_module, "read_manifest_rows", _read_manifest_rows)
-
-    def _write_parquet_manifest(snapshot_id, entries, dataset_location):
-        path = f"{dataset_location}/metadata/manifest-{snapshot_id}.parquet"
-        catalog._captured_manifests.append((path, [dict(e) for e in entries]))
-        return path
-
-    catalog.write_parquet_manifest = _write_parquet_manifest
+def _under(client, path):
+    return {p for p in client.docs if p[: len(path)] == path}
 
 
 def _emitted(capsys):
@@ -174,209 +221,309 @@ def _emitted(capsys):
     return [json.loads(line) for line in out.splitlines() if line.strip()]
 
 
-def _single_snapshot_catalog(monkeypatch, extra_rows=()):
-    rows = [{"file_path": f"{_OLD_LOC}/data/a.parquet", "record_count": 1}]
-    rows.extend(extra_rows)
-    snapshots = {1: {"snapshot-id": 1, "manifest": f"{_OLD_LOC}/metadata/manifest-1.parquet"}}
-    catalog, source, target = _catalog(snapshots=snapshots, manifest_rows=rows)
-    _patch_manifest_io(catalog, monkeypatch, {"manifest-1": rows})
-    return catalog, source, target
+# --- what a rename does ------------------------------------------------------
 
 
-def test_copies_data_files_to_the_new_location(monkeypatch, capsys):
-    catalog, _source, _target = _single_snapshot_catalog(monkeypatch)
+def test_the_dataset_document_moves_under_the_new_name_keeping_its_location():
+    catalog, client = _catalog()
 
     catalog.rename_dataset("coll.tbl", "newcoll.newtbl", author="alice")
 
-    assert f"{_NEW_LOC}/data/a.parquet" in catalog.io.objects
-    assert catalog.io.objects[f"{_NEW_LOC}/data/a.parquet"] == b"data"
+    moved = client.docs[NEW]
+    assert moved["name"] == "newtbl"
+    assert moved["collection"] == "newcoll"
+    assert moved["location"] == LOCATION
+    # Everything else on the document rides along unchanged.
+    assert moved["properties"] == {"k": "v"}
+    assert moved["vector-indexes"] == {"idx": {"name": "idx", "index-id": "a" * 32}}
+    assert moved["current-snapshot-id"] == 2
+    assert OLD not in client.docs
 
 
-def test_manifest_is_rewritten_with_remapped_paths(monkeypatch, capsys):
-    catalog, _source, _target = _single_snapshot_catalog(monkeypatch)
-
-    catalog.rename_dataset("coll.tbl", "newcoll.newtbl", author="alice")
-
-    path, entries = catalog._captured_manifests[0]
-    assert path == f"{_NEW_LOC}/metadata/manifest-1.parquet"
-    assert entries[0]["file_path"] == f"{_NEW_LOC}/data/a.parquet"
-
-
-def test_catalog_entry_moves_with_new_name_collection_and_location(monkeypatch, capsys):
-    catalog, source, target = _single_snapshot_catalog(monkeypatch)
+def test_nothing_is_left_under_the_old_path():
+    """Firestore never cascades, so a missed subcollection is a ghost path."""
+    catalog, client = _catalog()
 
     catalog.rename_dataset("coll.tbl", "newcoll.newtbl", author="alice")
 
-    assert target.written["name"] == "newtbl"
-    assert target.written["collection"] == "newcoll"
-    assert target.written["location"] == _NEW_LOC
-    assert source.deleted is True
+    assert _under(client, OLD) == set()
 
 
-def test_snapshot_docs_move_and_point_at_the_new_manifest(monkeypatch, capsys):
-    catalog, _source, target = _single_snapshot_catalog(monkeypatch)
+def test_snapshots_keep_their_manifests_unchanged():
+    """No manifest is rewritten: the files never moved, so the paths stay true."""
+    catalog, client = _catalog()
 
     catalog.rename_dataset("coll.tbl", "newcoll.newtbl", author="alice")
 
-    moved = target.collection("snapshots").document("1").get().to_dict()
-    assert moved["manifest"] == f"{_NEW_LOC}/metadata/manifest-1.parquet"
+    assert client.docs[NEW + ("snapshots", "1")]["manifest"] == (
+        f"{LOCATION}/metadata/manifest-1.parquet"
+    )
+    assert client.docs[NEW + ("snapshots", "2")]["manifest"] == (
+        f"{LOCATION}/metadata/manifest-2.parquet"
+    )
 
 
-def test_all_snapshots_move_not_just_the_current_one(monkeypatch, capsys):
-    """History must survive a rename - every historical manifest is rewritten."""
-    rows_1 = [{"file_path": f"{_OLD_LOC}/data/a.parquet"}]
-    rows_2 = [{"file_path": f"{_OLD_LOC}/data/b.parquet"}]
-    snapshots = {
-        1: {"snapshot-id": 1, "manifest": f"{_OLD_LOC}/metadata/manifest-1.parquet"},
-        2: {"snapshot-id": 2, "manifest": f"{_OLD_LOC}/metadata/manifest-2.parquet"},
+def test_schemas_and_tags_travel_verbatim():
+    """A tag left behind would unpin its snapshot, and the next expiration run
+    would reclaim exactly the data the tag exists to hold."""
+    catalog, client = _catalog()
+
+    catalog.rename_dataset("coll.tbl", "newcoll.newtbl", author="alice")
+
+    assert client.docs[NEW + ("schemas", "sc1")] == {"columns": [{"name": "id", "id": 1}]}
+    assert client.docs[NEW + ("tags", "release")] == {"snapshot-id": 1}
+
+
+def test_relationships_and_suppressions_travel_with_their_address_rewritten():
+    catalog, client = _catalog()
+
+    catalog.rename_dataset("coll.tbl", "newcoll.newtbl", author="alice")
+
+    relationship = client.docs[NEW + ("relationships", "r1")]
+    assert relationship["collection"] == "newcoll"
+    assert relationship["dataset"] == "newtbl"
+    assert relationship["references-dataset"] == "other"
+    suppression = client.docs[NEW + ("relationship-suppressions", "s1")]
+    assert (suppression["collection"], suppression["dataset"]) == ("newcoll", "newtbl")
+
+
+def test_the_orphan_quarantine_is_carried_because_its_paths_are_still_true():
+    catalog, client = _catalog()
+
+    catalog.rename_dataset("coll.tbl", "newcoll.newtbl", author="alice")
+
+    assert client.docs[NEW + ("maintenance", "orphan-quarantine")] == {
+        "entries": {f"{LOCATION}/data/stray.parquet": 123}
     }
-    catalog, _source, target = _catalog(snapshots=snapshots, manifest_rows=rows_1 + rows_2)
-    _patch_manifest_io(catalog, monkeypatch, {"manifest-1": rows_1, "manifest-2": rows_2})
+
+
+def test_the_maintenance_lease_is_not_carried_and_is_not_left_behind():
+    catalog, client = _catalog()
 
     catalog.rename_dataset("coll.tbl", "newcoll.newtbl", author="alice")
 
-    written = {path for path, _ in catalog._captured_manifests}
-    assert written == {
-        f"{_NEW_LOC}/metadata/manifest-1.parquet",
-        f"{_NEW_LOC}/metadata/manifest-2.parquet",
-    }
-    assert f"{_NEW_LOC}/data/a.parquet" in catalog.io.objects
-    assert f"{_NEW_LOC}/data/b.parquet" in catalog.io.objects
-    snapshots_moved = target.collection("snapshots")
-    assert {d.id for d in snapshots_moved.stream()} == {"1", "2"}
+    assert NEW + ("maintenance", "lease") not in client.docs
+    assert OLD + ("maintenance", "lease") not in client.docs
 
 
-def test_file_shared_by_two_snapshots_is_copied_once(monkeypatch, capsys):
-    shared = [{"file_path": f"{_OLD_LOC}/data/a.parquet"}]
-    snapshots = {
-        1: {"snapshot-id": 1, "manifest": f"{_OLD_LOC}/metadata/manifest-1.parquet"},
-        2: {"snapshot-id": 2, "manifest": f"{_OLD_LOC}/metadata/manifest-2.parquet"},
-    }
-    catalog, _source, _target = _catalog(snapshots=snapshots, manifest_rows=shared)
-    _patch_manifest_io(catalog, monkeypatch, {"manifest-1": shared, "manifest-2": shared})
-
-    copies = []
-    original = catalog._copy_object
-
-    def _counting_copy(src, dst):
-        copies.append((src, dst))
-        return original(src, dst)
-
-    catalog._copy_object = _counting_copy
+def test_workspace_deletion_protection_does_not_block_a_rename():
+    """It protects the workspace from being deleted, not the assets inside it."""
+    catalog, client = _catalog()
+    catalog._assert_not_deletion_protected = _forbid("_assert_not_deletion_protected")
 
     catalog.rename_dataset("coll.tbl", "newcoll.newtbl", author="alice")
 
-    assert len(copies) == 1
+    assert NEW in client.docs
 
 
-def test_externally_referenced_files_are_left_where_they_are(monkeypatch, capsys):
-    """A file outside the dataset's own location was never ours to move."""
-    external = {"file_path": "gs://bucket/elsewhere/shared.parquet"}
-    catalog, _source, _target = _single_snapshot_catalog(monkeypatch, extra_rows=[external])
+def test_rename_within_a_collection():
+    catalog, client = _catalog()
 
-    catalog.rename_dataset("coll.tbl", "newcoll.newtbl", author="alice")
+    catalog.rename_dataset("coll.tbl", "coll.renamed", author="alice")
 
-    _path, entries = catalog._captured_manifests[0]
-    paths = [e["file_path"] for e in entries]
-    assert "gs://bucket/elsewhere/shared.parquet" in paths
-    assert f"{_NEW_LOC}/elsewhere/shared.parquet" not in catalog.io.objects
+    assert client.docs[("ws", "coll", "datasets", "renamed")]["location"] == LOCATION
+    assert client.docs[("ws", "coll", "datasets", "renamed")]["collection"] == "coll"
+    assert OLD not in client.docs
 
 
-def test_vacated_files_are_deleted_by_exact_path(monkeypatch, capsys):
-    """The superseded originals go; nothing else under the old prefix does.
-
-    The distinction is the whole point: an unrelated object under the old
-    prefix survives, because this deletes the paths the copy actually
-    superseded rather than clearing the prefix. A prefix is re-bindable - a
-    later dataset of the same name lands on it - so clearing one is how a
-    reclamation pass ends up deleting live data.
-    """
-    catalog, _source, _target = _single_snapshot_catalog(monkeypatch)
-    bystander = f"{_OLD_LOC}/data/not-ours.parquet"
-    catalog.io.objects[bystander] = b"data"
+def test_no_storage_is_touched():
+    """`_NoStorage` and the forbidden copy/reclaim helpers fail the test on any
+    storage call; reaching here is the assertion."""
+    catalog, client = _catalog()
 
     catalog.rename_dataset("coll.tbl", "newcoll.newtbl", author="alice")
 
-    # the copies are in place at the new location
-    assert f"{_NEW_LOC}/data/a.parquet" in catalog.io.objects
-    # and the originals they superseded - data file and manifest alike - are gone
-    assert f"{_OLD_LOC}/data/a.parquet" not in catalog.io.objects
-    assert f"{_OLD_LOC}/metadata/manifest-1.parquet" not in catalog.io.objects
-    # but the bystander is untouched
-    assert bystander in catalog.io.objects
+    assert NEW in client.docs
 
 
-def test_rename_survives_undeletable_old_files(monkeypatch, capsys):
-    """A delete that fails leaves the rename standing.
-
-    The rename has fully succeeded by the time anything is deleted, so a
-    storage failure here must not raise - it just leaves unreferenced files
-    for reconciliation to find.
-    """
-    catalog, _source, _target = _single_snapshot_catalog(monkeypatch)
-
-    def _refuse(location):
-        raise OSError("storage unavailable")
-
-    catalog.io.delete = _refuse
-
-    catalog.rename_dataset("coll.tbl", "newcoll.newtbl", author="alice")
-
-    assert f"{_NEW_LOC}/data/a.parquet" in catalog.io.objects
-    assert f"{_OLD_LOC}/data/a.parquet" in catalog.io.objects
+# --- the transaction ---------------------------------------------------------
 
 
-def test_missing_source_raises(monkeypatch):
-    catalog, source, _target = _single_snapshot_catalog(monkeypatch)
-    source._doc.exists = False
+def test_a_failed_commit_leaves_the_old_dataset_exactly_as_it_was():
+    """All or nothing: there is no state with both names, or with neither."""
+    catalog, client = _catalog()
+    before = dict(client.docs)
+    client.fail_commit = True
+
+    with pytest.raises(RuntimeError, match="commit failed"):
+        catalog.rename_dataset("coll.tbl", "newcoll.newtbl", author="alice")
+
+    assert client.docs == before
+
+
+# --- refusals ----------------------------------------------------------------
+
+
+def _refused_and_untouched(catalog, client, exc, **match):
+    before = dict(client.docs)
+    with pytest.raises(exc, **match):
+        catalog.rename_dataset("coll.tbl", "newcoll.newtbl", author="alice")
+    assert client.docs == before
+
+
+def test_missing_source_raises():
+    catalog, client = _catalog()
+    del client.docs[OLD]
 
     with pytest.raises(DatasetNotFound):
         catalog.rename_dataset("coll.tbl", "newcoll.newtbl", author="alice")
 
 
-def test_existing_target_raises(monkeypatch):
-    snapshots = {1: {"snapshot-id": 1, "manifest": f"{_OLD_LOC}/metadata/manifest-1.parquet"}}
-    catalog, _source, _target = _catalog(snapshots=snapshots, target_exists=True)
-    _patch_manifest_io(catalog, monkeypatch, {"manifest-1": []})
+def test_existing_target_raises_and_nothing_is_written():
+    catalog, client = _catalog(extra={NEW: {"name": "newtbl", "location": "gs://bucket/ws/x"}})
 
-    with pytest.raises(DatasetAlreadyExists):
-        catalog.rename_dataset("coll.tbl", "newcoll.newtbl", author="alice")
+    _refused_and_untouched(catalog, client, DatasetAlreadyExists)
 
 
-def test_locked_dataset_cannot_be_renamed(monkeypatch):
+@pytest.mark.parametrize(
+    "holder", [("ws", "newcoll", "views", "newtbl"), ("ws", "newcoll", "tasks", "newtbl")]
+)
+def test_a_name_held_by_a_view_or_task_is_refused(holder):
+    """Tables, views and tasks share one namespace; `create_dataset` enforces it
+    and a rename into the same name must too."""
+    catalog, client = _catalog(extra={holder: {"name": "newtbl"}})
+
+    _refused_and_untouched(catalog, client, NameInUse)
+
+
+def test_locked_dataset_cannot_be_renamed():
     """The two-person deniability lock outranks a rename, as it does a drop."""
-    catalog, source, _target = _single_snapshot_catalog(monkeypatch)
-    source._doc._data["locked-by"] = "bob"
+    catalog, client = _catalog(dataset={"locked-by": "bob"})
 
-    with pytest.raises(DatasetLocked):
-        catalog.rename_dataset("coll.tbl", "newcoll.newtbl", author="alice")
+    _refused_and_untouched(catalog, client, DatasetLocked)
 
 
-def test_same_name_rejected(monkeypatch):
-    catalog, _source, _target = _single_snapshot_catalog(monkeypatch)
+def test_a_materialized_view_cannot_be_renamed():
+    catalog, client = _catalog(dataset={"dataset-type": "materialized_view"})
+
+    _refused_and_untouched(catalog, client, MaterializedViewError, match="materialized view")
+
+
+def test_a_dataset_with_triggers_cannot_be_renamed():
+    catalog, client = _catalog(extra={OLD + ("triggers", "t1"): {"kind": "commit"}})
+
+    _refused_and_untouched(catalog, client, MaterializedViewError, match="triggers")
+
+
+def test_an_upstream_with_forks_cannot_be_renamed():
+    catalog, client = _catalog(
+        extra={OLD + ("forks", "ws:other:copy"): {"fork": "ws.other.copy"}}
+    )
+
+    _refused_and_untouched(catalog, client, ForkError, match="ws.other.copy")
+
+
+def test_a_fork_cannot_be_renamed():
+    fork = {
+        "source": {"dataset": "ws.other.up", "snapshot-id": 5, "sequence-number": 1},
+        "target": {"sequence-number": 1, "last-sync-ms": 1},
+        "forked-at-ms": 1,
+        "forked-by": "alice",
+    }
+    catalog, client = _catalog(dataset={"fork": fork})
+
+    _refused_and_untouched(catalog, client, ForkError, match="is a fork")
+
+
+def test_an_unreadable_fork_registry_refuses_rather_than_assuming_none():
+    catalog, client = _catalog()
+    client.broken_streams.add(OLD + ("forks",))
+
+    _refused_and_untouched(catalog, client, ForkError, match="Refusing")
+
+
+def test_same_name_rejected():
+    catalog, _client = _catalog()
 
     with pytest.raises(ValueError, match="same"):
         catalog.rename_dataset("coll.tbl", "coll.tbl", author="alice")
 
 
-def test_nothing_is_copied_when_the_target_already_exists(monkeypatch):
-    """The existence checks run before any byte moves - a rejected rename must
-    not leave orphan copies behind."""
-    rows = [{"file_path": f"{_OLD_LOC}/data/a.parquet"}]
-    snapshots = {1: {"snapshot-id": 1, "manifest": f"{_OLD_LOC}/metadata/manifest-1.parquet"}}
-    catalog, _source, _target = _catalog(
-        snapshots=snapshots, manifest_rows=rows, target_exists=True
-    )
-    _patch_manifest_io(catalog, monkeypatch, {"manifest-1": rows})
+# --- the stored location -----------------------------------------------------
+
+
+def test_a_location_derived_from_the_old_name_is_carried_as_stored():
+    """Datasets created before locations were minted keep the prefix they have. No create
+    derives it again, so the vacated name cannot bind it (tests/test_create_location.py)."""
+    catalog, client = _catalog(dataset={"location": LEGACY_LOCATION})
+
+    catalog.rename_dataset("coll.tbl", "newcoll.newtbl", author="alice")
+
+    assert client.docs[NEW]["location"] == LEGACY_LOCATION
+
+
+def test_a_document_with_no_location_is_refused_not_guessed():
+    catalog, client = _catalog()
+    del client.docs[OLD]["location"]
+
+    _refused_and_untouched(catalog, client, DatasetLocationReusable, match="no location")
+
+
+# --- re-running after the commit --------------------------------------------
+
+
+def test_a_rerun_after_commit_raises_not_found_and_changes_nothing():
+    catalog, client = _catalog()
+    catalog.rename_dataset("coll.tbl", "newcoll.newtbl", author="alice")
+    after_first = dict(client.docs)
+
+    with pytest.raises(DatasetNotFound):
+        catalog.rename_dataset("coll.tbl", "newcoll.newtbl", author="alice")
+
+    assert client.docs == after_first
+
+
+def test_a_rerun_after_the_old_name_is_recreated_does_not_rename_the_newcomer():
+    """The target still exists, so a retried rename cannot take an unrelated
+    dataset that now answers to the old name."""
+    catalog, client = _catalog()
+    catalog.rename_dataset("coll.tbl", "newcoll.newtbl", author="alice")
+    client.docs[OLD] = {"name": "tbl", "collection": "coll", "location": "gs://bucket/ws/other"}
+    after_first = dict(client.docs)
 
     with pytest.raises(DatasetAlreadyExists):
         catalog.rename_dataset("coll.tbl", "newcoll.newtbl", author="alice")
 
-    assert f"{_NEW_LOC}/data/a.parquet" not in catalog.io.objects
+    assert client.docs == after_first
 
 
-def test_emits_audit_record(monkeypatch, capsys):
-    catalog, _source, _target = _single_snapshot_catalog(monkeypatch)
+# --- what happens after the commit ------------------------------------------
+
+
+def test_inbound_relationships_are_repointed_after_the_commit():
+    catalog, client = _catalog()
+    seen = {}
+
+    def _repoint(old_c, old_d, new_c, new_d, *, author):
+        seen["args"] = (old_c, old_d, new_c, new_d, author)
+        seen["committed"] = NEW in client.docs and OLD not in client.docs
+        return []
+
+    catalog._repoint_inbound_relationships = _repoint
+
+    catalog.rename_dataset("coll.tbl", "newcoll.newtbl", author="alice")
+
+    assert seen["args"] == ("coll", "tbl", "newcoll", "newtbl", "alice")
+    assert seen["committed"] is True
+
+
+def test_a_failed_repoint_does_not_undo_or_fail_the_rename(caplog):
+    catalog, client = _catalog()
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("collection group index missing")
+
+    catalog._repoint_inbound_relationships = _boom
+
+    with caplog.at_level(logging.WARNING):
+        catalog.rename_dataset("coll.tbl", "newcoll.newtbl", author="alice")
+
+    assert NEW in client.docs and OLD not in client.docs
+    assert "could not repoint inbound relationships" in caplog.text
+
+
+def test_emits_audit_record(capsys):
+    catalog, _client = _catalog()
 
     catalog.rename_dataset("coll.tbl", "newcoll.newtbl", author="alice")
 
@@ -388,91 +535,15 @@ def test_emits_audit_record(monkeypatch, capsys):
     assert record["author"] == "alice"
     assert record["detail"]["old_identifier"] == "coll.tbl"
     assert record["detail"]["new_identifier"] == "newcoll.newtbl"
-    assert record["detail"]["files_copied"] == 1
-    assert record["detail"]["snapshots_moved"] == 1
+    assert record["detail"]["location"] == LOCATION
+    # dataset doc + schema + 2 snapshots + tag + relationship + suppression + quarantine
+    assert record["detail"]["documents_moved"] == 8
 
 
-def test_unauthenticated_records_no_author(monkeypatch, capsys):
-    catalog, _source, _target = _single_snapshot_catalog(monkeypatch)
+def test_unauthenticated_records_no_author(capsys):
+    catalog, _client = _catalog()
 
     catalog.rename_dataset("coll.tbl", "newcoll.newtbl")
 
     record = next(r for r in _emitted(capsys) if r["action"] == "rename_dataset")
     assert record["author"] is None
-
-
-def test_vector_index_files_and_definitions_move_with_the_dataset(monkeypatch, capsys):
-    """Index files move like data files - remapped in EVERY manifest that names them,
-    copied once - and the definitions whose ids key them move too."""
-    from opteryx_catalog.catalog.vector_indexes import index_files
-    from opteryx_catalog.catalog.vector_indexes import index_refs
-    from opteryx_catalog.catalog.vector_indexes import with_index_refs
-
-    index_id = "a" * 32
-    old = index_files(
-        f"{_OLD_LOC}/index/{index_id}/a-01.vidx", file_bytes=30, footer_bytes=2, logical_bytes=30,
-    )
-    shared = [with_index_refs({"file_path": f"{_OLD_LOC}/data/a.parquet"}, {index_id: old})]
-    snapshots = {
-        1: {"snapshot-id": 1, "manifest": f"{_OLD_LOC}/metadata/manifest-1.parquet"},
-        2: {"snapshot-id": 2, "manifest": f"{_OLD_LOC}/metadata/manifest-2.parquet"},
-    }
-    definition = {"name": "idx", "index-id": index_id}
-    catalog, source, target = _catalog(
-        snapshots=snapshots, manifest_rows=shared,
-        dataset_data={"location": _OLD_LOC, "vector-indexes": {"idx": definition}},
-    )
-    catalog.io.objects[old.path] = b"v"
-    _patch_manifest_io(catalog, monkeypatch, {"manifest-1": shared, "manifest-2": shared})
-
-    catalog.rename_dataset("coll.tbl", "newcoll.newtbl", author="alice")
-
-    expected = old._replace(path=f"{_NEW_LOC}/index/{index_id}/a-01.vidx")
-    assert len(catalog._captured_manifests) == 2
-    for _path, entries in catalog._captured_manifests:
-        assert index_refs(entries[0]) == {index_id: expected}
-    assert catalog.io.objects[expected.path] == b"v"
-    assert old.path not in catalog.io.objects                  # vacated by exact path
-    # The definitions ride on the dataset document, so they move with it.
-    assert target.get().to_dict()["vector-indexes"] == {"idx": definition}
-
-
-def test_a_file_shared_by_two_snapshots_is_renamed_in_both_manifests(monkeypatch, capsys):
-    """Copied once, but EVERY manifest naming it is rewritten. The later manifest used to
-    keep the old path - which the rename then reclaimed, breaking that snapshot."""
-    shared = [{"file_path": f"{_OLD_LOC}/data/a.parquet"}]
-    snapshots = {
-        1: {"snapshot-id": 1, "manifest": f"{_OLD_LOC}/metadata/manifest-1.parquet"},
-        2: {"snapshot-id": 2, "manifest": f"{_OLD_LOC}/metadata/manifest-2.parquet"},
-    }
-    catalog, _source, _target = _catalog(snapshots=snapshots, manifest_rows=shared)
-    _patch_manifest_io(catalog, monkeypatch, {"manifest-1": shared, "manifest-2": shared})
-
-    catalog.rename_dataset("coll.tbl", "newcoll.newtbl", author="alice")
-
-    assert [entries[0]["file_path"] for _path, entries in catalog._captured_manifests] == [
-        f"{_NEW_LOC}/data/a.parquet",
-        f"{_NEW_LOC}/data/a.parquet",
-    ]
-
-
-def test_delete_vectors_move_with_their_data_file(monkeypatch, capsys):
-    """A delete vector left under the old location is reclaimed with it, and every row it
-    deleted would come back. It moves, in every manifest, like the data file."""
-    deletes = f"{_OLD_LOC}/deletes/deletes-7.parquet"
-    shared = [{"file_path": f"{_OLD_LOC}/data/a.parquet", "delete_file_path": deletes}]
-    snapshots = {
-        1: {"snapshot-id": 1, "manifest": f"{_OLD_LOC}/metadata/manifest-1.parquet"},
-        2: {"snapshot-id": 2, "manifest": f"{_OLD_LOC}/metadata/manifest-2.parquet"},
-    }
-    catalog, _source, _target = _catalog(snapshots=snapshots, manifest_rows=shared)
-    catalog.io.objects[deletes] = b"bitmap"
-    _patch_manifest_io(catalog, monkeypatch, {"manifest-1": shared, "manifest-2": shared})
-
-    catalog.rename_dataset("coll.tbl", "newcoll.newtbl", author="alice")
-
-    moved = f"{_NEW_LOC}/deletes/deletes-7.parquet"
-    for _path, entries in catalog._captured_manifests:
-        assert entries[0]["delete_file_path"] == moved
-    assert catalog.io.objects[moved] == b"bitmap"
-    assert deletes not in catalog.io.objects

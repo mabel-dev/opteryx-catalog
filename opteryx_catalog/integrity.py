@@ -41,6 +41,12 @@ Finding kinds:
   `create_trigger` refuses to close one, but two concurrent writes can
   each read a graph that is still acyclic.
 
+- ``duplicate-location``: two or more live datasets record the same storage
+  location. Dropping either would reclaim the other's files. A rename moves
+  no bytes, so this is the invariant a metadata-only rename rests on: it
+  holds only while no writer derives a location from a name. Reported on
+  every claimant.
+
 Provenance (PROVENANCE_DESIGN.md S3), checked on each dataset's CURRENT
 snapshot only - one document get per dataset, where streaming every
 snapshot of a 15-minutely dataset would be the whole sweep's cost:
@@ -488,6 +494,8 @@ def audit_workspace(client, workspace: str) -> list[dict[str, str]]:
     # a node, including the ones with no triggers - a node with no outgoing edge
     # is where a walk terminates.
     trigger_edges: dict[str, list[str]] = {}
+    # location -> the dataset paths that record it.
+    claims: dict[str, list[str]] = {}
     for collection_ref in client.collection(workspace).list_documents():
         if collection_ref.id.startswith("$"):
             continue
@@ -506,6 +514,8 @@ def audit_workspace(client, workspace: str) -> list[dict[str, str]]:
                 )
                 continue
             data = snapshot.to_dict() or {}
+            if data.get("location"):
+                claims.setdefault(data["location"], []).append(dataset_path)
             qualified = f"{workspace}.{collection_ref.id}.{dataset_ref.id}"
             trigger_edges.setdefault(qualified, [])
             for doc in dataset_ref.collection(TRIGGERS_SUBCOLLECTION).stream():
@@ -557,4 +567,15 @@ def audit_workspace(client, workspace: str) -> list[dict[str, str]]:
                     if finding:
                         findings.append(finding)
     findings.extend(_check_trigger_cycles(trigger_edges))
+    for location, paths in sorted(claims.items()):
+        if len(paths) > 1:
+            for path in paths:
+                findings.append(
+                    _finding(
+                        "duplicate-location",
+                        path,
+                        f"shares location {location} with "
+                        + ", ".join(other for other in paths if other != path),
+                    )
+                )
     return findings

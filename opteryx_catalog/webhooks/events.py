@@ -75,14 +75,15 @@ def dataset_renamed_payload(
     """Build payload for dataset rename event.
 
     Both identifiers and both locations are carried because a rename may move
-    the dataset between collections and always moves its files: a consumer
-    tracking either the catalog name or the storage prefix needs the old and
-    new value to follow it.
+    the dataset between collections: a consumer tracking either the catalog name
+    or the storage prefix needs the old and new value to follow it. A rename
+    moves no files, so the two locations are equal; both stay so a consumer
+    written against the copying rename keeps working.
 
     Args:
         old_identifier: 'collection.dataset' the dataset was addressed by
         new_identifier: 'collection.dataset' it is addressed by now
-        old_location: GCS prefix its files were under, now awaiting reclamation
+        old_location: GCS prefix its files were under
         new_location: GCS prefix its files are under now
         renamed_by: identity that renamed the dataset
 

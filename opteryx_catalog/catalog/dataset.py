@@ -609,7 +609,9 @@ def open_data_file_writer_at(
         if statistics
         else None
     )
-    handle = DataFileWriter(data_path, stream, None, accumulator, field_id_by_name)
+    handle = DataFileWriter(
+        data_path, stream, None, accumulator, field_id_by_name, location=location
+    )
     handle._writer = open_parquet_writer(handle._sink, **options)
     return handle
 
@@ -642,8 +644,17 @@ class DataFileWriter:
     expires on its own.
     """
 
-    def __init__(self, data_path: str, stream, writer, accumulator, field_id_by_name: dict[str, int]):
+    def __init__(
+        self,
+        data_path: str,
+        stream,
+        writer,
+        accumulator,
+        field_id_by_name: dict[str, int],
+        location: str | None = None,
+    ):
         self._data_path = data_path
+        self._location = location
         self._stream = stream
         self._writer = writer
         # None: the caller describes the file itself (statistics=False)
@@ -658,6 +669,13 @@ class DataFileWriter:
     def _sink(self, chunk: bytes) -> None:
         self._bytes_written += len(chunk)
         self._stream.write(chunk)
+
+    @property
+    def location(self) -> str | None:
+        """The dataset location this file is written under. For a pending (CTAS)
+        writer it is the location the dataset will be created with, which the
+        caller hands to later writers and to `create_dataset(location=...)`."""
+        return self._location
 
     @property
     def data_path(self) -> str:

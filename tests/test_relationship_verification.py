@@ -117,9 +117,9 @@ def test_a_break_keeps_the_evidence_the_row_already_carried():
 
 def test_renaming_a_dataset_repoints_inbound_references_rather_than_breaking_them():
     # Driven through `_repoint_inbound_relationships` rather than through
-    # `rename_dataset`, which moves every data file the dataset references and
-    # wants a GCS bucket this harness does not have. What is under test is the
-    # step `rename_dataset` now calls, not the copy around it.
+    # `rename_dataset`, whose transaction wants a Firestore fake this harness does
+    # not have. What is under test is the step `rename_dataset` calls after its
+    # commit, not the transaction around it.
     catalog = _seeded()
     _declare(catalog)
 
@@ -480,11 +480,9 @@ def test_the_repoint_helper_is_loud_and_rename_is_what_swallows_it(monkeypatch):
     monkeypatch.setattr(catalog, "find_relationships_to", _unavailable)
 
     # The helper raises; `rename_dataset` catches and logs. That split matters:
-    # by the time rename calls this it has already copied every byte to the new
-    # location, so raising through would abort it halfway - files at the new
-    # prefix, catalog entry still at the old one. The catch itself is not
-    # covered here because `rename_dataset` wants a GCS bucket this harness
-    # does not have; what is pinned is that the helper does not fail silently
-    # on its own.
+    # by the time rename calls this the transaction has committed, so raising
+    # through would report a failure for a rename that cannot be undone. The catch
+    # itself is covered in test_rename_dataset.py; what is pinned here is that the
+    # helper does not fail silently on its own.
     with pytest.raises(RuntimeError):
         catalog._repoint_inbound_relationships("crm", "customers", "crm", "accounts", author="o")

@@ -4,6 +4,7 @@ import hashlib
 import logging
 import re
 import secrets
+import threading
 import time
 import uuid
 from collections.abc import Iterable
@@ -57,6 +58,7 @@ from .exceptions import CollectionNotEmpty
 from .exceptions import CollectionNotFound
 from .exceptions import ConstraintNotFound
 from .exceptions import DatasetAlreadyExists
+from .exceptions import DatasetLocationReusable
 from .exceptions import DatasetLocked
 from .exceptions import DatasetNotFound
 from .exceptions import EgressRestricted
@@ -103,6 +105,9 @@ from .webhooks.events import workspace_locked_payload
 from .webhooks.events import workspace_unlocked_payload
 
 logger = logging.getLogger(__name__)
+
+# Guards the per-identifier location reservations (see `_reserve_location`).
+_RESERVATION_LOCK = threading.Lock()
 
 # Subcollection under a dataset document holding that dataset's triggers - one
 # document per trigger, keyed by trigger name. A subcollection rather than a
@@ -1187,12 +1192,52 @@ class OpteryxCatalog(SecretsMixin, Metastore):
         for doc in coll_ref.stream():
             coll_ref.document(doc.id).delete()
 
-    def _dataset_location(self, collection: str, dataset_name: str) -> str:
-        """Where a dataset's files live. Derived from the name, never stored
-        first and read back - which is what lets `open_pending_data_file_writer`
-        write into the location a dataset is ABOUT to be created with.
+    def _mint_location(self) -> str:
+        """A storage location no dataset has had and none will ever have.
+
+        `gs://<bucket>/<workspace>/<uuid4 hex>`: opaque on purpose. Nothing in
+        it is a collection or a dataset name, so a rename (which moves no
+        bytes) leaves it true, and a dropped or renamed-away name can never
+        derive it again - the property that makes a metadata-only rename safe
+        and a persisted note of a dropped location harmless
+        (RENAME_METADATA_ONLY_DESIGN.md). The dataset document stores it, and
+        the stored value is the only authority: it is never re-derived.
         """
-        return f"gs://{self.gcs_bucket}/{self.workspace}/{collection}/{dataset_name}"
+        return f"gs://{self.gcs_bucket}/{self.workspace}/{uuid.uuid4().hex}"
+
+    def _is_minted_location(self, location: str) -> bool:
+        """Whether `location` has the shape `_mint_location` produces here."""
+        prefix = f"gs://{self.gcs_bucket}/{self.workspace}/"
+        if not isinstance(location, str) or not location.startswith(prefix):
+            return False
+        return re.fullmatch(r"[0-9a-f]{32}", location[len(prefix) :]) is not None
+
+    def _reserve_location(self, identifier: str) -> str:
+        """The location a dataset about to be created as `identifier` will get.
+
+        A CTAS streams its data files BEFORE the dataset exists, so the
+        location has to be decided first and then honoured by the
+        `create_dataset` that follows. The first call for an identifier mints
+        one; every later call (one per data file) returns the same, and
+        `create_dataset` consumes it. Held on this catalog instance, not in
+        Firestore: the pending writer touches no catalog document, and a
+        reservation that dies with the process costs only the orphaned files of
+        a statement that died with it.
+
+        An engine that creates through a DIFFERENT catalog instance than it
+        wrote through would get a different location from `create_dataset`,
+        and its files would sit outside the dataset's own location. It should
+        pass the location it was given to `create_dataset(location=...)`.
+        """
+        with _RESERVATION_LOCK:
+            reservations = self.__dict__.setdefault("_pending_locations", {})
+            if identifier not in reservations:
+                reservations[identifier] = self._mint_location()
+            return reservations[identifier]
+
+    def _take_reservation(self, identifier: str) -> str | None:
+        with _RESERVATION_LOCK:
+            return self.__dict__.setdefault("_pending_locations", {}).pop(identifier, None)
 
     def _initial_field_ids(self, schema: Any) -> list | None:
         """The stable field-ids `create_dataset` will allocate to `schema`.
@@ -1218,6 +1263,7 @@ class OpteryxCatalog(SecretsMixin, Metastore):
         sorted_descending: bool = False,
         write_options: dict | None = None,
         statistics: bool = True,
+        location: str | None = None,
     ):
         """Open a streaming data file for a dataset that does not exist yet.
 
@@ -1229,11 +1275,19 @@ class OpteryxCatalog(SecretsMixin, Metastore):
         Asked to load the dataset it is in the middle of creating, the catalog
         rightly answered DatasetNotFound.
 
-        So this takes the schema the dataset is about to be created WITH and
-        derives both from it, through the very helpers `create_dataset` uses -
-        the location from the identifier, the field-ids as `1..N`. Both are
-        pure functions of inputs the caller already holds, which is the whole
-        reason this can be done without writing anything first.
+        So this takes the schema the dataset is about to be created WITH. The
+        field-ids are derived from it through the very helper `create_dataset`
+        uses (`1..N`, a pure function of the schema). The location is not
+        derivable from anything - it is a fresh never-reused one - so it is
+        RESERVED for this identifier (`_reserve_location`): every file of the
+        statement lands under it, and the `create_dataset` that follows takes
+        it (or is handed it explicitly, via `location=`).
+
+        The writer reports it as `.location`. A caller that carries it with the
+        statement passes it back as `location=` for every later file and to
+        `create_dataset(location=...)`, which does not depend on reaching this
+        same catalog instance again. It must be a minted location (ValueError
+        otherwise) - the same rule `create_dataset` applies.
 
         Nothing here mutates the catalog. The files are registered when the
         caller follows with `create_dataset` and a commit that takes their
@@ -1250,6 +1304,13 @@ class OpteryxCatalog(SecretsMixin, Metastore):
         collection, dataset_name = identifier.split(".")
         if self._dataset_doc_ref(collection, dataset_name).get().exists:
             raise DatasetAlreadyExists(f"Dataset already exists: {identifier}")
+        if location is None:
+            location = self._reserve_location(identifier)
+        elif not self._is_minted_location(location):
+            raise ValueError(
+                f"location {location!r} is not a freshly minted location of workspace "
+                f"{self.workspace!r}; locations are allocated by the catalog, not chosen"
+            )
 
         field_ids = self._initial_field_ids(schema)
         columns = self._schema_to_columns(schema, field_ids=field_ids)
@@ -1259,7 +1320,7 @@ class OpteryxCatalog(SecretsMixin, Metastore):
 
         return open_data_file_writer_at(
             self.io,
-            self._dataset_location(collection, dataset_name),
+            location,
             field_id_by_name,
             sorted_by=sorted_by,
             sorted_descending=sorted_descending,
@@ -1273,7 +1334,17 @@ class OpteryxCatalog(SecretsMixin, Metastore):
         schema: Any,
         properties: dict | None = None,
         author: str | None = None,
+        location: str | None = None,
     ) -> SimpleDataset:
+        """Create a dataset, giving it a storage location nobody has had before.
+
+        The location is never derived from the name. It is the one reserved by
+        `open_pending_data_file_writer` for this identifier if a CTAS wrote
+        files first, else a fresh one. `location` hands one over explicitly -
+        it must be of the shape `_mint_location` produces in this workspace,
+        and is refused (ValueError) otherwise: a caller-chosen path is how two
+        datasets end up on one prefix.
+        """
         if author is None:
             raise ValueError("author must be provided when creating a dataset")
         collection, dataset_name = identifier.split(".")
@@ -1284,8 +1355,18 @@ class OpteryxCatalog(SecretsMixin, Metastore):
         # ... and the rest of the namespace, which is shared with views and tasks.
         self.assert_name_free(collection, dataset_name, "dataset")
 
+        if location is not None:
+            if not self._is_minted_location(location):
+                raise ValueError(
+                    f"location {location!r} is not a freshly minted location of workspace "
+                    f"{self.workspace!r}; locations are allocated by the catalog, not chosen"
+                )
+            # An explicit location settles any reservation for this name.
+            self._take_reservation(identifier)
+        else:
+            location = self._take_reservation(identifier) or self._mint_location()
+
         # Build default dataset metadata
-        location = self._dataset_location(collection, dataset_name)
         metadata = DatasetMetadata(
             dataset_identifier=identifier,
             schema=schema,
@@ -1636,6 +1717,12 @@ class OpteryxCatalog(SecretsMixin, Metastore):
         # the raw list: a reader taking `.columns` off that list saw a relation
         # with no columns (2026-10-12, every Iceberg SELECT in production).
         stored_schema = data.get("schema")
+        # The derive-from-name fallback below is the LAST place a location comes
+        # from a name. It serves documents with none recorded - stubs projected
+        # from an external catalog, which own no files here. Nothing is ever
+        # written to such a location, and `rename_dataset` refuses them. It is
+        # to be replaced by an explicit "no location" once the architect rules
+        # on stubs (RENAME_METADATA_ONLY_DESIGN.md, Q3).
         metadata = DatasetMetadata(
             dataset_identifier=identifier,
             location=data.get("location")
@@ -1853,14 +1940,14 @@ class OpteryxCatalog(SecretsMixin, Metastore):
 
         Dropping removes the dataset from the catalog immediately; the files
         under its location are left in place and become unreferenced storage.
-        Nothing records where they were, deliberately. A dropped dataset's
-        location is derived from its name, so any persisted note of it is a
-        claim about a prefix that `create_dataset` can silently re-bind to a
-        new dataset - which is exactly how a stale note once pointed at live
-        data. Reclamation instead re-derives the answer from ground truth:
-        storage that no live dataset claims is orphaned, found by comparing
-        what is physically in the bucket against the locations the catalog
-        currently holds.
+        Nothing records where they were, deliberately: reclamation re-derives
+        the answer from ground truth - storage that no live dataset claims is
+        orphaned, found by comparing what is physically in the bucket against
+        the locations the catalog currently holds. (A dataset created now has a
+        minted, never-reused location, so a dropped one can never be bound to a
+        new dataset. Datasets created before that have a location derived from
+        their name, which `create_dataset` no longer produces, so the same holds
+        for them.)
 
         Raises `DatasetLocked` if the dataset's `locked-by` field is set -
         the two-person deniability lock takes precedence over the drop.
@@ -2050,49 +2137,50 @@ class OpteryxCatalog(SecretsMixin, Metastore):
         out.write(data)
         out.close()
 
-    def _read_bytes(self, path: str) -> bytes:
-        with self.io.new_input(path).open() as handle:
-            return handle.read()
-
-    def _write_bytes(self, path: str, data: bytes) -> None:
-        out = self.io.new_output(path).create()
-        out.write(data)
-        out.close()
-
     def rename_dataset(
         self, identifier: str, new_identifier: str, author: str | None = None
     ) -> None:
-        """Rename a dataset, moving its files, manifests and catalog entry.
+        """Rename a dataset. Metadata only: no data file, manifest or byte moves.
 
-        A dataset's `location` is assigned once at creation and never re-derived
-        from its name, so a catalog-only rename would leave the files under the
-        old prefix - and creating a new dataset under the vacated name would
-        then derive that same prefix, putting two datasets on one location where
-        dropping either reclaims the other's files. This moves everything so
-        name and storage stay in step and no prefix is ever shared.
+        ONE Firestore transaction reads the dataset's document and everything
+        under it, creates the same documents under the new name, and deletes
+        the old ones. It commits whole or not at all, so there is no state in
+        which both names exist or neither does, and there is no storage I/O to
+        interleave with it (RENAME_METADATA_ONLY_DESIGN.md).
 
-        All snapshots move, not just the current one: every historical manifest
-        is rewritten at the new location with remapped file paths, so
-        time-travel keeps working across a rename.
+        That is only sound because the dataset's `location` is carried over
+        VERBATIM and nothing derives it from a name any more: `create_dataset`
+        mints a fresh, never-reused location, so the vacated name cannot be
+        bound to the prefix the renamed dataset still owns. (A dataset created
+        before that has a location derived from its name; no create produces
+        that prefix again, so it is as safe to rename. A dataset whose document
+        records NO location - a stub projected from an external catalog - is
+        refused with `DatasetLocationReusable`, never given a guessed one.)
 
-        Cost: this copies every data file the dataset references. It is
-        server-side (see `_copy_object`) but still O(all bytes) and O(all
-        objects) - a rename of a large dataset is a long-running job, not the
-        instant metadata edit the SQL makes it look like.
+        What moves, as documents: the dataset document (every field, so vector
+        index definitions and the like ride along), `schemas`, `snapshots`,
+        `tags`, `relationships` and `relationship-suppressions` (their near
+        address rewritten), and the orphan quarantine, whose entries name paths
+        that have not changed. The maintenance `lease` does not: it is a claim
+        by a holder that knows the dataset by its old name.
 
-        Ordering, since Firestore and GCS share no transaction:
-        copy files -> rewrite manifests -> write new catalog entry -> delete old
-        entry -> delete the files the copy superseded. A failure before the new
-        entry is written leaves the dataset untouched and some orphan copies at
-        the new location (a re-run overwrites them). A failure after it leaves
-        the old entry present alongside the new one, both readable, until
-        re-run. No ordering here loses data; the superseded files are deleted
-        by exact path, never by clearing the old prefix, so a re-run that
-        already moved them simply finds nothing left to delete.
+        Refused, as before: a locked dataset, a materialized view, a dataset
+        wearing triggers, either end of a fork (both ends record the other by
+        name, and rewriting them is a separate decision), a source that does
+        not exist, and a target that does. The target name is also checked
+        against views and tasks, which share the dataset namespace.
 
-        Files the dataset references from *outside* its own location are left
-        exactly where they are and referenced unchanged - they were never this
-        dataset's to move.
+        NOT part of the transaction, and not retried by re-running it:
+        repointing relationships declared on OTHER datasets that point at this
+        one (they are other documents, possibly mid-commit), the webhook and
+        the audit record. A crash after the commit loses the webhook and audit,
+        and leaves stale inbound rows for `integrity.py` to find.
+
+        Re-running after the commit is well-defined: the source is gone, so it
+        raises `DatasetNotFound` - or `DatasetAlreadyExists` if the old name has
+        since been recreated, because the target still exists. It never renames
+        a second time. It cannot tell "already renamed" from "never existed";
+        an exactly idempotent retry would need an expected dataset id.
 
         Args:
             identifier: Current identifier, 'collection.dataset'
@@ -2104,7 +2192,11 @@ class OpteryxCatalog(SecretsMixin, Metastore):
         Raises:
             DatasetNotFound: If the source does not exist.
             DatasetAlreadyExists: If the target already exists.
+            NameInUse: If the target name is held by a view or a task.
             DatasetLocked: If the source's `locked-by` field is set.
+            MaterializedViewError: If the source is a materialized view or has triggers.
+            ForkError: If the source is, or has, a fork - or that is unknowable.
+            DatasetLocationReusable: If the source's document records no location.
             ValueError: If source and target are the same.
         """
         if identifier == new_identifier:
@@ -2114,212 +2206,175 @@ class OpteryxCatalog(SecretsMixin, Metastore):
         new_collection, new_dataset_name = new_identifier.split(".")
 
         doc_ref = self._dataset_doc_ref(collection, dataset_name)
-        doc = doc_ref.get()
-        if not doc.exists:
-            raise DatasetNotFound(f"Dataset not found: {identifier}")
-
-        data = doc.to_dict() or {}
-        # Same precedence as drop_dataset - the two-person deniability lock
-        # outranks any operation that would move the dataset out from under it.
-        if data.get("locked-by") is not None:
-            raise DatasetLocked(f"Dataset is locked: {identifier}")
-
-        # v1: a materialized view, or any dataset wearing triggers, cannot be
-        # renamed. Trigger documents and MV source lists reference names, and
-        # chasing that reference graph through a rename is not worth it yet -
-        # drop the MV (or its triggers) first, recreate under the new name.
-        if data.get("dataset-type") == MATERIALIZED_VIEW_TYPE:
-            raise MaterializedViewError(f"Cannot rename a materialized view: {identifier}")
-        if any(True for _ in self._triggers_collection(collection, dataset_name).stream()):
-            raise MaterializedViewError(
-                f"Cannot rename a dataset with triggers attached: {identifier}"
-            )
-
-        # v1: a dataset in a fork relationship, either end, cannot be renamed
-        # (FORKS_DESIGN.md S5.3). Both sides record the other BY NAME, because
-        # this catalog has no stable dataset id, so a rename has to rewrite the
-        # other end - and the other end is very often in another workspace, on
-        # a document `save_dataset_metadata` writes whole with `set()`. A
-        # read-modify-write against a document that may be committing at that
-        # moment can destroy the commit, which is a far worse outcome than a
-        # refusal. Detach the fork (ALTER TABLE <fork> DETACH) and rename, or
-        # rename before forking.
-        try:
-            forks = self.list_forks(identifier)
-        except Exception as exc:  # noqa: BLE001 - Firestore boundary
-            raise ForkError(
-                f"Cannot establish whether {identifier} has forks ({exc}). Refusing to "
-                "rename it while that is unknown."
-            ) from exc
-        if forks:
-            names = sorted(row.get("fork") or "?" for row in forks)
-            raise ForkError(
-                f"Cannot rename {identifier}: {len(names)} fork(s) record it by name "
-                f"({', '.join(names)}). Detach them first (ALTER TABLE <fork> DETACH)."
-            )
-        if Fork.from_dict(data.get("fork")) is not None:
-            raise ForkError(
-                f"Cannot rename {identifier}: it is a fork, and its upstream records it "
-                "by name. Detach it first (ALTER TABLE <fork> DETACH)."
-            )
-
         new_doc_ref = self._dataset_doc_ref(new_collection, new_dataset_name)
-        if new_doc_ref.get().exists:
-            raise DatasetAlreadyExists(f"Dataset already exists: {new_identifier}")
 
-        old_location = data.get("location")
-        new_location = (
-            f"gs://{self.gcs_bucket}/{self.workspace}/{new_collection}/{new_dataset_name}"
-        )
+        # (where the documents are, where they go, how a document is rewritten
+        # on the way, ids that are deleted but not carried). Everything under the dataset that is ITS metadata and
+        # still means the same thing under another name.
+        def _relocated(payload):
+            return {**payload, "collection": new_collection, "dataset": new_dataset_name}
 
-        def _remap(path: str) -> str:
-            """Move a path from under old_location to under new_location.
+        def _verbatim(payload):
+            return payload
 
-            Anything not under old_location is returned unchanged - see the
-            note about externally-referenced files above.
-            """
-            if old_location and path.startswith(old_location + "/"):
-                return new_location + path[len(old_location) :]
-            return path
+        carried = [
+            (doc_ref.collection("schemas"), new_doc_ref.collection("schemas"), _verbatim, ()),
+            (
+                self._snapshots_collection(collection, dataset_name),
+                self._snapshots_collection(new_collection, new_dataset_name),
+                _verbatim,
+                (),
+            ),
+            (
+                self._tags_collection(collection, dataset_name),
+                self._tags_collection(new_collection, new_dataset_name),
+                _verbatim,
+                (),
+            ),
+            # The near address is denormalised onto every row, so a verbatim copy
+            # would leave each one claiming to belong to the dataset that no
+            # longer exists - and the reverse lookup and the workspace-wide
+            # query read exactly these fields rather than the path.
+            (
+                self._relationships_collection(collection, dataset_name),
+                self._relationships_collection(new_collection, new_dataset_name),
+                _relocated,
+                (),
+            ),
+            # Rejections travel for a sharper reason than tags do: dropping them
+            # would have inference re-propose every pair the owner turned down.
+            (
+                self._relationship_suppressions_collection(collection, dataset_name),
+                self._relationship_suppressions_collection(new_collection, new_dataset_name),
+                _relocated,
+                (),
+            ),
+            (
+                doc_ref.collection(MAINTENANCE_SUBCOLLECTION),
+                new_doc_ref.collection(MAINTENANCE_SUBCOLLECTION),
+                _verbatim,
+                (LEASE_DOCUMENT,),
+            ),
+        ]
 
-        from .catalog.manifest import read_manifest_rows
+        @firestore.transactional
+        def _rename(transaction) -> dict:
+            # EVERY read first: a Firestore transaction refuses a read that
+            # follows a write in the same transaction.
+            source = doc_ref.get(transaction=transaction)
+            if not source.exists:
+                raise DatasetNotFound(f"Dataset not found: {identifier}")
+            data = source.to_dict() or {}
 
-        snapshot_docs = list(self._snapshots_collection(collection, dataset_name).stream())
+            # Same precedence as drop_dataset - the two-person deniability lock
+            # outranks any operation that would move the dataset out from under it.
+            if data.get("locked-by") is not None:
+                raise DatasetLocked(f"Dataset is locked: {identifier}")
 
-        # 1. Copy data files, and 2. rewrite manifests. One pass per snapshot;
-        # a file referenced by several snapshots is copied once (copied_paths).
-        copied_paths = set()
-        # Paths left behind under `old_location` once the copies land. Collected
-        # as they are copied, rather than by listing the old prefix afterwards:
-        # these exact paths are known to be superseded, whereas a listing would
-        # also sweep up anything written under that prefix concurrently.
-        vacated_paths = set()
-        rewritten_manifests = {}
-        for snapshot_doc in snapshot_docs:
-            snapshot_data = snapshot_doc.to_dict() or {}
-            manifest_path = snapshot_data.get("manifest")
-            if not manifest_path:
-                continue
+            # v1: a materialized view, or any dataset wearing triggers, cannot
+            # be renamed. Trigger documents and MV source lists reference names,
+            # and chasing that reference graph through a rename is not worth it
+            # yet - drop the MV (or its triggers) first, recreate under the new
+            # name.
+            if data.get("dataset-type") == MATERIALIZED_VIEW_TYPE:
+                raise MaterializedViewError(f"Cannot rename a materialized view: {identifier}")
+            triggers = self._triggers_collection(collection, dataset_name)
+            if any(True for _ in triggers.stream(transaction=transaction)):
+                raise MaterializedViewError(
+                    f"Cannot rename a dataset with triggers attached: {identifier}"
+                )
 
-            manifest_bytes = self._read_bytes(manifest_path)
-            rows = read_manifest_rows(manifest_bytes)
-            if old_location and manifest_path.startswith(old_location + "/"):
-                vacated_paths.add(manifest_path)
+            # v1: a dataset in a fork relationship, either end, cannot be
+            # renamed (FORKS_DESIGN.md S5.3). Both sides record the other BY
+            # NAME, so a rename has to rewrite the other end - very often in
+            # another workspace, on a document `save_dataset_metadata` writes
+            # whole with `set()`. A read-modify-write against a document that
+            # may be committing at that moment can destroy the commit, which is
+            # a far worse outcome than a refusal. Detach the fork (ALTER TABLE
+            # <fork> DETACH) and rename, or rename before forking.
+            #
+            # An unreadable registry refuses the rename: "no forks" is the
+            # answer that breaks other people's data.
+            try:
+                forks = [
+                    (row.to_dict() or {}).get("fork") or row.id.replace(":", ".")
+                    for row in self._forks_collection(identifier).stream(transaction=transaction)
+                ]
+            except Exception as exc:  # noqa: BLE001 - Firestore boundary
+                raise ForkError(
+                    f"Cannot establish whether {identifier} has forks ({exc}). Refusing to "
+                    "rename it while that is unknown."
+                ) from exc
+            if forks:
+                raise ForkError(
+                    f"Cannot rename {identifier}: {len(forks)} fork(s) record it by name "
+                    f"({', '.join(sorted(forks))}). Detach them first (ALTER TABLE <fork> DETACH)."
+                )
+            if Fork.from_dict(data.get("fork")) is not None:
+                raise ForkError(
+                    f"Cannot rename {identifier}: it is a fork, and its upstream records it "
+                    "by name. Detach it first (ALTER TABLE <fork> DETACH)."
+                )
 
-            def _move(path):
-                """The path this object has after the rename. Copied once however many
-                manifests name it; EVERY row naming it is rewritten (a file shared by
-                several snapshots must be renamed in all of their manifests, or the
-                later ones keep the old path, which is then reclaimed below)."""
-                target = _remap(path)
-                if target != path and target not in copied_paths:
-                    self._copy_object(path, target)
-                    copied_paths.add(target)
-                    vacated_paths.add(path)
-                return target
+            # The location is carried over as stored. No fallback to a derived
+            # value: a dataset with no recorded location (a stub projected from
+            # an external catalog has none) is not renamed, not guessed at.
+            location = data.get("location")
+            if not location:
+                raise DatasetLocationReusable(
+                    f"Cannot rename {identifier}: its document records no location."
+                )
+            if new_doc_ref.get(transaction=transaction).exists:
+                raise DatasetAlreadyExists(f"Dataset already exists: {new_identifier}")
+            for kind, ref in (
+                ("view", self._view_doc_ref(new_collection, new_dataset_name)),
+                ("task", self._task_doc_ref(new_collection, new_dataset_name)),
+            ):
+                if ref.get(transaction=transaction).exists:
+                    raise NameInUse(
+                        f"{new_identifier} already exists as a {kind}. A table, a view and a "
+                        "task share one namespace, so a name identifies exactly one of them."
+                    )
 
-            for row in rows:
-                if row.get("file_path"):
-                    row["file_path"] = _move(row["file_path"])
-                # The merge-on-read delete vector moves with its data file: left under
-                # the old location, every row it deletes would resurrect once that
-                # location is reclaimed.
-                if row.get(DELETE_FILE_PATH_KEY):
-                    row[DELETE_FILE_PATH_KEY] = _move(row[DELETE_FILE_PATH_KEY])
-                # Vector-index files move too: they key the data file by ordinal, which
-                # the copy preserves.
-                row.update(with_index_refs(row, {
-                    index_id: files._replace(path=_move(files.path))
-                    for index_id, files in index_refs(row).items()
-                }))
+            # Read every child now, while reads are still allowed; each is
+            # carried, or (the lease) only deleted.
+            children = []
+            for source_collection, target_collection, rewrite, skip in carried:
+                for child in source_collection.stream(transaction=transaction):
+                    target = None if child.id in skip else target_collection.document(child.id)
+                    children.append((child, target, rewrite))
 
-            snapshot_id = snapshot_data.get("snapshot-id")
-            new_manifest_path = self.write_parquet_manifest(snapshot_id, rows, new_location)
-            rewritten_manifests[snapshot_doc.id] = (snapshot_data, new_manifest_path)
-
-        # 3. Write the new catalog entry: dataset doc, schemas, snapshots. This
-        # is the point the rename becomes visible under the new name.
-        new_doc_ref.set(
-            {
-                **data,
-                "name": new_dataset_name,
-                "collection": new_collection,
-                "location": new_location,
-                "timestamp-ms": int(time.time() * 1000),
-            }
-        )
-
-        for schema_doc in doc_ref.collection("schemas").stream():
-            new_doc_ref.collection("schemas").document(schema_doc.id).set(
-                schema_doc.to_dict() or {}
+            # Writes. The new document goes in whole, with `location` untouched.
+            transaction.set(
+                new_doc_ref,
+                {
+                    **data,
+                    "name": new_dataset_name,
+                    "collection": new_collection,
+                    "timestamp-ms": int(time.time() * 1000),
+                },
             )
+            # Firestore never cascades: the old document's subcollections are
+            # deleted explicitly, or they are left as ghost paths.
+            for child, new_child_ref, rewrite in children:
+                if new_child_ref is not None:
+                    transaction.set(new_child_ref, rewrite(child.to_dict() or {}))
+                transaction.delete(child.reference)
+            transaction.delete(doc_ref)
+            moved = sum(1 for _child, target, _rewrite in children if target is not None)
+            return {"location": location, "documents_moved": moved + 1}
 
-        # Tags travel with the dataset. They name snapshot ids, and the ids are
-        # preserved by the copy below, so the documents move verbatim - but they
-        # MUST move: a rename that left them behind would unpin every tagged
-        # snapshot silently, and the next expiration run would reclaim exactly
-        # the data the tags exist to hold.
-        new_tags = self._tags_collection(new_collection, new_dataset_name)
-        for tag_doc in self._tags_collection(collection, dataset_name).stream():
-            new_tags.document(tag_doc.id).set(tag_doc.to_dict() or {})
-
-        # Vector-index definitions travel in `data` (the document's own map): their index
-        # ids key the index files the manifests above now reference at the new location.
-
-        # Relationships travel with the dataset for the same reason tags do:
-        # they are its own metadata, keyed under it, and a rename that left them
-        # behind would delete every relationship declared on it with nothing
-        # saying so.
-        #
-        # A relationship declared on some OTHER dataset that points AT this one
-        # is FOLLOWED, below. It used to be left stale on purpose, on the
-        # grounds that chasing inbound references would mean scanning every
-        # dataset in the workspace and that a stale reference is what
-        # `status = 'broken'` is for. THAT REASONING IS SUPERSEDED:
-        # `find_relationships_to` answers "what points at this dataset" in one
-        # collection group query - the same read `information_schema` already
-        # makes - so the punt now costs more than the fix.
-        new_relationships = self._relationships_collection(new_collection, new_dataset_name)
-        for relationship_doc in self._relationships_collection(collection, dataset_name).stream():
-            payload = relationship_doc.to_dict() or {}
-            # The near address is denormalised onto every row, so a rename that
-            # copied the documents verbatim would leave each one claiming to
-            # belong to the dataset that no longer exists - and the reverse
-            # lookup and the workspace-wide query both read exactly these
-            # fields rather than the path.
-            payload["collection"] = new_collection
-            payload["dataset"] = new_dataset_name
-            new_relationships.document(relationship_doc.id).set(payload)
-
-        # Rejections travel too, and for a sharper reason than tags do: a
-        # rename that dropped them would have inference re-propose every pair
-        # this dataset's owner has already turned down. The digest keys on the
-        # near COLUMN and the far end, neither of which a rename changes, so the
-        # documents move under their own ids.
-        new_suppressions = self._relationship_suppressions_collection(
-            new_collection, new_dataset_name
-        )
-        for suppression_doc in self._relationship_suppressions_collection(
-            collection, dataset_name
-        ).stream():
-            payload = suppression_doc.to_dict() or {}
-            payload["collection"] = new_collection
-            payload["dataset"] = new_dataset_name
-            new_suppressions.document(suppression_doc.id).set(payload)
+        result = _rename(self.firestore_client.transaction())
+        location = result["location"]
 
         # Inbound references follow the rename rather than breaking. A renamed
         # dataset is the SAME dataset - its snapshots, tags and relationships
         # all travelled above - so a reference to it still names the data it
         # meant. Breaking these would report a data problem where there is
-        # none, and an owner who "fixed" it by dropping the constraint would
-        # lose a true relationship to a bookkeeping event. A drop is the
-        # opposite case and is handled as one.
-        # Non-fatal, for a sharper reason than in `drop_dataset`: by this point
-        # the rename has already copied every byte to the new location, and
-        # raising here would abort it halfway - files at the new prefix, the
-        # catalog entry still at the old one. An inbound row left pointing at
-        # the old name is a stale reference, which is the state this whole
-        # sweep is an improvement on, and `fsck` finds it.
+        # none; a drop is the opposite case and is handled as one.
+        # Non-fatal: the rename has committed, and raising here would report a
+        # failure for something that cannot be undone. An inbound row left
+        # pointing at the old name is a stale reference, which `fsck` finds.
         try:
             self._repoint_inbound_relationships(
                 collection,
@@ -2340,41 +2395,6 @@ class OpteryxCatalog(SecretsMixin, Metastore):
                 exc,
             )
 
-        new_snapshots = self._snapshots_collection(new_collection, new_dataset_name)
-        for snapshot_doc in snapshot_docs:
-            snapshot_data, new_manifest_path = rewritten_manifests.get(
-                snapshot_doc.id, (snapshot_doc.to_dict() or {}, None)
-            )
-            payload = dict(snapshot_data)
-            if new_manifest_path is not None:
-                payload["manifest"] = new_manifest_path
-            new_snapshots.document(snapshot_doc.id).set(payload)
-
-        # 4. Remove the old catalog entry. The orphan quarantine is dropped
-        # rather than carried over: its entries name paths under the old
-        # location, which no longer exist, so the renamed dataset starts with a
-        # clean record and its files each need two fresh sightings.
-        self._delete_subcollection(self._snapshots_collection(collection, dataset_name))
-        self._delete_subcollection(self._tags_collection(collection, dataset_name))
-        self._delete_subcollection(doc_ref.collection("schemas"))
-        self._delete_subcollection(doc_ref.collection(MAINTENANCE_SUBCOLLECTION))
-        self._delete_subcollection(doc_ref.collection(RELATIONSHIPS_SUBCOLLECTION))
-        self._delete_subcollection(
-            doc_ref.collection(RELATIONSHIP_SUPPRESSIONS_SUBCOLLECTION)
-        )
-        doc_ref.delete()
-
-        # 5. Delete what the copy vacated. Done inline, and by exact path:
-        # every one of these was copied to `new_location` moments ago and is
-        # now a duplicate, so there is nothing to defer and no grace period to
-        # wait out. Deleting the old *prefix* instead would be the unsafe
-        # version - it can be re-bound to a new dataset of the same name - and
-        # is precisely what this no longer does. Failures are left alone rather
-        # than raised: the rename itself has fully succeeded by this point, and
-        # anything not deleted here is unreferenced storage that reconciliation
-        # finds later.
-        self._reclaim_paths(vacated_paths)
-
         send_webhook(
             action="rename",
             workspace=self.workspace,
@@ -2384,8 +2404,8 @@ class OpteryxCatalog(SecretsMixin, Metastore):
             payload=dataset_renamed_payload(
                 old_identifier=identifier,
                 new_identifier=new_identifier,
-                old_location=old_location,
-                new_location=new_location,
+                old_location=location,
+                new_location=location,
                 renamed_by=author,
             ),
         )
@@ -2399,10 +2419,8 @@ class OpteryxCatalog(SecretsMixin, Metastore):
             author=author,
             old_identifier=identifier,
             new_identifier=new_identifier,
-            old_location=old_location,
-            new_location=new_location,
-            files_copied=len(copied_paths),
-            snapshots_moved=len(snapshot_docs),
+            location=location,
+            documents_moved=result["documents_moved"],
         )
 
     def _reclaim_paths(self, paths) -> dict:

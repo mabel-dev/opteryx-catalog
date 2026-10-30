@@ -14,10 +14,10 @@ deleters already had by accident and one did not:
 * `SnapshotExpiration` enumerates from MANIFEST ENTRIES, which may name any
   path `add_files` was given - and deleted them.
 
-`rename_dataset` has always had the concept, from the other side: it remaps
-paths under `old_location` and returns "externally-referenced files" unchanged.
-`_is_own_path` is that same test, named, so the read side and the delete side
-cannot drift apart.
+`rename_dataset` once had the concept, from the other side: it remapped paths
+under `old_location` and returned "externally-referenced files" unchanged (it is
+metadata-only now, so no path is remapped). `_is_own_path` is that same test,
+named, so the read side and the delete side cannot drift apart.
 
 Making it explicit everywhere means a deleter's safety is a property of the
 code rather than of how it happened to enumerate - and it is what lets a

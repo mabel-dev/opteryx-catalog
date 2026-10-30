@@ -9,7 +9,8 @@ and asking for one answered `DatasetNotFound` naming the table being created.
 to be created with instead. What is pinned here is that the two derivations it
 does agree EXACTLY with what `create_dataset` will go on to persist:
 
-1. the file lands under the location `create_dataset` assigns that identifier;
+1. the file lands under the location reserved for that identifier, which the
+   `create_dataset` that follows takes (tests/test_create_location.py);
 2. its statistics are keyed by the field-ids `create_dataset` allocates.
 
 (2) is the one that fails silently if it ever drifts: a manifest entry keyed by
@@ -96,7 +97,10 @@ class _FakeCatalog:
         return _Ref(self._exists)
 
     _schema_to_columns = OpteryxCatalog._schema_to_columns
-    _dataset_location = OpteryxCatalog._dataset_location
+    _mint_location = OpteryxCatalog._mint_location
+    _reserve_location = OpteryxCatalog._reserve_location
+    _take_reservation = OpteryxCatalog._take_reservation
+    _is_minted_location = OpteryxCatalog._is_minted_location
     _initial_field_ids = OpteryxCatalog._initial_field_ids
     open_pending_data_file_writer = OpteryxCatalog.open_pending_data_file_writer
 
@@ -109,16 +113,60 @@ def _morsel():
     return m
 
 
-def test_pending_file_lands_where_create_dataset_will_put_it():
+def test_pending_file_lands_under_the_location_reserved_for_the_identifier():
     catalog = _FakeCatalog()
     writer = catalog.open_pending_data_file_writer("ops.zz_probe", SCHEMA)
     writer.write_row_group(_morsel())
     entry = writer.close()
 
-    # The formula create_dataset uses for this identifier, and nothing else.
-    assert entry.file_path.startswith("gs://bkt/opteryx/ops/zz_probe/data/")
+    reserved = catalog._pending_locations["ops.zz_probe"]
+    # Opaque and never derived from the name.
+    assert reserved.startswith("gs://bkt/opteryx/")
+    assert "zz_probe" not in reserved and "/ops/" not in reserved
+    assert entry.file_path.startswith(reserved + "/data/")
     assert entry.file_path in catalog.io.mapping
     assert entry.record_count == 3
+
+
+def test_every_file_of_one_statement_shares_one_location():
+    catalog = _FakeCatalog()
+    first = catalog.open_pending_data_file_writer("ops.zz_probe", SCHEMA)
+    second = catalog.open_pending_data_file_writer("ops.zz_probe", SCHEMA)
+    for writer in (first, second):
+        writer.write_row_group(_morsel())
+    paths = [first.close().file_path, second.close().file_path]
+
+    assert len({path.rsplit("/data/", 1)[0] for path in paths}) == 1
+
+
+def test_two_identifiers_never_share_a_location():
+    catalog = _FakeCatalog()
+    catalog.open_pending_data_file_writer("ops.one", SCHEMA)
+    catalog.open_pending_data_file_writer("ops.two", SCHEMA)
+
+    assert catalog._pending_locations["ops.one"] != catalog._pending_locations["ops.two"]
+
+
+def test_the_writer_reports_its_location_and_takes_it_back():
+    """The location travels with the statement: read off the first file, handed to the
+    next - which then needs no reservation on this catalog instance."""
+    first = _FakeCatalog().open_pending_data_file_writer("ops.zz_probe", SCHEMA)
+    other_instance = _FakeCatalog()
+    second = other_instance.open_pending_data_file_writer(
+        "ops.zz_probe", SCHEMA, location=first.location
+    )
+
+    assert second.location == first.location
+    assert second.data_path.startswith(first.location + "/data/")
+    assert "ops.zz_probe" not in other_instance.__dict__.get("_pending_locations", {})
+
+
+def test_a_location_that_was_not_minted_is_refused():
+    catalog = _FakeCatalog()
+    with pytest.raises(ValueError, match="not a freshly minted"):
+        catalog.open_pending_data_file_writer(
+            "ops.zz_probe", SCHEMA, location="gs://bkt/opteryx/ops/zz_probe"
+        )
 
 
 def test_pending_stats_are_keyed_by_the_ids_the_create_will_allocate():

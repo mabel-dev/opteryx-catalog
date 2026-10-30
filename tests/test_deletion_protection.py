@@ -203,18 +203,5 @@ def test_drop_view_is_not_blocked(monkeypatch):
     assert view_ref.deleted is True
 
 
-def test_rename_is_not_blocked(monkeypatch):
-    monkeypatch.setattr("opteryx_catalog.opteryx_catalog.send_webhook", lambda **k: None)
-    catalog, _d, _c, _v = _catalog(protected=True)
-
-    target = _DocRef(exists=False)
-    source = catalog._dataset_doc_ref("coll", "tbl")
-    catalog._dataset_doc_ref = lambda c, n: target if n == "new" else source
-    catalog._snapshots_collection = lambda c, n: _Collection()
-    catalog.gcs_bucket = "bucket"
-    catalog._storage_client = None
-    catalog.io = None
-
-    catalog.rename_dataset("coll.tbl", "coll.new", author="alice")
-
-    assert target.written["name"] == "new"
+# `deletion_protection` not blocking a rename is asserted in test_rename_dataset.py, which
+# has the transactional Firestore fake the metadata-only rename needs.
