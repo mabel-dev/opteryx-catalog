@@ -2227,6 +2227,41 @@ class SimpleDataset(Dataset):
           (there's no ranged/partial-read path in `FileIO` yet) — it saves
           decode CPU, not network transfer.
         """
+        snap = self._stage_add_files(
+            files=files,
+            author=author,
+            commit_message=commit_message,
+            footer_only=footer_only,
+            read_sources=read_sources,
+            produced_by=produced_by,
+            entries=entries,
+            manifest=manifest,
+            index_files=index_files,
+        )
+        if self.catalog and hasattr(self.catalog, "save_snapshot"):
+            self.catalog.save_snapshot(self.identifier, snap)
+        self._persist_metadata()
+
+        self._after_commit(author, snap)
+
+    def _stage_add_files(
+        self,
+        files: list[str] | None = None,
+        author: str | None = None,
+        commit_message: str | None = None,
+        footer_only: bool = False,
+        read_sources: Iterable[Any] | None = None,
+        produced_by: str | None = None,
+        entries: Iterable[dict] | None = None,
+        manifest: bytes | None = None,
+        index_files: dict | None = None,
+    ) -> Snapshot:
+        """Build add_files' snapshot in memory - manifest written to storage, the
+        snapshot appended and the pointer advanced on `self.metadata` - without
+        persisting anything to the catalog. `add_files` persists it as a commit
+        to an existing dataset; `OpteryxCatalog.create_dataset_with_files`
+        persists it in the same transaction that creates the dataset.
+        """
         entries = self._manifest_entries(entries, manifest, "add_files")
         if author is None:
             raise ValueError("author must be provided when adding files to a dataset")
@@ -2317,12 +2352,7 @@ class SimpleDataset(Dataset):
         self._stamp_provenance(snap, read_sources, produced_by)
         self.metadata.snapshots.append(snap)
         self._advance_current_snapshot(snapshot_id)
-
-        if self.catalog and hasattr(self.catalog, "save_snapshot"):
-            self.catalog.save_snapshot(self.identifier, snap)
-        self._persist_metadata()
-
-        self._after_commit(author, snap)
+        return snap
 
     def truncate_and_add_files(
         self,

@@ -61,6 +61,13 @@ class Metastore:
     ) -> Dataset:
         raise NotImplementedError()
 
+    def create_dataset_with_files(
+        self, identifier: str, schema: Any, *, author: str, **kwargs
+    ) -> Dataset:
+        """Create a dataset and its first snapshot as ONE atomic write: either it
+        exists holding the files, or nothing was published (CREATE TABLE AS)."""
+        raise NotImplementedError()
+
     def drop_dataset(self, identifier: str, author: str) -> None:
         """Drop a dataset. `author` is required - an unattributed drop is not
         something an implementation should silently accept."""

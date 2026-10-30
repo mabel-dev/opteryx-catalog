@@ -1379,12 +1379,7 @@ class OpteryxCatalog(SecretsMixin, Metastore):
         # ... and the rest of the namespace, which is shared with views and tasks.
         self.assert_name_free(collection, dataset_name, "dataset")
 
-        if location is not None:
-            self._require_minted_location(location)
-            # An explicit location settles any reservation for this name.
-            self._take_reservation(identifier)
-        else:
-            location = self._take_reservation(identifier) or self._mint_location()
+        location = self._creation_location(identifier, location)
 
         # Build default dataset metadata
         metadata = DatasetMetadata(
@@ -1467,7 +1462,24 @@ class OpteryxCatalog(SecretsMixin, Metastore):
             # update dataset doc to reference current schema
             doc_ref.update({"current-schema-id": metadata.current_schema_id})
 
-        # Send webhook notification
+        self._announce_dataset_created(collection, dataset_name, schema, location, properties, author)
+
+        # Return SimpleDataset (attach this catalog so append() can persist)
+        return SimpleDataset(identifier=identifier, _metadata=metadata, io=self.io, catalog=self)
+
+    def _creation_location(self, identifier: str, location: str | None) -> str:
+        """The storage location a new dataset is created at: `location` when the
+        caller holds one (a CTAS's pending writers), which must be minted here and
+        settles any reservation; else the reservation for this name, else fresh."""
+        if location is not None:
+            self._require_minted_location(location)
+            self._take_reservation(identifier)
+            return location
+        return self._take_reservation(identifier) or self._mint_location()
+
+    def _announce_dataset_created(
+        self, collection: str, dataset_name: str, schema: Any, location: str, properties, author
+    ) -> None:
         send_webhook(
             action="create",
             workspace=self.workspace,
@@ -1480,7 +1492,6 @@ class OpteryxCatalog(SecretsMixin, Metastore):
                 properties=properties,
             ),
         )
-
         emit_audit(
             "create_dataset",
             resource_type=ResourceType.DATASET,
@@ -1491,8 +1502,112 @@ class OpteryxCatalog(SecretsMixin, Metastore):
             location=location,
         )
 
-        # Return SimpleDataset (attach this catalog so append() can persist)
-        return SimpleDataset(identifier=identifier, _metadata=metadata, io=self.io, catalog=self)
+    def create_dataset_with_files(
+        self,
+        identifier: str,
+        schema: Any,
+        *,
+        entries: Iterable[dict] | None = None,
+        manifest: bytes | None = None,
+        author: str | None = None,
+        location: str | None = None,
+        commit_message: str | None = None,
+        read_sources: Iterable[Any] | None = None,
+        produced_by: str | None = None,
+        properties: dict | None = None,
+    ) -> SimpleDataset:
+        """Create a dataset AND its first snapshot as one atomic catalog write.
+
+        `create_dataset` followed by `add_files` is two commits: a failure between
+        them leaves an empty, visible dataset whose name a retry then finds taken
+        (a CREATE TABLE ... AS whose insert was refused). Here the snapshot is
+        staged in memory (its manifest written to storage, which is unreferenced
+        and reclaimed if the commit fails), then the dataset document, its schema
+        document and its snapshot document are written in ONE Firestore
+        transaction that also re-checks the name is still free. Either the
+        dataset exists with its data, or nothing was published.
+
+        The files arrive as `entries` OR `manifest`, exactly as `add_files` takes
+        them; `read_sources` / `produced_by` are the provenance receipt.
+        """
+        import uuid
+
+        from google.cloud import firestore
+
+        if author is None:
+            raise ValueError("author must be provided when creating a dataset")
+        collection, dataset_name = identifier.split(".")
+        doc_ref = self._dataset_doc_ref(collection, dataset_name)
+        if doc_ref.get().exists:
+            raise DatasetAlreadyExists(f"Dataset already exists: {identifier}")
+        self.assert_name_free(collection, dataset_name, "dataset")
+        location = self._creation_location(identifier, location)
+
+        metadata = DatasetMetadata(
+            dataset_identifier=identifier,
+            schema=schema,
+            location=location,
+            properties=properties or {},
+        )
+        field_ids = self._initial_field_ids(schema)
+        if field_ids is not None:
+            metadata.next_field_id = len(field_ids) + 1
+        now_ms = int(time.time() * 1000)
+        metadata.timestamp_ms = now_ms
+        metadata.author = author
+        metadata.sources = []
+        metadata.sources_complete = True
+
+        schema_document = None
+        if schema is not None:
+            schema_id = str(uuid.uuid4())
+            schema_document = {
+                "columns": self._schema_to_columns(schema, field_ids=field_ids),
+                "timestamp-ms": now_ms,
+                "author": author,
+                "sequence-number": 1,   # a new dataset has no earlier schema
+            }
+            metadata.current_schema_id = schema_id
+            metadata.schemas = [{"schema_id": schema_id, **schema_document}]
+
+        dataset = SimpleDataset(identifier=identifier, _metadata=metadata, io=self.io, catalog=self)
+        snapshot = dataset._stage_add_files(
+            entries=entries,
+            manifest=manifest,
+            author=author,
+            commit_message=commit_message,
+            read_sources=read_sources,
+            produced_by=produced_by,
+        )
+
+        document = self._dataset_document(collection, dataset_name, metadata)
+        # Creation-only fields `create_dataset` writes and a commit carries forward.
+        document["next-field-id"] = metadata.next_field_id
+        document["locked-by"] = None
+        document["locked-at-ms"] = None
+        snapshot_ref = self._snapshots_collection(collection, dataset_name).document(
+            str(snapshot.snapshot_id)
+        )
+        schema_ref = (
+            doc_ref.collection("schemas").document(metadata.current_schema_id)
+            if schema_document is not None
+            else None
+        )
+
+        @firestore.transactional
+        def _create(transaction) -> None:
+            if doc_ref.get(transaction=transaction).exists:
+                raise DatasetAlreadyExists(f"Dataset already exists: {identifier}")
+            transaction.set(doc_ref, document)
+            if schema_ref is not None:
+                transaction.set(schema_ref, schema_document)
+            transaction.set(snapshot_ref, _snapshot_to_document(snapshot))
+
+        _create(self.firestore_client.transaction())
+
+        self._announce_dataset_created(collection, dataset_name, schema, location, properties, author)
+        dataset._after_commit(author, snapshot)
+        return dataset
 
     def load_dataset(
         self,
@@ -8860,29 +8975,13 @@ class OpteryxCatalog(SecretsMixin, Metastore):
 
         _check_and_set(self.firestore_client.transaction())
 
-    def save_dataset_metadata(
-        self,
-        identifier: str,
-        metadata: DatasetMetadata,
-        expected_current_snapshot_id=_NO_SNAPSHOT_EXPECTATION,
-    ) -> None:
-        """Persist dataset-level metadata and snapshots to Firestore.
+    def _dataset_document(self, collection: str, dataset_name: str, metadata: DatasetMetadata) -> dict:
+        """The whole dataset document for `metadata`, as every commit writes it.
 
-        This writes the dataset document and upserts snapshot documents.
-
-        `expected_current_snapshot_id` makes the write CONDITIONAL: the stored
-        `current-snapshot-id` must still be that value or the write is refused
-        with SnapshotRaceError. A commit passes the parent it built its manifest
-        from; anything that does not move the pointer (an annotation, a
-        description) passes nothing and writes unconditionally.
-
-        The check and the write are ONE Firestore transaction. A read-back
-        followed by a write would only narrow the race, never close it - which
-        is exactly what compaction's `_dataset_moved_under_us` says about itself.
+        Shared by `save_dataset_metadata` and `create_dataset_with_files`, so a
+        dataset created with its first snapshot carries exactly the fields a
+        later commit would write.
         """
-        collection, dataset_name = identifier.split(".")
-        doc_ref = self._dataset_doc_ref(collection, dataset_name)
-
         document = {
             "name": dataset_name,
             "collection": collection,
@@ -8931,6 +9030,31 @@ class OpteryxCatalog(SecretsMixin, Metastore):
         # fork", and only one of them is the truth for a dataset nobody cloned.
         if metadata.fork is not None:
             document["fork"] = metadata.fork.to_dict()
+        return document
+
+    def save_dataset_metadata(
+        self,
+        identifier: str,
+        metadata: DatasetMetadata,
+        expected_current_snapshot_id=_NO_SNAPSHOT_EXPECTATION,
+    ) -> None:
+        """Persist dataset-level metadata and snapshots to Firestore.
+
+        This writes the dataset document and upserts snapshot documents.
+
+        `expected_current_snapshot_id` makes the write CONDITIONAL: the stored
+        `current-snapshot-id` must still be that value or the write is refused
+        with SnapshotRaceError. A commit passes the parent it built its manifest
+        from; anything that does not move the pointer (an annotation, a
+        description) passes nothing and writes unconditionally.
+
+        The check and the write are ONE Firestore transaction. A read-back
+        followed by a write would only narrow the race, never close it - which
+        is exactly what compaction's `_dataset_moved_under_us` says about itself.
+        """
+        collection, dataset_name = identifier.split(".")
+        doc_ref = self._dataset_doc_ref(collection, dataset_name)
+        document = self._dataset_document(collection, dataset_name, metadata)
         if expected_current_snapshot_id is _NO_SNAPSHOT_EXPECTATION:
             self._set_carrying_vector_indexes(doc_ref, document)
         else:
