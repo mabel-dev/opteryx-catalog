@@ -100,7 +100,7 @@ class _FakeCatalog:
     _mint_location = OpteryxCatalog._mint_location
     _reserve_location = OpteryxCatalog._reserve_location
     _take_reservation = OpteryxCatalog._take_reservation
-    _is_minted_location = OpteryxCatalog._is_minted_location
+    _require_minted_location = OpteryxCatalog._require_minted_location
     _initial_field_ids = OpteryxCatalog._initial_field_ids
     open_pending_data_file_writer = OpteryxCatalog.open_pending_data_file_writer
 

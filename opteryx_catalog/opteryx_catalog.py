@@ -11,6 +11,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
+from google.api_core.exceptions import InvalidArgument
 from google.cloud import firestore
 from google.cloud import storage
 
@@ -70,6 +71,7 @@ from .exceptions import MaintenanceLeaseLost
 from .exceptions import MaterializedViewError
 from .exceptions import NameInUse
 from .exceptions import PlatformIdentityOwnerRefused
+from .exceptions import RenameTooLarge
 from .exceptions import SnapshotAncestryTooDeep
 from .exceptions import SnapshotMissingError
 from .exceptions import TagAlreadyExists
@@ -971,6 +973,23 @@ def _carry_vector_indexes(stored_doc, document: dict) -> dict:
     return {**document, VECTOR_INDEXES_FIELD: stored}
 
 
+def _refuse_resurrection(stored_doc, document: dict) -> None:
+    """Refuse a whole-document save to a dataset document that no longer exists.
+
+    Every dataset document is written first by `create_dataset`, so a save that
+    finds none was built from a dataset loaded before it was renamed or dropped.
+    Writing it would bring the old name back carrying the SAME `location` as the
+    renamed dataset - and that ghost's expiration, seeing only its own snapshot,
+    would quarantine and then delete every file the renamed dataset writes after
+    (RENAME_METADATA_ONLY_DESIGN.md).
+    """
+    if not stored_doc.exists:
+        raise DatasetNotFound(
+            f"Dataset not found: {document.get('collection')}.{document.get('name')} - "
+            "it was renamed or dropped after this metadata was loaded. Nothing was saved."
+        )
+
+
 class OpteryxCatalog(SecretsMixin, Metastore):
     """Firestore-backed Metastore implementation.
 
@@ -1205,12 +1224,20 @@ class OpteryxCatalog(SecretsMixin, Metastore):
         """
         return f"gs://{self.gcs_bucket}/{self.workspace}/{uuid.uuid4().hex}"
 
-    def _is_minted_location(self, location: str) -> bool:
-        """Whether `location` has the shape `_mint_location` produces here."""
+    def _require_minted_location(self, location: str) -> None:
+        """Refuse (ValueError) a `location` not of the shape `_mint_location`
+        produces here: a caller-chosen path is how two datasets end up on one
+        prefix."""
         prefix = f"gs://{self.gcs_bucket}/{self.workspace}/"
-        if not isinstance(location, str) or not location.startswith(prefix):
-            return False
-        return re.fullmatch(r"[0-9a-f]{32}", location[len(prefix) :]) is not None
+        if not (
+            isinstance(location, str)
+            and location.startswith(prefix)
+            and re.fullmatch(r"[0-9a-f]{32}", location[len(prefix) :])
+        ):
+            raise ValueError(
+                f"location {location!r} is not a freshly minted location of workspace "
+                f"{self.workspace!r}; locations are allocated by the catalog, not chosen"
+            )
 
     def _reserve_location(self, identifier: str) -> str:
         """The location a dataset about to be created as `identifier` will get.
@@ -1306,11 +1333,8 @@ class OpteryxCatalog(SecretsMixin, Metastore):
             raise DatasetAlreadyExists(f"Dataset already exists: {identifier}")
         if location is None:
             location = self._reserve_location(identifier)
-        elif not self._is_minted_location(location):
-            raise ValueError(
-                f"location {location!r} is not a freshly minted location of workspace "
-                f"{self.workspace!r}; locations are allocated by the catalog, not chosen"
-            )
+        else:
+            self._require_minted_location(location)
 
         field_ids = self._initial_field_ids(schema)
         columns = self._schema_to_columns(schema, field_ids=field_ids)
@@ -1356,11 +1380,7 @@ class OpteryxCatalog(SecretsMixin, Metastore):
         self.assert_name_free(collection, dataset_name, "dataset")
 
         if location is not None:
-            if not self._is_minted_location(location):
-                raise ValueError(
-                    f"location {location!r} is not a freshly minted location of workspace "
-                    f"{self.workspace!r}; locations are allocated by the catalog, not chosen"
-                )
+            self._require_minted_location(location)
             # An explicit location settles any reservation for this name.
             self._take_reservation(identifier)
         else:
@@ -2197,6 +2217,8 @@ class OpteryxCatalog(SecretsMixin, Metastore):
             MaterializedViewError: If the source is a materialized view or has triggers.
             ForkError: If the source is, or has, a fork - or that is unknowable.
             DatasetLocationReusable: If the source's document records no location.
+            RenameTooLarge: If Firestore refuses the one transaction (too many
+                snapshot documents); nothing is changed.
             ValueError: If source and target are the same.
         """
         if identifier == new_identifier:
@@ -2343,6 +2365,7 @@ class OpteryxCatalog(SecretsMixin, Metastore):
                 for child in source_collection.stream(transaction=transaction):
                     target = None if child.id in skip else target_collection.document(child.id)
                     children.append((child, target, rewrite))
+            staged["documents"] = len(children) + 1
 
             # Writes. The new document goes in whole, with `location` untouched.
             transaction.set(
@@ -2364,7 +2387,23 @@ class OpteryxCatalog(SecretsMixin, Metastore):
             moved = sum(1 for _child, target, _rewrite in children if target is not None)
             return {"location": location, "documents_moved": moved + 1}
 
-        result = _rename(self.firestore_client.transaction())
+        # shortcut: the whole rename is ONE Firestore commit, so it is bounded by
+        # Firestore's per-request size (10 MiB). Every snapshot document is
+        # written and deleted in it, so somewhere in the thousands of snapshots
+        # a dataset becomes too big to rename. Firestore refuses atomically -
+        # nothing has changed - and the caller is told what to do about it.
+        staged: dict = {}
+        try:
+            result = _rename(self.firestore_client.transaction())
+        except InvalidArgument as exc:
+            if "documents" not in staged:
+                raise  # refused before any write was staged: not a size problem
+            raise RenameTooLarge(
+                f"Cannot rename {identifier}: Firestore refused the rename transaction "
+                f"({staged['documents']} documents to move, each written and deleted). "
+                "Nothing was changed. Expire old snapshots to make it smaller, then "
+                f"retry. ({exc})"
+            ) from exc
         location = result["location"]
 
         # Inbound references follow the rename rather than breaking. A renamed
@@ -8769,12 +8808,16 @@ class OpteryxCatalog(SecretsMixin, Metastore):
 
     def _set_carrying_vector_indexes(self, doc_ref, document) -> None:
         """Write the dataset document whole, carrying its vector index definitions from
-        a read in the SAME transaction (see catalog/vector_indexes.py)."""
+        a read in the SAME transaction (see catalog/vector_indexes.py).
+
+        Refuses a document that is gone (`_refuse_resurrection`)."""
         from google.cloud import firestore
 
         @firestore.transactional
         def _carry_and_set(transaction) -> None:
-            transaction.set(doc_ref, _carry_vector_indexes(doc_ref.get(transaction=transaction), document))
+            doc = doc_ref.get(transaction=transaction)
+            _refuse_resurrection(doc, document)
+            transaction.set(doc_ref, _carry_vector_indexes(doc, document))
 
         _carry_and_set(self.firestore_client.transaction())
 
@@ -8799,7 +8842,10 @@ class OpteryxCatalog(SecretsMixin, Metastore):
         @firestore.transactional
         def _check_and_set(transaction) -> None:
             doc = doc_ref.get(transaction=transaction)
-            stored = doc.to_dict().get("current-snapshot-id") if doc.exists else None
+            # Before the pointer test: a missing document reads as pointer None,
+            # which a first commit to an empty dataset would otherwise "match".
+            _refuse_resurrection(doc, document)
+            stored = doc.to_dict().get("current-snapshot-id")
             carried = _carry_vector_indexes(doc, document)
             if stored != expected:
                 raise SnapshotRaceError(

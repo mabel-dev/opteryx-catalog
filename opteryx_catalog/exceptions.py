@@ -274,6 +274,15 @@ class DatasetLocationReusable(CatalogError):
     """
 
 
+class RenameTooLarge(CatalogError):
+    """Raised by `rename_dataset` when Firestore refuses its one transaction.
+
+    The rename moves every snapshot document in a single commit, which is bounded
+    by Firestore's request size. Nothing has changed; expiring old snapshots makes
+    the dataset small enough to rename.
+    """
+
+
 class ForkError(CatalogError):
     """A fork operation that cannot be performed as asked.
 

@@ -11,7 +11,9 @@ import json
 import logging
 
 import pytest
+from google.api_core.exceptions import InvalidArgument
 
+from opteryx_catalog.catalog.metadata import DatasetMetadata
 from opteryx_catalog.exceptions import DatasetAlreadyExists
 from opteryx_catalog.exceptions import DatasetLocationReusable
 from opteryx_catalog.exceptions import DatasetLocked
@@ -19,6 +21,7 @@ from opteryx_catalog.exceptions import DatasetNotFound
 from opteryx_catalog.exceptions import ForkError
 from opteryx_catalog.exceptions import MaterializedViewError
 from opteryx_catalog.exceptions import NameInUse
+from opteryx_catalog.exceptions import RenameTooLarge
 from opteryx_catalog.opteryx_catalog import OpteryxCatalog
 
 # A minted location (`OpteryxCatalog._mint_location`): not derivable from any name.
@@ -114,6 +117,8 @@ class _Txn:
         self.writes = []
 
     def _commit(self):
+        if isinstance(self._client.fail_commit, Exception):
+            raise self._client.fail_commit
         if self._client.fail_commit:
             raise RuntimeError("commit failed")
         for kind, ref, data in self.writes:
@@ -351,6 +356,20 @@ def test_a_failed_commit_leaves_the_old_dataset_exactly_as_it_was():
     assert client.docs == before
 
 
+def test_a_transaction_firestore_refuses_as_too_big_says_so_and_changes_nothing():
+    """The whole rename is one commit, bounded by Firestore's request size: a
+    dataset with thousands of snapshots crosses it. The caller is told what to
+    do rather than handed a bare InvalidArgument."""
+    catalog, client = _catalog()
+    before = dict(client.docs)
+    client.fail_commit = InvalidArgument("Request payload size exceeds the limit")
+
+    with pytest.raises(RenameTooLarge, match=r"9 documents to move.*Expire old snapshots"):
+        catalog.rename_dataset("coll.tbl", "newcoll.newtbl", author="alice")
+
+    assert client.docs == before
+
+
 # --- refusals ----------------------------------------------------------------
 
 
@@ -485,6 +504,26 @@ def test_a_rerun_after_the_old_name_is_recreated_does_not_rename_the_newcomer():
         catalog.rename_dataset("coll.tbl", "newcoll.newtbl", author="alice")
 
     assert client.docs == after_first
+
+
+@pytest.mark.parametrize(
+    "expectation",
+    [{}, {"expected_current_snapshot_id": None}],
+    ids=["unconditional-save", "first-commit"],
+)
+def test_a_save_built_before_the_rename_does_not_bring_the_old_name_back(expectation):
+    """A description or annotation saved from metadata loaded before the rename
+    would recreate `coll.tbl` on the renamed dataset's location - and that
+    ghost's expiration would reclaim the renamed dataset's new files."""
+    catalog, client = _catalog()
+    stale = DatasetMetadata(dataset_identifier="coll.tbl", location=LOCATION)
+    catalog.rename_dataset("coll.tbl", "newcoll.newtbl", author="alice")
+    after_rename = dict(client.docs)
+
+    with pytest.raises(DatasetNotFound):
+        catalog.save_dataset_metadata("coll.tbl", stale, **expectation)
+
+    assert client.docs == after_rename
 
 
 # --- what happens after the commit ------------------------------------------
