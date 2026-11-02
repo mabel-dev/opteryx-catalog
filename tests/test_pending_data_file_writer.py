@@ -96,11 +96,16 @@ class _FakeCatalog:
     def _dataset_doc_ref(self, collection, dataset_name):
         return _Ref(self._exists)
 
+    def _location_in_use(self, location):
+        return False
+
     _schema_to_columns = OpteryxCatalog._schema_to_columns
+    _name_location = OpteryxCatalog._name_location
     _mint_location = OpteryxCatalog._mint_location
+    _choose_location = OpteryxCatalog._choose_location
     _reserve_location = OpteryxCatalog._reserve_location
     _take_reservation = OpteryxCatalog._take_reservation
-    _require_minted_location = OpteryxCatalog._require_minted_location
+    _require_creation_location = OpteryxCatalog._require_creation_location
     _initial_field_ids = OpteryxCatalog._initial_field_ids
     open_pending_data_file_writer = OpteryxCatalog.open_pending_data_file_writer
 
@@ -120,9 +125,8 @@ def test_pending_file_lands_under_the_location_reserved_for_the_identifier():
     entry = writer.close()
 
     reserved = catalog._pending_locations["ops.zz_probe"]
-    # Opaque and never derived from the name.
-    assert reserved.startswith("gs://bkt/opteryx/")
-    assert "zz_probe" not in reserved and "/ops/" not in reserved
+    # Nothing is there yet, so the name location.
+    assert reserved == "gs://bkt/opteryx/ops/zz_probe"
     assert entry.file_path.startswith(reserved + "/data/")
     assert entry.file_path in catalog.io.mapping
     assert entry.record_count == 3
@@ -161,11 +165,11 @@ def test_the_writer_reports_its_location_and_takes_it_back():
     assert "ops.zz_probe" not in other_instance.__dict__.get("_pending_locations", {})
 
 
-def test_a_location_that_was_not_minted_is_refused():
+def test_a_location_the_catalog_would_not_allocate_is_refused():
     catalog = _FakeCatalog()
-    with pytest.raises(ValueError, match="not a freshly minted"):
+    with pytest.raises(ValueError, match="not a location the catalog allocates"):
         catalog.open_pending_data_file_writer(
-            "ops.zz_probe", SCHEMA, location="gs://bkt/opteryx/ops/zz_probe"
+            "ops.zz_probe", SCHEMA, location="gs://bkt/opteryx/ops/other_name"
         )
 
 

@@ -5,6 +5,15 @@ Q1/Q2 were built on the recommendations below when the architect asked for the c
 read-doc / create-doc / drop-doc in ONE Firestore transaction and moves no bytes.
 Everything under "Open questions" is not decided - it is for the architect.
 
+**2026-11-02 - Q1 overruled by the architect:** "the name should be detached from the path but
+not forced to be different". A new dataset gets `gs://<bucket>/<workspace>/<collection>/<name>`;
+only when that is in use (a live dataset records it - a rename carried it away - or objects are
+stored under it - a drop awaiting reconciliation) does it get a minted `<uuid4 hex>` location
+(architect chose "different path" over refusing). The location is still stored and never
+re-derived, so rename stays metadata-only. `_choose_location` / `_location_in_use` /
+`_require_creation_location`; tests in `tests/test_create_location.py`. The opaque-by-default
+rule below caused the upload service's ForeignFilePathError (it writes under the name path).
+
 ## What is already true
 
 A dataset's `location` is **already stored** on its Firestore doc. `create_dataset`
@@ -30,7 +39,7 @@ keep re-deriving from ground truth (bucket vs. claimed locations) and loses noth
 | | Before | Now |
 |---|---|---|
 | `rename_dataset` | copy files, rewrite manifests, write new entry, delete old, delete superseded files; not atomic | one transaction: read every doc, create under new name, delete old; `location` carried **verbatim**; no storage I/O |
-| `create_dataset` | location = derived from `(collection, name)` | location = `gs://<bucket>/<workspace>/<uuid4 hex>`, minted (`_mint_location`), stored, never re-derived; optional `location=` accepted only if of that shape |
+| `create_dataset` | location = derived from `(collection, name)` | location = `gs://<bucket>/<workspace>/<collection>/<name>` when not in use, else minted `gs://<bucket>/<workspace>/<uuid4 hex>` (`_choose_location`, 2026-11-02); stored, never re-derived; optional `location=` accepted only if one of those two |
 | `open_pending_data_file_writer` | wrote under the derived location | writes under a location RESERVED per identifier (`_reserve_location`, in-process); the following `create_dataset` takes it |
 | `_dataset_from_doc` | `data.get("location") or <derive>` | unchanged - now serves only stubs, which own no files (Q3) |
 
@@ -95,7 +104,8 @@ Outside this repo:
 
 ## Open questions (architect)
 
-**Q1 - Location format. BUILT as recommended, minus the id field.** `location =
+**Q1 - Location format. SUPERSEDED 2026-11-02 (see the note at the top): name location unless in use.**
+What was built on 2026-10-30, as recommended, minus the id field: `location =
 gs://<bucket>/<workspace>/<uuid4 hex>` - opaque, no collection or name in it, so it
 stays true across a rename (including cross-collection). Costs: the bucket stops
 being human-browsable by name; anything listing `<workspace>/<collection>/` by prefix

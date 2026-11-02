@@ -172,6 +172,8 @@ def _catalog():
     catalog._snapshot_cache = {}
     catalog._schema_cache = {}
     catalog._catalog_ref = _Collection("ws")
+    # Location allocation is tested in test_create_location.py.
+    catalog._location_in_use = lambda location: False
     return catalog
 
 

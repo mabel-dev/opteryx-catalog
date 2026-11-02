@@ -654,6 +654,8 @@ def test_create_dataset_initializes_lock_fields_to_none():
     catalog._schema_cache = {}
     log = []
     catalog._catalog_ref = _Collection("ws", log=log)
+    # Location allocation is tested in test_create_location.py.
+    catalog._location_in_use = lambda location: False
 
     with patch("opteryx_catalog.opteryx_catalog.send_webhook"):
         catalog.create_dataset("coll.tbl", schema=None, author="alice")

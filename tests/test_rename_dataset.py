@@ -76,6 +76,12 @@ class _Coll:
     def document(self, doc_id):
         return _Ref(self._client, self.path + (doc_id,))
 
+    def list_documents(self):
+        # Firestore lists a parent with subcollections even when it has no fields.
+        n = len(self.path)
+        ids = sorted({p[n] for p in self._client.docs if len(p) > n and p[:n] == self.path})
+        return [_Ref(self._client, self.path + (i,)) for i in ids]
+
     def stream(self, transaction=None):
         if transaction is not None:
             transaction.check_read()

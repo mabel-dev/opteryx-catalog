@@ -1211,32 +1211,70 @@ class OpteryxCatalog(SecretsMixin, Metastore):
         for doc in coll_ref.stream():
             coll_ref.document(doc.id).delete()
 
+    def _name_location(self, identifier: str) -> str:
+        """`gs://<bucket>/<workspace>/<collection>/<name>`: where a new dataset
+        goes when nothing else is there (architect, 2026-11-02: the location is
+        detached from the name - stored, never re-derived - but not forced to
+        differ from it)."""
+        collection, dataset_name = identifier.split(".")
+        return f"gs://{self.gcs_bucket}/{self.workspace}/{collection}/{dataset_name}"
+
     def _mint_location(self) -> str:
         """A storage location no dataset has had and none will ever have.
 
-        `gs://<bucket>/<workspace>/<uuid4 hex>`: opaque on purpose. Nothing in
-        it is a collection or a dataset name, so a rename (which moves no
-        bytes) leaves it true, and a dropped or renamed-away name can never
-        derive it again - the property that makes a metadata-only rename safe
-        and a persisted note of a dropped location harmless
-        (RENAME_METADATA_ONLY_DESIGN.md). The dataset document stores it, and
-        the stored value is the only authority: it is never re-derived.
+        `gs://<bucket>/<workspace>/<uuid4 hex>`. Used only when a new dataset's
+        name location is already in use (`_choose_location`): a dataset renamed
+        away still owns the old name's prefix, and a dropped one's files stay
+        there until reconciliation reclaims them.
         """
         return f"gs://{self.gcs_bucket}/{self.workspace}/{uuid.uuid4().hex}"
 
-    def _require_minted_location(self, location: str) -> None:
-        """Refuse (ValueError) a `location` not of the shape `_mint_location`
-        produces here: a caller-chosen path is how two datasets end up on one
+    def _location_in_use(self, location: str) -> bool:
+        """True when a live dataset in this workspace records `location`, or any
+        object is stored under it.
+
+        Every collection is checked, not just the new dataset's: a rename
+        carries its location verbatim, across collections too. Storage is
+        listed through the GCS client because `FileIO.list_files` reports a
+        failed listing as empty, which here would hand out an occupied prefix.
+        """
+        for collection_ref in self._catalog_ref.list_documents():
+            for doc in collection_ref.collection("datasets").stream():
+                if (doc.to_dict() or {}).get("location") == location:
+                    return True
+        if self._storage_client is not None and self.gcs_bucket:
+            blobs = self._storage_client.list_blobs(
+                self.gcs_bucket, prefix=self._blob_name(location) + "/", max_results=1
+            )
+            return any(True for _ in blobs)
+        # shortcut: a storage-less catalog (local FileIO) cannot tell a failed listing
+        # from an empty one; upgrade if a non-GCS catalog ever serves shared datasets.
+        return bool(self.io.list_files(location + "/"))
+
+    def _choose_location(self, identifier: str) -> str:
+        """The name location when it is free, else a minted one."""
+        location = self._name_location(identifier)
+        return self._mint_location() if self._location_in_use(location) else location
+
+    def _require_creation_location(self, identifier: str, location: str) -> None:
+        """Refuse (ValueError) a `location` that `_choose_location` could not have
+        given `identifier`: a caller-chosen path is how two datasets end up on one
         prefix."""
         prefix = f"gs://{self.gcs_bucket}/{self.workspace}/"
         if not (
             isinstance(location, str)
-            and location.startswith(prefix)
-            and re.fullmatch(r"[0-9a-f]{32}", location[len(prefix) :])
+            and (
+                location == self._name_location(identifier)
+                or (
+                    location.startswith(prefix)
+                    and re.fullmatch(r"[0-9a-f]{32}", location[len(prefix) :])
+                )
+            )
         ):
             raise ValueError(
-                f"location {location!r} is not a freshly minted location of workspace "
-                f"{self.workspace!r}; locations are allocated by the catalog, not chosen"
+                f"location {location!r} is not a location the catalog allocates for "
+                f"{identifier!r} in workspace {self.workspace!r}; locations are "
+                "allocated by the catalog, not chosen"
             )
 
     def _reserve_location(self, identifier: str) -> str:
@@ -1244,8 +1282,8 @@ class OpteryxCatalog(SecretsMixin, Metastore):
 
         A CTAS streams its data files BEFORE the dataset exists, so the
         location has to be decided first and then honoured by the
-        `create_dataset` that follows. The first call for an identifier mints
-        one; every later call (one per data file) returns the same, and
+        `create_dataset` that follows. The first call for an identifier chooses
+        one (`_choose_location`); every later call (one per data file) returns the same, and
         `create_dataset` consumes it. Held on this catalog instance, not in
         Firestore: the pending writer touches no catalog document, and a
         reservation that dies with the process costs only the orphaned files of
@@ -1259,7 +1297,7 @@ class OpteryxCatalog(SecretsMixin, Metastore):
         with _RESERVATION_LOCK:
             reservations = self.__dict__.setdefault("_pending_locations", {})
             if identifier not in reservations:
-                reservations[identifier] = self._mint_location()
+                reservations[identifier] = self._choose_location(identifier)
             return reservations[identifier]
 
     def _take_reservation(self, identifier: str) -> str | None:
@@ -1304,8 +1342,8 @@ class OpteryxCatalog(SecretsMixin, Metastore):
 
         So this takes the schema the dataset is about to be created WITH. The
         field-ids are derived from it through the very helper `create_dataset`
-        uses (`1..N`, a pure function of the schema). The location is not
-        derivable from anything - it is a fresh never-reused one - so it is
+        uses (`1..N`, a pure function of the schema). The location depends on
+        what is already in use (`_choose_location`), so it is
         RESERVED for this identifier (`_reserve_location`): every file of the
         statement lands under it, and the `create_dataset` that follows takes
         it (or is handed it explicitly, via `location=`).
@@ -1313,8 +1351,8 @@ class OpteryxCatalog(SecretsMixin, Metastore):
         The writer reports it as `.location`. A caller that carries it with the
         statement passes it back as `location=` for every later file and to
         `create_dataset(location=...)`, which does not depend on reaching this
-        same catalog instance again. It must be a minted location (ValueError
-        otherwise) - the same rule `create_dataset` applies.
+        same catalog instance again. It must be this identifier's name location
+        or a minted one (ValueError otherwise) - the same rule `create_dataset` applies.
 
         Nothing here mutates the catalog. The files are registered when the
         caller follows with `create_dataset` and a commit that takes their
@@ -1334,7 +1372,7 @@ class OpteryxCatalog(SecretsMixin, Metastore):
         if location is None:
             location = self._reserve_location(identifier)
         else:
-            self._require_minted_location(location)
+            self._require_creation_location(identifier, location)
 
         field_ids = self._initial_field_ids(schema)
         columns = self._schema_to_columns(schema, field_ids=field_ids)
@@ -1360,14 +1398,16 @@ class OpteryxCatalog(SecretsMixin, Metastore):
         author: str | None = None,
         location: str | None = None,
     ) -> SimpleDataset:
-        """Create a dataset, giving it a storage location nobody has had before.
+        """Create a dataset at `gs://<bucket>/<workspace>/<collection>/<name>`, or
+        at a minted location when that one is in use (`_choose_location`).
 
-        The location is never derived from the name. It is the one reserved by
+        The location is stored on the document and never re-derived, so a later
+        rename leaves it where it is. It is the one reserved by
         `open_pending_data_file_writer` for this identifier if a CTAS wrote
-        files first, else a fresh one. `location` hands one over explicitly -
-        it must be of the shape `_mint_location` produces in this workspace,
-        and is refused (ValueError) otherwise: a caller-chosen path is how two
-        datasets end up on one prefix.
+        files first, else chosen now. `location` hands one over explicitly - it
+        must be this identifier's name location or a minted one, and is refused
+        (ValueError) otherwise: a caller-chosen path is how two datasets end up
+        on one prefix.
         """
         if author is None:
             raise ValueError("author must be provided when creating a dataset")
@@ -1469,13 +1509,14 @@ class OpteryxCatalog(SecretsMixin, Metastore):
 
     def _creation_location(self, identifier: str, location: str | None) -> str:
         """The storage location a new dataset is created at: `location` when the
-        caller holds one (a CTAS's pending writers), which must be minted here and
-        settles any reservation; else the reservation for this name, else fresh."""
+        caller holds one (a CTAS's pending writers), which must be one this catalog
+        allocates and settles any reservation; else the reservation for this name,
+        else chosen now."""
         if location is not None:
-            self._require_minted_location(location)
+            self._require_creation_location(identifier, location)
             self._take_reservation(identifier)
             return location
-        return self._take_reservation(identifier) or self._mint_location()
+        return self._take_reservation(identifier) or self._choose_location(identifier)
 
     def _announce_dataset_created(
         self, collection: str, dataset_name: str, schema: Any, location: str, properties, author
@@ -2078,11 +2119,10 @@ class OpteryxCatalog(SecretsMixin, Metastore):
         Nothing records where they were, deliberately: reclamation re-derives
         the answer from ground truth - storage that no live dataset claims is
         orphaned, found by comparing what is physically in the bucket against
-        the locations the catalog currently holds. (A dataset created now has a
-        minted, never-reused location, so a dropped one can never be bound to a
-        new dataset. Datasets created before that have a location derived from
-        their name, which `create_dataset` no longer produces, so the same holds
-        for them.)
+        the locations the catalog currently holds. (A dataset created under the
+        dropped name gets a minted location while these files are still there -
+        `_choose_location` treats a non-empty prefix as in use - so they are
+        never bound to it.)
 
         Raises `DatasetLocked` if the dataset's `locked-by` field is set -
         the two-person deniability lock takes precedence over the drop.

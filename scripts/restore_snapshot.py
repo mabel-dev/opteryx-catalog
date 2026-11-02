@@ -358,9 +358,9 @@ def cmd_restore(args) -> None:
     if target_ref.get().exists:
         sys.exit(f"target dataset {args.target!r} already exists; refusing to overwrite")
 
-    # A fresh never-reused location, minted by the catalog: a location derived
-    # from the target's name is how two datasets once shared a prefix.
-    target_location = catalog._mint_location()
+    # The location the catalog would give a new dataset of that name: its name
+    # location when free, else a minted one.
+    target_location = catalog._choose_location(args.target)
     target_prefix = _blob_name(target_location, bucket_name) + "/"
     if any(storage_client.list_blobs(bucket_name, prefix=target_prefix, max_results=1)):
         sys.exit(f"target location is not empty: {target_location}")
