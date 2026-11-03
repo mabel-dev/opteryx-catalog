@@ -691,8 +691,9 @@ else:
 ```
 
 Scheduling is handled by the `xb500.opteryx` housekeeping service (Cloud
-Scheduler → `/housekeeping/trigger_compaction`), which walks allowlisted
-collections and audits every dataset it evaluates. See
+Scheduler → `/housekeeping/trigger_compaction`), which submits `OPTIMIZE` as
+`federator` for every dataset that identity may write — workspaces with
+maintenance turned on, plus `public` and `samples`. See
 [COMPACTION.md](COMPACTION.md).
 
 Rules `brute` and `sort_aware` are independent. To attempt both in one tick,

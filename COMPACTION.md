@@ -106,15 +106,35 @@ DatasetCompactor(dataset, author="me").compact()
 
 Scheduling lives outside this library, in the `xb500.opteryx` housekeeping
 service: Cloud Scheduler calls its `/housekeeping/trigger_compaction`
-endpoint, which discovers workspaces from Firestore, walks the allowlisted
-collections, and calls `compact()` per dataset — writing one audit row per
-dataset evaluated to `opteryx.ops.compaction_log`. See
+endpoint, which discovers workspaces from Firestore and submits
+`OPTIMIZE TABLE <workspace>.<collection>.<dataset>` to the jobs API as the
+`federator` identity, returning without waiting for the statement. See
 `xb500.opteryx/app/operations/trigger_compaction.py`.
 
-Compaction there is opt-in per collection: only `workspace.collection` names
-in `COMPACTION_ALLOWED_COLLECTIONS` (default `opteryx.ops`) are ever
-rewritten, with `COMPACTION_BLOCKED_WORKSPACES` (default `benchmarks`)
-applied on top, so a newly discovered workspace is inert by default.
+What is in scope is decided by access policy, not service configuration: a
+dataset is compacted only if `federator` holds WRITE on it (the same check
+the engine applies to `OPTIMIZE`). That access comes from two places:
+
+- `ALTER WORKSPACE <ws> SET maintenance TO ON|OFF`, which grants or revokes
+  `federator`'s writer access in an ordinary workspace — so a newly
+  created workspace is not compacted until it opts in.
+- The implicit grants in `opteryx_access.checks.implicit_grants`: platform
+  identities (`federator`, `xb500`) hold `writer` on `public.*` and
+  `samples.*`, so both workspaces are always in scope without any policy
+  being issued.
+
+`COMPACTION_BLOCKED_WORKSPACES` (default `benchmarks,personal`) is the only
+exclusion applied on top. `benchmarks` is blocked because its file layout is
+deliberate and rewriting it would change what the benchmarks measure;
+`personal` because nobody's personal datasets are this job's to maintain.
+
+A permitted dataset is only submitted if it is worth it: it has more than one
+file, it is not a materialized view's backing table (which `OPTIMIZE` cannot
+write), and `compact(dry_run=True)` returns a plan.
+
+The trigger records nothing itself. The catalog emits an audit row when it
+commits a compaction snapshot, and `ops.compaction_log_ingest` unpacks those
+into `opteryx.ops.compaction_log`.
 
 For working through a backlog outside the request-timeout of a container,
 `scripts/catchup_compaction.py` loops `compact()` per dataset on a
@@ -258,7 +278,8 @@ Sizing is not property-driven either: it comes from the module constants in
 ### Scheduled Compaction
 
 Driven by Cloud Scheduler against the `xb500.opteryx` housekeeping service —
-see "Scheduled Trigger" above for the endpoint, allowlist, and audit log.
+see "Scheduled Trigger" above for the endpoint, what is in scope, and the
+audit log.
 
 ## Future Enhancements
 
