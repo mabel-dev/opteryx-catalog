@@ -18,6 +18,7 @@ from ..exceptions import ForeignFilePathError
 from ..exceptions import ManifestReadError
 from ..exceptions import SnapshotAncestryTooDeep
 from ..exceptions import SnapshotMissingError
+from ..exceptions import SnapshotRaceError
 from ..exceptions import SummaryInconsistencyError
 from ..resource_types import ResourceType
 from .manifest import ParquetManifestEntry
@@ -56,6 +57,16 @@ _NODE = f"{uuid.getnode():x}-{os.getpid():x}"
 # for the real gap between two user commits (compaction and statistics refresh,
 # so single digits) with several orders of magnitude of headroom.
 MAX_ANCESTOR_WALK = 200
+
+# Commits an append may be rebased over (`SimpleDataset._rebase_onto_current`): they add
+# rows or change no rows - compaction rewrites files, the others touch only statistics or
+# index sidecars. Anything not listed keeps the race (architect, 2026-11-03).
+REBASE_SAFE_OPERATIONS = frozenset(
+    {"append", "add-files", "compact", "statistics-refresh", "index-build", "index-drop"}
+)
+
+# add_files tries its commit this many times: the first, then a rebase per race lost.
+ADD_FILES_COMMIT_ATTEMPTS = 3
 
 logger = logging.getLogger(__name__)
 
@@ -2227,7 +2238,7 @@ class SimpleDataset(Dataset):
           (there's no ranged/partial-read path in `FileIO` yet) — it saves
           decode CPU, not network transfer.
         """
-        snap = self._stage_add_files(
+        snap, new_entries = self._stage_add_files_entries(
             files=files,
             author=author,
             commit_message=commit_message,
@@ -2238,11 +2249,55 @@ class SimpleDataset(Dataset):
             manifest=manifest,
             index_files=index_files,
         )
-        if self.catalog and hasattr(self.catalog, "save_snapshot"):
-            self.catalog.save_snapshot(self.identifier, snap)
-        self._persist_metadata()
+        for attempt in range(1, ADD_FILES_COMMIT_ATTEMPTS + 1):
+            if self.catalog and hasattr(self.catalog, "save_snapshot"):
+                self.catalog.save_snapshot(self.identifier, snap)
+            try:
+                self._persist_metadata()
+                break
+            except SnapshotRaceError:
+                if attempt == ADD_FILES_COMMIT_ATTEMPTS or not self._rebase_onto_current():
+                    raise
+            # The entries built the first time are reused - index refs and all - so a rebase
+            # never reads the files again; the new parent's manifest decides what is new.
+            snap, new_entries = self._stage_add_files_entries(
+                author=author,
+                commit_message=commit_message,
+                read_sources=read_sources,
+                produced_by=produced_by,
+                entries=new_entries,
+            )
 
         self._after_commit(author, snap)
+
+    def _rebase_onto_current(self) -> bool:
+        """Re-read the dataset and take its current snapshot as this commit's parent - only
+        when every commit that landed since the one this was built against is an append or
+        changes no rows (`REBASE_SAFE_OPERATIONS`), and the schema has not moved.
+
+        Appends commute with those: a reader of the rebased commit sees exactly the rows
+        the winner published plus this commit's. Anything else (an overwrite, a truncate, a
+        delete, a merge, an operation not listed) may have removed rows this commit's
+        author saw, so the race stands (architect, 2026-11-03). The lost attempt's snapshot
+        document stays behind unreferenced, as it does for any race.
+        """
+        built_against = self._expected_current_snapshot_id
+        fresh = self.catalog.load_dataset(self.identifier)
+        if fresh.metadata.current_schema_id != self.metadata.current_schema_id:
+            return False
+        sid = fresh.metadata.current_snapshot_id
+        for _ in range(MAX_ANCESTOR_WALK):
+            if sid == built_against:
+                break
+            snap = fresh.snapshot(sid) if sid is not None else None
+            if snap is None or snap.operation_type not in REBASE_SAFE_OPERATIONS:
+                return False
+            sid = snap.parent_snapshot_id
+        else:
+            return False
+        self._metadata = fresh.metadata
+        self._expected_current_snapshot_id = _NO_SNAPSHOT_EXPECTATION
+        return True
 
     def _stage_add_files(
         self,
@@ -2262,6 +2317,31 @@ class SimpleDataset(Dataset):
         to an existing dataset; `OpteryxCatalog.create_dataset_with_files`
         persists it in the same transaction that creates the dataset.
         """
+        return self._stage_add_files_entries(
+            files=files,
+            author=author,
+            commit_message=commit_message,
+            footer_only=footer_only,
+            read_sources=read_sources,
+            produced_by=produced_by,
+            entries=entries,
+            manifest=manifest,
+            index_files=index_files,
+        )[0]
+
+    def _stage_add_files_entries(
+        self,
+        files: list[str] | None = None,
+        author: str | None = None,
+        commit_message: str | None = None,
+        footer_only: bool = False,
+        read_sources: Iterable[Any] | None = None,
+        produced_by: str | None = None,
+        entries: Iterable[dict] | None = None,
+        manifest: bytes | None = None,
+        index_files: dict | None = None,
+    ) -> tuple[Snapshot, list[dict]]:
+        """`_stage_add_files`, also returning the entries the commit adds."""
         entries = self._manifest_entries(entries, manifest, "add_files")
         if author is None:
             raise ValueError("author must be provided when adding files to a dataset")
@@ -2352,7 +2432,7 @@ class SimpleDataset(Dataset):
         self._stamp_provenance(snap, read_sources, produced_by)
         self.metadata.snapshots.append(snap)
         self._advance_current_snapshot(snapshot_id)
-        return snap
+        return snap, new_entries
 
     def truncate_and_add_files(
         self,
