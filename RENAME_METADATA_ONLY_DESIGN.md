@@ -7,9 +7,10 @@ Everything under "Open questions" is not decided - it is for the architect.
 
 **2026-11-02 - Q1 overruled by the architect:** "the name should be detached from the path but
 not forced to be different". A new dataset gets `gs://<bucket>/<workspace>/<collection>/<name>`;
-only when that is in use (a live dataset records it - a rename carried it away - or objects are
-stored under it - a drop awaiting reconciliation) does it get a minted `<uuid4 hex>` location
-(architect chose "different path" over refusing). The location is still stored and never
+only when that is in use (a live dataset records it - a rename carried it away) does it get a
+minted `<uuid4 hex>` location (architect chose "different path" over refusing). 2026-11-03:
+objects under the prefix no longer count - the upload service stages a contract's files there
+before the commit creates the dataset, so the storage test minted every upload-created dataset. The location is still stored and never
 re-derived, so rename stays metadata-only. `_choose_location` / `_location_in_use` /
 `_require_creation_location`; tests in `tests/test_create_location.py`. The opaque-by-default
 rule below caused the upload service's ForeignFilePathError (it writes under the name path).

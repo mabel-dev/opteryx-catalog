@@ -1224,32 +1224,23 @@ class OpteryxCatalog(SecretsMixin, Metastore):
 
         `gs://<bucket>/<workspace>/<uuid4 hex>`. Used only when a new dataset's
         name location is already in use (`_choose_location`): a dataset renamed
-        away still owns the old name's prefix, and a dropped one's files stay
-        there until reconciliation reclaims them.
+        away still owns the old name's prefix.
         """
         return f"gs://{self.gcs_bucket}/{self.workspace}/{uuid.uuid4().hex}"
 
     def _location_in_use(self, location: str) -> bool:
-        """True when a live dataset in this workspace records `location`, or any
-        object is stored under it.
+        """True when a live dataset in this workspace records `location`.
 
         Every collection is checked, not just the new dataset's: a rename
-        carries its location verbatim, across collections too. Storage is
-        listed through the GCS client because `FileIO.list_files` reports a
-        failed listing as empty, which here would hand out an occupied prefix.
+        carries its location verbatim, across collections too. Storage is NOT
+        consulted: a writer (the upload service, CTAS) stages its files under the
+        name location before the dataset exists, so objects there mean nothing.
         """
         for collection_ref in self._catalog_ref.list_documents():
             for doc in collection_ref.collection("datasets").stream():
                 if (doc.to_dict() or {}).get("location") == location:
                     return True
-        if self._storage_client is not None and self.gcs_bucket:
-            blobs = self._storage_client.list_blobs(
-                self.gcs_bucket, prefix=self._blob_name(location) + "/", max_results=1
-            )
-            return any(True for _ in blobs)
-        # shortcut: a storage-less catalog (local FileIO) cannot tell a failed listing
-        # from an empty one; upgrade if a non-GCS catalog ever serves shared datasets.
-        return bool(self.io.list_files(location + "/"))
+        return False
 
     def _choose_location(self, identifier: str) -> str:
         """The name location when it is free, else a minted one."""
@@ -2120,9 +2111,10 @@ class OpteryxCatalog(SecretsMixin, Metastore):
         the answer from ground truth - storage that no live dataset claims is
         orphaned, found by comparing what is physically in the bucket against
         the locations the catalog currently holds. (A dataset created under the
-        dropped name gets a minted location while these files are still there -
-        `_choose_location` treats a non-empty prefix as in use - so they are
-        never bound to it.)
+        dropped name takes the same name location; files still there are then
+        under a claimed prefix but unreferenced - no manifest names them - and
+        a drop with forks standing on it is refused below, so no borrowed path
+        can land under a reused prefix.)
 
         Raises `DatasetLocked` if the dataset's `locked-by` field is set -
         the two-person deniability lock takes precedence over the drop.

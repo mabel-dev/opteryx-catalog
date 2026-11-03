@@ -3,8 +3,9 @@
 The location is detached from the name - stored on the document, never re-derived,
 so a rename leaves it where it is - but not forced to differ from it (architect,
 2026-11-02). A new dataset gets `gs://<bucket>/<workspace>/<collection>/<name>`;
-when a live dataset records that location (it was renamed away) or objects are
-stored under it (a drop's files awaiting reconciliation), it gets a minted one.
+only when a live dataset records that location (it was renamed away) does it get a
+minted one. Objects under the name location do not count: the upload service stages a
+contract's files there before the commit creates the dataset.
 """
 
 from __future__ import annotations
@@ -28,18 +29,10 @@ MINTED = re.compile(r"^gs://bucket/ws/[0-9a-f]{32}$")
 
 
 class _Storage:
-    """A GCS client fake holding object names; a listing can be made to fail."""
-
-    def __init__(self):
-        self.objects = set()
-        self.broken = False
+    """A GCS client fake that fails any listing: choosing a location must not consult storage."""
 
     def list_blobs(self, bucket, prefix="", max_results=None):
-        assert bucket == "bucket"
-        if self.broken:
-            raise RuntimeError("storage unavailable")
-        names = sorted(n for n in self.objects if n.startswith(prefix))
-        return iter(names[:max_results])
+        raise AssertionError(f"storage listed for {prefix!r}")
 
 
 @pytest.fixture
@@ -90,31 +83,17 @@ def test_a_rename_into_another_collection_still_claims_its_location(catalog):
     assert MINTED.match(_location(catalog, "coll", "tbl"))
 
 
-def test_a_dropped_datasets_files_keep_the_name_location_out_of_use(catalog):
+def test_a_dropped_datasets_name_location_is_given_to_the_next_dataset(catalog):
+    """Regression (2026-11-03): the upload service stages files under the name location,
+    then commits; counting those objects as "in use" minted a uuid location and the
+    commit was refused (ForeignFilePathError). Only a live dataset's claim counts."""
     catalog.create_dataset("coll.tbl", None, author="alice")
-    catalog._storage_client.objects.add("ws/coll/tbl/data/part-0.parquet")
-    # Dropping is exercised elsewhere; here the document just goes, the files stay.
+    # Dropping is exercised elsewhere; here the document just goes.
     del catalog.firestore_client.docs[("ws", "coll", "datasets", "tbl")]
 
     catalog.create_dataset("coll.tbl", None, author="alice")
 
-    assert MINTED.match(_location(catalog, "coll", "tbl"))
-
-
-def test_a_sibling_prefix_is_not_mistaken_for_the_name_location(catalog):
-    catalog._storage_client.objects.add("ws/coll/tbl2/data/part-0.parquet")
-
-    catalog.create_dataset("coll.tbl", None, author="alice")
-
     assert _location(catalog, "coll", "tbl") == "gs://bucket/ws/coll/tbl"
-
-
-def test_a_failed_storage_listing_fails_the_create(catalog):
-    catalog._storage_client.broken = True
-
-    with pytest.raises(RuntimeError, match="storage unavailable"):
-        catalog.create_dataset("coll.tbl", None, author="alice")
-    assert ("ws", "coll", "datasets", "tbl") not in catalog.firestore_client.docs
 
 
 def test_a_ctas_reservation_is_the_location_create_takes(catalog):
