@@ -205,16 +205,23 @@ def get_arrow_manifest(io: Any, manifest_path: str) -> ArrowManifest:
     return ArrowManifest(columns, row_count, sketch_vectors)
 
 
-def seed_arrow_manifest(manifest_path: str, data: bytes) -> ArrowManifest:
+def seed_arrow_manifest(manifest_path: str, data: bytes) -> None:
     """Populate the columnar cache from manifest bytes already in hand (the
     write path holds them at upload time). One decode serves the planner's
     columnar reads AND, via ``manifest.seed_parsed_manifest``, the commit
-    path's row dicts. Replaces any stale entry at the same path."""
+    path's row dicts. Replaces any stale entry at the same path.
+
+    A manifest too large for the cache is not decoded at all: decoding it only
+    for ``_cache_store`` to refuse it was a full extra decode (~1 GB for a 28 MB
+    manifest) at the commit's memory peak - the moment upload instances died of
+    OOM on 2026-11-04."""
+    if len(data) * MANIFEST_CACHE_INFLATION > MANIFEST_CACHE_BYTES:
+        invalidate_arrow_manifest(manifest_path)
+        return
     columns, row_count, sketch_vectors = read_manifest_columns(
         data, keep_native=_SKETCH_VECTOR_COLUMNS
     )
     _cache_store(manifest_path, (columns, row_count, sketch_vectors), len(data))
-    return ArrowManifest(columns, row_count, sketch_vectors)
 
 
 def get_parsed_manifest(io: Any, manifest_path: str) -> list:

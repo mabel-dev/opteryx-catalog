@@ -1488,10 +1488,129 @@ def encode_parquet_manifest(entries: list[dict]) -> bytes:
                     values, element_type=_dn.DrakenType.UINT64.value, nesting_depth=2
                 ),
             )
+        elif dtype == "ARRAY":
+            # Leaf type and depth pinned, never inferred: a batch whose lists are
+            # all empty would otherwise be written one level shallower, or with an
+            # INT64 leaf where an indexed batch writes VARCHAR, and its manifest
+            # could not be appended to one written from a fuller batch.
+            varchar, depth = _ARRAY_COLUMN_SHAPES[name]
+            leaf = _dn.DrakenType.VARCHAR if varchar else _dn.DrakenType.INT64
+            morsel.append_vector(
+                name,
+                _dn.vector_array_from_sequence(values, element_type=leaf.value, nesting_depth=depth),
+            )
         else:
             morsel.append_vector(name, vector_from_sequence(values, dtype=dtype))
 
     return write_parquet(morsel, **WRITE_PARQUET_OPTIONS)
+
+
+# (VARCHAR leaf? else INT64, nesting depth) of every ARRAY manifest column but min_k_hashes,
+# as the encoder writes them from full data.
+_ARRAY_COLUMN_SHAPES = {
+    "column_uncompressed_sizes_in_bytes": (False, 1),
+    "null_counts": (False, 1),
+    "histogram_counts": (False, 2),
+    "min_values": (False, 1),
+    "max_values": (False, 1),
+    "min_lengths": (False, 1),
+    "max_lengths": (False, 1),
+    "field_ids": (False, 1),
+    "char_class_counts": (False, 2),
+    "char_total_bytes": (False, 1),
+    "element_min_values": (False, 1),
+    "element_max_values": (False, 1),
+    "element_min_k_hashes": (False, 2),
+    "distinct_counts": (False, 1),
+    "vidx_ids": (True, 1),
+    "vidx_paths": (True, 1),
+    "vidx_bytes": (False, 1),
+    "vidx_footer_bytes": (False, 1),
+    "vidx_logical_bytes": (False, 1),
+}
+
+
+# What an append needs from the parent manifest: the paths it holds (so a file
+# is not registered twice) and what the snapshot totals are summed from
+# (`Dataset._totals_from_entries`, `index_totals`). Everything else - the
+# statistics, ~95% of a manifest's decoded size - is copied, never decoded.
+_SUMMARY_COLUMNS = (
+    "file_path",
+    "record_count",
+    "file_size_in_bytes",
+    "uncompressed_size_in_bytes",
+    "vidx_ids",
+    "vidx_paths",
+    "vidx_bytes",
+    "vidx_footer_bytes",
+    "vidx_logical_bytes",
+)
+
+
+def _read_projected_rows(data: bytes, columns) -> list[dict]:
+    from rugo import parquet as _rugo_parquet
+
+    values: dict[str, list] = {}
+    with _rugo_parquet.read_parquet(bytes(data), columns=list(columns)) as reader:
+        for morsel in reader:
+            for name in columns:
+                col = morsel.column(name).to_pylist()
+                # Frozen like read_manifest_columns' cells, which index_refs expects.
+                values.setdefault(name, []).extend(
+                    tuple(c) if isinstance(c, list) else c for c in col
+                )
+    count = len(values[columns[0]]) if values else 0
+    return [{name: values[name][i] for name in columns} for i in range(count)]
+
+
+def manifest_file_paths(data: bytes) -> list[str]:
+    """The data file paths a manifest holds, decoding nothing else."""
+    return [row["file_path"] for row in _read_projected_rows(data, ("file_path",))]
+
+
+def manifest_has_summary_columns(data: bytes) -> bool:
+    """Whether a manifest carries every `_SUMMARY_COLUMNS` (an older encoder's may not)."""
+    names = {name for name, *_ in _manifest_schema(data)}
+    return all(name in names for name in _SUMMARY_COLUMNS)
+
+
+def manifest_summary_rows(data: bytes) -> list[dict]:
+    """Rows of a manifest in the current schema, holding only `_SUMMARY_COLUMNS`."""
+    return _read_projected_rows(data, _SUMMARY_COLUMNS)
+
+
+def _manifest_schema(data: bytes) -> tuple:
+    """Every column's name and LEAF type and nesting, as its chunks are written -
+    what rugo's append requires to agree. A manifest with no row groups has none."""
+    from rugo.rugo_native import read_rowgroup_stats
+
+    row_groups = read_rowgroup_stats(bytes(data))
+    if not row_groups:
+        return ()
+    return tuple(
+        (c["name"], c["physical_type"], c["logical_type"], c["max_repetition_level"])
+        for c in row_groups[0]["columns"]
+    )
+
+
+def append_manifest_entries(parent: bytes, entries: list[dict]) -> bytes | None:
+    """`parent` with `entries` appended as new row groups, without decoding `parent`.
+
+    The parent's row groups are copied byte for byte (rugo `append_row_groups`),
+    so this costs the parent's compressed size, where re-encoding the cumulative
+    manifest costs its decoded size - over 1 GB for a 28 MB manifest. Returns
+    None when the parent is not in the schema the encoder writes for `entries`
+    (a manifest from an older encoder): the caller re-encodes it once instead.
+    """
+    from rugo.parquet import append_row_groups
+
+    from ..iops.fileio import WRITE_PARQUET_OPTIONS
+
+    added = encode_parquet_manifest(entries)
+    parent_schema = _manifest_schema(parent)
+    if not parent_schema or parent_schema != _manifest_schema(added):
+        return None
+    return append_row_groups(bytes(parent), added, **WRITE_PARQUET_OPTIONS)
 
 
 def get_manifest_metrics() -> dict:

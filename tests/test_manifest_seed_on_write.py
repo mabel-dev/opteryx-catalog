@@ -76,6 +76,27 @@ def test_seeding_replaces_a_stale_entry_at_the_same_path():
     assert rows[0]["file_path"] == "f2.parquet"
 
 
+def test_a_manifest_too_large_to_cache_is_not_decoded_and_drops_the_stale_entry(monkeypatch):
+    from opteryx_catalog.catalog import manifest_arrow
+
+    clear_parsed_manifest_cache()
+    path = "gs://bucket/metadata/manifest-1-abc.parquet"
+    data = _manifest_bytes()
+    io = _CountingIO({path: data})
+    get_parsed_manifest(io, path)  # a stale entry at the path
+
+    def _no_decode(*args, **kwargs):
+        raise AssertionError("decoded a manifest the cache would refuse")
+
+    monkeypatch.setattr(manifest_arrow, "MANIFEST_CACHE_BYTES", 1)
+    monkeypatch.setattr(manifest_arrow, "read_manifest_columns", _no_decode)
+    seed_parsed_manifest(path, data)
+    monkeypatch.undo()
+
+    get_parsed_manifest(io, path)
+    assert io.reads == 2  # the stale entry is gone, so this read went to storage
+
+
 if __name__ == "__main__":  # pragma: no cover
     from tests.tools import run_tests
 

@@ -98,6 +98,7 @@ class _FakeCatalog:
         self.saved_metadata = []
 
     write_parquet_manifest = OpteryxCatalog.write_parquet_manifest
+    write_manifest_bytes = OpteryxCatalog.write_manifest_bytes
 
     def save_snapshot(self, identifier, snapshot):
         self.saved_snapshots.append((identifier, snapshot))

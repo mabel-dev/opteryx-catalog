@@ -113,6 +113,12 @@ class _RecordingCatalog:
         self.written.append(list(entries))
         return f"{location}/metadata/manifest-{snapshot_id}.parquet"
 
+    def write_manifest_bytes(self, snapshot_id, data, location):
+        from opteryx_catalog.catalog.manifest import read_manifest_rows
+
+        self.written.append(read_manifest_rows(data))
+        return f"{location}/metadata/manifest-{snapshot_id}.parquet"
+
     def save_snapshot(self, identifier, snap):
         pass
 

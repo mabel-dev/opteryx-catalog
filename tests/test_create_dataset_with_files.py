@@ -29,6 +29,7 @@ def catalog(monkeypatch):
     catalog.assert_name_free = lambda *a, **k: None
     catalog._creation_location = lambda identifier, location: "mem://ws/created"
     catalog.write_parquet_manifest = lambda snapshot_id, entries, location: "mem://manifest"
+    catalog.write_manifest_bytes = lambda snapshot_id, data, location: "mem://manifest"
     catalog._announce_dataset_created = lambda *a, **k: None
     monkeypatch.setattr(SimpleDataset, "_after_commit", lambda self, author, snapshot: None)
     return catalog

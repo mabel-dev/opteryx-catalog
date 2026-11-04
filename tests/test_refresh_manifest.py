@@ -75,6 +75,7 @@ class _FakeCatalog:
 
     # Reuse the real implementation so this test fixture can't drift from it.
     write_parquet_manifest = OpteryxCatalog.write_parquet_manifest
+    write_manifest_bytes = OpteryxCatalog.write_manifest_bytes
 
 
 def _make_test_morsel(columns: list, rows: list):

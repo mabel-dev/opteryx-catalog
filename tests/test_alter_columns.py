@@ -101,6 +101,12 @@ class _FakeCatalog:
         self.manifests.append(entries)
         return f"{dataset_location}/metadata/manifest-{snapshot_id}.parquet"
 
+    def write_manifest_bytes(self, snapshot_id, data, dataset_location):
+        from opteryx_catalog.catalog.manifest import read_manifest_rows
+
+        self.manifests.append(read_manifest_rows(data))
+        return f"{dataset_location}/metadata/manifest-{snapshot_id}.parquet"
+
     def save_snapshot(self, identifier, snapshot):
         pass
 

@@ -8908,7 +8908,14 @@ class OpteryxCatalog(SecretsMixin, Metastore):
         # remain readable.
         if entries is None:
             return None
+        return self.write_manifest_bytes(
+            snapshot_id, encode_parquet_manifest(entries), dataset_location
+        )
 
+    def write_manifest_bytes(self, snapshot_id: int, data: bytes, dataset_location: str) -> str:
+        """Write manifest bytes already encoded - by `write_parquet_manifest`, or
+        by an append onto the parent's (`append_manifest_entries`) - for the given
+        snapshot id, and return the path written."""
         # manifest-<snapshot_id>-<nonce>.parquet. The nonce is what makes the
         # name unique: snapshot ids are wall-clock milliseconds bumped past the
         # highest in the WRITER'S OWN in-memory history, so two writers holding
@@ -8923,8 +8930,6 @@ class OpteryxCatalog(SecretsMixin, Metastore):
         # Use provided FileIO if it supports writing; otherwise write to GCS.
         # Nothing below is recoverable - see the note on out.close() - so this
         # runs unguarded and lets failures reach the caller.
-        data = encode_parquet_manifest(entries)
-
         if self.io:
             out = self.io.new_output(parquet_path).create()
             out.write(data)

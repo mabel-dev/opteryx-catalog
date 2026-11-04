@@ -23,8 +23,13 @@ from ..exceptions import SummaryInconsistencyError
 from ..resource_types import ResourceType
 from .manifest import ParquetManifestEntry
 from .manifest import ParquetManifestEntryAccumulator
+from .manifest import append_manifest_entries
 from .manifest import build_parquet_manifest_entry_from_bytes
 from .manifest import build_parquet_manifest_entry_from_morsel
+from .manifest import encode_parquet_manifest
+from .manifest import manifest_file_paths
+from .manifest import manifest_has_summary_columns
+from .manifest import manifest_summary_rows
 from .metadata import DatasetMetadata
 from .metadata import Snapshot
 from .metadata import provenance_fields_from_document
@@ -1392,6 +1397,19 @@ class SimpleDataset(Dataset):
                 "Refusing to commit a manifest that would drop its entries."
             ) from err
 
+    def _parent_manifest_bytes(self, snapshot) -> bytes:
+        """The raw bytes of the manifest a commit appends to. Unreadable stops the
+        commit, on the same doctrine as `_parent_manifest_entries`."""
+        manifest_path = snapshot.manifest_list
+        try:
+            with self.io.new_input(manifest_path).open() as f:
+                return f.read()
+        except Exception as err:
+            raise ManifestReadError(
+                f"Cannot read parent manifest {manifest_path} for {self.identifier}: {err}. "
+                "Refusing to commit a manifest that would drop its entries."
+            ) from err
+
     def _totals_from_entries(self, entries: list[dict]) -> dict[str, int]:
         """Derive the snapshot summary totals from the manifest being written.
 
@@ -2348,18 +2366,18 @@ class SimpleDataset(Dataset):
 
         snapshot_id = self._allocate_snapshot_id()
 
-        # Gather the previous manifest entries this commit must carry forward.
-        # A previous manifest that cannot be read stops the commit — see
-        # `_parent_manifest_entries`.
+        # The parent manifest this commit appends to, as raw bytes: only its file
+        # paths are decoded here, never its statistics. A previous manifest that
+        # cannot be read stops the commit — see `_parent_manifest_entries`.
         prev = self.snapshot(None)
-        prev_entries = []
+        parent = None
+        parent_paths: list = []
         if prev and getattr(prev, "manifest_list", None):
-            prev_entries = self._parent_manifest_entries(prev)
-            self._warn_if_summary_disagrees(prev, prev_entries)
+            parent = self._parent_manifest_bytes(prev)
+            parent_paths = manifest_file_paths(parent)
+            self._warn_if_summary_disagrees(prev, parent_paths)
 
-        existing = {
-            e.get("file_path") for e in prev_entries if isinstance(e, dict) and e.get("file_path")
-        }
+        existing = {p for p in parent_paths if p}
 
         if entries is not None and files:
             raise ValueError("add_files takes entries OR files, not both")
@@ -2369,13 +2387,37 @@ class SimpleDataset(Dataset):
             new_entries = self._build_entries_for_files(files, existing, footer_only=footer_only)
         new_entries = self._attach_new_index_files(new_entries, index_files)
 
-        merged_entries = prev_entries + new_entries
+        # The cumulative manifest is the parent's row groups, copied, with the new
+        # entries appended - its cost is the parent's compressed size, not its
+        # decoded size (append_manifest_entries). `merged_entries` holds only the
+        # columns the totals below are summed from.
+        if parent is None:
+            data = encode_parquet_manifest(new_entries)
+            merged_entries = new_entries
+        elif not new_entries and manifest_has_summary_columns(parent):
+            data = parent
+            merged_entries = manifest_summary_rows(parent)
+        else:
+            data = append_manifest_entries(parent, new_entries) if new_entries else None
+            if data is not None:
+                merged_entries = manifest_summary_rows(parent) + new_entries
+            else:
+                # An older encoder's manifest: re-encoded whole, once - the
+                # manifest this writes is in the current schema, so the next
+                # commit appends to it.
+                logging.getLogger(__name__).warning(
+                    "%s: parent manifest %s is not in the current manifest schema; "
+                    "re-encoding it whole (once) instead of appending",
+                    self.identifier,
+                    prev.manifest_list,
+                )
+                merged_entries = self._parent_manifest_entries(prev) + new_entries
+                data = encode_parquet_manifest(merged_entries)
 
-        # write cumulative manifest
         manifest_path = None
-        if self.catalog and hasattr(self.catalog, "write_parquet_manifest"):
-            manifest_path = self.catalog.write_parquet_manifest(
-                snapshot_id, merged_entries, self.metadata.location
+        if self.catalog:
+            manifest_path = self.catalog.write_manifest_bytes(
+                snapshot_id, data, self.metadata.location
             )
 
         # Build summary deltas
