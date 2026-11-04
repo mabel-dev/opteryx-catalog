@@ -10,6 +10,16 @@ import sys
 
 sys.path.insert(0, os.path.join(sys.path[0], ".."))
 
+import pytest
+
+# The append is rugo's `append_row_groups`; without it add_files re-encodes the
+# parent instead, so these tests would be asserting a capability that is absent.
+if not hasattr(__import__("rugo.parquet", fromlist=["parquet"]), "append_row_groups"):
+    pytest.skip(
+        "this rugo has no parquet.append_row_groups - manifest append needs a newer rugo",
+        allow_module_level=True,
+    )
+
 from rugo.parquet import patch_columns
 from rugo.rugo_native import read_rowgroup_stats
 

@@ -2404,10 +2404,12 @@ class SimpleDataset(Dataset):
             else:
                 # An older encoder's manifest: re-encoded whole, once - the
                 # manifest this writes is in the current schema, so the next
-                # commit appends to it.
+                # commit appends to it. A rugo without append_row_groups lands
+                # here on every commit.
                 logging.getLogger(__name__).warning(
-                    "%s: parent manifest %s is not in the current manifest schema; "
-                    "re-encoding it whole (once) instead of appending",
+                    "%s: cannot append to parent manifest %s (not in the current "
+                    "manifest schema, or rugo has no append_row_groups); "
+                    "re-encoding it whole instead",
                     self.identifier,
                     prev.manifest_list,
                 )
