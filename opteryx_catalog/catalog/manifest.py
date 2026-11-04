@@ -1600,9 +1600,13 @@ def append_manifest_entries(parent: bytes, entries: list[dict]) -> bytes | None:
     so this costs the parent's compressed size, where re-encoding the cumulative
     manifest costs its decoded size - over 1 GB for a 28 MB manifest. Returns
     None when the parent is not in the schema the encoder writes for `entries`
-    (a manifest from an older encoder): the caller re-encodes it once instead.
+    (a manifest from an older encoder), or when the installed rugo predates
+    `append_row_groups`: the caller re-encodes it instead.
     """
-    from rugo.parquet import append_row_groups
+    try:
+        from rugo.parquet import append_row_groups
+    except ImportError:
+        return None
 
     from ..iops.fileio import WRITE_PARQUET_OPTIONS
 
