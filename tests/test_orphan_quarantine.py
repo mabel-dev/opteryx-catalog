@@ -14,6 +14,7 @@ import pytest
 sys.path.insert(0, os.path.join(sys.path[0], ".."))
 
 from opteryx_catalog.catalog.orphan_quarantine import MAX_QUARANTINE_ENTRIES
+from opteryx_catalog.catalog.orphan_quarantine import ORPHAN_QUARANTINE_BATCH
 from opteryx_catalog.catalog.orphan_quarantine import ORPHAN_QUARANTINE_MIN_AGE_MS
 from opteryx_catalog.catalog.orphan_quarantine import OrphanQuarantine
 from opteryx_catalog.catalog.orphan_quarantine import QuarantineUnavailable
@@ -260,6 +261,58 @@ def test_oversized_record_refuses_to_truncate():
 
     with pytest.raises(QuarantineUnavailable):
         quarantine.save("github.events", entries)
+
+
+def test_first_sightings_beyond_the_cap_are_deferred_not_recorded():
+    candidates = {"c.parquet", "a.parquet", "d.parquet", "b.parquet"}
+
+    decision = review_candidates({}, candidates, now_ms=1_000, min_age_ms=DAY_MS, max_held=2)
+
+    # Path order, so successive runs admit the same files.
+    assert decision.held == {"a.parquet": 1_000, "b.parquet": 1_000}
+    assert decision.deferred == {"c.parquet", "d.parquet"}
+    assert decision.to_delete == set()
+
+
+def test_files_already_held_are_never_displaced_by_the_cap():
+    """A held file losing its place would lose its first strike."""
+    previous = {"z.parquet": 1_000}
+
+    decision = review_candidates(
+        previous, {"a.parquet", "z.parquet"}, now_ms=2_000, min_age_ms=DAY_MS, max_held=1
+    )
+
+    assert decision.held == {"z.parquet": 1_000}
+    assert decision.deferred == {"a.parquet"}
+
+
+def test_backlog_over_the_cap_drains_over_successive_sweeps():
+    """The pypi_large case: more orphans than one record holds."""
+    quarantine = OrphanQuarantine(_FakeCatalog(), min_age_ms=DAY_MS)
+    orphans = {f"f{i:05}.parquet" for i in range(11_156)}
+    deleted = set()
+
+    for day in range(13):
+        remaining = orphans - deleted
+        decision = quarantine.review("test.pypi_large", remaining, now_ms=day * DAY_MS)
+        assert len(quarantine.load("test.pypi_large")) <= ORPHAN_QUARANTINE_BATCH
+        assert len(decision.to_delete) <= ORPHAN_QUARANTINE_BATCH
+        deleted |= decision.to_delete
+
+    assert deleted == orphans
+    assert quarantine.load("test.pypi_large") == {}
+
+
+def test_review_for_deletion_reports_deferred_count():
+    quarantine = OrphanQuarantine(_FakeCatalog(), min_age_ms=DAY_MS)
+    candidates = {f"f{i}.parquet" for i in range(ORPHAN_QUARANTINE_BATCH + 5)}
+
+    to_delete, fields = quarantine.review_for_deletion("test.pypi_large", candidates, dry_run=False)
+
+    assert to_delete == set()
+    assert fields["quarantine_available"] is True
+    assert fields["orphans_newly_quarantined"] == ORPHAN_QUARANTINE_BATCH
+    assert fields["orphans_deferred"] == 5
 
 
 def test_malformed_entries_are_dropped_back_to_strike_one():
