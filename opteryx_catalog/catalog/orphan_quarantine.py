@@ -25,10 +25,17 @@ what keeps the guarantee ("two independent sightings, a day apart") true at
 every point in time rather than just the first time.
 
 The record is one Firestore document per dataset, holding one entry per
-quarantined file. Datasets here run to hundreds of files, not millions, and only
-the suspect subset is ever recorded, so a single document has ample headroom;
-`MAX_QUARANTINE_ENTRIES` exists to fail loudly rather than silently truncate if
-that assumption is ever wrong.
+quarantined file. A dataset that is rewritten often (repeated OPTIMIZE cycles)
+can orphan thousands of files in one go, so admission is capped at
+`ORPHAN_QUARANTINE_BATCH`: files already held always keep their place, and new
+sightings fill whatever room is left, in path order.
+The rest are deferred - not recorded, not deleted, exactly as if this run had
+not seen them - and are admitted by a later run once deletions free room. A
+large backlog therefore drains over several sweeps instead of stalling. Path
+order matters: it makes successive runs pick the same files, so the ones
+admitted go on to their second strike instead of being displaced by a different
+arbitrary subset each time. `MAX_QUARANTINE_ENTRIES` stays as the document's
+hard limit, which `save` refuses to exceed rather than truncate.
 """
 
 from __future__ import annotations
@@ -54,9 +61,14 @@ ORPHAN_QUARANTINE_MIN_AGE_MS = 24 * 60 * 60 * 1000  # 1 day
 MAINTENANCE_SUBCOLLECTION = "maintenance"
 QUARANTINE_DOC = "orphan-quarantine"
 
-# Refuse to write a quarantine document larger than this rather than truncate
-# it. Truncation would silently arm or disarm an arbitrary subset of files.
+# Hard limit on one record. `save` refuses anything larger rather than truncate
+# it, since truncation would silently arm or disarm an arbitrary subset of files.
 MAX_QUARANTINE_ENTRIES = 10_000
+
+# Most files the record admits, and so the most one run can go on to delete. Well
+# under the document limit: it bounds the work of a single sweep, and a backlog
+# drains at this many files per sweep.
+ORPHAN_QUARANTINE_BATCH = 1_000
 
 
 # Re-exported: the definition moved to `opteryx_catalog.exceptions` so the
@@ -65,6 +77,7 @@ MAX_QUARANTINE_ENTRIES = 10_000
 # and test refers to it.
 __all__ = [
     "MAX_QUARANTINE_ENTRIES",
+    "ORPHAN_QUARANTINE_BATCH",
     "OrphanQuarantine",
     "QuarantineDecision",
     "QuarantineUnavailable",
@@ -83,6 +96,9 @@ class QuarantineDecision:
     newly_quarantined: set[str] = field(default_factory=set)
     # Previously quarantined files this run did NOT flag, so they are forgotten.
     released: set[str] = field(default_factory=set)
+    # First sightings left out because the record was full. Untouched: neither
+    # recorded nor deleted, so a later run sees them as first sightings again.
+    deferred: set[str] = field(default_factory=set)
 
 
 def review_candidates(
@@ -90,6 +106,7 @@ def review_candidates(
     candidates: set[str],
     now_ms: int,
     min_age_ms: int = ORPHAN_QUARANTINE_MIN_AGE_MS,
+    max_held: int = ORPHAN_QUARANTINE_BATCH,
 ) -> QuarantineDecision:
     """Decide which candidates are deletable, given the previous record.
 
@@ -100,19 +117,20 @@ def review_candidates(
         candidates: paths this run believes are orphaned
         now_ms: current wall-clock time in ms
         min_age_ms: minimum gap between first and second sighting
+        max_held: most entries `held` may contain. Files already in `previous`
+            are never displaced; first sightings beyond this are deferred.
 
     Returns:
         A `QuarantineDecision`. Deleted files are absent from `held` - once the
         file is gone there is nothing left to quarantine.
     """
     decision = QuarantineDecision()
+    first_sightings = []
 
     for path in candidates:
         first_seen = previous.get(path)
         if first_seen is None:
-            # First sighting: record and leave alone.
-            decision.held[path] = now_ms
-            decision.newly_quarantined.add(path)
+            first_sightings.append(path)
         elif now_ms - first_seen >= min_age_ms:
             # Second sighting, far enough after the first.
             decision.to_delete.add(path)
@@ -121,6 +139,15 @@ def review_candidates(
             # time - refreshing it here would let a frequently-run job push the
             # deadline back forever and never delete anything.
             decision.held[path] = first_seen
+
+    # First sightings take whatever room the files already held leave. Sorted,
+    # so every run admits the same files and they reach their second strike.
+    room = max(max_held - len(decision.held), 0)
+    first_sightings.sort()
+    for path in first_sightings[:room]:
+        decision.held[path] = now_ms
+        decision.newly_quarantined.add(path)
+    decision.deferred = set(first_sightings[room:])
 
     decision.released = set(previous) - set(candidates)
     return decision
@@ -304,8 +331,19 @@ class OrphanQuarantine:
                 "orphans_quarantined": 0,
                 "orphans_newly_quarantined": 0,
                 "orphans_released": 0,
+                "orphans_deferred": 0,
                 "quarantined_files": [],
             }
+
+        if decision.deferred:
+            # Expected after heavy rewrites, and self-clearing: each sweep that
+            # deletes files frees room for the next batch. Logged so a backlog
+            # that never drains is still visible.
+            logger.warning(
+                "Quarantine for %s is full: %d orphan candidates deferred to a later run",
+                identifier,
+                len(decision.deferred),
+            )
 
         if decision.newly_quarantined or decision.released:
             logger.info(
@@ -321,5 +359,6 @@ class OrphanQuarantine:
             "orphans_quarantined": len(decision.held),
             "orphans_newly_quarantined": len(decision.newly_quarantined),
             "orphans_released": len(decision.released),
+            "orphans_deferred": len(decision.deferred),
             "quarantined_files": sorted(decision.held),
         }
