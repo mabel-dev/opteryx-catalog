@@ -1,10 +1,14 @@
 """
 `SimpleDataset.snapshot(snapshot_id)` and where it looks for the answer.
 
-A snapshot id addresses write-once content, so a copy already held is the
-answer — this is the same rule that lets `OpteryxCatalog` keep `_snapshot_cache`
-at all. The lookup used to go to Firestore first and treat memory as the failure
-path, which meant it re-read a document `load_dataset()` had just fetched.
+A copy this load already holds is the answer. The lookup used to go to
+Firestore first and treat memory as the failure path, which meant it re-read a
+document `load_dataset()` had just fetched.
+
+The catalog's process-long `_snapshot_cache` is NOT an answer: expiration
+tombstones a snapshot document in place, so a copy cached while it was live goes
+on answering for a version whose files may be gone (opteryx.test.pypi_large,
+2026-11-05).
 
 `OpteryxConnector.get_dataset_metadata()` asks for the same id twice (once via
 `scan()`, once via `manifest_sketch_vectors()`), so planning a single-table query
@@ -113,7 +117,7 @@ def test_the_same_id_asked_for_twice_costs_one_read_at_most():
     assert catalog.document_reads == 0
 
 
-def test_an_id_in_the_catalog_cache_is_not_fetched():
+def test_an_id_in_the_catalog_cache_is_still_read():
     wanted = _snap(99)
     catalog = _CountingCatalog(remote_snapshots=[wanted])
     catalog._snapshot_cache[("ops", "test", 99)] = wanted
@@ -123,10 +127,10 @@ def test_an_id_in_the_catalog_cache_is_not_fetched():
     got = ds.snapshot(99)
 
     assert got.snapshot_id == 99
-    assert catalog.document_reads == 0, "the catalog had already fetched this id"
+    assert catalog.document_reads == 1, "a cached copy cannot say whether it has expired since"
 
 
-def test_an_unheld_id_is_fetched_once_and_then_cached():
+def test_an_unheld_id_is_read_on_every_ask_and_seeds_the_cache():
     historical = _snap(42)
     catalog = _CountingCatalog(remote_snapshots=[historical])
     ds = _dataset([_snap(100)], catalog)
@@ -135,13 +139,12 @@ def test_an_unheld_id_is_fetched_once_and_then_cached():
     assert first.snapshot_id == 42
     assert catalog.document_reads == 1, "nothing held it, so it had to be read"
 
-    # Seeding the cache is what stops the next Dataset built from this catalog
-    # paying for the same document again.
+    # Still seeded, for load_dataset()'s head lookup.
     assert catalog._snapshot_cache[("ops", "test", 42)].snapshot_id == 42
 
     second = ds.snapshot(42)
     assert second.snapshot_id == 42
-    assert catalog.document_reads == 1, "the second ask came from the cache"
+    assert catalog.document_reads == 2, "the cache never answers a by-id ask"
 
 
 def test_an_id_that_exists_nowhere_is_none():

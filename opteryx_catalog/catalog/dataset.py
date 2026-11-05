@@ -899,20 +899,20 @@ class SimpleDataset(Dataset):
         """Return a Snapshot.
 
         - If `snapshot_id` is None, return the in-memory current snapshot.
-        - If a `snapshot_id` is provided, answer it from whatever copy is
-          already in hand — `metadata.snapshots`, then the catalog's id-keyed
-          `_snapshot_cache` — and only read the Firestore document when neither
-          holds it, seeding the cache with what comes back.
+        - If a `snapshot_id` is provided, answer it from `metadata.snapshots`
+          when this load already holds it, and otherwise read the Firestore
+          document, seeding the catalog's `_snapshot_cache` with what comes
+          back.
         - If `user_only` is True (with no `snapshot_id`), return the most
           recent USER-created snapshot instead of the current one — see
           `last_user_snapshot`.
 
-        Looking before fetching is safe for exactly the reason the catalog's
-        caches exist (see the note on `_snapshot_cache` in
-        `OpteryxCatalog.__init__`): a snapshot id addresses write-once content,
-        so a copy already held IS the answer and the document read cannot
-        return anything different. Only the dataset doc's `current-*-id`
-        pointers are mutable, and those are re-read on every `get_relation()`.
+        The catalog's `_snapshot_cache` is NOT consulted here. It lives as long
+        as the process, and expiration tombstones a snapshot document IN PLACE,
+        so a copy cached while the snapshot was live goes on answering for a
+        version whose files may already be gone. That is how a long-lived worker
+        walked `VERSION AS OF PREVIOUS` into an expired snapshot on
+        opteryx.test.pypi_large.
 
         This used to try Firestore first and treat memory as the failure path,
         which cost a document read per call for a snapshot `load_dataset()` had
@@ -950,9 +950,6 @@ class SimpleDataset(Dataset):
                 # here, and that has always degraded to `None` rather than
                 # propagating out of a read-only lookup.
                 cache_key = (collection, dataset_name, snapshot_id)
-                cached = self.catalog._snapshot_cache.get(cache_key)
-                if cached is not None:
-                    return cached
                 doc = (
                     self.catalog._dataset_doc_ref(collection, dataset_name)
                     .collection("snapshots")
@@ -986,9 +983,9 @@ class SimpleDataset(Dataset):
                         commit_message=sd.get("commit-message"),
                         **provenance_fields_from_document(sd),
                     )
-                    # Seed the id-keyed cache the same way load_dataset() does,
-                    # so a historical id fetched once is not fetched again by
-                    # the next Dataset built from this catalog.
+                    # Seed the id-keyed cache the same way load_dataset() does.
+                    # Its reader is the head lookup there, and a head is never
+                    # expired; this method never reads it.
                     self.catalog._snapshot_cache[cache_key] = snap
                     return snap
             except Exception as exc:  # noqa: BLE001 - Firestore client boundary
@@ -1098,46 +1095,119 @@ class SimpleDataset(Dataset):
         recency, because after a `rollback` the newest snapshots are not
         ancestors of the head at all - they are the version that was undone.
 
+        The walk reads lineage RECORDS, not versions (`_snapshot_record`).
+        Expiration routinely tombstones the maintenance commits between the head
+        and the previous version, and the current user commit too, and a
+        tombstoned document still names its parent. Only the answer has to be
+        readable, and its record says whether it is. Refusing tombstones on
+        every hop is what lost the previous
+        version of opteryx.test.pypi_large: the walk stopped short, expiration
+        stopped protecting the version, and the next run retired it.
+
         Cost is one document read per hop that is not already in memory, and
         the gap between two user commits is normally zero to a few maintenance
         commits. `SnapshotAncestryTooDeep` bounds the pathological case.
         """
+        previous, _lineage = self.previous_version_lineage()
+        if previous is None:
+            return None
+
+        if previous.expired_at_ms is not None:
+            # There IS a previous version, we just cannot read it, and saying
+            # "there is none" would be a different and wrong answer.
+            raise SnapshotMissingError(
+                f"The previous version of {self.identifier}, snapshot "
+                f"{previous.snapshot_id}, has expired and can no longer be read."
+            )
+        return previous
+
+    def previous_version_lineage(self) -> tuple[Snapshot | None, list[Snapshot]]:
+        """The previous version's record, and every record walked to reach it.
+
+        The list runs from the head back to the previous version inclusive, or
+        to the root when there is none (then the version is None). Its entries
+        may be tombstoned. Expiration's purge sweep keeps these records, because
+        losing any one of them breaks the walk that `VERSION AS OF PREVIOUS`
+        and the previous-version retention both depend on; see
+        `SnapshotExpiration.purge_snapshot_tombstones`.
+        """
         head = self.metadata.current_snapshot()
         if head is None:
-            return None
+            return None, []
 
-        current_version = self._walk_to_user_snapshot(head)
+        lineage: list[Snapshot] = []
+        current_version = self._walk_to_user_snapshot(head, lineage)
         if current_version is None or current_version.parent_snapshot_id is None:
+            return None, lineage
+        previous = self._walk_to_user_snapshot(self._lineage_parent(current_version), lineage)
+        return previous, lineage
+
+    def _lineage_parent(self, node: Snapshot) -> Snapshot:
+        """The record of `node`'s parent; raises when none remains.
+
+        Raised rather than answered with None: None would end the walk as if
+        `node` were the root, and report "no previous version" for a dataset
+        whose history is merely incomplete.
+        """
+        parent = self._snapshot_record(node.parent_snapshot_id)
+        if parent is None:
+            raise SnapshotMissingError(
+                f"The history of {self.identifier} is incomplete: snapshot "
+                f"{node.snapshot_id} names parent {node.parent_snapshot_id}, and no "
+                "record of it remains, so the previous version cannot be traced."
+            )
+        return parent
+
+    def _snapshot_record(self, snapshot_id: int) -> Snapshot | None:
+        """`snapshot_id`'s record, live OR tombstoned; None when none remains.
+
+        For walking lineage. A tombstoned record carries `expired_at_ms` and is
+        not a version anyone may read. Every record is either this load's live
+        copy or a fresh document read, never the process-long `_snapshot_cache`,
+        so `expired_at_ms` is current and the walk's answer needs no second read
+        to know whether it can be read.
+
+        Read failures propagate. None means "no record exists", and reporting a
+        transport error as that would be a wrong answer about the history.
+        """
+        for s in self.metadata.snapshots:
+            if s.snapshot_id == snapshot_id:
+                return s
+        if not self.catalog:
             return None
 
-        parent = self.snapshot(current_version.parent_snapshot_id)
-        if parent is None:
-            # The chain runs into a snapshot that has expired out of the
-            # history. There IS a previous version, we just cannot read it, and
-            # saying "there is none" would be a different and wrong answer.
-            raise SnapshotMissingError(
-                f"The version before snapshot {current_version.snapshot_id} of "
-                f"{self.identifier} has expired and can no longer be read."
-            )
-        return self._walk_to_user_snapshot(parent)
+        collection, dataset_name = self.identifier.split(".")
+        # shortcut: every hop not in this load's memory is a document read on
+        # every walk; a lineage-only cache (parents never change) would make
+        # repeats free if PREVIOUS shows up in planning time.
+        # pylint: disable=protected-access
+        doc = (
+            self.catalog._dataset_doc_ref(collection, dataset_name)
+            .collection("snapshots")
+            .document(str(snapshot_id))
+            .get()
+        )
+        if not doc.exists:
+            return None
+        return self.catalog._snapshot_from_dict(doc.to_dict() or {})
 
-    def _walk_to_user_snapshot(self, start: Snapshot) -> Snapshot | None:
-        """`start`, or the nearest user-created snapshot behind it; None if none.
+    def _walk_to_user_snapshot(self, start: Snapshot, lineage: list[Snapshot]) -> Snapshot | None:
+        """`start`, or the nearest user-created record behind it; None at the root.
 
-        `user_created` must be explicitly True, for the reason
-        `select_last_user_snapshot` gives: a missing value means "not known to
-        be a user commit", and counting it as one puts a maintenance commit in
-        front of somebody asking what they changed.
+        Appends every record it visits to `lineage`. `user_created` must be
+        explicitly True, for the reason `select_last_user_snapshot` gives: a
+        missing value means "not known to be a user commit", and counting it as
+        one puts a maintenance commit in front of somebody asking what they
+        changed.
         """
-        node: Snapshot | None = start
+        node = start
         for _ in range(MAX_ANCESTOR_WALK):
-            if node is None:
-                return None
+            lineage.append(node)
             if node.user_created is True:
                 return node
             if node.parent_snapshot_id is None:
                 return None
-            node = self.snapshot(node.parent_snapshot_id)
+            node = self._lineage_parent(node)
 
         raise SnapshotAncestryTooDeep(
             f"Gave up walking the ancestors of snapshot {start.snapshot_id} on "

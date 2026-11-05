@@ -269,6 +269,12 @@ class SnapshotExpiration:
         with an unreadable one, is never touched here - the stamp is the proof
         the waiting period ran, so no stamp means no deletion.
 
+        A tombstone the previous-version walk passes through is kept however
+        old it is (`_lineage_record_ids`). It is the only record of which
+        snapshot came before it; purging it breaks `VERSION AS OF PREVIOUS`,
+        and the next expiration run stops protecting the previous version and
+        retires it.
+
         Failures are logged and skipped rather than raised: a tombstone that
         cannot be purged today is a stale record, not a risk, and will be
         caught by any later run.
@@ -285,28 +291,56 @@ class SnapshotExpiration:
             collection, dataset_name = identifier.split(".", 1)
             # pylint: disable=protected-access
             snaps_coll = self.catalog._snapshots_collection(collection, dataset_name)
+            due: list[str] = []
             for doc in snaps_coll.stream():
                 data = doc.to_dict() or {}
                 if not snapshot_is_tombstoned(data):
                     continue
                 expired_at = data.get(SNAPSHOT_EXPIRED_AT_KEY)
                 if isinstance(expired_at, int) and expired_at <= cutoff_ms:
-                    try:
-                        snaps_coll.document(doc.id).delete()
-                        purged.append(doc.id)
-                    except Exception as exc:  # noqa: BLE001 - GCS/Firestore client boundary
-                        logger.error(
-                            "Failed to purge snapshot tombstone %s of %s: %s",
-                            doc.id,
-                            identifier,
-                            exc,
-                        )
+                    due.append(doc.id)
+            # Resolved only when something is due: it costs a load and a walk.
+            lineage_ids = self._lineage_record_ids(identifier) if due else set()
+            for doc_id in due:
+                if doc_id in lineage_ids:
+                    continue
+                try:
+                    snaps_coll.document(doc_id).delete()
+                    purged.append(doc_id)
+                except Exception as exc:  # noqa: BLE001 - GCS/Firestore client boundary
+                    logger.error(
+                        "Failed to purge snapshot tombstone %s of %s: %s",
+                        doc_id,
+                        identifier,
+                        exc,
+                    )
         except Exception as exc:  # noqa: BLE001 - GCS/Firestore client boundary
             # Includes catalogs/fakes whose snapshot collections cannot
             # stream. Purging is housekeeping; nothing downstream depends on
             # it having run.
             logger.debug("Tombstone purge unavailable for %s: %s", identifier, exc)
         return purged
+
+    def _lineage_record_ids(self, identifier: str) -> set[str]:
+        """Document ids of the records the previous-version walk passes through.
+
+        A walk that already fails keeps nothing: expiration cannot protect the
+        previous version of such a dataset either (`_previous_user_snapshot`),
+        so these records would preserve a path that leads nowhere.
+        """
+        dataset = self.catalog.load_dataset(identifier)
+        if dataset is None:
+            return set()
+        try:
+            _previous, lineage = dataset.previous_version_lineage()
+        except (SnapshotMissingError, SnapshotAncestryTooDeep) as exc:
+            logger.info(
+                "No lineage to keep for %s, purging its tombstones by age alone: %s",
+                identifier,
+                exc,
+            )
+            return set()
+        return {str(record.snapshot_id) for record in lineage}
 
     def _previous_user_snapshot(self, dataset, identifier: str) -> Snapshot | None:
         """The version of the data before the current one, best-effort.
