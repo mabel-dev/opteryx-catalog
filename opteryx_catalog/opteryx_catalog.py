@@ -13,7 +13,6 @@ from typing import Any
 
 from google.api_core.exceptions import InvalidArgument
 from google.cloud import firestore
-from google.cloud import storage
 
 from .alerts import report as _alert
 from .audit import emit_audit
@@ -21,6 +20,8 @@ from .billing_index import BILLING_ACCOUNT_SUBCOLLECTION
 from .billing_index import BILLING_DOC
 from .billing_index import clear_billing_index
 from .billing_index import write_billing_index
+from .clients import shared_firestore_client
+from .clients import shared_storage_client
 
 # The "no expectation" sentinel for save_dataset_metadata, defined with the
 # commit paths that pass it (catalog/dataset.py).
@@ -1025,6 +1026,7 @@ class OpteryxCatalog(SecretsMixin, Metastore):
         io: FileIO | None = None,
         include_deleted: bool = False,
         create_if_missing: bool = False,
+        firestore_client: firestore.Client | None = None,
     ):
         # Before any Firestore work: a catalog handle whose Parquet engine is
         # missing can read metadata but fails on the first manifest touch, so
@@ -1034,8 +1036,10 @@ class OpteryxCatalog(SecretsMixin, Metastore):
         self.workspace = workspace
         # Backwards-compatible alias: keep `catalog_name` for older code paths
         self.catalog_name = workspace
-        self.firestore_client = firestore.Client(
-            project=firestore_project, database=firestore_database
+        # One client per process, not per handle: see `clients.py`. A caller
+        # that already holds a client (a service with its own) may pass it.
+        self.firestore_client = firestore_client or shared_firestore_client(
+            firestore_project, firestore_database
         )
         # Kept so a handle can build a SIBLING handle for another workspace -
         # see `_catalog_for`. Without them the only cross-workspace reach is a
@@ -1104,7 +1108,7 @@ class OpteryxCatalog(SecretsMixin, Metastore):
                     # Be conservative: don't fail catalog initialization on Firestore errors
                     logger.debug("Could not seed $properties for %s (%s)", workspace, exc)
         self.gcs_bucket = gcs_bucket
-        self._storage_client = storage.Client() if gcs_bucket else None
+        self._storage_client = shared_storage_client() if gcs_bucket else None
         # Caches for immutable, version-addressed artifacts. Snapshots, schemas
         # and data files are write-once (a new write mints a new id), so caching
         # them by id is always correct: only the dataset doc's current-*-id
@@ -6670,6 +6674,7 @@ class OpteryxCatalog(SecretsMixin, Metastore):
                 firestore_project=self._firestore_project,
                 firestore_database=self._firestore_database,
                 gcs_bucket=self.gcs_bucket,
+                firestore_client=self.firestore_client,
             )
             self._sibling_catalogs[workspace] = handle
         return handle

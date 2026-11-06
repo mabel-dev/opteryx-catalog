@@ -8,6 +8,7 @@ import io
 import logging
 import os
 import random
+import threading
 import time
 import urllib.parse
 from collections.abc import Callable
@@ -38,15 +39,36 @@ logger = logging.getLogger(__name__)
 
 
 def _get_storage_credentials():
-    from google.cloud import storage
+    # The shared client's credentials, so every FileIO in the process refreshes
+    # ONE access token rather than fetching its own. See `clients.py`.
+    from opteryx_catalog.clients import shared_storage_client
 
-    if os.environ.get("STORAGE_EMULATOR_HOST"):
-        from google.auth.credentials import AnonymousCredentials
+    return shared_storage_client()._credentials
 
-        storage_client = storage.Client(credentials=AnonymousCredentials())
-    else:
-        storage_client = storage.Client()
-    return storage_client._credentials
+
+_session_lock = threading.Lock()
+_shared_session: tuple[int, requests.Session] | None = None
+
+
+def _get_shared_session() -> requests.Session:
+    """One pooled HTTP session per process, reused by every GcsFileIO.
+
+    A session per FileIO meant a TLS handshake to storage.googleapis.com on
+    each catalog handle's first read. Keyed on the pid for the same reason as
+    the shared clients: a pool inherited across `fork()` is not safe to use.
+    """
+    global _shared_session
+    pid = os.getpid()
+    current = _shared_session
+    if current is not None and current[0] == pid:
+        return current[1]
+    with _session_lock:
+        if _shared_session is None or _shared_session[0] != pid:
+            session = requests.session()
+            adapter = HTTPAdapter(pool_connections=100, pool_maxsize=100)
+            session.mount("https://", adapter)
+            _shared_session = (pid, session)
+        return _shared_session[1]
 
 
 def _backoff_seconds(response, attempt: int) -> float:
@@ -571,9 +593,7 @@ class GcsFileIO(FileIO):
 
         self.get_access_token = get_access_token
 
-        self._session = requests.session()
-        adapter = HTTPAdapter(pool_connections=100, pool_maxsize=100)
-        self._session.mount("https://", adapter)
+        self._session = _get_shared_session()
 
     def new_input(self, location: str) -> InputFile:
         return _GcsInputFile(location, self._session, self.get_access_token, self._read_cache)
@@ -739,14 +759,14 @@ class GcsFileIO(FileIO):
         """
         try:
             if prefix and prefix.startswith("gs://"):
-                from google.cloud import storage
+                from opteryx_catalog.clients import shared_storage_client
 
                 _, rest = prefix.split("://", 1)
                 parts = rest.split("/", 1)
                 bucket_name = parts[0]
                 object_prefix = parts[1] if len(parts) > 1 else ""
 
-                client = storage.Client()
+                client = shared_storage_client()
                 blobs = client.list_blobs(bucket_name, prefix=object_prefix)
                 return [f"gs://{bucket_name}/{b.name}" for b in blobs]
         except Exception:
@@ -788,14 +808,14 @@ class GcsFileIO(FileIO):
             if prefix and prefix.startswith("gs://"):
                 import time as _time
 
-                from google.cloud import storage
+                from opteryx_catalog.clients import shared_storage_client
 
                 _, rest = prefix.split("://", 1)
                 parts = rest.split("/", 1)
                 bucket_name = parts[0]
                 object_prefix = parts[1] if len(parts) > 1 else ""
 
-                client = storage.Client()
+                client = shared_storage_client()
                 blobs = client.list_blobs(bucket_name, prefix=object_prefix)
                 now_ms = int(_time.time() * 1000)
                 stats = {}
