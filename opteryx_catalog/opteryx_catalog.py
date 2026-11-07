@@ -135,10 +135,14 @@ TRIGGERS_SUBCOLLECTION = "triggers"
 # two strings. If a third name is ever added, both lists move together.
 PLATFORM_IDENTITIES = frozenset({"federator", "xb500"})
 
-# The reserved workspace of curated open data, and the identity that maintains
-# it. Together they are the one place the rule above cannot apply - see
-# `_assert_can_own`.
+# The reserved workspaces the house maintains, and the identity that maintains
+# them. Together they are the one place the rule above cannot apply - see
+# `_assert_can_own`. `public` is curated open data; `demo` is the one workspace
+# readable without signing in, rebuilt from `public` by tasks and refreshed by
+# materialized views whose triggers this identity owns.
 PUBLIC_WORKSPACE = "public"
+DEMO_WORKSPACE = "demo"
+HOUSE_WORKSPACES = frozenset({PUBLIC_WORKSPACE, DEMO_WORKSPACE})
 PUBLIC_MAINTENANCE_IDENTITY = "xb500"
 
 
@@ -149,9 +153,12 @@ def _assert_can_own(principal: str | None, what: str, *, workspace: str | None =
     handling at fire time (`MaterializedViewOwnerMissing`, `TaskOwnerMissing`),
     and conflating the two would report "cannot be billed" for a damaged record.
 
-    ONE EXEMPTION: `xb500` may own a TRIGGER in `public`. The rule assumes a
-    billable owner is always available and that reaching for a platform identity
-    is a way of dodging the bill. In `public`, neither half holds.
+    ONE EXEMPTION: `xb500` may own a TRIGGER in a house workspace
+    (`HOUSE_WORKSPACES`: `public` and `demo`). The rule assumes a billable owner
+    is always available and that reaching for a platform identity is a way of
+    dodging the bill. In a house workspace, neither half holds - the argument
+    below is made for `public` and holds for `demo` word for word: it is
+    reserved too, and only `xb500` can write it.
 
     Reached only by passing `workspace`, which every trigger path does - a
     materialized view's refresh triggers are triggers, pinned and gated on
@@ -187,7 +194,7 @@ def _assert_can_own(principal: str | None, what: str, *, workspace: str | None =
     normalized = principal.strip().lower()
     if normalized not in PLATFORM_IDENTITIES:
         return
-    if workspace == PUBLIC_WORKSPACE and normalized == PUBLIC_MAINTENANCE_IDENTITY:
+    if workspace in HOUSE_WORKSPACES and normalized == PUBLIC_MAINTENANCE_IDENTITY:
         return
     raise PlatformIdentityOwnerRefused(
         f"{principal} cannot be the owner of {what}. It is a platform identity "

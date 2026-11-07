@@ -199,6 +199,46 @@ def test_xb500_may_own_a_trigger_in_public():
     assert catalog.list_triggers("security.nvd_updates")[0]["runs-as"] == "xb500"
 
 
+def test_xb500_may_own_a_trigger_in_demo():
+    """`demo` is a house workspace on the same terms as `public`: reserved, and
+    writable only by the platform. Its materialized views refresh off copies
+    that tasks in `public` land there, and those refresh triggers are owned by
+    xb500."""
+    catalog = _catalog()
+    catalog.workspace = "demo"
+    _add_dataset(catalog, "security.nvd_vulnerabilities")
+    _add_dataset(catalog, "security.mv")
+
+    catalog.create_materialized_view(
+        "security.mv",
+        sql="SELECT 1",
+        source_tables=["security.nvd_vulnerabilities"],
+        author="xb500",
+    )
+    [trigger] = catalog.list_triggers("security.nvd_vulnerabilities")
+    assert trigger["runs-as"] == "xb500"
+
+    with pytest.raises(PlatformIdentityOwnerRefused):
+        catalog.create_trigger(
+            "security.nvd_vulnerabilities",
+            name="t",
+            target_task="security.copy",
+            kind="task",
+            author="federator",
+        )
+
+
+def test_the_house_exemption_names_only_public_and_demo():
+    catalog = _catalog()
+    catalog.workspace = "samples"
+    _add_dataset(catalog, "tpch_sf1.lineitem")
+
+    with pytest.raises(PlatformIdentityOwnerRefused):
+        catalog.create_trigger(
+            "tpch_sf1.lineitem", name="t", target_task="tpch_sf1.copy", kind="task", author="xb500"
+        )
+
+
 def test_federator_may_not_own_a_trigger_even_in_public():
     """Only the COSTING half of the rationale is answered in `public`. The other
     half is about federator specifically - its credential is shipped to every
