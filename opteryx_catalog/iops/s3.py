@@ -5,6 +5,7 @@ S3 (and S3-compatible) FileIO for opteryx_catalog.iops
 from __future__ import annotations
 
 import logging
+from concurrent.futures import ThreadPoolExecutor
 
 from opteryx_catalog.exceptions import StorageReadError
 
@@ -76,52 +77,157 @@ class _S3InputFile(InputFile):
         return super().open()
 
 
-class _S3OutputStream:
-    """Buffers writes in memory and uploads as a single PutObject on close.
+# A part is handed to the upload pool once the buffer holds this much (S3's
+# floor is 5 MiB for every part but the last; 10,000 parts caps an object at
+# ~640 GiB, far past any data file we write).
+MULTIPART_PART_BYTES = 64 * 1024 * 1024
+# Parts of ONE stream in flight at once: bounds its memory to about this many
+# parts while the writer keeps encoding.
+MULTIPART_PARTS_IN_FLIGHT = 4
+# Upload threads shared by every stream of one S3FileIO.
+UPLOAD_THREADS = 8
 
-    Mirrors `iops.gcs._GcsOutputStream`'s buffer-then-upload shape: callers
-    that call `out.write(data)` and rely on `close()` to persist it (the
-    common pattern in this codebase) work the same way against either
-    backend.
+
+class _S3OutputStream:
+    """A write-then-close output that STREAMS large objects as a multipart upload.
+
+    Writes accumulate in a buffer; once it holds `part_bytes` a multipart upload
+    is opened and the buffer is handed, whole and without a copy, to the upload
+    pool, so parts go over the wire while the caller keeps producing bytes. At
+    most `parts_in_flight` parts of this stream are pending; a write that would
+    exceed that waits for the oldest. An object that never reaches one part is
+    uploaded in one PutObject on close, so manifests and metadata see no change
+    in the requests made.
+
+    A failed part surfaces on the next write or on close, which raise it. A
+    `close` that raises has aborted the upload: no object is created.
+    `abort()` waits out parts already sending, then aborts the upload.
     """
 
-    def __init__(self, location: str, client, cache: _ByteBudgetLRU | None = None):
+    def __init__(
+        self,
+        location: str,
+        client,
+        executor,
+        cache: _ByteBudgetLRU | None = None,
+        part_bytes: int = MULTIPART_PART_BYTES,
+        parts_in_flight: int = MULTIPART_PARTS_IN_FLIGHT,
+    ):
         self._location = location
+        self._bucket, self._key = _split_bucket_key(location)
         self._client = client
+        self._executor = executor
         self._cache = cache
+        self._part_bytes = part_bytes
+        self._parts_in_flight = parts_in_flight
         self._buffer = bytearray()
+        self._upload_id: str | None = None
+        self._pending: list = []  # futures of parts not yet collected, oldest first
+        self._parts: list[dict] = []
         self._closed = False
 
-    def write(self, data: bytes | bytearray) -> int:
+    def write(self, data: bytes | bytearray | memoryview) -> int:
+        if self._closed:
+            raise ValueError(f"write to closed output '{self._location}'")
         self._buffer.extend(data)
+        if len(self._buffer) >= self._part_bytes:
+            self._send_buffer()
         return len(data)
 
     def close(self) -> None:
         if self._closed:
             return
-
-        bucket, key = _split_bucket_key(self._location)
-        self._client.put_object(Bucket=bucket, Key=key, Body=bytes(self._buffer))
-
+        self._closed = True
+        if self._upload_id is None:
+            self._client.put_object(Bucket=self._bucket, Key=self._key, Body=self._buffer)
+        else:
+            try:
+                if self._buffer:
+                    self._send_buffer()  # the last part may be under the 5 MiB floor
+                while self._pending:
+                    self._collect_oldest()
+                self._client.complete_multipart_upload(
+                    Bucket=self._bucket,
+                    Key=self._key,
+                    UploadId=self._upload_id,
+                    MultipartUpload={"Parts": sorted(self._parts, key=lambda p: p["PartNumber"])},
+                )
+            except BaseException:
+                self._abort_upload()
+                raise
+        self._buffer = bytearray()
         if self._cache is not None:
             self._cache.pop(self._location, None)
 
-        self._closed = True
-
     def abort(self) -> None:
-        """Discard the buffer without uploading. Nothing has reached S3 yet."""
-        self._buffer = bytearray()
+        """Discard everything: abort the multipart upload if one was opened.
+
+        Best-effort on the wire - the caller is already handling a failure and
+        an abort that fails changes nothing about that. An upload left open
+        never becomes an object (a bucket lifecycle rule reclaims its parts).
+        """
+        if self._closed:
+            return
         self._closed = True
+        self._buffer = bytearray()
+        if self._upload_id is not None:
+            self._abort_upload()
+
+    # -- multipart -------------------------------------------------------------
+
+    def _send_buffer(self) -> None:
+        if self._upload_id is None:
+            self._upload_id = self._client.create_multipart_upload(
+                Bucket=self._bucket, Key=self._key
+            )["UploadId"]
+        while len(self._pending) >= self._parts_in_flight:
+            self._collect_oldest()
+        part, self._buffer = self._buffer, bytearray()
+        number = len(self._parts) + len(self._pending) + 1
+        self._pending.append(self._executor.submit(self._upload_part, number, part))
+
+    def _upload_part(self, number: int, body: bytearray) -> dict:
+        response = self._client.upload_part(
+            Bucket=self._bucket, Key=self._key, UploadId=self._upload_id, PartNumber=number, Body=body
+        )
+        # Checksum* fields echo back: an upload created under a checksum
+        # algorithm must name each part's checksum to complete.
+        part = {k: v for k, v in response.items() if k.startswith("Checksum") and k != "ChecksumType"}
+        part["ETag"] = response["ETag"]
+        part["PartNumber"] = number
+        return part
+
+    def _collect_oldest(self) -> None:
+        self._parts.append(self._pending.pop(0).result())
+
+    def _abort_upload(self) -> None:
+        from botocore.exceptions import BotoCoreError
+        from botocore.exceptions import ClientError
+
+        # A part still sending after the abort would leave storage behind it.
+        for future in self._pending:
+            future.cancel()
+        for future in self._pending:
+            if not future.cancelled():
+                future.exception()
+        self._pending = []
+        try:
+            self._client.abort_multipart_upload(
+                Bucket=self._bucket, Key=self._key, UploadId=self._upload_id
+            )
+        except (BotoCoreError, ClientError):
+            logger.warning("Could not abort multipart upload of '%s'", self._location)
 
 
 class _S3OutputFile(OutputFile):
-    def __init__(self, location: str, client, cache: _ByteBudgetLRU | None = None):
+    def __init__(self, location: str, client, executor, cache: _ByteBudgetLRU | None = None):
         super().__init__(location)
         self._client = client
+        self._executor = executor
         self._cache = cache
 
     def create(self):
-        return _S3OutputStream(self.location, self._client, self._cache)
+        return _S3OutputStream(self.location, self._client, self._executor, self._cache)
 
 
 class S3FileIO(FileIO):
@@ -146,6 +252,9 @@ class S3FileIO(FileIO):
 
         self._client = boto3.client("s3", **client_kwargs)
         self._read_cache = _ByteBudgetLRU()
+        self._upload_executor = ThreadPoolExecutor(
+            max_workers=UPLOAD_THREADS, thread_name_prefix="s3-upload"
+        )
 
     def new_input(self, location: str) -> InputFile:
         return _S3InputFile(location, self._client, self._read_cache)
@@ -153,7 +262,7 @@ class S3FileIO(FileIO):
     def new_output(self, location: str) -> OutputFile:
         logger.info(f"new_output -> {location}")
         self._read_cache.pop(location, None)
-        return _S3OutputFile(location, self._client, self._read_cache)
+        return _S3OutputFile(location, self._client, self._upload_executor, self._read_cache)
 
     def delete(self, location: str | InputFile | OutputFile) -> None:
         if isinstance(location, (InputFile, OutputFile)):
