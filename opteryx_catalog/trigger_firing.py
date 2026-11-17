@@ -294,10 +294,9 @@ def policies_for(
 # both, one name to grep for when the credential is the thing that broke.
 # Deployed services leave the ENVVAR unset on purpose, exactly as federator.py
 # documents: an env-injected secret is resolved at instance start and never
-# sees a rotation, while the Secret Manager read happens at every MINT - so a
-# rotated secret lands on the next token, not the next restart. The mint is
-# already throttled by the token cache below, so this is not a per-refresh
-# Secret Manager call.
+# sees a rotation, while the Secret Manager read is held for at most
+# `_SECRET_CACHE_SECONDS` - so a rotated secret lands within minutes, not at the
+# next restart.
 FEDERATOR_CLIENT_ID_ENV = "FEDERATOR_CLIENT_ID"
 FEDERATOR_CLIENT_SECRET_ENV = "FEDERATOR_CLIENT_SECRET"
 
@@ -305,6 +304,12 @@ FEDERATOR_CLIENT_SECRET_ENV = "FEDERATOR_CLIENT_SECRET"
 # commit can fire several. Margin so a token is never spent in its last seconds.
 _TOKEN_EXPIRY_MARGIN_SECONDS = 60
 _token_cache: dict = {"access_token": None, "expires_at": 0.0}
+
+# The Secret Manager read, held briefly. Bounded far inside the rotation overlap
+# (a rotated-out secret stays valid until the NEXT daily rotation), so a rotation
+# lands within this window. Only a successful read is held: a failed one raises.
+_SECRET_CACHE_SECONDS = 300
+_secret_cache: dict = {"value": None, "expires_at": 0.0}
 
 
 def _auth_url() -> str:
@@ -326,9 +331,14 @@ def _federator_token() -> str:
 
     secret = os.environ.get(FEDERATOR_CLIENT_SECRET_ENV)
     if not secret:
+        secret = _secret_cache["value"] if _secret_cache["expires_at"] > now else None
+    if not secret:
         from .alerts._secrets import access_secret
 
         secret = access_secret(FEDERATOR_CLIENT_SECRET_ENV)
+        if secret:
+            _secret_cache["value"] = secret
+            _secret_cache["expires_at"] = now + _SECRET_CACHE_SECONDS
     if not secret:
         raise MaterializedViewError(
             f"cannot submit a materialized view refresh: {FEDERATOR_CLIENT_SECRET_ENV} "

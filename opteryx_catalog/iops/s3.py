@@ -121,7 +121,7 @@ class _S3OutputFile(OutputFile):
         self._cache = cache
 
     def create(self):
-        return _S3OutputStream(self._location, self._client, self._cache)
+        return _S3OutputStream(self.location, self._client, self._cache)
 
 
 class S3FileIO(FileIO):

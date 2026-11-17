@@ -9,6 +9,7 @@ and the never-break-the-commit failure contract.
 
 from __future__ import annotations
 
+import urllib.parse
 from unittest.mock import MagicMock
 from unittest.mock import patch
 
@@ -279,9 +280,38 @@ def test_refuses_to_submit_without_a_secret(monkeypatch):
     """
     monkeypatch.delenv(trigger_firing.FEDERATOR_CLIENT_SECRET_ENV, raising=False)
     trigger_firing._token_cache["access_token"] = None
+    trigger_firing._secret_cache["expires_at"] = 0.0
 
     with pytest.raises(MaterializedViewError, match=trigger_firing.FEDERATOR_CLIENT_SECRET_ENV):
         trigger_firing._federator_token()
+
+
+def test_secret_is_held_for_five_minutes_then_reread(monkeypatch):
+    """A rotation must land within `_SECRET_CACHE_SECONDS`, never at restart."""
+    monkeypatch.delenv(trigger_firing.FEDERATOR_CLIENT_SECRET_ENV, raising=False)
+    trigger_firing._secret_cache["expires_at"] = 0.0
+    clock = [1000.0]
+    monkeypatch.setattr(trigger_firing.time, "time", lambda: clock[0])
+    secrets = iter(["gen-1", "gen-2"])
+    reads = MagicMock(side_effect=lambda name: next(secrets))
+    monkeypatch.setattr("opteryx_catalog.alerts._secrets.access_secret", reads)
+    sent = []
+
+    def urlopen(request, timeout):
+        sent.append(urllib.parse.parse_qs(request.data.decode())["client_secret"][0])
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = b'{"access_token": "t", "expires_in": 0}'
+        return response
+
+    monkeypatch.setattr(trigger_firing.urllib.request, "urlopen", urlopen)
+
+    for at in (1000.0, 1299.0, 1301.0):
+        clock[0] = at
+        trigger_firing._token_cache["access_token"] = None
+        trigger_firing._federator_token()
+
+    assert sent == ["gen-1", "gen-1", "gen-2"]
+    assert reads.call_count == 2
 
 
 def test_a_failed_submission_audits_instead_of_breaking_the_commit():
