@@ -82,7 +82,7 @@ SEVERITY_INFO = "info"
 # The route's own field constraints, restated so a payload that would be
 # rejected fails HERE, loudly, at the producer. Cloud Tasks retries any non-2xx,
 # so a 400 would otherwise burn all five attempts and vanish silently.
-CLIENT_ID_PATTERN = re.compile(r"^[a-zA-Z][a-zA-Z0-9_-]{3,31}$")
+CLIENT_ID_PATTERN = re.compile(r"^[a-zA-Z][a-zA-Z0-9_-]{3,63}\Z")
 MAX_TITLE = 200
 MAX_BODY = 2000
 
