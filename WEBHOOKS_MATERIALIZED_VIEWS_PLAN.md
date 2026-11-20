@@ -66,7 +66,8 @@ special-casing needed for it anywhere in this plan.
 the same pattern jobs.opteryx already uses against worker.opteryx
 (`jobs.opteryx/app/routes/v1/interface.py:371` → `worker.opteryx/app/routes/v1/interface.py`
 `POST /api/v1/submit`). That pair is the concrete template for the Cloud Tasks producer/consumer
-wiring in Phase 3.
+wiring in Phase 3. (2026-11-20: that pair no longer exists — jobs queues for the worker
+fleet and the worker has no HTTP route, so it is not a template any more.)
 
 ## Phase 1 — Catalog: resource type + event completeness
 

@@ -90,24 +90,21 @@ export GOOGLE_CLOUD_PROJECT="my-gcp-project"
 
 ### Trigger firing (materialized-view refresh) ⚡
 
-A user-created commit on a dataset carrying triggers enqueues a refresh job
-for each target materialized view: a `jobs/{execution_id}` document plus an
-OIDC-authenticated Cloud Task to worker.opteryx (see
-`MATERIALIZED_VIEWS_TRIGGERS_PLAN.md`). Firing environments need:
+A user-created commit on a dataset carrying triggers submits
+`REFRESH MATERIALIZED VIEW <name>` for each target materialized view to
+jobs.opteryx (`POST /api/v1/jobs`) as the `federator` client; jobs writes the job
+and the worker fleet runs it (see `MATERIALIZED_VIEWS_TRIGGERS_PLAN.md`). Firing
+environments need:
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `OPTERYX_TRIGGER_FIRING` | on | `0` disables commit-time firing entirely (local scripts, tests) |
-| `GCP_PROJECT_ID` / `GCP_PROJECT` / `GOOGLE_CLOUD_PROJECT` | catalog's Firestore project | Project holding the `jobs` collection and the task queue |
-| `OPTERYX_JOBS_DATABASE` | *(default database)* | Firestore database for the `jobs` collection — jobs.opteryx/worker.opteryx use the project default, not `catalogs` |
-| `TASKS_LOCATION` | `us-east1` | Cloud Tasks queue location |
-| `TASKS_QUEUE` | `worker-dispatch` | Cloud Tasks queue name |
-| `TASKS_TARGET_URL` | `https://worker.opteryx.app/api/v1/submit` | Where the task is pushed |
-| `TASKS_OIDC_SA` | — | Service account for the task's OIDC token. **Must be the same SA jobs.opteryx enqueues as** — worker.opteryx pins that OIDC subject. Without it the task is enqueued unauthenticated and the worker rejects it |
-| `TASKS_OIDC_AUDIENCE` | the target URL | OIDC audience — the worker checks exact equality with its submit URL |
-| `JOB_TTL_DAYS` | `14` | `purge_at` horizon on refresh job documents, matching jobs.opteryx |
+| `AUTH_URL` | `https://authenticate.opteryx.app` | Where the `federator` token is minted (`client_credentials`) |
+| `JOBS_URL` | `https://jobs.opteryx.app` | Where the refresh is submitted |
+| `FEDERATOR_CLIENT_ID` | `federator` | Client id for the token |
+| `FEDERATOR_CLIENT_SECRET` | read from Secret Manager | Client secret; without it (env or the secret of the same name) every fire fails loudly |
 
-Enqueue failures never break the commit that triggered them — they alert and
+Submission failures never break the commit that triggered them — they alert and
 write a `trigger.fire_failed` audit record instead. A missed fire is a stale
 materialized view, so keep alerting configured wherever firing is enabled.
 

@@ -1,6 +1,12 @@
 # Materialized Views via Table Triggers — Implementation Plan
 
 Status: approved — decisions settled 2026-08-06.
+
+**Transport superseded (2026-11-20):** the catalog no longer writes the job document or
+enqueues a Cloud Task. It POSTs `REFRESH MATERIALIZED VIEW` to jobs.opteryx as `federator`
+(`trigger_firing._post_job`), jobs queues it, and the worker fleet claims it. The
+worker-dispatch queue, the worker's `/api/v1/submit` route and its OIDC check are deleted,
+so everything below about Cloud Tasks, OIDC, `TASKS_OIDC_SA` and `GPC_SUBJECT` is history.
 Delivered: Phase 1-2 (catalog storage/API + commit-time firing), Phase 3
 (engine CREATE/DROP MATERIALIZED VIEW, incl. LocalStoreConnector sidecar for
 GCP-free tests), Phase 4 (DROP TRIGGER / SHOW TRIGGERS FOR &lt;table&gt; /
@@ -44,11 +50,11 @@ catalog: mv stored as a dataset document (readable as a table by the FE, no engi
    |  (later: any user-created data commit on src.a or src.b)
    v
 catalog commit path reads the dataset's triggers subcollection
-   → writes a jobs/{execution_id} document (REFRESH statement, principal, origin: "trigger")
-   → enqueues a Cloud Task (OIDC) targeting https://worker.opteryx.app/api/v1/submit
+   → POSTs REFRESH MATERIALIZED VIEW to jobs.opteryx as federator (origin: "trigger")
+   → jobs writes jobs/{execution_id} for the worker fleet
    |
    v
-worker.opteryx executes the REFRESH exactly like any other job — the engine's binder
+the worker fleet executes the REFRESH exactly like any other job — the engine's binder
 enforces permissions from the job's policies; if the principal lacks rights the plan
 fails and the MV goes stale (visibly, via last-refreshed-at)
    |
