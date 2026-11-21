@@ -34,6 +34,13 @@ class _Catalog:
         return list(self._listeners)
 
 
+@pytest.fixture(autouse=True)
+def no_metadata_server(monkeypatch):
+    """Hermetic: no test asks the real metadata server who it is."""
+    monkeypatch.setattr(tn, "_runtime_sa", None)
+    monkeypatch.setattr(tn, "_runtime_service_account", lambda: None)
+
+
 @pytest.fixture
 def configured(monkeypatch):
     monkeypatch.setenv("CONTROL_URL", "https://control.opteryx.app/")
@@ -330,3 +337,148 @@ def test_the_request_targets_the_internal_route_with_the_admin_token(configured)
     assert kwargs["url"] == "https://control.opteryx.app/v1/internal/notifications"
     assert kwargs["headers"]["X-Admin-Token"] == "sekrit"
     assert json.loads(kwargs["body"])["client_id"] == "alice"
+
+
+# --- who is sending: OIDC (SEC-06 CTRL-7) ---------------------------------------
+
+RUNTIME_SA = "run-jobs@mabeldev.iam.gserviceaccount.com"
+
+
+def test_the_audience_is_the_one_control_verifies():
+    """Must equal control.opteryx's `DEFAULT_OIDC_AUDIENCE`, or every token is refused."""
+    assert tn.DEFAULT_OIDC_AUDIENCE == "https://control.opteryx.app/v1/internal/notifications"
+
+
+def test_the_task_carries_an_oidc_token_for_the_runtime_service_account(configured, monkeypatch):
+    monkeypatch.setattr(tn, "_runtime_service_account", lambda: RUNTIME_SA)
+    with patch.object(tn, "_enqueue") as enqueue:
+        tn.notify_run_finished(_Catalog([{"user": "alice", "outcome": "ERROR"}]), "ws.ops.t", "failed")
+
+    assert enqueue.call_args.kwargs == {
+        "service_account": RUNTIME_SA,
+        "audience": tn.DEFAULT_OIDC_AUDIENCE,
+    }
+
+
+def test_a_configured_producer_account_overrides_the_runtime_one(configured, monkeypatch):
+    monkeypatch.setattr(tn, "_runtime_service_account", lambda: RUNTIME_SA)
+    monkeypatch.setenv("NOTIFICATIONS_PRODUCER_SA", "other@p.iam.gserviceaccount.com")
+    monkeypatch.setenv("NOTIFICATIONS_OIDC_AUDIENCE", "https://control.example/v1/internal/notifications")
+    with patch.object(tn, "_enqueue") as enqueue:
+        tn.notify_run_finished(_Catalog([{"user": "alice", "outcome": "ERROR"}]), "ws.ops.t", "failed")
+
+    assert enqueue.call_args.kwargs == {
+        "service_account": "other@p.iam.gserviceaccount.com",
+        "audience": "https://control.example/v1/internal/notifications",
+    }
+
+
+def test_with_the_shared_token_retired_oidc_alone_is_enough(configured, monkeypatch):
+    """The end state: CONTROL_ADMIN_TOKEN removed from the deployment."""
+    monkeypatch.delenv("CONTROL_ADMIN_TOKEN")
+    monkeypatch.setattr(tn, "_runtime_service_account", lambda: RUNTIME_SA)
+    with patch.object(tn, "_enqueue") as enqueue:
+        sent = tn.notify_run_finished(
+            _Catalog([{"user": "alice", "outcome": "ERROR"}]), "ws.ops.t", "failed"
+        )
+
+    assert sent == 1
+    assert enqueue.call_args.args[1] is None  # no shared token to send
+
+
+def test_with_no_credential_at_all_nothing_is_sent_and_it_is_a_warning(configured, monkeypatch, caplog):
+    monkeypatch.delenv("CONTROL_ADMIN_TOKEN")
+    with patch.object(tn, "_enqueue") as enqueue, caplog.at_level("WARNING"):
+        sent = tn.notify_run_finished(
+            _Catalog([{"user": "alice", "outcome": "ERROR"}]), "ws.ops.t", "failed"
+        )
+
+    assert sent == 0
+    enqueue.assert_not_called()
+    assert "no credential" in caplog.text
+
+
+def _built_request(monkeypatch, **kwargs):
+    """Run the real `_enqueue` against a stub client; return the request it sent."""
+    from google.cloud import tasks_v2
+
+    client = MagicMock()
+    monkeypatch.setattr(tasks_v2, "CloudTasksClient", lambda: client)
+    tn._enqueue(
+        "https://control.opteryx.app",
+        kwargs.pop("token", None),
+        "projects/p/locations/l/queues/notifications",
+        {"client_id": "alice"},
+        **kwargs,
+    )
+    return client.create_task.call_args.kwargs["request"].task.http_request
+
+
+def test_enqueue_sets_the_oidc_token_and_the_shared_header_during_dual_accept(monkeypatch):
+    pytest.importorskip("google.cloud.tasks_v2")
+    request = _built_request(
+        monkeypatch,
+        token="sekrit",
+        service_account=RUNTIME_SA,
+        audience=tn.DEFAULT_OIDC_AUDIENCE,
+    )
+    assert request.oidc_token.service_account_email == RUNTIME_SA
+    assert request.oidc_token.audience == tn.DEFAULT_OIDC_AUDIENCE
+    assert request.headers["X-Admin-Token"] == "sekrit"
+    assert request.url == "https://control.opteryx.app/v1/internal/notifications"
+
+
+def test_enqueue_sends_no_shared_header_once_the_token_is_unset(monkeypatch):
+    pytest.importorskip("google.cloud.tasks_v2")
+    request = _built_request(monkeypatch, service_account=RUNTIME_SA)
+    assert "X-Admin-Token" not in request.headers
+    assert request.oidc_token.service_account_email == RUNTIME_SA
+
+
+def test_enqueue_without_an_account_attaches_no_oidc_token(monkeypatch):
+    pytest.importorskip("google.cloud.tasks_v2")
+    request = _built_request(monkeypatch, token="sekrit")
+    assert not request.oidc_token.service_account_email
+
+
+def test_the_runtime_account_is_read_from_the_metadata_server_and_cached(monkeypatch):
+    monkeypatch.undo()  # the real lookup, not the autouse stub
+    monkeypatch.setattr(tn, "_runtime_sa", None)
+    asked = []
+
+    class _Response:
+        def __init__(self, body):
+            self._body = body
+
+        def read(self):
+            return self._body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def _urlopen(request, timeout):
+        asked.append((request.full_url, request.get_header("Metadata-flavor")))
+        return _Response(RUNTIME_SA.encode() + b"\n")
+
+    monkeypatch.setattr("urllib.request.urlopen", _urlopen)
+    assert tn._runtime_service_account() == RUNTIME_SA
+    assert tn._runtime_service_account() == RUNTIME_SA
+    assert asked == [(tn._METADATA_SA_EMAIL_URL, "Google")]
+
+
+def test_a_failed_metadata_lookup_is_not_cached(monkeypatch):
+    monkeypatch.undo()
+    monkeypatch.setattr(tn, "_runtime_sa", None)
+    calls = []
+
+    def _urlopen(request, timeout):
+        calls.append(1)
+        raise OSError("no metadata server here")
+
+    monkeypatch.setattr("urllib.request.urlopen", _urlopen)
+    assert tn._runtime_service_account() is None
+    assert tn._runtime_service_account() is None
+    assert len(calls) == 2

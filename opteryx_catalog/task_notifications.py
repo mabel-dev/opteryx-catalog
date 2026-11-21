@@ -302,7 +302,11 @@ def _setting(key: str) -> Optional[str]:
 
 
 def _config() -> tuple[Optional[str], Optional[str], Optional[str]]:
-    """`(control_url, admin_token, queue_path)`, each None when unset."""
+    """`(control_url, admin_token, queue_path)`, each None when unset.
+
+    `admin_token` is the interim shared secret (`notifications-producer-token`,
+    under its historical name). It is OPTIONAL now: see `_producer_identity`.
+    """
     url = _setting("CONTROL_URL")
     return (
         url.rstrip("/") if url else None,
@@ -311,26 +315,111 @@ def _config() -> tuple[Optional[str], Optional[str], Optional[str]]:
     )
 
 
-def _enqueue(url: str, token: str, queue_path: str, payload: dict[str, Any]) -> None:
-    """Put one notification on the queue. Raises; the caller reports."""
+# --- who is sending ------------------------------------------------------------
+#
+# control.opteryx accepts a producer by its Google identity (SEC-06 CTRL-7,
+# opteryx-infrastructure docs/sec-02/admin-identity-proposal.md §4): an OIDC
+# token for this deployment's own runtime service account, whose numeric `sub`
+# control holds in an allow-list. Cloud Tasks mints that token itself, fresh
+# for every attempt, from `oidc_token` on the task - so nothing secret is
+# stored in the queue, and the creator of the task must be allowed to act as
+# the service account it names (`iam.serviceAccounts.actAs`). Naming our OWN
+# account needs that permission on ourselves only.
+
+# What control verifies the token against: the route's identity, not the
+# transport's URL, so it is the same whichever address CONTROL_URL holds.
+# Must equal control's `NOTIFICATIONS_OIDC_AUDIENCE`.
+DEFAULT_OIDC_AUDIENCE = "https://control.opteryx.app/v1/internal/notifications"
+
+# The metadata server answers this on Cloud Run and on Compute Engine alike, with
+# the service account the code is running as.
+_METADATA_SA_EMAIL_URL = (
+    "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email"
+)
+_runtime_sa: Optional[str] = None
+
+
+def _runtime_service_account() -> Optional[str]:
+    """This process's own service account email, from the metadata server.
+
+    Only a SUCCESS is cached. A lookup that fails (a laptop, a test, a metadata
+    blip) is tried again on the next bell rather than pinning this process to
+    sending none.
+    """
+    global _runtime_sa
+    if _runtime_sa:
+        return _runtime_sa
+    import urllib.request
+
+    try:
+        request = urllib.request.Request(
+            _METADATA_SA_EMAIL_URL, headers={"Metadata-Flavor": "Google"}
+        )
+        with urllib.request.urlopen(request, timeout=2) as response:  # noqa: S310 - fixed URL
+            email = response.read().decode().strip()
+    except Exception as exc:  # noqa: BLE001 - no metadata server is an answer, not a fault
+        logger.debug("no runtime service account from the metadata server: %s", exc)
+        return None
+    if "@" not in email:
+        return None
+    _runtime_sa = email
+    return email
+
+
+def _producer_identity() -> tuple[Optional[str], str]:
+    """`(service_account_email, audience)` for the task's OIDC token.
+
+    The email is `NOTIFICATIONS_PRODUCER_SA` when a deployment sets it, and
+    otherwise the runtime service account the metadata server reports - which
+    is what it should be on every deployment, so the setting exists for the
+    exception (a deployment that must sign as an account other than the one it
+    runs as) rather than as something every service has to carry. None when
+    neither is available: then no token is attached.
+    """
+    audience = _setting("NOTIFICATIONS_OIDC_AUDIENCE") or DEFAULT_OIDC_AUDIENCE
+    return _setting("NOTIFICATIONS_PRODUCER_SA") or _runtime_service_account(), audience
+
+
+def _enqueue(
+    url: str,
+    token: Optional[str],
+    queue_path: str,
+    payload: dict[str, Any],
+    *,
+    service_account: Optional[str] = None,
+    audience: str = DEFAULT_OIDC_AUDIENCE,
+) -> None:
+    """Put one notification on the queue. Raises; the caller reports.
+
+    Authenticates by OIDC when `service_account` is given. `X-Admin-Token` is
+    added only while `token` is configured - control's dual-accept phase. A
+    deployment leaves it by having `CONTROL_ADMIN_TOKEN` removed, with no
+    release; the header and the setting are then deleted from this code.
+    """
     from google.cloud import tasks_v2
+
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "opteryx-catalog-task-notifications/1.0",
+    }
+    if token:
+        headers["X-Admin-Token"] = token
+    http_request = tasks_v2.HttpRequest(
+        http_method=tasks_v2.HttpMethod.POST,
+        url=f"{url}/v1/internal/notifications",
+        headers=headers,
+        body=json.dumps(payload).encode(),
+    )
+    if service_account:
+        http_request.oidc_token = tasks_v2.OidcToken(
+            service_account_email=service_account, audience=audience
+        )
 
     client = tasks_v2.CloudTasksClient()
     client.create_task(
         request=tasks_v2.CreateTaskRequest(
             parent=queue_path,
-            task=tasks_v2.Task(
-                http_request=tasks_v2.HttpRequest(
-                    http_method=tasks_v2.HttpMethod.POST,
-                    url=f"{url}/v1/internal/notifications",
-                    headers={
-                        "Content-Type": "application/json",
-                        "X-Admin-Token": token,
-                        "User-Agent": "opteryx-catalog-task-notifications/1.0",
-                    },
-                    body=json.dumps(payload).encode(),
-                )
-            ),
+            task=tasks_v2.Task(http_request=http_request),
         )
     )
 
@@ -343,7 +432,10 @@ def _notify(catalog, identifier: str, status: str, outcome: str, **context) -> i
     deployment - which are not the same thing but are the same non-event here.
     """
     url, token, queue_path = _config()
-    if not (url and token and queue_path):
+    service_account, audience = (None, DEFAULT_OIDC_AUDIENCE)
+    if url and queue_path:
+        service_account, audience = _producer_identity()
+    if not (url and queue_path and (token or service_account)):
         # Not configured. Not an error: a deployment without the notification
         # queue - a local run, a test - has no bell to ring. Logged at debug so
         # it does not become noise on every fire.
@@ -353,12 +445,24 @@ def _notify(catalog, identifier: str, status: str, outcome: str, **context) -> i
         # setting away, and a caller who raises this logger to DEBUG to find
         # out why the bell is silent should not also have to go read this
         # function's source to learn which key `_config()` actually missed.
+        #
+        # A credential is one of two: the runtime service account (OIDC) or,
+        # while control still accepts it, CONTROL_ADMIN_TOKEN.
         missing = [
             name
-            for name, value in (("CONTROL_URL", url), ("CONTROL_ADMIN_TOKEN", token),
-                                 ("OPTERYX_NOTIFICATIONS_QUEUE", queue_path))
+            for name, value in (("CONTROL_URL", url), ("OPTERYX_NOTIFICATIONS_QUEUE", queue_path))
             if not value
         ]
+        if url and queue_path:
+            # The queue is configured, so this deployment MEANS to ring bells
+            # and has no way to prove who it is: no metadata server answered
+            # and no shared token is set. That is a fault, not a local run, so
+            # it is a warning rather than debug.
+            logger.warning(
+                "task notifications have no credential: no runtime service account "
+                "from the metadata server and no CONTROL_ADMIN_TOKEN; nothing sent"
+            )
+            return 0
         logger.debug("task notifications are not configured; missing %s; nothing sent", missing)
         return 0
 
@@ -436,7 +540,14 @@ def _notify(catalog, identifier: str, status: str, outcome: str, **context) -> i
             },
         }
         try:
-            _enqueue(url, token, queue_path, payload)
+            _enqueue(
+                url,
+                token,
+                queue_path,
+                payload,
+                service_account=service_account,
+                audience=audience,
+            )
             sent += 1
         except Exception as exc:  # noqa: BLE001 - Cloud Tasks client boundary
             _alert(
