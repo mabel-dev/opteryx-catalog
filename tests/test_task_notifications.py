@@ -139,6 +139,8 @@ def test_the_payload_matches_the_routes_contract(configured):
         "workspace": "ws",
         "collection": "ops",
         "object": "rollup",
+        # What the Studio's bell follows: the object's own page.
+        "url": "/studio/manage-dataset.html?dataset=ws.ops.rollup",
     }
     # It has to survive the trip as JSON: Cloud Tasks carries the body encoded.
     json.dumps(payload)
@@ -482,3 +484,29 @@ def test_a_failed_metadata_lookup_is_not_cached(monkeypatch):
     assert tn._runtime_service_account() is None
     assert tn._runtime_service_account() is None
     assert len(calls) == 2
+
+
+# --- where the bell leads --------------------------------------------------------
+
+# control.opteryx's D5 rule (`app/notifications.py` STUDIO_URL_PATTERN), restated:
+# a bell whose url fails it is a 400 that Cloud Tasks retries out silently.
+_CONTROL_STUDIO_URL = re.compile(
+    r"/studio/[A-Za-z0-9._~/-]*(?:\?[A-Za-z0-9._~%/=&+,:-]*)?(?:#[A-Za-z0-9._~%/=&+,:-]*)?"
+)
+
+
+@pytest.mark.parametrize(
+    "identifier", ["ws.ops.rollup", "acme.raw.nightly_load", "ws.ops.name.with.dots", "w-s.o_p.Mixed9"]
+)
+def test_the_target_url_is_one_control_accepts(configured, identifier):
+    with patch.object(tn, "_enqueue") as enqueue:
+        tn.notify_run_finished(_Catalog([{"user": "alice", "outcome": "ERROR"}]), identifier, "failed")
+    url = _enqueued(enqueue)[0]["target"]["url"]
+    assert _CONTROL_STUDIO_URL.fullmatch(url), url
+    assert url.startswith("/studio/manage-dataset.html?dataset=")
+
+
+def test_an_unqualified_identifier_gets_no_url_rather_than_a_wrong_one(configured):
+    with patch.object(tn, "_enqueue") as enqueue:
+        tn.notify_run_finished(_Catalog([{"user": "alice", "outcome": "ERROR"}]), "ops.rollup", "failed")
+    assert "url" not in _enqueued(enqueue)[0]["target"]

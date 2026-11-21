@@ -59,6 +59,7 @@ import logging
 import os
 import re
 import uuid
+from urllib.parse import urlencode
 from typing import Any
 from typing import Optional
 
@@ -217,6 +218,24 @@ def _split(task_identifier: str) -> tuple[str, str, str]:
     if len(parts) == 2:
         return "", parts[0], parts[1]
     return "", "", parts[0]
+
+
+# The Studio page every task and view is managed from - the same link its
+# workflow map draws (web.opteryx `static/js/workflows.js`, `datasetUrl`). The
+# bell follows `target.url` and nothing else, so a target without one is a bell
+# that goes nowhere when clicked.
+STUDIO_OBJECT_PAGE = "/studio/manage-dataset.html"
+
+
+def _studio_url(workspace: str, collection: str, name: str) -> Optional[str]:
+    """The object's Studio page, or None if the identifier is not qualified.
+
+    That page reads `dataset` as `workspace.collection.name`; a local name has no
+    workspace to put first, and a link built from it would open the wrong object.
+    """
+    if not (workspace and collection and name):
+        return None
+    return f"{STUDIO_OBJECT_PAGE}?{urlencode({'dataset': f'{workspace}.{collection}.{name}'})}"
 
 
 def _compose(
@@ -531,7 +550,9 @@ def _notify(catalog, identifier: str, status: str, outcome: str, **context) -> i
             "body": body,
             "severity": severity,
             # Where clicking it goes. The object's own page - which is where
-            # every remedy above is carried out.
+            # every remedy above is carried out. `url` is what the bell
+            # follows; control.opteryx accepts only a Studio path there. The
+            # other keys name the object for anything that reads the feed.
             "target": {
                 "kind": kind,
                 "workspace": workspace,
@@ -539,6 +560,9 @@ def _notify(catalog, identifier: str, status: str, outcome: str, **context) -> i
                 "object": name,
             },
         }
+        studio_url = _studio_url(workspace, collection, name)
+        if studio_url:
+            payload["target"]["url"] = studio_url
         try:
             _enqueue(
                 url,
