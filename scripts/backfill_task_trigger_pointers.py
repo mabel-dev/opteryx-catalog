@@ -47,9 +47,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from opteryx_catalog.opteryx_catalog import TASK_TRIGGER_KIND  # noqa: E402
-from opteryx_catalog.opteryx_catalog import TASKS_SUBCOLLECTION  # noqa: E402
-from opteryx_catalog.opteryx_catalog import TRIGGERS_SUBCOLLECTION  # noqa: E402
+from opteryx_catalog.opteryx_catalog import TASK_TRIGGER_KIND
+from opteryx_catalog.opteryx_catalog import TASKS_SUBCOLLECTION
+from opteryx_catalog.opteryx_catalog import TRIGGERS_SUBCOLLECTION
 
 
 def _source_of(reference) -> str:

@@ -70,9 +70,7 @@ class _Client:
 
     def commit(self, path, reads, produced_by=None, expired=False, at=None):
         """One snapshot whose receipt read `reads`, as (dataset, version)."""
-        entries = [
-            {"dataset": d, "snapshot-id": v, "resolved-by": "current"} for d, v in reads
-        ]
+        entries = [{"dataset": d, "snapshot-id": v, "resolved-by": "current"} for d, v in reads]
         keys = []
         for d, v in reads:
             if d not in keys:
@@ -127,9 +125,7 @@ def test_an_incomplete_consumer_says_so():
 
 def test_consumers_come_back_in_a_stable_order():
     client = (
-        _Client()
-        .dataset("zeta/z/datasets/last", [SRC])
-        .dataset("alpha/a/datasets/first", [SRC])
+        _Client().dataset("zeta/z/datasets/last", [SRC]).dataset("alpha/a/datasets/first", [SRC])
     )
 
     assert [row["dataset"] for row in find_impacted(client, SRC)["consumers"]] == [
@@ -164,7 +160,11 @@ def test_commits_are_folded_to_one_row_per_consuming_dataset():
     client = (
         _Client()
         .commit("platform/billing/datasets/events/snapshots/100", [(SRC, 10)])
-        .commit("platform/billing/datasets/events/snapshots/200", [(SRC, 11)], produced_by="task:platform.billing.ingest")
+        .commit(
+            "platform/billing/datasets/events/snapshots/200",
+            [(SRC, 11)],
+            produced_by="task:platform.billing.ingest",
+        )
     )
 
     rows = find_readers(client, SRC)["consumers"]
@@ -226,9 +226,7 @@ def test_a_source_read_with_no_commits_yet_is_matched_by_its_bare_name():
     """`read-source-keys` carries the bare name as well as name@version, which
     is the only way to ask "at any version" - `array_contains` is equality
     only, with no prefix matching."""
-    client = _Client().commit(
-        "platform/billing/datasets/events/snapshots/100", [(SRC, None)]
-    )
+    client = _Client().commit("platform/billing/datasets/events/snapshots/100", [(SRC, None)])
 
     rows = find_readers(client, SRC)["consumers"]
 

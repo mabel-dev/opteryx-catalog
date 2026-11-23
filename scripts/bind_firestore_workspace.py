@@ -50,12 +50,20 @@ from opteryx_catalog.binding import write_catalog_binding
 
 
 def _parse_args(argv):
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument("--project", required=True, help="GCP project of the catalogs Firestore")
-    parser.add_argument("--database", required=True, help="Firestore database holding the workspaces")
+    parser.add_argument(
+        "--database", required=True, help="Firestore database holding the workspaces"
+    )
     parser.add_argument("--workspace", required=True)
-    parser.add_argument("--updated-by", required=True, help="who is recorded as the binding's author")
-    parser.add_argument("--clear", action="store_true", help="remove the binding (workspace reverts to native)")
+    parser.add_argument(
+        "--updated-by", required=True, help="who is recorded as the binding's author"
+    )
+    parser.add_argument(
+        "--clear", action="store_true", help="remove the binding (workspace reverts to native)"
+    )
     parser.add_argument("--firestore-project", help="GCP project of the Firestore database to read")
     parser.add_argument("--firestore-database", default="(default)", help="database id to read")
     parser.add_argument(

@@ -89,11 +89,16 @@ class _FakeCatalog:
         self.altered = None
         self.manifests = []
 
-    def alter_dataset_schema(self, identifier, add=None, drop=None, rename=None,
-                             retype=None, author=None):
+    def alter_dataset_schema(
+        self, identifier, add=None, drop=None, rename=None, retype=None, author=None
+    ):
         self.altered = {
-            "identifier": identifier, "add": add, "drop": drop,
-            "rename": rename, "retype": retype, "author": author,
+            "identifier": identifier,
+            "add": add,
+            "drop": drop,
+            "rename": rename,
+            "retype": retype,
+            "author": author,
         }
         return "schema-2"
 
@@ -140,12 +145,8 @@ def _donor(name, value, sql_type):
     from draken.morsels.morsel import Morsel
     from rugo.parquet import write_parquet
 
-    morsel = Morsel.from_vectors(
-        [name], [vector_from_sequence([value], dtype=sql_type)]
-    )
-    return write_parquet(
-        morsel, compression="none", bloom_filters=False, dictionary=False
-    )
+    morsel = Morsel.from_vectors([name], [vector_from_sequence([value], dtype=sql_type)])
+    return write_parquet(morsel, compression="none", bloom_filters=False, dictionary=False)
 
 
 def _pages(raw):
@@ -260,8 +261,7 @@ def test_add_without_a_value_backfills_null(dataset):
     ds, store, _catalog, _paths, committed = dataset
 
     ds.alter_columns(
-        add=[{"name": "note", "type": "VARCHAR",
-              "donor": _donor("note", None, "VARCHAR")}],
+        add=[{"name": "note", "type": "VARCHAR", "donor": _donor("note", None, "VARCHAR")}],
         author="alice",
     )
 
@@ -418,7 +418,7 @@ def test_a_bad_column_name_is_refused_before_any_file_is_rewritten(dataset):
     """The catalog validates the change too, but only after the files are
     written. Catching it here means a typo costs nothing and reports the COLUMN,
     not a parquet-level message, and leaves no rewritten files behind."""
-    ds, store, catalog, paths, committed = dataset
+    ds, store, catalog, _paths, committed = dataset
     ds.schema = lambda *a, **k: type(
         "S", (), {"columns": [type("C", (), {"name": n})() for n in ("id", "small", "label")]}
     )()

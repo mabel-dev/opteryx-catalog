@@ -68,12 +68,12 @@ LOCAL = "/srv/catalog/ws/coll/ds"
 @pytest.mark.parametrize(
     "path, admitted",
     [
-        (f"{LOCAL}/data/f.parquet", True),             # a local catalog's own file
+        (f"{LOCAL}/data/f.parquet", True),  # a local catalog's own file
         (f"{LOCAL}/f.parquet", True),
-        (f"{LOCAL}_v2/data/f.parquet", False),         # sibling sharing a name prefix
+        (f"{LOCAL}_v2/data/f.parquet", False),  # sibling sharing a name prefix
         ("/srv/catalog/ws/coll/other/f.parquet", False),
         ("/etc/passwd.parquet", False),
-        (f"{LOCAL}/data/../../x/f.parquet", False),    # traversal
+        (f"{LOCAL}/data/../../x/f.parquet", False),  # traversal
         ("gs://elsewhere/ws/coll/ds/data/f.parquet", False),
     ],
 )
@@ -114,7 +114,9 @@ def _world():
 
 
 def _entry(storage, path):
-    return build_parquet_manifest_entry_from_bytes(storage[path], path, len(storage[path])).to_dict()
+    return build_parquet_manifest_entry_from_bytes(
+        storage[path], path, len(storage[path])
+    ).to_dict()
 
 
 # ---------------------------------------------------------------------------

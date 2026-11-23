@@ -39,7 +39,9 @@ def _field_filter_paths() -> list[tuple[str, int, str]]:
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
-            name = node.func.id if isinstance(node.func, ast.Name) else getattr(node.func, "attr", "")
+            name = (
+                node.func.id if isinstance(node.func, ast.Name) else getattr(node.func, "attr", "")
+            )
             if name != "FieldFilter" or not node.args:
                 continue
             first = node.args[0]

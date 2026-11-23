@@ -188,7 +188,9 @@ def test_the_evidence_carries_the_sample_size_not_just_the_ratio():
     94% of three is not, and they must be distinguishable."""
     codes = [f"C{n:04}" for n in range(300)]
     (candidate,) = list(
-        score_candidates([_profile("a.child", "ref", codes[:200]), _profile("a.parent", "id", codes)])
+        score_candidates(
+            [_profile("a.child", "ref", codes[:200]), _profile("a.parent", "id", codes)]
+        )
     )
 
     evidence = candidate.evidence()
@@ -210,9 +212,7 @@ def test_confidence_ranks_a_wide_sample_above_a_narrow_one():
     small = [f"s{n}" for n in range(MIN_COMPARED + 8)]
     narrow = next(
         iter(
-            score_candidates(
-                [_profile("a.child", "ref", small), _profile("a.parent", "id", small)]
-            )
+            score_candidates([_profile("a.child", "ref", small), _profile("a.parent", "id", small)])
         )
     )
 

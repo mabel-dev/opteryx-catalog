@@ -101,7 +101,7 @@ def encode_positions(positions: Iterable[int], record_count: int) -> bytes:
     ``record_count`` is the file's physical row count; every ordinal must lie
     in ``[0, record_count)``. Duplicates are tolerated (a set is taken).
     """
-    ordered = sorted(set(int(p) for p in positions))
+    ordered = sorted({int(p) for p in positions})
     if ordered and (ordered[0] < 0 or ordered[-1] >= record_count):
         bad = ordered[0] if ordered[0] < 0 else ordered[-1]
         raise ValueError(f"delete position {bad} out of range for a file of {record_count} rows")
@@ -193,7 +193,7 @@ def write_delete_vector_file(io, path: str, vectors: dict[str, list[int]]) -> No
     encoded = []
     counts = []
     for file_path in paths:
-        ordered = sorted(set(int(p) for p in vectors[file_path]))
+        ordered = sorted({int(p) for p in vectors[file_path]})
         if not ordered:
             raise ValueError(f"empty delete vector for {file_path}; omit the file instead")
         # Encode against an open bound: the true record_count lives on the

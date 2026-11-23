@@ -14,12 +14,14 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.dirname(__file__))
 
 import pytest
+import test_rollback as fake
+from test_rollback import IDENTIFIER
+from test_rollback import _catalog
+from test_rollback import _dataset
+from test_rollback import _stored
 
 from opteryx_catalog.catalog.metadata import DatasetMetadata
 from opteryx_catalog.exceptions import SnapshotRaceError
-
-import test_rollback as fake
-from test_rollback import IDENTIFIER, _catalog, _dataset, _stored
 
 
 class _AtomicTransaction(fake._Transaction):
@@ -72,7 +74,7 @@ def test_unmoved_pointer_commits_through_the_transaction():
 
 def test_moved_pointer_writes_nothing():
     catalog = _atomic_catalog()
-    _dataset(catalog, head=150)                       # another writer already moved it
+    _dataset(catalog, head=150)  # another writer already moved it
     before = _stored(catalog)
     _forbid_direct_set(catalog)
     with pytest.raises(SnapshotRaceError, match="moved while this commit was being built"):

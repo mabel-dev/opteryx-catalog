@@ -59,9 +59,8 @@ import logging
 import os
 import re
 import uuid
-from urllib.parse import urlencode
 from typing import Any
-from typing import Optional
+from urllib.parse import urlencode
 
 from .alerts import report as _alert
 
@@ -94,7 +93,7 @@ _SUCCESS = "SUCCESS"
 _EVERYTHING = "EVERYTHING"
 
 
-def _wants(subscribed_to: Optional[str], outcome: str) -> bool:
+def _wants(subscribed_to: str | None, outcome: str) -> bool:
     """Whether a subscription recorded as `subscribed_to` covers `outcome`.
 
     An unrecognised value covers NOTHING. A subscription whose filter cannot be
@@ -135,18 +134,14 @@ _OWNER_STATEMENTS = {
 # Where the object's own state is readable. Two tables, because a task is not a
 # relation and a view is.
 _STATE_STATEMENTS = {
-    "task": (
-        "SELECT * FROM {workspace}.information_schema.tasks WHERE task_name = '{name}'"
-    ),
+    "task": ("SELECT * FROM {workspace}.information_schema.tasks WHERE task_name = '{name}'"),
     "materialized_view": (
         "SELECT * FROM {workspace}.information_schema.views WHERE table_name = '{name}'"
     ),
 }
 
 _BODIES = {
-    "succeeded": (
-        "The run completed. {state_statement} shows when it last ran."
-    ),
+    "succeeded": ("The run completed. {state_statement} shows when it last ran."),
     # Never started.
     "egress-blocked": (
         "This {noun_lower} writes into another workspace, and {workspace}'s egress "
@@ -169,13 +164,11 @@ _BODIES = {
         "task with a statement that takes no window."
     ),
     "error": (
-        "The trigger could not submit a run. {state_statement} shows the last recorded "
-        "status."
+        "The trigger could not submit a run. {state_statement} shows the last recorded status."
     ),
     # Ran and did not succeed.
     "failed": (
-        "The run was submitted and the statement failed. {definition_statement} is "
-        "what ran."
+        "The run was submitted and the statement failed. {definition_statement} is what ran."
     ),
     "denied": (
         "The run was refused on permissions. An unattended run executes as the "
@@ -227,7 +220,7 @@ def _split(task_identifier: str) -> tuple[str, str, str]:
 STUDIO_OBJECT_PAGE = "/studio/manage-dataset.html"
 
 
-def _studio_url(workspace: str, collection: str, name: str) -> Optional[str]:
+def _studio_url(workspace: str, collection: str, name: str) -> str | None:
     """The object's Studio page, or None if the identifier is not qualified.
 
     That page reads `dataset` as `workspace.collection.name`; a local name has no
@@ -299,7 +292,7 @@ def _compose(
 # --- delivery ------------------------------------------------------------------
 
 
-def _setting(key: str) -> Optional[str]:
+def _setting(key: str) -> str | None:
     """One configuration value, from wherever this deployment serves it.
 
     `opteryx_shared_services` resolves ENVVAR first and then the fleet's config
@@ -320,7 +313,7 @@ def _setting(key: str) -> Optional[str]:
     return get_config(key) or os.getenv(key)
 
 
-def _config() -> tuple[Optional[str], Optional[str], Optional[str]]:
+def _config() -> tuple[str | None, str | None, str | None]:
     """`(control_url, admin_token, queue_path)`, each None when unset.
 
     `admin_token` is the interim shared secret (`notifications-producer-token`,
@@ -355,10 +348,10 @@ DEFAULT_OIDC_AUDIENCE = "https://control.opteryx.app/v1/internal/notifications"
 _METADATA_SA_EMAIL_URL = (
     "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email"
 )
-_runtime_sa: Optional[str] = None
+_runtime_sa: str | None = None
 
 
-def _runtime_service_account() -> Optional[str]:
+def _runtime_service_account() -> str | None:
     """This process's own service account email, from the metadata server.
 
     Only a SUCCESS is cached. A lookup that fails (a laptop, a test, a metadata
@@ -374,7 +367,7 @@ def _runtime_service_account() -> Optional[str]:
         request = urllib.request.Request(
             _METADATA_SA_EMAIL_URL, headers={"Metadata-Flavor": "Google"}
         )
-        with urllib.request.urlopen(request, timeout=2) as response:  # noqa: S310 - fixed URL
+        with urllib.request.urlopen(request, timeout=2) as response:
             email = response.read().decode().strip()
     except Exception as exc:  # noqa: BLE001 - no metadata server is an answer, not a fault
         logger.debug("no runtime service account from the metadata server: %s", exc)
@@ -385,7 +378,7 @@ def _runtime_service_account() -> Optional[str]:
     return email
 
 
-def _producer_identity() -> tuple[Optional[str], str]:
+def _producer_identity() -> tuple[str | None, str]:
     """`(service_account_email, audience)` for the task's OIDC token.
 
     The email is `NOTIFICATIONS_PRODUCER_SA` when a deployment sets it, and
@@ -401,11 +394,11 @@ def _producer_identity() -> tuple[Optional[str], str]:
 
 def _enqueue(
     url: str,
-    token: Optional[str],
+    token: str | None,
     queue_path: str,
     payload: dict[str, Any],
     *,
-    service_account: Optional[str] = None,
+    service_account: str | None = None,
     audience: str = DEFAULT_OIDC_AUDIENCE,
 ) -> None:
     """Put one notification on the queue. Raises; the caller reports.

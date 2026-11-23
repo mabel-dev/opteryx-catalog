@@ -65,8 +65,7 @@ def test_window_is_bound_at_fire_time():
 
     sql = post.call_args[0][0]["sql_text"]
     assert sql == (
-        "EXECUTE ws.ops.compaction_log_ingest "
-        "USING 100 AS parent_version, 200 AS current_version"
+        "EXECUTE ws.ops.compaction_log_ingest USING 100 AS parent_version, 200 AS current_version"
     )
     # Nothing relative reaches the worker - that is the whole point.
     assert "PREVIOUS" not in sql.upper()
@@ -463,7 +462,9 @@ def _claim(granted, at_ms=1_000_000, previous_ms=None, interval_seconds=120):
 
 
 def _floored_catalog(seconds=120, **task):
-    return _catalog_stub(triggers=[{**_task_trigger(), "minimum-interval-seconds": seconds}], **task)
+    return _catalog_stub(
+        triggers=[{**_task_trigger(), "minimum-interval-seconds": seconds}], **task
+    )
 
 
 def test_a_trigger_with_no_floor_is_never_claimed():
@@ -540,7 +541,9 @@ def test_a_throttled_bookkeeping_post_that_fails_does_not_break_the_fire():
         patch.object(trigger_firing, "write_audit_record"),
         patch.object(trigger_firing, "_alert") as alert,
     ):
-        fire_triggers(catalog, "ops.catalog_changes", author="alice", snapshot_id=200, parent_snapshot_id=100)
+        fire_triggers(
+            catalog, "ops.catalog_changes", author="alice", snapshot_id=200, parent_snapshot_id=100
+        )
 
     alert.assert_not_called()
     catalog.mark_trigger_fired.assert_called_once_with(

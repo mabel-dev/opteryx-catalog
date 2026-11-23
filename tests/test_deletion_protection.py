@@ -76,7 +76,7 @@ def _catalog(protected: bool):
     # drop_workspace enumerates collections/datasets/views before dropping
     # each - empty here since these tests are about the protection gate
     # itself, not about what gets swept up once it's cleared.
-    catalog.list_collections = lambda: []
+    catalog.list_collections = list
     return catalog, dataset_ref, collection_ref, view_ref
 
 

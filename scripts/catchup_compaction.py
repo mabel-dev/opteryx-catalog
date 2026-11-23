@@ -47,9 +47,9 @@ sys.path.insert(1, os.path.join(os.path.dirname(__file__), ".."))
 # os.environ. Nothing else about opteryx (session, planner, connector
 # registry) is used below - the catalog is driven directly.
 import opteryx  # noqa: F401
+from opteryx_catalog.catalog.compaction import DatasetCompactor
 
 from opteryx_catalog import OpteryxCatalog
-from opteryx_catalog.catalog.compaction import DatasetCompactor
 
 _REQUIRED_ENV = ("GCP_PROJECT_ID", "FIRESTORE_DATABASE", "GCS_BUCKET")
 

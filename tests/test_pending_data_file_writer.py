@@ -211,9 +211,7 @@ def test_pending_writer_touches_no_catalog_document():
     writer.write_row_group(_morsel())
     writer.close()
     # Only the data file exists; registering it is the caller's next commit.
-    assert list(catalog.io.mapping) == [
-        path for path in catalog.io.mapping if "/data/" in path
-    ]
+    assert list(catalog.io.mapping) == [path for path in catalog.io.mapping if "/data/" in path]
     assert len(catalog.io.mapping) == 1
 
 

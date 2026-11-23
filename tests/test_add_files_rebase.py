@@ -86,7 +86,9 @@ def _dataset_with_one_file():
     catalog = _RacingCatalog(mem_io)
     ds = SimpleDataset(
         identifier=IDENTIFIER,
-        _metadata=DatasetMetadata(dataset_identifier=IDENTIFIER, location="mem://", schema=None, properties={}),
+        _metadata=DatasetMetadata(
+            dataset_identifier=IDENTIFIER, location="mem://", schema=None, properties={}
+        ),
     )
     ds.io, ds.catalog = mem_io, catalog
     ds.add_files(["mem://data/f1.parquet"], author="tester")
@@ -94,7 +96,8 @@ def _dataset_with_one_file():
 
 
 @pytest.mark.parametrize(
-    "operation", ["append", "add-files", "compact", "statistics-refresh", "index-build", "index-drop"]
+    "operation",
+    ["append", "add-files", "compact", "statistics-refresh", "index-build", "index-drop"],
 )
 def test_an_append_rebases_over_a_commit_that_adds_or_changes_no_rows(operation):
     ds, catalog, mapping = _dataset_with_one_file()
@@ -111,7 +114,8 @@ def test_an_append_rebases_over_a_commit_that_adds_or_changes_no_rows(operation)
 
 
 @pytest.mark.parametrize(
-    "operation", ["overwrite", "truncate", "truncate-and-add-files", "delete", "merge", "something-new"]
+    "operation",
+    ["overwrite", "truncate", "truncate-and-add-files", "delete", "merge", "something-new"],
 )
 def test_an_append_keeps_the_race_over_anything_that_may_remove_rows(operation):
     ds, catalog, _ = _dataset_with_one_file()

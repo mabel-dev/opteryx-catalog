@@ -188,11 +188,17 @@ class _S3OutputStream:
 
     def _upload_part(self, number: int, body: bytearray) -> dict:
         response = self._client.upload_part(
-            Bucket=self._bucket, Key=self._key, UploadId=self._upload_id, PartNumber=number, Body=body
+            Bucket=self._bucket,
+            Key=self._key,
+            UploadId=self._upload_id,
+            PartNumber=number,
+            Body=body,
         )
         # Checksum* fields echo back: an upload created under a checksum
         # algorithm must name each part's checksum to complete.
-        part = {k: v for k, v in response.items() if k.startswith("Checksum") and k != "ChecksumType"}
+        part = {
+            k: v for k, v in response.items() if k.startswith("Checksum") and k != "ChecksumType"
+        }
         part["ETag"] = response["ETag"]
         part["PartNumber"] = number
         return part

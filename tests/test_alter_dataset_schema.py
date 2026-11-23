@@ -70,12 +70,36 @@ class _DocRef:
 
 
 _INITIAL = [
-    {"id": 1, "name": "id", "type": "INTEGER", "element-type": None,
-     "scale": None, "precision": None, "expectation-policies": [], "annotations": []},
-    {"id": 2, "name": "name", "type": "VARCHAR", "element-type": None,
-     "scale": None, "precision": None, "expectation-policies": [], "annotations": []},
-    {"id": 3, "name": "region", "type": "VARCHAR", "element-type": None,
-     "scale": None, "precision": None, "expectation-policies": [], "annotations": []},
+    {
+        "id": 1,
+        "name": "id",
+        "type": "INTEGER",
+        "element-type": None,
+        "scale": None,
+        "precision": None,
+        "expectation-policies": [],
+        "annotations": [],
+    },
+    {
+        "id": 2,
+        "name": "name",
+        "type": "VARCHAR",
+        "element-type": None,
+        "scale": None,
+        "precision": None,
+        "expectation-policies": [],
+        "annotations": [],
+    },
+    {
+        "id": 3,
+        "name": "region",
+        "type": "VARCHAR",
+        "element-type": None,
+        "scale": None,
+        "precision": None,
+        "expectation-policies": [],
+        "annotations": [],
+    },
 ]
 
 
@@ -123,9 +147,7 @@ def test_dropping_every_column_is_refused(capsys):
     catalog, _dataset_ref, _schemas = _catalog()
 
     with pytest.raises(ValueError, match="no relation"):
-        catalog.alter_dataset_schema(
-            "coll.tbl", drop=["id", "name", "region"], author="alice"
-        )
+        catalog.alter_dataset_schema("coll.tbl", drop=["id", "name", "region"], author="alice")
 
 
 # --- renaming ----------------------------------------------------------------
@@ -134,12 +156,10 @@ def test_dropping_every_column_is_refused(capsys):
 def test_rename_changes_the_name_and_nothing_else(capsys):
     catalog, dataset_ref, schemas = _catalog()
 
-    sid = catalog.alter_dataset_schema(
-        "coll.tbl", rename={"region": "territory"}, author="alice"
-    )
+    sid = catalog.alter_dataset_schema("coll.tbl", rename={"region": "territory"}, author="alice")
 
     columns = _new_schema(dataset_ref, schemas, sid)
-    renamed = [c for c in columns if c["name"] == "territory"][0]
+    renamed = next(c for c in columns if c["name"] == "territory")
     assert renamed["id"] == 3, "a rename must not re-identify the column"
     assert renamed["type"] == "VARCHAR"
     assert [c["name"] for c in columns] == ["id", "name", "territory"]
@@ -237,9 +257,7 @@ def test_next_field_id_is_derived_when_the_dataset_predates_it(capsys):
 def test_retype_rewrites_the_type_in_place(capsys):
     catalog, dataset_ref, schemas = _catalog()
 
-    sid = catalog.alter_dataset_schema(
-        "coll.tbl", retype={"id": {"type": "INT64"}}, author="alice"
-    )
+    sid = catalog.alter_dataset_schema("coll.tbl", retype={"id": {"type": "INT64"}}, author="alice")
 
     columns = _new_schema(dataset_ref, schemas, sid)
     assert columns[0]["name"] == "id" and columns[0]["type"] == "INT64"
@@ -317,7 +335,7 @@ def test_a_missing_dataset_is_reported_as_such(capsys):
 def test_the_previous_schema_document_is_left_intact(capsys):
     """Snapshots taken before this edit still resolve their own schema id, so
     the document they point at must not be edited in place."""
-    catalog, dataset_ref, schemas = _catalog()
+    catalog, _dataset_ref, schemas = _catalog()
 
     catalog.alter_dataset_schema("coll.tbl", drop=["name"], author="alice")
 
@@ -336,7 +354,7 @@ def test_emits_an_audit_record(capsys):
         author="alice",
     )
 
-    record = [r for r in _emitted(capsys) if r["action"] == "alter_schema"][0]
+    record = next(r for r in _emitted(capsys) if r["action"] == "alter_schema")
     assert record["resource_type"] == "dataset"
     assert (record["collection"], record["resource"]) == ("coll", "tbl")
     assert record["author"] == "alice"
@@ -354,11 +372,9 @@ def test_an_unrecognised_stored_field_rides_through_untouched(capsys):
     columns[2]["some-future-field"] = "keep me"
     catalog, dataset_ref, schemas = _catalog(columns=columns)
 
-    sid = catalog.alter_dataset_schema(
-        "coll.tbl", rename={"region": "territory"}, author="alice"
-    )
+    sid = catalog.alter_dataset_schema("coll.tbl", rename={"region": "territory"}, author="alice")
 
-    renamed = [c for c in _new_schema(dataset_ref, schemas, sid) if c["id"] == 3][0]
+    renamed = next(c for c in _new_schema(dataset_ref, schemas, sid) if c["id"] == 3)
     assert renamed["expectation-policies"] == [{"kind": "not-null"}]
     assert renamed["some-future-field"] == "keep me"
 

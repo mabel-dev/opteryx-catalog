@@ -15,14 +15,13 @@ the party the lock protects against.
 from __future__ import annotations
 
 import pytest
+from test_materialized_views import _add_dataset
+from test_materialized_views import _catalog
+from test_materialized_views import _register_mv
 
 from opteryx_catalog import OpteryxCatalog
 from opteryx_catalog.exceptions import EgressRestricted
 from opteryx_catalog.opteryx_catalog import SECURE_OBJECTS_PROPERTY
-from test_materialized_views import _add_dataset
-from test_materialized_views import _catalog
-from test_materialized_views import _register_mv
-from test_materialized_views import _set_egress_restriction
 
 TASK = "ws.ops.billing_events_ingest"
 

@@ -31,10 +31,14 @@ def stub_kms(monkeypatch):
         return bytes(seed[i % len(seed)] ^ (i & 0xFF) for i in range(length))
 
     monkeypatch.setattr(
-        kms_module, "_wrap_dek", lambda dek, key: bytes(a ^ b for a, b in zip(dek, _stream(key, len(dek))))
+        kms_module,
+        "_wrap_dek",
+        lambda dek, key: bytes(a ^ b for a, b in zip(dek, _stream(key, len(dek)))),
     )
     monkeypatch.setattr(
-        kms_module, "_unwrap_dek", lambda wrapped, key: bytes(a ^ b for a, b in zip(wrapped, _stream(key, len(wrapped))))
+        kms_module,
+        "_unwrap_dek",
+        lambda wrapped, key: bytes(a ^ b for a, b in zip(wrapped, _stream(key, len(wrapped)))),
     )
 
 

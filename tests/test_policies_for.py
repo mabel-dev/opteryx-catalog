@@ -14,8 +14,6 @@ relation outside it denied, however the principal was actually granted.
 
 from __future__ import annotations
 
-import pytest
-
 from opteryx_catalog.trigger_firing import policies_for
 
 
@@ -36,9 +34,7 @@ class _Query:
         self._principals = principals
 
     def stream(self):
-        return [
-            doc for doc in self._docs if doc.to_dict().get("principal") in self._principals
-        ]
+        return [doc for doc in self._docs if doc.to_dict().get("principal") in self._principals]
 
 
 class _Access:
@@ -97,7 +93,10 @@ OPTERYX_POLICIES = [
     _Doc("p-read-logs", {"principal": "ingest", "role": "reader", "pattern": "opteryx.ops.*"}),
 ]
 PLATFORM_POLICIES = [
-    _Doc("p-write-billing", {"principal": "ingest", "role": "writer", "pattern": "platform.billing.*"}),
+    _Doc(
+        "p-write-billing",
+        {"principal": "ingest", "role": "writer", "pattern": "platform.billing.*"},
+    ),
 ]
 
 

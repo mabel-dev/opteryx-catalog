@@ -139,13 +139,21 @@ def stub_kms(monkeypatch):
         calls["unwrap"] += 1
         return _xor(wrapped, key)
 
-    monkeypatch.setattr(kms_module, "_wrap_dek_versioned", lambda dek, key: (_xor(dek, key), f"{key}/cryptoKeyVersions/1"))
+    monkeypatch.setattr(
+        kms_module,
+        "_wrap_dek_versioned",
+        lambda dek, key: (_xor(dek, key), f"{key}/cryptoKeyVersions/1"),
+    )
     monkeypatch.setattr(kms_module, "_unwrap_dek", _unwrap)
     kms_module.clear_dek_cache()
-    set_kek_namer(lambda account: f"projects/p/locations/l/keyRings/customer-secrets/cryptoKeys/ba-{account}")
+    set_kek_namer(
+        lambda account: f"projects/p/locations/l/keyRings/customer-secrets/cryptoKeys/ba-{account}"
+    )
     import opteryx_catalog.secrets.store as store_module
 
-    monkeypatch.setattr(store_module, "_is_already_exists", lambda err: isinstance(err, AlreadyExists))
+    monkeypatch.setattr(
+        store_module, "_is_already_exists", lambda err: isinstance(err, AlreadyExists)
+    )
     yield calls
     set_kek_namer(None)
     kms_module.clear_dek_cache()
@@ -156,7 +164,9 @@ def audit(monkeypatch):
     records = []
     import opteryx_catalog.secrets.store as store_module
 
-    monkeypatch.setattr(store_module, "emit_audit", lambda action, **kw: records.append((action, kw)))
+    monkeypatch.setattr(
+        store_module, "emit_audit", lambda action, **kw: records.append((action, kw))
+    )
     return records
 
 
@@ -218,7 +228,11 @@ def test_or_replace_replaces_the_value_and_keeps_creation_stamp():
     catalog.create_secret(
         "billing_reader",
         "aws_access_key",
-        {"ACCESS_KEY_ID": AWS_ID, "SECRET_ACCESS_KEY": AWS_SECRET, "SCOPE": "s3://acme-lake/exports/"},
+        {
+            "ACCESS_KEY_ID": AWS_ID,
+            "SECRET_ACCESS_KEY": AWS_SECRET,
+            "SCOPE": "s3://acme-lake/exports/",
+        },
         author="bob",
         replace=True,
     )
@@ -249,7 +263,10 @@ def test_list_and_get_never_return_key_material():
     catalog = _catalog()
     _gcs(catalog)
     catalog.create_secret(
-        "alerts", "http_endpoint", {"URL": f"https://hooks.example.com/{CANARY}"}, author="alice",
+        "alerts",
+        "http_endpoint",
+        {"URL": f"https://hooks.example.com/{CANARY}"},
+        author="alice",
         resolve_host=_public_resolver,
     )
     listed = catalog.list_secrets()
@@ -289,7 +306,7 @@ def test_use_decrypts_stamps_and_audits(audit, stub_kms):
     _gcs(catalog)
     kms_module.clear_dek_cache()
     material = catalog.use_secret(
-        "analytics.billing_reader".split(".")[1],
+        ["analytics", "billing_reader"][1],
         used_by="alice",
         purpose="read",
         path="gs://mabel_logs/gcp_billing/x/a.parquet",
@@ -304,7 +321,9 @@ def test_use_decrypts_stamps_and_audits(audit, stub_kms):
     assert audit[-1][0] == "use_secret"
     assert audit[-1][1]["path"] == "gs://mabel_logs/gcp_billing/x/a.parquet"
     # The second use is served from the DEK cache, not another KMS call.
-    catalog.use_secret("billing_reader", used_by="alice", purpose="read", path="gs://mabel_logs/gcp_billing/y")
+    catalog.use_secret(
+        "billing_reader", used_by="alice", purpose="read", path="gs://mabel_logs/gcp_billing/y"
+    )
     assert stub_kms["unwrap"] == 1
 
 
@@ -312,22 +331,35 @@ def test_use_refuses_a_path_outside_scope_or_of_the_wrong_scheme():
     catalog = _catalog()
     _gcs(catalog)
     with pytest.raises(SecretRefused, match="outside"):
-        catalog.use_secret("billing_reader", used_by="a", purpose="read", path="gs://mabel_logs/other/x")
+        catalog.use_secret(
+            "billing_reader", used_by="a", purpose="read", path="gs://mabel_logs/other/x"
+        )
     with pytest.raises(SecretRefused, match="outside"):
-        catalog.use_secret("billing_reader", used_by="a", purpose="read", path="gs://mabel_logs_private/gcp_billing/x")
+        catalog.use_secret(
+            "billing_reader",
+            used_by="a",
+            purpose="read",
+            path="gs://mabel_logs_private/gcp_billing/x",
+        )
     with pytest.raises(SecretRefused, match="type"):
-        catalog.use_secret("billing_reader", used_by="a", purpose="read", path="s3://mabel_logs/gcp_billing/x")
+        catalog.use_secret(
+            "billing_reader", used_by="a", purpose="read", path="s3://mabel_logs/gcp_billing/x"
+        )
 
 
 def test_a_sealed_record_does_not_open_at_another_address():
     catalog = _catalog()
     _gcs(catalog)
     items = ("analytics", "$secrets", "items")
-    catalog._store[items + ("copy",)] = dict(catalog._store[items + ("billing_reader",)], name="copy")
+    catalog._store[items + ("copy",)] = dict(
+        catalog._store[items + ("billing_reader",)], name="copy"
+    )
     from opteryx_catalog.security.kms import SecretDecryptionError
 
     with pytest.raises(SecretDecryptionError):
-        catalog.use_secret("copy", used_by="a", purpose="read", path="gs://mabel_logs/gcp_billing/x")
+        catalog.use_secret(
+            "copy", used_by="a", purpose="read", path="gs://mabel_logs/gcp_billing/x"
+        )
 
 
 # -- validation --------------------------------------------------------------
@@ -341,18 +373,47 @@ def test_a_sealed_record_does_not_open_at_another_address():
         ("http_endpoint", {"URL": "https://u:p@hooks.example.com/"}, "userinfo"),
         ("http_endpoint", {"URL": "https://10.0.0.1/"}, "private"),
         ("http_endpoint", {"URL": "https://169.254.169.254/"}, "private"),
-        ("http_endpoint", {"URL": "https://hooks.example.com/", "HEADER_COOKIE": "x"}, "does not take"),
+        (
+            "http_endpoint",
+            {"URL": "https://hooks.example.com/", "HEADER_COOKIE": "x"},
+            "does not take",
+        ),
         ("http_endpoint", {"URLL": "https://hooks.example.com/"}, "does not take"),
         ("gcs_service_account", {"KEY": SA_KEY}, "requires SCOPE"),
         ("gcs_service_account", {"KEY": "not json", "SCOPE": "gs://bkt1/"}, "not valid JSON"),
-        ("gcs_service_account", {"KEY": '{"type": "user"}', "SCOPE": "gs://bkt1/"}, "service_account"),
+        (
+            "gcs_service_account",
+            {"KEY": '{"type": "user"}', "SCOPE": "gs://bkt1/"},
+            "service_account",
+        ),
         ("gcs_service_account", {"KEY": SA_KEY, "SCOPE": "s3://bkt1/"}, "gs://"),
-        ("gcs_service_account", {"KEY": SA_KEY.replace("https://oauth2.googleapis.com/token", "https://attacker.example/token"), "SCOPE": "gs://bkt1/"}, "token endpoint"),
+        (
+            "gcs_service_account",
+            {
+                "KEY": SA_KEY.replace(
+                    "https://oauth2.googleapis.com/token", "https://attacker.example/token"
+                ),
+                "SCOPE": "gs://bkt1/",
+            },
+            "token endpoint",
+        ),
         ("gcs_service_account", {"KEY": SA_KEY, "SCOPE": "gs://bkt1/*.parquet"}, "not a glob"),
         ("gcs_service_account", {"KEY": SA_KEY, "SCOPE": "gs://bkt1/../x"}, "segments"),
-        ("aws_access_key", {"ACCESS_KEY_ID": "nope", "SECRET_ACCESS_KEY": AWS_SECRET, "SCOPE": "s3://bkt1/"}, "shape"),
-        ("aws_access_key", {"ACCESS_KEY_ID": AWS_ID, "SECRET_ACCESS_KEY": AWS_SECRET}, "requires SCOPE"),
-        ("aws_access_key", {"ACCESS_KEY_ID": AWS_TEMP_ID, "SECRET_ACCESS_KEY": AWS_SECRET, "SCOPE": "s3://bkt1/"}, "SESSION_TOKEN"),
+        (
+            "aws_access_key",
+            {"ACCESS_KEY_ID": "nope", "SECRET_ACCESS_KEY": AWS_SECRET, "SCOPE": "s3://bkt1/"},
+            "shape",
+        ),
+        (
+            "aws_access_key",
+            {"ACCESS_KEY_ID": AWS_ID, "SECRET_ACCESS_KEY": AWS_SECRET},
+            "requires SCOPE",
+        ),
+        (
+            "aws_access_key",
+            {"ACCESS_KEY_ID": AWS_TEMP_ID, "SECRET_ACCESS_KEY": AWS_SECRET, "SCOPE": "s3://bkt1/"},
+            "SESSION_TOKEN",
+        ),
     ],
 )
 def test_validation_refusals(secret_type, options, message):
@@ -366,7 +427,11 @@ def test_validation_refusals(secret_type, options, message):
 
 def test_http_endpoint_refuses_a_host_resolving_privately():
     with pytest.raises(SecretInvalid, match="private"):
-        validate_secret("http_endpoint", {"URL": "https://internal.example.com/"}, resolve_host=lambda h: ["10.1.2.3"])
+        validate_secret(
+            "http_endpoint",
+            {"URL": "https://internal.example.com/"},
+            resolve_host=lambda h: ["10.1.2.3"],
+        )
 
 
 def test_valid_types_normalise_option_keys():
@@ -375,10 +440,18 @@ def test_valid_types_normalise_option_keys():
         {"url": "https://hooks.example.com/x", "header_authorization": "Bearer z"},
         resolve_host=_public_resolver,
     )
-    assert v.payload == {"url": "https://hooks.example.com/x", "headers": {"Authorization": "Bearer z"}}
+    assert v.payload == {
+        "url": "https://hooks.example.com/x",
+        "headers": {"Authorization": "Bearer z"},
+    }
     a = validate_secret(
         "aws_access_key",
-        {"ACCESS_KEY_ID": AWS_ID, "SECRET_ACCESS_KEY": AWS_SECRET, "REGION": "eu-west-2", "SCOPE": "s3://acme-lake"},
+        {
+            "ACCESS_KEY_ID": AWS_ID,
+            "SECRET_ACCESS_KEY": AWS_SECRET,
+            "REGION": "eu-west-2",
+            "SCOPE": "s3://acme-lake",
+        },
     )
     assert a.scope == "s3://acme-lake/"
     assert a.payload["region"] == "eu-west-2"

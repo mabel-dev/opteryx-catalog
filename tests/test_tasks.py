@@ -11,15 +11,14 @@ The Firestore stand-ins are the ones the materialized-view tests use.
 from __future__ import annotations
 
 import pytest
+from test_materialized_views import _add_dataset
+from test_materialized_views import _catalog
+from test_materialized_views import _set_egress_restriction
 
 from opteryx_catalog.exceptions import EgressRestricted
 from opteryx_catalog.exceptions import PlatformIdentityOwnerRefused
 from opteryx_catalog.exceptions import TaskAlreadyExists
 from opteryx_catalog.exceptions import TaskNotFound
-from test_materialized_views import _add_dataset
-from test_materialized_views import _catalog
-from test_materialized_views import _set_egress_restriction
-
 
 # --- registration
 
@@ -828,9 +827,9 @@ def test_redefining_replaces_what_a_task_reads():
     a redefinition that changes the sources must not leave the old answer
     standing beside the new statement."""
     catalog = _catalog()
-    catalog.create_task("ops.ingest", sql="SELECT * FROM ops.raw", author="xb500", reads=["ops.raw"])
     catalog.create_task(
-        "ops.ingest", sql="SELECT 1", author="xb500", update_if_exists=True
+        "ops.ingest", sql="SELECT * FROM ops.raw", author="xb500", reads=["ops.raw"]
     )
+    catalog.create_task("ops.ingest", sql="SELECT 1", author="xb500", update_if_exists=True)
 
     assert catalog.get_task("ops.ingest")["reads"] == []

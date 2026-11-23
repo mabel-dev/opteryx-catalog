@@ -25,6 +25,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.dirname(__file__))
 
 import pytest
+import test_rollback as fake
+from test_commit_pointer_atomic import _AtomicTransaction
+from test_mor_deletes import LOCATION
+from test_mor_deletes import _current_entries
+from test_mor_deletes import _make_morsel
+from test_mor_deletes import _seed_dataset
 
 from opteryx_catalog.catalog.vector_indexes import IndexFiles
 from opteryx_catalog.catalog.vector_indexes import index_files
@@ -38,24 +44,24 @@ from opteryx_catalog.exceptions import MaintenanceLeaseLost
 from opteryx_catalog.exceptions import VectorIndexAlreadyExists
 from opteryx_catalog.exceptions import VectorIndexNotFound
 
-import test_rollback as fake
-from test_commit_pointer_atomic import _AtomicTransaction
-from test_mor_deletes import LOCATION
-from test_mor_deletes import _current_entries
-from test_mor_deletes import _make_morsel
-from test_mor_deletes import _seed_dataset
-
 INDEX_A = "a" * 32
 INDEX_B = "b" * 32
 IDENTITY = "minilm-l6-v2:256:sha256:" + "0" * 64
 
 
 def _define(**overrides):
-    args = dict(
-        name="Docs_Idx", column="body", method="ivf", metric="cosine", build=None,
-        clusters=0, embedding_identity=IDENTITY, dimensions=384,
-        author="tester", created_at_ms=1,
-    )
+    args = {
+        "name": "Docs_Idx",
+        "column": "body",
+        "method": "ivf",
+        "metric": "cosine",
+        "build": None,
+        "clusters": 0,
+        "embedding_identity": IDENTITY,
+        "dimensions": 384,
+        "author": "tester",
+        "created_at_ms": 1,
+    }
     args.update(overrides)
     return new_index_definition(**args)
 
@@ -104,8 +110,13 @@ def test_create_list_get_alter():
         fake.IDENTIFIER, "Second", "body", embedding_identity=IDENTITY, dimensions=384, author="t"
     )
     catalog.create_vector_index(
-        fake.IDENTIFIER, "first", "title", embedding_identity=IDENTITY, dimensions=384,
-        author="t", build="sync",
+        fake.IDENTIFIER,
+        "first",
+        "title",
+        embedding_identity=IDENTITY,
+        dimensions=384,
+        author="t",
+        build="sync",
     )
     assert [i["name"] for i in catalog.list_vector_indexes(fake.IDENTIFIER)] == ["first", "second"]
     assert catalog.get_vector_index(fake.IDENTIFIER, "SECOND")["index-id"] == created["index-id"]
@@ -167,7 +178,9 @@ FILE_BYTES, FOOTER_BYTES, LOGICAL_BYTES = 1000, 100, 1000
 def _files(index_id, data_path):
     return index_files(
         vector_index_path(LOCATION, index_id, data_path),
-        file_bytes=FILE_BYTES, footer_bytes=FOOTER_BYTES, logical_bytes=LOGICAL_BYTES,
+        file_bytes=FILE_BYTES,
+        footer_bytes=FOOTER_BYTES,
+        logical_bytes=LOGICAL_BYTES,
     )
 
 
@@ -199,11 +212,12 @@ def test_commit_attaches_and_replaces_only_its_own_index():
     ds, _ = _seed_dataset({"mem://f1.parquet": [1, 2], "mem://f2.parquet": [3]})
     first_a = _attach(ds, INDEX_A, "mem://f1.parquet", "mem://f2.parquet")
     b = _attach(ds, INDEX_B, "mem://f1.parquet")
-    second_a = _attach(ds, INDEX_A, "mem://f1.parquet")     # rebuild f1 for A
+    second_a = _attach(ds, INDEX_A, "mem://f1.parquet")  # rebuild f1 for A
 
     refs = _refs(ds)
     assert refs["mem://f1.parquet"] == {
-        INDEX_A: second_a["mem://f1.parquet"], INDEX_B: b["mem://f1.parquet"],
+        INDEX_A: second_a["mem://f1.parquet"],
+        INDEX_B: b["mem://f1.parquet"],
     }
     assert refs["mem://f2.parquet"] == {INDEX_A: first_a["mem://f2.parquet"]}
     snap = ds.snapshot(None)
@@ -227,13 +241,15 @@ def test_remove_detaches_only_that_index_and_is_idempotent():
     assert ds.remove_vector_index_files(INDEX_A, author="t") is not None
     assert ds.snapshot(None).operation_type == "index-drop"
     assert _refs(ds)["mem://f1.parquet"] == {INDEX_B: b["mem://f1.parquet"]}
-    assert ds.remove_vector_index_files(INDEX_A, author="t") is None   # nothing left to drop
+    assert ds.remove_vector_index_files(INDEX_A, author="t") is None  # nothing left to drop
 
 
 def test_build_plan_lists_the_uncovered_files_with_size_deletes_and_new_paths():
-    ds, _ = _seed_dataset({"mem://f1.parquet": [1, 2, 3], "mem://f2.parquet": [4], "mem://f3.parquet": [5]})
+    ds, _ = _seed_dataset(
+        {"mem://f1.parquet": [1, 2, 3], "mem://f2.parquet": [4], "mem://f3.parquet": [5]}
+    )
     _attach(ds, INDEX_A, "mem://f2.parquet")
-    _attach(ds, INDEX_B, "mem://f1.parquet")                # another index covers nothing of A's
+    _attach(ds, INDEX_B, "mem://f1.parquet")  # another index covers nothing of A's
     ds.delete_rows({"mem://f1.parquet": [0, 2]}, author="tester")
     sizes = {e["file_path"]: e["file_size_in_bytes"] for e in _current_entries(ds)}
 
@@ -245,10 +261,10 @@ def test_build_plan_lists_the_uncovered_files_with_size_deletes_and_new_paths():
     for task in plan:
         assert task.path.startswith(f"{LOCATION}/index/{INDEX_A}/")
         assert task.path.endswith(".vidx") and is_vector_index_path(task.path)
-    assert plan[0].path != ds.vector_index_build_plan(INDEX_A)[0].path   # minted fresh
+    assert plan[0].path != ds.vector_index_build_plan(INDEX_A)[0].path  # minted fresh
 
     _attach(ds, INDEX_A, "mem://f1.parquet", "mem://f3.parquet")
-    assert ds.vector_index_build_plan(INDEX_A) == []        # up to date
+    assert ds.vector_index_build_plan(INDEX_A) == []  # up to date
 
 
 # --- lifecycle -------------------------------------------------------------
@@ -260,7 +276,7 @@ def test_append_carries_references_forward():
     ds.append(_make_morsel([7, 8]), author="tester")
     refs = _refs(ds)
     assert refs["mem://f1.parquet"] == {INDEX_A: files["mem://f1.parquet"]}
-    assert [r for p, r in refs.items() if p != "mem://f1.parquet"] == [{}]   # new file: unindexed
+    assert [r for p, r in refs.items() if p != "mem://f1.parquet"] == [{}]  # new file: unindexed
 
 
 def test_statistics_refresh_carries_references():
@@ -305,18 +321,29 @@ def test_inconsistent_columns_are_refused():
         index_refs({"file_path": "x", "vidx_ids": [INDEX_A], "vidx_paths": []})
     # Paths without their sizes are as inconsistent as a missing path.
     with pytest.raises(ValueError, match="inconsistent"):
-        index_refs({"file_path": "x", "vidx_ids": [INDEX_A], "vidx_paths": ["v"], "vidx_bytes": [1]})
+        index_refs(
+            {"file_path": "x", "vidx_ids": [INDEX_A], "vidx_paths": ["v"], "vidx_bytes": [1]}
+        )
 
 
 def test_the_retired_two_file_columns_read_as_not_indexed():
     """A manifest written before 2026-10-04 carries the skene pair's six columns. This
     reader does not know them: the file is not indexed (its old files are orphans the
     sweeps reclaim - they still classify as index files), never an error."""
-    assert index_refs({
-        "file_path": "x", "vector_index_ids": [INDEX_A], "vector_index_vectors": ["v.vectors.skene"],
-        "vector_index_centroids": ["c.centroids.skene"], "vector_index_vectors_bytes": [1],
-        "vector_index_centroids_bytes": [1], "vector_index_logical_bytes": [2],
-    }) == {}
+    assert (
+        index_refs(
+            {
+                "file_path": "x",
+                "vector_index_ids": [INDEX_A],
+                "vector_index_vectors": ["v.vectors.skene"],
+                "vector_index_centroids": ["c.centroids.skene"],
+                "vector_index_vectors_bytes": [1],
+                "vector_index_centroids_bytes": [1],
+                "vector_index_logical_bytes": [2],
+            }
+        )
+        == {}
+    )
     assert is_vector_index_path(f"{LOCATION}/index/{INDEX_A}/f-0a1b.vectors.skene")
     assert is_vector_index_path(f"{LOCATION}/index/{INDEX_A}/f-0a1b.centroids.skene")
 
@@ -349,10 +376,15 @@ def test_a_commit_without_sizes_is_refused():
     before = ds.metadata.current_snapshot_id
     path = vector_index_path(LOCATION, INDEX_A, "mem://f1.parquet")
     with pytest.raises(ValueError, match="must be IndexFiles"):
-        ds.commit_vector_index_files(INDEX_A, {"mem://f1.parquet": (path, 1, 1)}, author="b", agent="t")
+        ds.commit_vector_index_files(
+            INDEX_A, {"mem://f1.parquet": (path, 1, 1)}, author="b", agent="t"
+        )
     with pytest.raises(ValueError, match="positive integer"):
         ds.commit_vector_index_files(
-            INDEX_A, {"mem://f1.parquet": IndexFiles(path, 0, 1, 1)}, author="b", agent="t",
+            INDEX_A,
+            {"mem://f1.parquet": IndexFiles(path, 0, 1, 1)},
+            author="b",
+            agent="t",
         )
     assert ds.metadata.current_snapshot_id == before
 
@@ -363,14 +395,18 @@ def test_sizes_round_trip_through_the_manifest():
     (stored,) = _refs(ds)["mem://f1.parquet"].values()
     assert stored == files["mem://f1.parquet"]
     assert (stored.file_bytes, stored.footer_bytes, stored.logical_bytes) == (
-        FILE_BYTES, FOOTER_BYTES, LOGICAL_BYTES,
+        FILE_BYTES,
+        FOOTER_BYTES,
+        LOGICAL_BYTES,
     )
 
 
 def _counters(ds):
     summary = ds.snapshot(None).summary
     return (
-        summary["total-index-files"], summary["total-index-size"], summary["total-index-data-size"]
+        summary["total-index-files"],
+        summary["total-index-size"],
+        summary["total-index-data-size"],
     )
 
 
@@ -381,31 +417,32 @@ def _data_totals(ds):
 
 def test_summary_counters_follow_build_drop_append_and_refresh():
     ds, _ = _seed_dataset({"mem://f1.parquet": [1, 2], "mem://f2.parquet": [3]})
-    ds.refresh_manifest(agent="test", author="t")         # the seed's summary is hand-made
+    ds.refresh_manifest(agent="test", author="t")  # the seed's summary is hand-made
     data = _data_totals(ds)
     assert _counters(ds) == (0, 0, 0)
 
     _attach(ds, INDEX_A, "mem://f1.parquet", "mem://f2.parquet")
     _attach(ds, INDEX_B, "mem://f1.parquet")
     assert _counters(ds) == (3, 3 * FILE_BYTES, 3 * LOGICAL_BYTES)
-    assert _data_totals(ds) == data                       # an index never moves the data figures
+    assert _data_totals(ds) == data  # an index never moves the data figures
 
-    _attach(ds, INDEX_A, "mem://f1.parquet")              # a rebuild replaces, never adds
+    _attach(ds, INDEX_A, "mem://f1.parquet")  # a rebuild replaces, never adds
     assert _counters(ds) == (3, 3 * FILE_BYTES, 3 * LOGICAL_BYTES)
 
     ds.remove_vector_index_files(INDEX_A, author="t")
     assert _counters(ds) == (1, FILE_BYTES, LOGICAL_BYTES)
     assert _data_totals(ds) == data
 
-    ds.append(_make_morsel([7, 8]), author="tester")      # carried; the new file is unindexed
+    ds.append(_make_morsel([7, 8]), author="tester")  # carried; the new file is unindexed
     assert _counters(ds) == (1, FILE_BYTES, LOGICAL_BYTES)
     ds.refresh_manifest(agent="test", author="t")
     assert _counters(ds) == (1, FILE_BYTES, LOGICAL_BYTES)
 
 
 def _compaction_output(storage, values, name="out"):
-    from opteryx_catalog.catalog.manifest import build_parquet_manifest_entry_from_bytes
     from rugo.parquet import write_parquet
+
+    from opteryx_catalog.catalog.manifest import build_parquet_manifest_entry_from_bytes
 
     out = f"mem://ws/mor/data/{name}.parquet"
     data = write_parquet(_make_morsel(values), compression="zstd")
@@ -421,7 +458,9 @@ def test_compaction_carries_index_files_in_the_same_commit():
     out, entry = _compaction_output(storage, [1, 2, 3])
     carried = _files(INDEX_A, out)
     ds.compaction_commit(
-        entries=[entry], retired_files=["mem://f1.parquet", "mem://f2.parquet"], author="tester",
+        entries=[entry],
+        retired_files=["mem://f1.parquet", "mem://f2.parquet"],
+        author="tester",
         index_files={out: {INDEX_A: carried}},
     )
     assert _refs(ds) == {out: {INDEX_A: carried}}
@@ -431,8 +470,11 @@ def test_compaction_carries_index_files_in_the_same_commit():
 @pytest.mark.parametrize(
     "carry, message",
     [
-        (lambda out: None, "must keep exactly its inputs' index coverage"),        # dropped coverage
-        (lambda out: {out: {INDEX_A: _files(INDEX_A, out), INDEX_B: _files(INDEX_B, out)}}, "exactly"),
+        (lambda out: None, "must keep exactly its inputs' index coverage"),  # dropped coverage
+        (
+            lambda out: {out: {INDEX_A: _files(INDEX_A, out), INDEX_B: _files(INDEX_B, out)}},
+            "exactly",
+        ),
         (lambda out: {"mem://other.parquet": {INDEX_A: _files(INDEX_A, out)}}, "does not write"),
         (lambda out: {out: {INDEX_A: (_files(INDEX_A, out)[0], "c")}}, "must be IndexFiles"),
     ],
@@ -446,7 +488,9 @@ def test_compaction_refuses_to_change_index_coverage(carry, message):
     out, entry = _compaction_output(storage, [1, 2])
     with pytest.raises((CompactionInvariantError, ValueError), match=message):
         ds.compaction_commit(
-            entries=[entry], retired_files=["mem://f1.parquet"], author="tester",
+            entries=[entry],
+            retired_files=["mem://f1.parquet"],
+            author="tester",
             index_files=carry(out),
         )
     assert ds.metadata.current_snapshot_id == head
@@ -457,10 +501,12 @@ def test_compaction_refuses_inputs_with_different_coverage():
 
     ds, storage = _seed_dataset({"mem://f1.parquet": [1, 2], "mem://f2.parquet": [3]})
     _attach(ds, INDEX_A, "mem://f1.parquet")
-    out, entry = _compaction_output(storage, [1, 2, 3])
+    _out, entry = _compaction_output(storage, [1, 2, 3])
     with pytest.raises(CompactionInvariantError, match="same vector index coverage"):
         ds.compaction_commit(
-            entries=[entry], retired_files=["mem://f1.parquet", "mem://f2.parquet"], author="tester",
+            entries=[entry],
+            retired_files=["mem://f1.parquet", "mem://f2.parquet"],
+            author="tester",
         )
 
 
@@ -536,7 +582,7 @@ def test_lease_is_exclusive_and_refused_loudly(lease_catalog):
         catalog.claim_maintenance_lease(
             fake.IDENTIFIER, holder="refresh-index", operation="index-build", ttl_seconds=60
         )
-    assert _stored_lease(catalog)["claim-id"] == lease.claim_id      # the refusal wrote nothing
+    assert _stored_lease(catalog)["claim-id"] == lease.claim_id  # the refusal wrote nothing
 
 
 def test_an_expired_lease_is_claimable_and_the_late_holder_loses_it(lease_catalog):
@@ -544,13 +590,13 @@ def test_an_expired_lease_is_claimable_and_the_late_holder_loses_it(lease_catalo
     stale = catalog.claim_maintenance_lease(
         fake.IDENTIFIER, holder="crashed", operation="index-build", ttl_seconds=60
     )
-    clock["ms"] += 60_000                                            # expires exactly now
+    clock["ms"] += 60_000  # expires exactly now
     fresh = catalog.claim_maintenance_lease(
         fake.IDENTIFIER, holder="compactor", operation="compaction", ttl_seconds=60
     )
     with pytest.raises(MaintenanceLeaseLost, match="now held for compaction by compactor"):
         catalog.renew_maintenance_lease(stale, ttl_seconds=60)
-    assert catalog.release_maintenance_lease(stale) is False        # never removes fresh's claim
+    assert catalog.release_maintenance_lease(stale) is False  # never removes fresh's claim
     assert _stored_lease(catalog)["claim-id"] == fresh.claim_id
 
 
@@ -563,14 +609,18 @@ def test_renew_extends_and_release_frees(lease_catalog):
     renewed = catalog.renew_maintenance_lease(lease, ttl_seconds=60)
     assert renewed.expires_at_ms == clock["ms"] + 60_000
     assert renewed.claim_id == lease.claim_id
-    clock["ms"] += 30_000                                            # past the ORIGINAL expiry
+    clock["ms"] += 30_000  # past the ORIGINAL expiry
     with pytest.raises(MaintenanceLeaseHeld):
-        catalog.claim_maintenance_lease(fake.IDENTIFIER, holder="x", operation="compaction", ttl_seconds=5)
+        catalog.claim_maintenance_lease(
+            fake.IDENTIFIER, holder="x", operation="compaction", ttl_seconds=5
+        )
     assert catalog.release_maintenance_lease(renewed) is True
     assert _stored_lease(catalog) is None
-    with pytest.raises(MaintenanceLeaseLost):                       # released = no longer held
+    with pytest.raises(MaintenanceLeaseLost):  # released = no longer held
         catalog.renew_maintenance_lease(renewed, ttl_seconds=60)
-    catalog.claim_maintenance_lease(fake.IDENTIFIER, holder="x", operation="compaction", ttl_seconds=5)
+    catalog.claim_maintenance_lease(
+        fake.IDENTIFIER, holder="x", operation="compaction", ttl_seconds=5
+    )
 
 
 @pytest.mark.parametrize(
@@ -592,7 +642,9 @@ def test_lease_requests_are_validated(lease_catalog, kwargs):
 def test_lease_on_a_missing_dataset_is_refused(lease_catalog):
     catalog, _ = lease_catalog
     with pytest.raises(DatasetNotFound):
-        catalog.claim_maintenance_lease("reports.absent", holder="h", operation="compaction", ttl_seconds=5)
+        catalog.claim_maintenance_lease(
+            "reports.absent", holder="h", operation="compaction", ttl_seconds=5
+        )
 
 
 # --- the dataset's own lifecycle -----------------------------------------------
@@ -601,7 +653,9 @@ def test_lease_on_a_missing_dataset_is_refused(lease_catalog):
 def test_drop_dataset_removes_its_index_definitions(monkeypatch):
     """A same-named table created after a DROP must not inherit the old definitions:
     they lived on the dropped dataset's document."""
-    monkeypatch.setattr(fake._DocRef, "delete", lambda self: setattr(self, "_exists", False), raising=False)
+    monkeypatch.setattr(
+        fake._DocRef, "delete", lambda self: setattr(self, "_exists", False), raising=False
+    )
     catalog = _catalog_with_dataset()
     catalog.create_vector_index(
         fake.IDENTIFIER, "idx", "body", embedding_identity=IDENTITY, dimensions=384, author="t"
@@ -609,7 +663,7 @@ def test_drop_dataset_removes_its_index_definitions(monkeypatch):
     catalog.drop_dataset(fake.IDENTIFIER, author="t")
     with pytest.raises(DatasetNotFound):
         catalog.list_vector_indexes(fake.IDENTIFIER)
-    fake._dataset(catalog, head=100)                          # the same name, created again
+    fake._dataset(catalog, head=100)  # the same name, created again
     assert catalog.list_vector_indexes(fake.IDENTIFIER) == []
 
 
@@ -624,8 +678,13 @@ def test_a_commit_from_stale_metadata_keeps_a_definition_created_meanwhile(condi
     stale = DatasetMetadata(dataset_identifier=fake.IDENTIFIER, location="mem://ws/reports/monthly")
     stale.current_snapshot_id = 100
     catalog.create_vector_index(
-        fake.IDENTIFIER, "idx", "body", embedding_identity=IDENTITY, dimensions=384,
-        author="t", build="sync",
+        fake.IDENTIFIER,
+        "idx",
+        "body",
+        embedding_identity=IDENTITY,
+        dimensions=384,
+        author="t",
+        build="sync",
     )
     if conditional:
         catalog.save_dataset_metadata(fake.IDENTIFIER, stale, expected_current_snapshot_id=100)
@@ -636,13 +695,20 @@ def test_a_commit_from_stale_metadata_keeps_a_definition_created_meanwhile(condi
 
 def test_the_loaded_dataset_carries_its_definitions(monkeypatch):
     """A query plans an index search from the dataset it loaded - no read of its own."""
-    monkeypatch.setattr(fake._DocRef, "path", property(lambda self: f"docs/{id(self)}"), raising=False)
+    monkeypatch.setattr(
+        fake._DocRef, "path", property(lambda self: f"docs/{id(self)}"), raising=False
+    )
     catalog = _catalog_with_dataset()
     catalog.gcs_bucket = "bucket"
     for name in ("second", "first"):
         catalog.create_vector_index(
-            fake.IDENTIFIER, name, "body", embedding_identity=IDENTITY, dimensions=384,
-            author="t", build="sync",
+            fake.IDENTIFIER,
+            name,
+            "body",
+            embedding_identity=IDENTITY,
+            dimensions=384,
+            author="t",
+            build="sync",
         )
     loaded = catalog.load_dataset(fake.IDENTIFIER)
     assert [i["name"] for i in loaded.metadata.vector_indexes] == ["first", "second"]
@@ -652,10 +718,17 @@ def test_dropping_an_index_leaves_the_others():
     catalog = _catalog_with_dataset()
     for name in ("keep", "gone"):
         catalog.create_vector_index(
-            fake.IDENTIFIER, name, "body", embedding_identity=IDENTITY, dimensions=384,
-            author="t", build="sync",
+            fake.IDENTIFIER,
+            name,
+            "body",
+            embedding_identity=IDENTITY,
+            dimensions=384,
+            author="t",
+            build="sync",
         )
-    catalog.load_dataset = lambda identifier: type("D", (), {"remove_vector_index_files": lambda *a, **k: None})()
+    catalog.load_dataset = lambda identifier: type(
+        "D", (), {"remove_vector_index_files": lambda *a, **k: None}
+    )()
     catalog.drop_vector_index(fake.IDENTIFIER, "gone", author="t")
     assert [i["name"] for i in catalog.list_vector_indexes(fake.IDENTIFIER)] == ["keep"]
 
@@ -678,7 +751,9 @@ def test_merge_commit_references_sync_index_files_in_the_same_commit():
     out, entry = _compaction_output(storage, [9], name="merged")
     files = _files(INDEX_A, out)
     ds.merge_commit(
-        entries=[entry], positions={"mem://f1.parquet": [0]}, author="tester",
+        entries=[entry],
+        positions={"mem://f1.parquet": [0]},
+        author="tester",
         index_files={out: {INDEX_A: files}},
     )
     assert _refs(ds)[out] == {INDEX_A: files}
@@ -707,13 +782,24 @@ def test_an_async_create_fires_its_refresh_and_a_sync_one_does_not(monkeypatch):
 
     fired = []
     monkeypatch.setattr(
-        trigger_firing, "fire_index_refreshes",
-        lambda catalog, dataset, author, snapshot_id=None, only=None: fired.append((dataset, author, only)),
+        trigger_firing,
+        "fire_index_refreshes",
+        lambda catalog, dataset, author, snapshot_id=None, only=None: fired.append(
+            (dataset, author, only)
+        ),
     )
     catalog = _catalog_with_dataset()
-    catalog.create_vector_index(fake.IDENTIFIER, "Lazy", "body", embedding_identity=IDENTITY, dimensions=384, author="t")
     catalog.create_vector_index(
-        fake.IDENTIFIER, "eager", "body", embedding_identity=IDENTITY, dimensions=384, author="t", build="sync",
+        fake.IDENTIFIER, "Lazy", "body", embedding_identity=IDENTITY, dimensions=384, author="t"
+    )
+    catalog.create_vector_index(
+        fake.IDENTIFIER,
+        "eager",
+        "body",
+        embedding_identity=IDENTITY,
+        dimensions=384,
+        author="t",
+        build="sync",
     )
     assert fired == [(fake.IDENTIFIER, "t", "lazy")]
 
@@ -724,7 +810,7 @@ def test_vector_index_files_lists_what_one_index_covers_at_a_snapshot():
     a = _attach(ds, INDEX_A, "mem://f1.parquet")
     _attach(ds, INDEX_B, "mem://f2.parquet")
     assert ds.vector_index_files(INDEX_A) == a
-    assert ds.vector_index_files(INDEX_A, seeded) == {}          # time travel: not yet built
+    assert ds.vector_index_files(INDEX_A, seeded) == {}  # time travel: not yet built
 
 
 def test_an_index_build_commit_message_looks_the_name_up_from_the_definition():
@@ -733,7 +819,10 @@ def test_an_index_build_commit_message_looks_the_name_up_from_the_definition():
     class _Catalog:
         def list_vector_indexes(self, identifier):
             assert identifier == ds.identifier
-            return [{"index-id": INDEX_B, "name": "other_idx"}, {"index-id": INDEX_A, "name": "body_idx"}]
+            return [
+                {"index-id": INDEX_B, "name": "other_idx"},
+                {"index-id": INDEX_A, "name": "body_idx"},
+            ]
 
     ds.catalog = _Catalog()
     assert ds._index_build_message(INDEX_A, None, 3) == "Indexed 3 files for vector index body_idx"

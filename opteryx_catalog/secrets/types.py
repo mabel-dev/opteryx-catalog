@@ -26,8 +26,8 @@ import ipaddress
 import json
 import re
 import socket
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
 from urllib.parse import urlsplit
 
 from .errors import SecretInvalid
@@ -172,9 +172,7 @@ def _validate_http_endpoint(options: dict, resolve_host) -> ValidatedSecret:
             )
 
     payload = {"url": url}
-    headers = {
-        _HTTP_HEADERS[key]: value for key, value in options.items() if key in _HTTP_HEADERS
-    }
+    headers = {_HTTP_HEADERS[key]: value for key, value in options.items() if key in _HTTP_HEADERS}
     if headers:
         payload["headers"] = headers
     if _payload_size(payload) > _MAX_HTTP_PAYLOAD:
@@ -209,7 +207,7 @@ def normalise_scope(secret_type: str, scope: str) -> str:
         raise SecretInvalid(f"{secret_type} SCOPE must be a {expected}:// prefix")
     if any(ch in _GLOB_CHARS for ch in scope):
         raise SecretInvalid("SCOPE is a prefix, not a glob")
-    bucket, slash, prefix = rest.partition("/")
+    bucket, _slash, prefix = rest.partition("/")
     if not _BUCKET.match(bucket):
         raise SecretInvalid("SCOPE must name a bucket")
     if _has_dot_segment(prefix):
@@ -257,10 +255,12 @@ def _validate_gcs_service_account(options: dict) -> ValidatedSecret:
     raw = _require(GCS_SERVICE_ACCOUNT, options, "KEY")
     try:
         key = json.loads(raw)
-    except ValueError as err:
+    except ValueError:
         raise SecretInvalid("gcs_service_account KEY is not valid JSON") from None
     if not isinstance(key, dict) or key.get("type") != "service_account":
-        raise SecretInvalid('gcs_service_account KEY must be a JSON key with "type": "service_account"')
+        raise SecretInvalid(
+            'gcs_service_account KEY must be a JSON key with "type": "service_account"'
+        )
     for field in ("client_email", "private_key", "token_uri"):
         if not isinstance(key.get(field), str) or not key[field]:
             raise SecretInvalid(f"gcs_service_account KEY is missing {field}")
@@ -268,7 +268,9 @@ def _validate_gcs_service_account(options: dict) -> ValidatedSecret:
     # key's own token_uri. Any endpoint but Google's would make every use of
     # this secret a request from our process to a URL the creator chose.
     if key["token_uri"] not in _GOOGLE_TOKEN_URIS:
-        raise SecretInvalid("gcs_service_account KEY must name Google's token endpoint as token_uri")
+        raise SecretInvalid(
+            "gcs_service_account KEY must name Google's token endpoint as token_uri"
+        )
     payload = {"key": key}
     if _payload_size(payload) > _MAX_OBJECT_STORE_PAYLOAD:
         raise SecretInvalid("gcs_service_account secret exceeds 16 KiB")
@@ -287,7 +289,9 @@ def _validate_aws_access_key(options: dict) -> ValidatedSecret:
     if not _AWS_KEY_ID.match(key_id):
         raise SecretInvalid("aws_access_key ACCESS_KEY_ID does not have the shape of an AWS key id")
     if not _AWS_SECRET.match(secret):
-        raise SecretInvalid("aws_access_key SECRET_ACCESS_KEY does not have the shape of an AWS secret key")
+        raise SecretInvalid(
+            "aws_access_key SECRET_ACCESS_KEY does not have the shape of an AWS secret key"
+        )
     payload = {"access_key_id": key_id, "secret_access_key": secret}
     token = options.get("SESSION_TOKEN")
     if token:

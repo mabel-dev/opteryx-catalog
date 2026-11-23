@@ -1071,8 +1071,12 @@ class ParquetManifestEntryAccumulator:
                         pair = None
                     if pair is not None:
                         lo, hi = int(pair[0]), int(pair[1])
-                        acc["element_min"] = lo if acc["element_min"] is None else min(acc["element_min"], lo)
-                        acc["element_max"] = hi if acc["element_max"] is None else max(acc["element_max"], hi)
+                        acc["element_min"] = (
+                            lo if acc["element_min"] is None else min(acc["element_min"], lo)
+                        )
+                        acc["element_max"] = (
+                            hi if acc["element_max"] is None else max(acc["element_max"], hi)
+                        )
 
     @staticmethod
     def _fold_length(acc: dict, length_range) -> None:
@@ -1107,7 +1111,9 @@ class ParquetManifestEntryAccumulator:
     def finish(self, file_path: str, file_size_in_bytes: int) -> ParquetManifestEntry:
         """The entry for everything added. Callable once the file is complete."""
         if self._col_names is None:
-            raise ValueError("no row groups were added and no columns were declared; nothing to describe")
+            raise ValueError(
+                "no row groups were added and no columns were declared; nothing to describe"
+            )
 
         min_k_hashes: list = []
         histograms: list = []
@@ -1192,7 +1198,6 @@ class ParquetManifestEntryAccumulator:
             element_max_values=element_max_values,
             element_min_k_hashes=element_min_k_hashes,
         )
-
 
 
 def build_parquet_manifest_entry_from_bytes(
@@ -1497,7 +1502,9 @@ def encode_parquet_manifest(entries: list[dict]) -> bytes:
             leaf = _dn.DrakenType.VARCHAR if varchar else _dn.DrakenType.INT64
             morsel.append_vector(
                 name,
-                _dn.vector_array_from_sequence(values, element_type=leaf.value, nesting_depth=depth),
+                _dn.vector_array_from_sequence(
+                    values, element_type=leaf.value, nesting_depth=depth
+                ),
             )
         else:
             morsel.append_vector(name, vector_from_sequence(values, dtype=dtype))

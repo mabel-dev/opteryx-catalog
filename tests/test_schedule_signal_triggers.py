@@ -148,31 +148,57 @@ def test_the_event_and_the_holder_must_agree():
     # A schedule on a dataset holder: the commit path would never read it.
     with pytest.raises(ValueError, match="held by the task it fires"):
         catalog.create_trigger(
-            "src.a", "t", target_task="ops.rollup", kind="task", author="alice",
-            event_kind=SCHEDULE_EVENT_KIND, schedule="0 * * * *",
+            "src.a",
+            "t",
+            target_task="ops.rollup",
+            kind="task",
+            author="alice",
+            event_kind=SCHEDULE_EVENT_KIND,
+            schedule="0 * * * *",
         )
     with pytest.raises(ValueError, match="belong to a schedule or signal trigger"):
         catalog.create_trigger(
-            "src.a", "t", target_task="ops.rollup", kind="task", author="alice",
+            "src.a",
+            "t",
+            target_task="ops.rollup",
+            kind="task",
+            author="alice",
             window_source="src.a",
         )
     # A commit event on a task holder: nothing commits to a task.
     with pytest.raises(ValueError, match="held by the dataset whose commits fire it"):
         catalog.create_trigger(
-            "ops.rollup", "t", target_task="ops.rollup", kind="task", author="alice",
-            holder_kind=TASK_HOLDER, event_kind="commit",
+            "ops.rollup",
+            "t",
+            target_task="ops.rollup",
+            kind="task",
+            author="alice",
+            holder_kind=TASK_HOLDER,
+            event_kind="commit",
         )
     # A task-held trigger runs its holder and nothing else.
     _task(catalog, "ops.other")
     with pytest.raises(ValueError, match="runs that task, not"):
-        _schedule(catalog, task="ops.rollup", target_task_override="ops.other") if False else catalog.create_trigger(
-            "ops.rollup", "t", target_task="ops.other", kind="task", author="alice",
-            holder_kind=TASK_HOLDER, event_kind=SIGNAL_EVENT_KIND,
+        _schedule(
+            catalog, task="ops.rollup", target_task_override="ops.other"
+        ) if False else catalog.create_trigger(
+            "ops.rollup",
+            "t",
+            target_task="ops.other",
+            kind="task",
+            author="alice",
+            holder_kind=TASK_HOLDER,
+            event_kind=SIGNAL_EVENT_KIND,
         )
     with pytest.raises(ValueError, match="unknown trigger event kind"):
         catalog.create_trigger(
-            "ops.rollup", "t", target_task="ops.rollup", kind="task", author="alice",
-            holder_kind=TASK_HOLDER, event_kind="every",
+            "ops.rollup",
+            "t",
+            target_task="ops.rollup",
+            kind="task",
+            author="alice",
+            holder_kind=TASK_HOLDER,
+            event_kind="every",
         )
 
 
@@ -228,7 +254,9 @@ def test_a_task_has_one_trigger_whichever_holder():
     catalog = _catalog()
     _add_dataset(catalog, "src.a")
     _task(catalog)
-    catalog.create_trigger("src.a", "on_commit", target_task="ops.rollup", kind="task", author="alice")
+    catalog.create_trigger(
+        "src.a", "on_commit", target_task="ops.rollup", kind="task", author="alice"
+    )
 
     with pytest.raises(MaterializedViewError, match="already fired by on_commit ON ws.src.a"):
         _schedule(catalog)
@@ -238,7 +266,9 @@ def test_a_task_has_one_trigger_whichever_holder():
     catalog.drop_trigger("src.a", "on_commit", author="alice")
     _schedule(catalog)
     with pytest.raises(MaterializedViewError, match="already fired by hourly ON ws.ops.rollup"):
-        catalog.create_trigger("src.a", "on_commit", target_task="ops.rollup", kind="task", author="alice")
+        catalog.create_trigger(
+            "src.a", "on_commit", target_task="ops.rollup", kind="task", author="alice"
+        )
     with pytest.raises(MaterializedViewError, match="already fired by hourly"):
         _signal(catalog)
 
@@ -254,13 +284,17 @@ def test_or_replace_recomputes_the_due_instant_and_keeps_the_identity():
     _task(catalog)
     with patch("opteryx_catalog.opteryx_catalog.time.time", return_value=T0 / 1000):
         _schedule(catalog, schedule="0 * * * *")
-    catalog.set_trigger_owner("ops.rollup", "hourly", "bob", author="alice", holder_kind=TASK_HOLDER)
+    catalog.set_trigger_owner(
+        "ops.rollup", "hourly", "bob", author="alice", holder_kind=TASK_HOLDER
+    )
     with patch("opteryx_catalog.opteryx_catalog.time.time", return_value=T0 / 1000):
         _schedule(catalog, schedule="30 * * * *")
     trigger = _held(catalog)
     assert trigger["schedule"] == "30 * * * *"
     assert trigger["next-due-at-ms"] == T0 + 30 * 60 * 1000
-    assert trigger["runs-as"] == "bob", "re-registration never transfers whose authority the work runs with"
+    assert trigger["runs-as"] == "bob", (
+        "re-registration never transfers whose authority the work runs with"
+    )
 
 
 # --- the trigger methods through a task holder -----------------------------------------
@@ -271,14 +305,18 @@ def test_suspend_and_resume_through_the_task_holder():
     _task(catalog)
     with patch("opteryx_catalog.opteryx_catalog.time.time", return_value=T0 / 1000):
         _schedule(catalog)
-    catalog.set_trigger_suspended("ops.rollup", "hourly", True, author="alice", holder_kind=TASK_HOLDER)
+    catalog.set_trigger_suspended(
+        "ops.rollup", "hourly", True, author="alice", holder_kind=TASK_HOLDER
+    )
     assert _held(catalog)["suspended-by"] == "alice"
 
     # RESUME recomputes from now: a week later, the due instant is the next
     # occurrence after now, not the slot it was paused on.
     later = T0 / 1000 + 7 * 24 * 3600 + 600
     with patch("opteryx_catalog.opteryx_catalog.time.time", return_value=later):
-        catalog.set_trigger_suspended("ops.rollup", "hourly", False, author="alice", holder_kind=TASK_HOLDER)
+        catalog.set_trigger_suspended(
+            "ops.rollup", "hourly", False, author="alice", holder_kind=TASK_HOLDER
+        )
     trigger = _held(catalog)
     assert trigger["suspended-at-ms"] is None
     assert trigger["next-due-at-ms"] == T0 + 7 * 24 * HOUR_MS + HOUR_MS
@@ -286,7 +324,9 @@ def test_suspend_and_resume_through_the_task_holder():
     catalog.mark_trigger_fired("ops.rollup", "hourly", status="enqueued", holder_kind=TASK_HOLDER)
     assert _held(catalog)["last-fired-status"] == "enqueued"
     with pytest.raises(TriggerNotFound):
-        catalog.set_trigger_owner("ops.rollup", "nope", "bob", author="alice", holder_kind=TASK_HOLDER)
+        catalog.set_trigger_owner(
+            "ops.rollup", "nope", "bob", author="alice", holder_kind=TASK_HOLDER
+        )
     with pytest.raises(ValueError, match="unknown trigger holder kind"):
         catalog.list_triggers("ops.rollup", holder_kind="view")
 
@@ -406,14 +446,20 @@ def test_a_signal_fires_the_task_as_the_triggers_identity():
     catalog = _catalog()
     _task(catalog, author="alice")
     _signal(catalog, author="alice")
-    catalog.set_trigger_owner("ops.rollup", "on_demand", "olive", author="alice", holder_kind=TASK_HOLDER)
+    catalog.set_trigger_owner(
+        "ops.rollup", "on_demand", "olive", author="alice", holder_kind=TASK_HOLDER
+    )
 
     with _submitting() as (post, _audit, alert):
         outcome = fire_signal(catalog, "ops.rollup", caller="hook-bot")
 
     assert outcome == {
-        "status": "enqueued", "execution_id": "x1", "trigger": "on_demand",
-        "task": "ws.ops.rollup", "detail": None, "channel": "bearer",
+        "status": "enqueued",
+        "execution_id": "x1",
+        "trigger": "on_demand",
+        "task": "ws.ops.rollup",
+        "detail": None,
+        "channel": "bearer",
     }
     payload = post.call_args[0][0]
     # Windowless: no USING.
@@ -476,8 +522,10 @@ def test_a_statement_that_grew_a_window_after_arming_is_refused_at_fire_time():
     _task(catalog)
     _signal(catalog)
     catalog.create_task(
-        "ops.rollup", sql="INSERT INTO ops.out SELECT * FROM src.a WHERE v > :current_version",
-        author="alice", update_if_exists=True,
+        "ops.rollup",
+        sql="INSERT INTO ops.out SELECT * FROM src.a WHERE v > :current_version",
+        author="alice",
+        update_if_exists=True,
     )
     with _submitting() as (post, _audit, alert):
         outcome = fire_signal(catalog, "ops.rollup", caller="hook-bot")
@@ -508,7 +556,9 @@ def test_suspended_and_throttled_signals_are_outcomes_not_errors():
     # A task-held trigger has no source dataset - see _submit_throttled_record.
     assert "source_dataset" not in throttled_trigger
 
-    catalog.set_trigger_suspended("ops.rollup", "on_demand", True, author="alice", holder_kind=TASK_HOLDER)
+    catalog.set_trigger_suspended(
+        "ops.rollup", "on_demand", True, author="alice", holder_kind=TASK_HOLDER
+    )
     with _submitting() as (post, _audit, alert):
         paused = fire_signal(catalog, "ops.rollup", caller="hook-bot")
     assert paused["status"] == "suspended"
@@ -529,7 +579,9 @@ def test_a_signal_names_something_to_fire_or_is_not_found():
     # A commit trigger elsewhere is reported as what it is.
     catalog.drop_trigger("ops.rollup", "hourly", author="alice", holder_kind=TASK_HOLDER)
     _add_dataset(catalog, "src.a")
-    catalog.create_trigger("src.a", "on_commit", target_task="ops.rollup", kind="task", author="alice")
+    catalog.create_trigger(
+        "src.a", "on_commit", target_task="ops.rollup", kind="task", author="alice"
+    )
     with pytest.raises(TriggerNotFound, match="a commit trigger, not a signal"):
         fire_signal(catalog, "ops.rollup", caller="hook-bot")
 
@@ -654,7 +706,9 @@ def test_a_suspended_schedule_is_stamped_and_not_advanced():
     _task(catalog)
     with patch("opteryx_catalog.opteryx_catalog.time.time", return_value=T0 / 1000):
         _schedule(catalog)
-    catalog.set_trigger_suspended("ops.rollup", "hourly", True, author="alice", holder_kind=TASK_HOLDER)
+    catalog.set_trigger_suspended(
+        "ops.rollup", "hourly", True, author="alice", holder_kind=TASK_HOLDER
+    )
     client = _Client(_due_rows(catalog))
     with _submitting() as (post, _audit, _alert):
         outcomes = fire_due_schedules(
@@ -672,7 +726,9 @@ def test_the_tick_never_raises_and_one_bad_trigger_does_not_stop_the_rest():
     with patch("opteryx_catalog.opteryx_catalog.time.time", return_value=T0 / 1000):
         _schedule(catalog, task="ops.good", name="hourly")
     misfiled = _Snapshot("ws/ops/datasets/x/triggers/nope", {"event-kind": "schedule"})
-    gone = _Snapshot("ws/ops/tasks/vanished/triggers/hourly", {"name": "hourly", "event-kind": "schedule"})
+    gone = _Snapshot(
+        "ws/ops/tasks/vanished/triggers/hourly", {"name": "hourly", "event-kind": "schedule"}
+    )
     client = _Client([misfiled, gone, *_due_rows(catalog, "ops.good")])
 
     with _submitting() as (_post, _audit, alert):
@@ -722,9 +778,11 @@ def test_integrity_sees_task_held_triggers():
     def _list_documents(collection):
         return list(collection._docs.values())
 
-    for coll in [client.collection("ws")] + [
-        ref.collection("datasets") for ref in client.collection("ws")._docs.values()
-    ] + [ref.collection("tasks") for ref in client.collection("ws")._docs.values()]:
+    for coll in (
+        [client.collection("ws")]
+        + [ref.collection("datasets") for ref in client.collection("ws")._docs.values()]
+        + [ref.collection("tasks") for ref in client.collection("ws")._docs.values()]
+    ):
         coll.list_documents = lambda c=coll: _list_documents(c)
 
     two_days_on = T0 + 2 * 24 * HOUR_MS
@@ -764,7 +822,9 @@ def test_a_signing_key_binds_a_signature_to_one_task_and_one_identity():
     assert not signal_signature_matches(None, "ws.ops.rollup", "github-actions", signature)
     assert not signal_signature_matches(key, "ws.ops.rollup", "github-actions", None)
     # HMAC with a separator: the boundary between task and identity matters.
-    assert signal_signature(key, "ws.ops.rollup", "ab") != signal_signature(key, "ws.ops.rollupa", "b")
+    assert signal_signature(key, "ws.ops.rollup", "ab") != signal_signature(
+        key, "ws.ops.rollupa", "b"
+    )
 
 
 def test_rotating_invalidates_every_url_and_clearing_revokes_them_all():
@@ -778,12 +838,16 @@ def test_rotating_invalidates_every_url_and_clearing_revokes_them_all():
     old_url = signal_signature(first, "ws.ops.rollup", "github-actions")
     second = catalog.rotate_signal_token("ops.rollup", author="alice")
     assert second != first
-    assert not signal_signature_matches(_held(catalog)["signal-token"], "ws.ops.rollup", "github-actions", old_url)
+    assert not signal_signature_matches(
+        _held(catalog)["signal-token"], "ws.ops.rollup", "github-actions", old_url
+    )
 
     catalog.clear_signal_token("ops.rollup", author="alice")
     assert _held(catalog)["signal-token"] is None
     assert not signal_signature_matches(
-        _held(catalog)["signal-token"], "ws.ops.rollup", "github-actions",
+        _held(catalog)["signal-token"],
+        "ws.ops.rollup",
+        "github-actions",
         signal_signature(second, "ws.ops.rollup", "github-actions"),
     )
 

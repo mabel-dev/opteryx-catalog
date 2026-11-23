@@ -49,13 +49,12 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import re
+from collections.abc import Iterable
+from collections.abc import Iterator
 from dataclasses import dataclass
 from dataclasses import field
 from itertools import combinations
 from typing import Any
-from typing import Iterable
-from typing import Iterator
 
 logger = logging.getLogger(__name__)
 
@@ -109,12 +108,20 @@ MIN_CONTAINMENT = 0.90
 #: boolean columns overlap perfectly and say nothing, and float equality is not
 #: a join.
 _FAMILY = {
-    "INT8": "int", "INT16": "int", "INT32": "int", "INT64": "int",
-    "UINT8": "int", "UINT16": "int", "UINT32": "int", "UINT64": "int",
+    "INT8": "int",
+    "INT16": "int",
+    "INT32": "int",
+    "INT64": "int",
+    "UINT8": "int",
+    "UINT16": "int",
+    "UINT32": "int",
+    "UINT64": "int",
     "INTEGER": "int",
     "DECIMAL": "decimal",
-    "VARCHAR": "varchar", "NVARCHAR": "varchar",
-    "BLOB": "blob", "VARBINARY": "blob",
+    "VARCHAR": "varchar",
+    "NVARCHAR": "varchar",
+    "BLOB": "blob",
+    "VARBINARY": "blob",
     "IPV4": "ipv4",
 }
 _JOIN_SHAPED = frozenset({"int", "varchar", "decimal", "blob", "ipv4"})

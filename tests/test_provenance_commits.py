@@ -119,7 +119,9 @@ def _dataset():
     clear_parsed_manifest_cache()
     storage: dict[str, bytes] = {}
     mem_io = _MemIO(storage)
-    meta = DatasetMetadata(dataset_identifier=IDENTIFIER, location=LOCATION, schema=None, properties={})
+    meta = DatasetMetadata(
+        dataset_identifier=IDENTIFIER, location=LOCATION, schema=None, properties={}
+    )
     ds = SimpleDataset(identifier=IDENTIFIER, _metadata=meta)
     ds.io = mem_io
     ds.catalog = _DocumentStore(mem_io)
@@ -129,7 +131,11 @@ def _dataset():
 def _seeded(values=(1, 2, 3), read_sources=()):
     """A dataset with one committed file, its receipt as given."""
     ds, storage = _dataset()
-    ds.add_files([_stage(storage, "f1.parquet", list(values))], author="seed", read_sources=list(read_sources))
+    ds.add_files(
+        [_stage(storage, "f1.parquet", list(values))],
+        author="seed",
+        read_sources=list(read_sources),
+    )
     return ds, storage
 
 
@@ -148,7 +154,9 @@ def alerts(monkeypatch):
 @pytest.fixture
 def audits(monkeypatch):
     recorded = []
-    monkeypatch.setattr(dataset_module, "emit_audit", lambda action, **kw: recorded.append((action, kw)))
+    monkeypatch.setattr(
+        dataset_module, "emit_audit", lambda action, **kw: recorded.append((action, kw))
+    )
     return recorded
 
 
@@ -174,7 +182,12 @@ def test_the_first_commits_receipt_survives_the_second_commit():
     ds, storage = _seeded(read_sources=[(A, 10, "version")])
     first = ds.metadata.current_snapshot_id
 
-    ds.add_files([_stage(storage, "f2.parquet", [4])], author="t", read_sources=[(B, 7)], produced_by="task:ws.ops.t")
+    ds.add_files(
+        [_stage(storage, "f2.parquet", [4])],
+        author="t",
+        read_sources=[(B, 7)],
+        produced_by="task:ws.ops.t",
+    )
 
     assert ds.catalog.snapshot_docs[first]["read-sources"] == [
         {"dataset": A, "snapshot-id": 10, "resolved-by": "version"}
@@ -210,9 +223,16 @@ def test_a_snapshot_fetched_by_id_carries_its_receipt():
     receipt the loader keeps."""
     from opteryx_catalog.catalog.metadata import provenance_fields_from_document
 
-    doc = {"read-sources": [{"dataset": A, "snapshot-id": 1, "resolved-by": "current"}], "produced-by": "view:ws.ops.v"}
+    doc = {
+        "read-sources": [{"dataset": A, "snapshot-id": 1, "resolved-by": "current"}],
+        "produced-by": "view:ws.ops.v",
+    }
     fields = provenance_fields_from_document(doc)
-    assert fields == {"read_sources": doc["read-sources"], "read_sources_truncated": False, "produced_by": "view:ws.ops.v"}
+    assert fields == {
+        "read_sources": doc["read-sources"],
+        "read_sources_truncated": False,
+        "produced_by": "view:ws.ops.v",
+    }
 
 
 # ── `None` is a bug ──────────────────────────────────────────────────────────
@@ -240,7 +260,9 @@ def test_a_commit_without_a_receipt_leaves_the_list_but_marks_it_incomplete(aler
     assert ds.metadata.sources_complete is False
 
 
-def test_a_rewrite_without_a_receipt_empties_the_list_because_the_old_one_is_certainly_wrong(alerts, audits):
+def test_a_rewrite_without_a_receipt_empties_the_list_because_the_old_one_is_certainly_wrong(
+    alerts, audits
+):
     ds, storage = _seeded(read_sources=[(A, 1)])
 
     ds.truncate_and_add_files([_stage(storage, "f2.parquet", [4])], author="t")
@@ -291,7 +313,9 @@ def test_an_append_keeps_the_list_distinct():
 
 def test_a_rewrite_replaces_the_list():
     ds, storage = _seeded(read_sources=[(A, 1)])
-    ds.truncate_and_add_files([_stage(storage, "f2.parquet", [4])], author="t", read_sources=[(C, 2)])
+    ds.truncate_and_add_files(
+        [_stage(storage, "f2.parquet", [4])], author="t", read_sources=[(C, 2)]
+    )
 
     assert ds.metadata.sources == [C]
     assert ds.metadata.sources_complete is True
@@ -302,7 +326,9 @@ def test_a_rewrite_makes_an_incomplete_list_complete_again(alerts, audits):
     ds.add_files([_stage(storage, "f2.parquet", [4])], author="t")  # no receipt
     assert ds.metadata.sources_complete is False
 
-    ds.truncate_and_add_files([_stage(storage, "f3.parquet", [5])], author="t", read_sources=[(C, 2)])
+    ds.truncate_and_add_files(
+        [_stage(storage, "f3.parquet", [5])], author="t", read_sources=[(C, 2)]
+    )
 
     assert ds.metadata.sources == [C]
     assert ds.metadata.sources_complete is True

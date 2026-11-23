@@ -21,16 +21,14 @@ no longer do" is information. Deleting it hides a data problem.
 from __future__ import annotations
 
 import pytest
+from test_declared_relationships import _add_dataset
+from test_declared_relationships import _catalog
+from test_declared_relationships import _declare
 
 from opteryx_catalog.inference.relationships import ColumnProfile
 from opteryx_catalog.inference.relationships import observed_cardinality
 from opteryx_catalog.inference.relationships import value_hash
 from opteryx_catalog.inference.relationships import verify_declared
-
-from test_declared_relationships import _add_dataset
-from test_declared_relationships import _catalog
-from test_declared_relationships import _declare
-
 
 # --- helpers ------------------------------------------------------------
 
@@ -170,9 +168,7 @@ def test_dropping_a_column_breaks_relationships_in_both_directions_and_deletes_n
     catalog = _seeded()
     _declare(catalog)
 
-    broken = catalog.break_relationships_through_column(
-        "crm.customers", "id", author="olive"
-    )
+    broken = catalog.break_relationships_through_column("crm.customers", "id", author="olive")
 
     assert [row["inbound"] for row in broken] == [True]
     row = _row(catalog, "helpdesk.tickets", "tickets_customer_fk")
@@ -224,9 +220,7 @@ def test_an_unprofiled_end_is_not_verifiable_and_is_never_marked_broken():
     # dataset that failed to read, or in a collection this run was scoped away
     # from - and inferring "gone" from "not measured" would mark half a
     # catalog broken the first time a read failed.
-    profiles = [
-        _profile("helpdesk", "tickets", "customer_ref", [f"a{i}" for i in range(100)])
-    ]
+    profiles = [_profile("helpdesk", "tickets", "customer_ref", [f"a{i}" for i in range(100)])]
 
     (result,) = verify_declared(catalog, profiles)
     assert result.outcome == "not-verifiable"

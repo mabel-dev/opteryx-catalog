@@ -190,7 +190,7 @@ def _wrap_dek_versioned(dek: bytes, kms_key: str) -> tuple[bytes, str | None]:
 
 
 def _associated_data(kms_key: str, context: str) -> bytes:
-    return f"{kms_key}\n{context}".encode("utf-8")
+    return f"{kms_key}\n{context}".encode()
 
 
 def seal(plaintext: bytes | str, kms_key: str, *, context: str) -> dict:

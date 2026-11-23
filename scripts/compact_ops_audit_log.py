@@ -36,8 +36,9 @@ if not all([GCP_PROJECT_ID, BUCKET_NAME]):
     print("   GCP_PROJECT_ID, GCS_BUCKET")
     sys.exit(1)
 
-from opteryx_catalog import OpteryxCatalog
 from opteryx_catalog.catalog.compaction import DatasetCompactor
+
+from opteryx_catalog import OpteryxCatalog
 
 
 def load_github_events_dataset():

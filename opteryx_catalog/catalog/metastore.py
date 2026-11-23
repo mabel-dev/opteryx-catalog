@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from typing import Any
-from typing import Optional
 
 
 class Metastore:
@@ -114,7 +113,7 @@ class Dataset:
     # None means the implementation has not declared it. Readers must treat
     # that as an error rather than guessing a default -- either guess is
     # silently wrong for half the implementations.
-    bounds_are_ordinal: Optional[bool] = None
+    bounds_are_ordinal: bool | None = None
 
     def manifest_bytes(self, snapshot_id: int | None = None) -> bytes | None:
         """The bytes of a snapshot's manifest as the opteryx manifest parquet

@@ -22,14 +22,14 @@ if not hasattr(__import__("rugo.parquet", fromlist=["parquet"]), "append_row_gro
 
 from rugo.parquet import patch_columns
 from rugo.rugo_native import read_rowgroup_stats
+from test_add_files_summary import _make_dataset
+from test_add_files_summary import _make_parquet_file
+from test_add_files_summary import _MemIO
 
 from opteryx_catalog.catalog import manifest as manifest_module
 from opteryx_catalog.catalog import manifest_arrow
 from opteryx_catalog.catalog.manifest import clear_parsed_manifest_cache
 from opteryx_catalog.catalog.manifest import read_manifest_rows
-from test_add_files_summary import _make_dataset
-from test_add_files_summary import _make_parquet_file
-from test_add_files_summary import _MemIO
 
 
 def _manifest(mapping, ds):
@@ -79,7 +79,9 @@ def test_a_batch_with_empty_statistics_appends_to_one_with_full_statistics():
     mapping, ds, paths = _seeded("append_empty_stats", files=1)
     ds.add_files(paths, author="tester")
     bare = "mem://data/append_empty_stats-bare.parquet"
-    ds.add_files(entries=[{"file_path": bare, "record_count": 0, "file_size_in_bytes": 0}], author="tester")
+    ds.add_files(
+        entries=[{"file_path": bare, "record_count": 0, "file_size_in_bytes": 0}], author="tester"
+    )
     data = _manifest(mapping, ds)
     assert [rg["num_rows"] for rg in read_rowgroup_stats(data)] == [1, 1]
     assert [r["file_path"] for r in read_manifest_rows(data)] == paths + [bare]

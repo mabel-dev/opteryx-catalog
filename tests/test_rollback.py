@@ -21,7 +21,6 @@ from opteryx_catalog.exceptions import SnapshotMissingError
 from opteryx_catalog.opteryx_catalog import TAGS_SUBCOLLECTION
 from opteryx_catalog.opteryx_catalog import OpteryxCatalog
 
-
 # --- an in-memory Firestore ---------------------------------------------
 
 

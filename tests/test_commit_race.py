@@ -12,13 +12,11 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.dirname(__file__))
 
-import pytest
-
-from opteryx_catalog.catalog.deletes import delete_vector_path
-from opteryx_catalog.catalog.deletes import is_delete_vector_path
 
 from test_mor_deletes import _seed_dataset
 
+from opteryx_catalog.catalog.deletes import delete_vector_path
+from opteryx_catalog.catalog.deletes import is_delete_vector_path
 
 # ---------------------------------------------------------------------------
 # Filenames: the snapshot id is NOT unique across writers
@@ -40,13 +38,11 @@ def test_sidecar_name_still_carries_its_snapshot_id():
     """Age-gated sweeps parse the id back out of the name; the nonce must not
     hide it."""
     path = delete_vector_path("mem://ws/ds", 1755000000000)
-    assert re.search(r"deletes-(\d+)(?:-[0-9a-f]+)?\.parquet$", path).group(1) == (
-        "1755000000000"
-    )
+    assert re.search(r"deletes-(\d+)(?:-[0-9a-f]+)?\.parquet$", path).group(1) == ("1755000000000")
 
 
 def test_manifest_names_are_unique_per_write():
-    ds, storage = _seed_dataset({"f1.parquet": [1, 2, 3]})
+    ds, _storage = _seed_dataset({"f1.parquet": [1, 2, 3]})
     ds.merge_commit([], {"f1.parquet": [0]}, author="a")
     first = ds.snapshot(None).manifest_list
     ds.merge_commit([], {"f1.parquet": [1]}, author="a")

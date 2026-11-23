@@ -46,9 +46,9 @@ from .dataset import visible_history
 from .metadata import SNAPSHOT_EXPIRED_AT_KEY
 from .metadata import Snapshot
 from .metadata import snapshot_is_tombstoned
-from .vector_indexes import referenced_index_files
 from .orphan_quarantine import OrphanQuarantine
 from .ownership import is_own_path as _is_own_path
+from .vector_indexes import referenced_index_files
 
 logger = logging.getLogger(__name__)
 

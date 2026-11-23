@@ -240,7 +240,7 @@ def test_read_vectors_for_entries_missing_vector_raises():
 
 
 def test_delete_rows_commits_sidecar_and_manifest():
-    ds, storage = _seed_dataset({"mem://f1.parquet": [10, 20, 30, 40], "mem://f2.parquet": [1, 2]})
+    ds, _storage = _seed_dataset({"mem://f1.parquet": [10, 20, 30, 40], "mem://f2.parquet": [1, 2]})
 
     snap = ds.delete_rows({"mem://f1.parquet": [1, 3]}, author="tester")
 
@@ -453,8 +453,9 @@ def test_drop_deleted_rows_from_morsels_spans_row_groups():
 
 
 def test_materialise_live_parquet():
-    from opteryx_catalog.catalog.deletes import materialise_live_parquet
     from rugo.parquet import read_parquet
+
+    from opteryx_catalog.catalog.deletes import materialise_live_parquet
 
     data = write_parquet(_make_morsel([10, 20, 30, 40]), compression="zstd")
     live = materialise_live_parquet(data, [0, 2])

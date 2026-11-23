@@ -309,9 +309,7 @@ def test_recording_the_server_is_a_no_op_for_an_unbound_workspace():
 
     fs.collection("native_ws").document("$properties").set({"timestamp-ms": 1})
     record_server_identity(fs, "native_ws", flavour="cockroachdb")
-    assert fs.collection("native_ws").document("$properties").get().to_dict() == {
-        "timestamp-ms": 1
-    }
+    assert fs.collection("native_ws").document("$properties").get().to_dict() == {"timestamp-ms": 1}
 
 
 def test_rebinding_drops_the_observation():

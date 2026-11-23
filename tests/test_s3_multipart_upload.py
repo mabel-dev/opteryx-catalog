@@ -39,7 +39,11 @@ def io():
 def _stream(io, key, part_bytes, parts_in_flight=2):
     location = f"s3://{io.bucket}/{key}"
     return location, _S3OutputStream(
-        location, io._client, io._upload_executor, part_bytes=part_bytes, parts_in_flight=parts_in_flight
+        location,
+        io._client,
+        io._upload_executor,
+        part_bytes=part_bytes,
+        parts_in_flight=parts_in_flight,
     )
 
 

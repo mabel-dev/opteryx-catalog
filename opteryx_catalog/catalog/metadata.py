@@ -175,7 +175,7 @@ class Fork:
         }
 
     @classmethod
-    def from_dict(cls, data: dict | None) -> "Fork | None":
+    def from_dict(cls, data: dict | None) -> Fork | None:
         """Read a stored fork block, or None for a dataset that is not a fork.
 
         A block missing either anchor is read as NOT A FORK rather than as a
@@ -366,7 +366,7 @@ class DatasetMetadata:
     # field it does not know about is DESTROYED by the fork's next commit -
     # and a fork that forgets its upstream is a fork whose pin the upstream is
     # still honouring forever.
-    fork: "Fork | None" = None
+    fork: Fork | None = None
     # Refresh suspended by an operator. On the VIEW rather than on its triggers:
     # a view with four sources has four triggers, and suspending three of
     # them would not suspend the view, it would refresh from a subset of its

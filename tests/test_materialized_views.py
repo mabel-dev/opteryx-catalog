@@ -9,7 +9,6 @@ rules in drop/rename, and the workspace egress lock.
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
 from unittest.mock import patch
 
 import pytest
@@ -330,7 +329,10 @@ def test_create_mv_registers_and_creates_triggers():
 
     for src in (src_a, src_b):
         trigger = (
-            src.collection(TRIGGERS_SUBCOLLECTION).document(OpteryxCatalog._mv_trigger_name("ws.mart.daily")).get().to_dict()
+            src.collection(TRIGGERS_SUBCOLLECTION)
+            .document(OpteryxCatalog._mv_trigger_name("ws.mart.daily"))
+            .get()
+            .to_dict()
         )
         assert trigger["target-view"] == "ws.mart.daily"
         assert trigger["statement-id"] == doc["statement-id"]
@@ -474,9 +476,7 @@ def test_view_schema_is_stored_on_the_statement_it_describes():
 
     # Redefined without a schema: the NEW statement records none, and the old
     # statement keeps the shape it was registered with.
-    catalog.create_view(
-        "mart.daily", "SELECT * FROM src.a", author="alice", update_if_exists=True
-    )
+    catalog.create_view("mart.daily", "SELECT * FROM src.a", author="alice", update_if_exists=True)
     second = view_ref.get().to_dict()["statement-id"]
     assert second != first
     assert view_ref.collection("statement").document(second).get().to_dict()["columns"] is None
@@ -820,7 +820,9 @@ def test_set_materialized_view_owner_finds_triggers_by_target_not_by_name():
     catalog = _catalog()
     _add_dataset(catalog, "src.a")
     _register_mv(catalog, "mart.daily", sources=("src.a",))
-    catalog.create_trigger("src.a", "refresh__mart__daily", target_view="mart.daily", author="alice")
+    catalog.create_trigger(
+        "src.a", "refresh__mart__daily", target_view="mart.daily", author="alice"
+    )
     catalog.create_trigger("src.a", "other", target_view="mart.other", author="alice")
 
     catalog.set_materialized_view_owner("mart.daily", "svc-etl", author="admin")
@@ -993,7 +995,9 @@ def test_drop_mv_removes_source_triggers_and_dataset():
     with patch("opteryx_catalog.opteryx_catalog.send_webhook"):
         catalog.drop_materialized_view("mart.daily", author="alice")
 
-    trigger_ref = src_a.collection(TRIGGERS_SUBCOLLECTION).document(OpteryxCatalog._mv_trigger_name("ws.mart.daily"))
+    trigger_ref = src_a.collection(TRIGGERS_SUBCOLLECTION).document(
+        OpteryxCatalog._mv_trigger_name("ws.mart.daily")
+    )
     assert not trigger_ref.get().exists
     assert not catalog._dataset_doc_ref("mart", "daily").get().exists
 
@@ -1015,7 +1019,9 @@ def test_drop_dataset_directly_on_mv_still_cleans_source_triggers():
     with patch("opteryx_catalog.opteryx_catalog.send_webhook"):
         catalog.drop_dataset("mart.daily", author="alice")
 
-    trigger_ref = src_a.collection(TRIGGERS_SUBCOLLECTION).document(OpteryxCatalog._mv_trigger_name("ws.mart.daily"))
+    trigger_ref = src_a.collection(TRIGGERS_SUBCOLLECTION).document(
+        OpteryxCatalog._mv_trigger_name("ws.mart.daily")
+    )
     assert not trigger_ref.get().exists
 
 
@@ -1200,7 +1206,9 @@ def test_egress_lock_turned_on_after_registration_blocks_refresh():
     _set_egress_restriction(catalog, "ichnos", False)
 
     with (
-        patch.object(trigger_firing, "_submit_refresh_job", return_value=("exec-1", "enqueued")) as enqueue,
+        patch.object(
+            trigger_firing, "_submit_refresh_job", return_value=("exec-1", "enqueued")
+        ) as enqueue,
     ):
         fire_triggers(catalog, "src.a", author="alice")
 
@@ -1218,7 +1226,9 @@ def test_egress_lock_turned_on_after_registration_blocks_refresh():
         patch.object(_time, "time", return_value=_time.time() + 200),
         patch.object(trigger_firing, "_alert") as alert,
         patch.object(trigger_firing, "write_audit_record") as audit,
-        patch.object(trigger_firing, "_submit_refresh_job", return_value=("exec-1", "enqueued")) as enqueue,
+        patch.object(
+            trigger_firing, "_submit_refresh_job", return_value=("exec-1", "enqueued")
+        ) as enqueue,
     ):
         fire_triggers(catalog, "src.a", author="alice")  # must not raise
 
@@ -1244,7 +1254,9 @@ def test_a_suspended_view_does_not_refresh():
     catalog.set_materialized_view_suspended("mart.daily", True, author="admin")
 
     with (
-        patch.object(trigger_firing, "_submit_refresh_job", return_value=("exec-1", "enqueued")) as enq,
+        patch.object(
+            trigger_firing, "_submit_refresh_job", return_value=("exec-1", "enqueued")
+        ) as enq,
         patch.object(trigger_firing, "_alert") as alert,
     ):
         fire_triggers(catalog, "src.a", author="alice", snapshot_id=1)
@@ -1270,7 +1282,9 @@ def test_resume_lets_it_refresh_again():
     assert record["suspended-by"] is None
 
     with (
-        patch.object(trigger_firing, "_submit_refresh_job", return_value=("exec-1", "enqueued")) as enq,
+        patch.object(
+            trigger_firing, "_submit_refresh_job", return_value=("exec-1", "enqueued")
+        ) as enq,
     ):
         fire_triggers(catalog, "src.a", author="alice", snapshot_id=1)
     enq.assert_called_once()

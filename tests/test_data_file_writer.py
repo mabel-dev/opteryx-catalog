@@ -120,7 +120,9 @@ def _morsel(ints, strs=None, bools=None):
 def _row_groups():
     """Three row groups with overlapping, differently placed int ranges."""
     return [
-        _morsel([5, 1, 9, None, 3], ["a", "bb", None, "dddd", "e"], [True, False, True, None, True]),
+        _morsel(
+            [5, 1, 9, None, 3], ["a", "bb", None, "dddd", "e"], [True, False, True, None, True]
+        ),
         _morsel([100, 42, 7, 8, 8], ["zz", "y", "y", "", "x"], [False, False, None, True, True]),
         _morsel([-4, 50, 50, 50, 2], ["m", "n", "o", "p", "q"], [True, True, True, True, False]),
     ]
@@ -146,7 +148,9 @@ def _seed_dataset(files: dict):
 
     snapshot_id = 1000
     manifest_path = catalog.write_parquet_manifest(snapshot_id, entries, LOCATION)
-    meta = DatasetMetadata(dataset_identifier="col.stream", location=LOCATION, schema=None, properties={})
+    meta = DatasetMetadata(
+        dataset_identifier="col.stream", location=LOCATION, schema=None, properties={}
+    )
     meta.snapshots.append(
         Snapshot(
             snapshot_id=snapshot_id,
@@ -263,7 +267,9 @@ def test_bytes_path_is_unchanged_by_the_refactor():
     data = bytes(buffer)
     assert _row_group_count(data) == 3
 
-    from_bytes = build_parquet_manifest_entry_from_bytes(data, "mem://f.parquet", len(data)).to_dict()
+    from_bytes = build_parquet_manifest_entry_from_bytes(
+        data, "mem://f.parquet", len(data)
+    ).to_dict()
     from_morsel = build_parquet_manifest_entry_from_morsel(
         _concat(groups), data, "mem://f.parquet", len(data)
     ).to_dict()
@@ -496,7 +502,9 @@ def test_merge_commit_with_entries_adds_and_deletes_in_one_snapshot():
     assert [e["file_path"] for e in entries] == [src, entry["file_path"]]
     assert ds.delete_vectors() == {src: [1]}
     with pytest.raises(ValueError, match="entries OR files"):
-        ds.merge_commit(files=[src], entries=[entry], positions={}, author="tester", read_sources=[])
+        ds.merge_commit(
+            files=[src], entries=[entry], positions={}, author="tester", read_sources=[]
+        )
     with pytest.raises(ValueError, match="requires files to add"):
         ds.merge_commit(entries=[], positions={}, author="tester", read_sources=[])
 
@@ -556,15 +564,30 @@ def test_commits_take_the_new_files_as_a_manifest():
     assert entry["file_path"] not in mem_io.reads
     (via_entries,) = _current_entries(ds_entries)
     (via_manifest,) = _current_entries(ds_manifest)
-    for key in ("record_count", "min_values", "max_values", "null_counts", "min_k_hashes", "field_ids"):
+    for key in (
+        "record_count",
+        "min_values",
+        "max_values",
+        "null_counts",
+        "min_k_hashes",
+        "field_ids",
+    ):
         assert via_manifest[key] == via_entries[key], key
     assert ds_manifest.snapshot(None).summary["total-records"] == 10
 
     for commit in (
-        lambda: ds_manifest.add_files(entries=[entry], manifest=manifest, author="tester", read_sources=[]),
-        lambda: ds_manifest.truncate_and_add_files(entries=[entry], manifest=manifest, author="tester", read_sources=[]),
-        lambda: ds_manifest.merge_commit(entries=[entry], manifest=manifest, positions={}, author="tester", read_sources=[]),
-        lambda: ds_manifest.compaction_commit(entries=[entry], manifest=manifest, retired_files=[], author="tester"),
+        lambda: ds_manifest.add_files(
+            entries=[entry], manifest=manifest, author="tester", read_sources=[]
+        ),
+        lambda: ds_manifest.truncate_and_add_files(
+            entries=[entry], manifest=manifest, author="tester", read_sources=[]
+        ),
+        lambda: ds_manifest.merge_commit(
+            entries=[entry], manifest=manifest, positions={}, author="tester", read_sources=[]
+        ),
+        lambda: ds_manifest.compaction_commit(
+            entries=[entry], manifest=manifest, retired_files=[], author="tester"
+        ),
     ):
         with pytest.raises(ValueError, match="entries OR manifest"):
             commit()

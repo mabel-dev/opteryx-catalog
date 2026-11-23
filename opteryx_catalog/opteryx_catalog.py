@@ -20,8 +20,6 @@ from .billing_index import BILLING_ACCOUNT_SUBCOLLECTION
 from .billing_index import BILLING_DOC
 from .billing_index import clear_billing_index
 from .billing_index import write_billing_index
-from .clients import shared_firestore_client
-from .clients import shared_storage_client
 
 # The "no expectation" sentinel for save_dataset_metadata, defined with the
 # commit paths that pass it (catalog/dataset.py).
@@ -31,12 +29,10 @@ from .catalog.dataset import _as_int
 from .catalog.dataset import open_data_file_writer_at
 from .catalog.dataset import relation_schema_from_stored
 from .catalog.deletes import DELETE_FILE_PATH_KEY
-from .catalog.vector_indexes import BUILD_MODES
-from .catalog.vector_indexes import VECTOR_INDEXES_FIELD
-from .catalog.vector_indexes import index_refs
-from .catalog.vector_indexes import new_index_definition
-from .catalog.vector_indexes import normalize_index_name
-from .catalog.vector_indexes import with_index_refs
+from .catalog.maintenance_lease import LEASE_DOCUMENT
+from .catalog.maintenance_lease import MaintenanceLease
+from .catalog.maintenance_lease import describe_holder
+from .catalog.maintenance_lease import validate_lease_request
 from .catalog.metadata import SNAPSHOT_EXPIRED_AT_KEY
 from .catalog.metadata import DatasetMetadata
 from .catalog.metadata import Fork
@@ -47,13 +43,17 @@ from .catalog.metadata import provenance_document_fields
 from .catalog.metadata import provenance_fields_from_document
 from .catalog.metadata import snapshot_is_tombstoned
 from .catalog.metastore import Metastore
-from .catalog.maintenance_lease import LEASE_DOCUMENT
-from .catalog.maintenance_lease import MaintenanceLease
-from .catalog.maintenance_lease import describe_holder
-from .catalog.maintenance_lease import validate_lease_request
 from .catalog.orphan_quarantine import MAINTENANCE_SUBCOLLECTION
 from .catalog.ownership import is_own_path
+from .catalog.vector_indexes import BUILD_MODES
+from .catalog.vector_indexes import VECTOR_INDEXES_FIELD
+from .catalog.vector_indexes import index_refs
+from .catalog.vector_indexes import new_index_definition
+from .catalog.vector_indexes import normalize_index_name
+from .catalog.vector_indexes import with_index_refs
 from .catalog.view import View as CatalogView
+from .clients import shared_firestore_client
+from .clients import shared_storage_client
 from .exceptions import CollectionAlreadyExists
 from .exceptions import CollectionLocked
 from .exceptions import CollectionNotEmpty
@@ -72,17 +72,19 @@ from .exceptions import MaintenanceLeaseLost
 from .exceptions import MaterializedViewError
 from .exceptions import NameInUse
 from .exceptions import PlatformIdentityOwnerRefused
+from .exceptions import PropertyGraphAlreadyExists
+from .exceptions import PropertyGraphNotFound
 from .exceptions import RenameTooLarge
 from .exceptions import SnapshotAncestryTooDeep
 from .exceptions import SnapshotMissingError
 from .exceptions import TagAlreadyExists
 from .exceptions import TagLimitExceeded
 from .exceptions import TagNotFound
-from .exceptions import VectorIndexAlreadyExists
-from .exceptions import VectorIndexNotFound
 from .exceptions import TaskAlreadyExists
 from .exceptions import TaskNotFound
 from .exceptions import TriggerNotFound
+from .exceptions import VectorIndexAlreadyExists
+from .exceptions import VectorIndexNotFound
 from .exceptions import ViewAlreadyExists
 from .exceptions import ViewNotFound
 from .exceptions import WorkspaceDeletionProtected
@@ -416,6 +418,7 @@ def generated_constraint_name(
         return f"{INFERRED_CONSTRAINT_PREFIX}{digest}"
     return f"{INFERRED_CONSTRAINT_PREFIX}{stem}_{digest}"
 
+
 # Longest accepted tag name, in characters.
 MAX_TAG_NAME_LENGTH = 128
 
@@ -511,6 +514,7 @@ class TriggerFireClaim:
     previous_ms: int | None
     interval_seconds: int
 
+
 # Value of a dataset document's `dataset-type` field marking it as the backing
 # table of a materialized view. Plain datasets have no `dataset-type` field.
 MATERIALIZED_VIEW_TYPE = "materialized_view"
@@ -598,8 +602,7 @@ class EgressRefusal:
         """
         if self.secured:
             narrow = (
-                f"ALTER WORKSPACE {self.workspace} SET SECURE {self.secured} "
-                f"TO {self.destination}"
+                f"ALTER WORKSPACE {self.workspace} SET SECURE {self.secured} TO {self.destination}"
             )
         else:
             narrow = (
@@ -1054,7 +1057,7 @@ class OpteryxCatalog(SecretsMixin, Metastore):
         # not enough to load a dataset with its manifests and history.
         self._firestore_project = firestore_project
         self._firestore_database = firestore_database
-        self._sibling_catalogs: dict[str, "OpteryxCatalog"] = {}
+        self._sibling_catalogs: dict[str, OpteryxCatalog] = {}
         self._catalog_ref = self.firestore_client.collection(workspace)
         # Gate construction on the workspace existing. The $properties doc
         # records metadata for the workspace such as 'timestamp-ms',
@@ -1094,26 +1097,25 @@ class OpteryxCatalog(SecretsMixin, Metastore):
             logger.debug("Workspace properties for %s unreadable (%s)", workspace, exc)
             props_doc = None
 
-        if props_doc is not None:
-            if not props_doc.exists:
-                if not create_if_missing:
-                    raise WorkspaceNotFound(f"Workspace does not exist: {workspace}")
-                try:
-                    now_ms = int(time.time() * 1000)
-                    props_ref.set(
-                        {
-                            "timestamp-ms": now_ms,
-                            "billing-account-id": None,
-                            "owner": None,
-                            "deleted-at-ms": None,
-                            "deleted-by": None,
-                            "locked-by": None,
-                            "locked-at-ms": None,
-                        }
-                    )
-                except Exception as exc:  # noqa: BLE001 - Firestore client boundary
-                    # Be conservative: don't fail catalog initialization on Firestore errors
-                    logger.debug("Could not seed $properties for %s (%s)", workspace, exc)
+        if props_doc is not None and not props_doc.exists:
+            if not create_if_missing:
+                raise WorkspaceNotFound(f"Workspace does not exist: {workspace}")
+            try:
+                now_ms = int(time.time() * 1000)
+                props_ref.set(
+                    {
+                        "timestamp-ms": now_ms,
+                        "billing-account-id": None,
+                        "owner": None,
+                        "deleted-at-ms": None,
+                        "deleted-by": None,
+                        "locked-by": None,
+                        "locked-at-ms": None,
+                    }
+                )
+            except Exception as exc:  # noqa: BLE001 - Firestore client boundary
+                # Be conservative: don't fail catalog initialization on Firestore errors
+                logger.debug("Could not seed $properties for %s (%s)", workspace, exc)
         self.gcs_bucket = gcs_bucket
         self._storage_client = shared_storage_client() if gcs_bucket else None
         # Caches for immutable, version-addressed artifacts. Snapshots, schemas
@@ -1158,14 +1160,20 @@ class OpteryxCatalog(SecretsMixin, Metastore):
     def _view_doc_ref(self, collection: str, view_name: str):
         return self._views_collection(collection).document(view_name)
 
+    def _property_graphs_collection(self, collection: str):
+        return self._collection_ref(collection).collection("property_graphs")
+
+    def _property_graph_doc_ref(self, collection: str, graph_name: str):
+        return self._property_graphs_collection(collection).document(graph_name)
+
     def name_holder(self, collection: str, name: str) -> str | None:
         """Which kind of object holds `collection.name`, or None if it is free.
 
-        `workspace.collection.<object>` is one namespace. Datasets, views and
-        tasks are stored in three separate subcollections, so nothing about the
-        storage prevents the same name existing in all three - this is what
-        prevents it. A materialized view is a dataset carrying a type marker, so
-        the dataset check covers it.
+        `workspace.collection.<object>` is one namespace. Datasets, views, tasks
+        and property graphs are stored in separate subcollections, so nothing
+        about the storage prevents the same name existing in all of them - this
+        is what prevents it. A materialized view is a dataset carrying a type
+        marker, so the dataset check covers it.
         """
         if self._dataset_doc_ref(collection, name).get().exists:
             return "dataset"
@@ -1173,6 +1181,8 @@ class OpteryxCatalog(SecretsMixin, Metastore):
             return "view"
         if self._task_doc_ref(collection, name).get().exists:
             return "task"
+        if self._property_graph_doc_ref(collection, name).get().exists:
+            return "property graph"
         return None
 
     def assert_name_free(self, collection: str, name: str, kind: str) -> None:
@@ -1184,9 +1194,9 @@ class OpteryxCatalog(SecretsMixin, Metastore):
         holder = self.name_holder(collection, name)
         if holder is not None and holder != kind:
             raise NameInUse(
-                f"{collection}.{name} already exists as a {holder}. A table, a view "
-                "and a task share one namespace, so a name identifies exactly one of "
-                "them - drop the existing object or choose another name."
+                f"{collection}.{name} already exists as a {holder}. Tables, views, tasks "
+                "and property graphs share one namespace, so a name identifies exactly "
+                "one of them - drop the existing object or choose another name."
             )
 
     def _task_parts(self, identifier: str | tuple) -> tuple[str, str]:
@@ -1504,7 +1514,9 @@ class OpteryxCatalog(SecretsMixin, Metastore):
             # update dataset doc to reference current schema
             doc_ref.update({"current-schema-id": metadata.current_schema_id})
 
-        self._announce_dataset_created(collection, dataset_name, schema, location, properties, author)
+        self._announce_dataset_created(
+            collection, dataset_name, schema, location, properties, author
+        )
 
         # Return SimpleDataset (attach this catalog so append() can persist)
         return SimpleDataset(identifier=identifier, _metadata=metadata, io=self.io, catalog=self)
@@ -1608,7 +1620,7 @@ class OpteryxCatalog(SecretsMixin, Metastore):
                 "columns": self._schema_to_columns(schema, field_ids=field_ids),
                 "timestamp-ms": now_ms,
                 "author": author,
-                "sequence-number": 1,   # a new dataset has no earlier schema
+                "sequence-number": 1,  # a new dataset has no earlier schema
             }
             metadata.current_schema_id = schema_id
             metadata.schemas = [{"schema_id": schema_id, **schema_document}]
@@ -1648,7 +1660,9 @@ class OpteryxCatalog(SecretsMixin, Metastore):
 
         _create(self.firestore_client.transaction())
 
-        self._announce_dataset_created(collection, dataset_name, schema, location, properties, author)
+        self._announce_dataset_created(
+            collection, dataset_name, schema, location, properties, author
+        )
         dataset._after_commit(author, snapshot)
         return dataset
 
@@ -2180,7 +2194,7 @@ class OpteryxCatalog(SecretsMixin, Metastore):
         # destroys other people's data.
         try:
             forks = self.list_forks(identifier)
-        except Exception as exc:  # noqa: BLE001 - Firestore boundary
+        except Exception as exc:
             raise ForkError(
                 f"Cannot establish whether {identifier} has forks ({exc}). Refusing to "
                 "drop it while that is unknown."
@@ -2257,9 +2271,7 @@ class OpteryxCatalog(SecretsMixin, Metastore):
         self._delete_subcollection(doc_ref.collection("statement"))
         self._delete_subcollection(doc_ref.collection(TRIGGERS_SUBCOLLECTION))
         self._delete_subcollection(doc_ref.collection(RELATIONSHIPS_SUBCOLLECTION))
-        self._delete_subcollection(
-            doc_ref.collection(RELATIONSHIP_SUPPRESSIONS_SUBCOLLECTION)
-        )
+        self._delete_subcollection(doc_ref.collection(RELATIONSHIP_SUPPRESSIONS_SUBCOLLECTION))
         # Subscriptions are a property of what they hang off - here, a
         # materialized view, whose drop routes through this method. Nothing is
         # left to notify about, and an ordinary dataset simply has none.
@@ -2480,7 +2492,7 @@ class OpteryxCatalog(SecretsMixin, Metastore):
                     (row.to_dict() or {}).get("fork") or row.id.replace(":", ".")
                     for row in self._forks_collection(identifier).stream(transaction=transaction)
                 ]
-            except Exception as exc:  # noqa: BLE001 - Firestore boundary
+            except Exception as exc:
                 raise ForkError(
                     f"Cannot establish whether {identifier} has forks ({exc}). Refusing to "
                     "rename it while that is unknown."
@@ -2509,11 +2521,16 @@ class OpteryxCatalog(SecretsMixin, Metastore):
             for kind, ref in (
                 ("view", self._view_doc_ref(new_collection, new_dataset_name)),
                 ("task", self._task_doc_ref(new_collection, new_dataset_name)),
+                (
+                    "property graph",
+                    self._property_graph_doc_ref(new_collection, new_dataset_name),
+                ),
             ):
                 if ref.get(transaction=transaction).exists:
                     raise NameInUse(
-                        f"{new_identifier} already exists as a {kind}. A table, a view and a "
-                        "task share one namespace, so a name identifies exactly one of them."
+                        f"{new_identifier} already exists as a {kind}. Tables, views, tasks "
+                        "and property graphs share one namespace, so a name identifies "
+                        "exactly one of them."
                     )
 
             # Read every child now, while reads are still allowed; each is
@@ -3894,6 +3911,106 @@ class OpteryxCatalog(SecretsMixin, Metastore):
         return [doc.id for doc in coll.stream()]
 
     # ------------------------------------------------------------------
+    # Property graphs (SQL/PGQ)
+    # ------------------------------------------------------------------
+    #
+    # A property graph is catalog TEXT, like a view: the engine validates the
+    # definition against its tables and hands over the canonical CREATE PROPERTY
+    # GRAPH statement (every key, endpoint, label and property written out), which
+    # is all that is stored. Unlike a view it keeps no statement history: a graph
+    # owns no data and its definition is replaced whole.
+
+    @staticmethod
+    def _property_graph_parts(identifier: str | tuple) -> tuple[str, str]:
+        if isinstance(identifier, (tuple, list)):
+            return identifier[0], identifier[1]
+        collection, graph_name = identifier.split(".")
+        return collection, graph_name
+
+    def create_property_graph(
+        self,
+        identifier: str | tuple,
+        statement: str,
+        author: str | None = None,
+        update_if_exists: bool = False,
+        description: str | None = None,
+    ) -> dict:
+        """Store a property graph's canonical definition; returns the stored record.
+
+        Raises `PropertyGraphAlreadyExists` when the graph exists and
+        `update_if_exists` is False, and `NameInUse` when another kind of
+        object holds the name.
+        """
+        if author is None:
+            raise ValueError("author must be provided when creating a property graph")
+        collection, graph_name = self._property_graph_parts(identifier)
+        doc_ref = self._property_graph_doc_ref(collection, graph_name)
+        self.assert_name_free(collection, graph_name, "property graph")
+        existed = doc_ref.get().exists
+        if existed and not update_if_exists:
+            raise PropertyGraphAlreadyExists(
+                f"Property graph already exists: {collection}.{graph_name}"
+            )
+
+        record = {
+            "name": graph_name,
+            "collection": collection,
+            "workspace": self.workspace,
+            "statement": statement,
+            "author": author,
+            "description": description,
+            "timestamp-ms": int(time.time() * 1000),
+        }
+        doc_ref.set(record)
+
+        emit_audit(
+            "update_property_graph" if existed else "create_property_graph",
+            resource_type=ResourceType.PROPERTY_GRAPH,
+            workspace=self.workspace,
+            collection=collection,
+            resource=graph_name,
+            author=author,
+        )
+        return record
+
+    def load_property_graph(self, identifier: str | tuple) -> dict:
+        """The stored record (`statement`, `author`, `description`, ...).
+
+        Raises `PropertyGraphNotFound` when there is no such graph.
+        """
+        collection, graph_name = self._property_graph_parts(identifier)
+        doc = self._property_graph_doc_ref(collection, graph_name).get()
+        if not doc.exists:
+            raise PropertyGraphNotFound(f"Property graph not found: {collection}.{graph_name}")
+        return doc.to_dict()
+
+    def property_graph_exists(self, identifier: str | tuple) -> bool:
+        collection, graph_name = self._property_graph_parts(identifier)
+        return self._property_graph_doc_ref(collection, graph_name).get().exists
+
+    def drop_property_graph(self, identifier: str | tuple, author: str | None = None) -> None:
+        """Drop a property graph. It owns no storage, so nothing is reclaimed.
+
+        An author is required, as it is to create one, and is checked before the
+        does-it-exist return (see `drop_dataset`).
+        """
+        if not author:
+            raise ValueError("author must be provided when dropping a property graph")
+        collection, graph_name = self._property_graph_parts(identifier)
+        doc_ref = self._property_graph_doc_ref(collection, graph_name)
+        if not doc_ref.get().exists:
+            return
+        doc_ref.delete()
+        emit_audit(
+            "drop_property_graph",
+            resource_type=ResourceType.PROPERTY_GRAPH,
+            workspace=self.workspace,
+            collection=collection,
+            resource=graph_name,
+            author=author,
+        )
+
+    # ------------------------------------------------------------------
     # Tasks
     # ------------------------------------------------------------------
 
@@ -4261,8 +4378,7 @@ class OpteryxCatalog(SecretsMixin, Metastore):
             return dataset_ref, LISTENER_KIND_MATERIALIZED_VIEW, collection, name
 
         raise TaskNotFound(
-            f"Nothing to subscribe to: {collection}.{name} is not a task or a "
-            "materialized view"
+            f"Nothing to subscribe to: {collection}.{name} is not a task or a materialized view"
         )
 
     def _listeners_collection(self, collection: str, name: str):
@@ -4899,8 +5015,7 @@ class OpteryxCatalog(SecretsMixin, Metastore):
         else:
             if event_kind == COMMIT_EVENT_KIND:
                 raise ValueError(
-                    "a commit trigger is held by the dataset whose commits fire it, "
-                    "not by a task"
+                    "a commit trigger is held by the dataset whose commits fire it, not by a task"
                 )
             if kind != TASK_TRIGGER_KIND or target_task is None:
                 raise ValueError("a trigger held by a task runs that task: pass target_task")
@@ -5324,9 +5439,7 @@ class OpteryxCatalog(SecretsMixin, Metastore):
             raise DatasetNotFound(f"Dataset not found: {far_collection}.{far_dataset}")
 
         relationships = self._relationships_collection(collection, dataset_name)
-        digest = relationship_pair_digest(
-            column, far_collection, far_dataset, references_column
-        )
+        digest = relationship_pair_digest(column, far_collection, far_dataset, references_column)
 
         # The proposal this statement might be confirming, found either way it
         # can be named: by the generated name the Studio's confirm button sends
@@ -5490,9 +5603,9 @@ class OpteryxCatalog(SecretsMixin, Metastore):
         # to the job because the job is not the only caller that could exist,
         # and a suppression that only holds when the caller remembers to look
         # is not a suppression.
-        suppression = self._relationship_suppressions_collection(
-            collection, dataset_name
-        ).document(digest)
+        suppression = self._relationship_suppressions_collection(collection, dataset_name).document(
+            digest
+        )
         if suppression.get().exists:
             return None
 
@@ -5657,9 +5770,7 @@ class OpteryxCatalog(SecretsMixin, Metastore):
             resource=dataset_name,
             author=author,
             constraint=constraint_name,
-            references=(
-                f"{data.get('references-collection')}.{data.get('references-dataset')}"
-            ),
+            references=(f"{data.get('references-collection')}.{data.get('references-dataset')}"),
         )
         return True
 
@@ -5832,9 +5943,11 @@ class OpteryxCatalog(SecretsMixin, Metastore):
         """
         broken = []
         for row in self.find_relationships_to(f"{collection}.{dataset_name}"):
-            if column is not None:
-                if (row.get("references-column") or "").casefold() != column.casefold():
-                    continue
+            if (
+                column is not None
+                and (row.get("references-column") or "").casefold() != column.casefold()
+            ):
+                continue
             near_collection = row.get("collection")
             near_dataset = row.get("dataset")
             name = row.get("name")
@@ -6056,8 +6169,7 @@ class OpteryxCatalog(SecretsMixin, Metastore):
         if status == "broken":
             payload["broken-reason"] = "values-diverged"
             payload["broken-detail"] = (
-                "the values no longer correspond - see this row's evidence for "
-                "what was compared"
+                "the values no longer correspond - see this row's evidence for what was compared"
             )
             payload["broken-at-ms"] = now_ms
         elif status == "active":
@@ -6658,7 +6770,7 @@ class OpteryxCatalog(SecretsMixin, Metastore):
         """
         return fork_identifier.replace(".", ":")
 
-    def _catalog_for(self, workspace: str) -> "OpteryxCatalog":
+    def _catalog_for(self, workspace: str) -> OpteryxCatalog:
         """A handle bound to `workspace`, reusing this one's connection settings.
 
         For the questions a raw document ref cannot answer. `_foreign_properties_ref`
@@ -6719,9 +6831,7 @@ class OpteryxCatalog(SecretsMixin, Metastore):
         )
 
     def _forks_collection(self, upstream_identifier: str):
-        return self._foreign_dataset_doc_ref(upstream_identifier).collection(
-            FORKS_SUBCOLLECTION
-        )
+        return self._foreign_dataset_doc_ref(upstream_identifier).collection(FORKS_SUBCOLLECTION)
 
     def register_fork(
         self,
@@ -6858,16 +6968,13 @@ class OpteryxCatalog(SecretsMixin, Metastore):
         schema_id = (doc_ref.get().to_dict() or {}).get("current-schema-id")
         if not schema_id:
             raise ForkError(
-                f"{identifier} has no current schema, so there is nothing to clone its "
-                "shape from."
+                f"{identifier} has no current schema, so there is nothing to clone its shape from."
             )
-        stored = (
-            doc_ref.collection("schemas").document(str(schema_id)).get().to_dict() or {}
-        ).get("columns")
+        stored = (doc_ref.collection("schemas").document(str(schema_id)).get().to_dict() or {}).get(
+            "columns"
+        )
         if not stored:
-            raise ForkError(
-                f"{identifier}'s schema document {schema_id} is missing or empty."
-            )
+            raise ForkError(f"{identifier}'s schema document {schema_id} is missing or empty.")
         return {"columns": stored}
 
     def clone_dataset(
@@ -7002,9 +7109,7 @@ class OpteryxCatalog(SecretsMixin, Metastore):
 
         datasets = sorted(self._foreign_list_datasets(source_fq))
         if not datasets:
-            raise ForkError(
-                f"{source_fq} holds no datasets to clone."
-            )
+            raise ForkError(f"{source_fq} holds no datasets to clone.")
 
         for name in datasets:
             if self._dataset_doc_ref(target_collection_name, name).get().exists:
@@ -7106,9 +7211,7 @@ class OpteryxCatalog(SecretsMixin, Metastore):
                 "until they expire."
             )
         if not state["revisions_behind"]:
-            raise ForkError(
-                f"{fork_fq} is already up to date with {fork.source.dataset}."
-            )
+            raise ForkError(f"{fork_fq} is already up to date with {fork.source.dataset}.")
 
         snapshot, entries = self._upstream_entries(upstream, None)
 
@@ -7121,8 +7224,7 @@ class OpteryxCatalog(SecretsMixin, Metastore):
             borrowed_paths=_borrowed_paths(entries),
             author=author,
             commit_message=(
-                f"RESYNC {fork_fq} FROM {fork.source.dataset} "
-                f"AT VERSION {snapshot.snapshot_id}"
+                f"RESYNC {fork_fq} FROM {fork.source.dataset} AT VERSION {snapshot.snapshot_id}"
             ),
             read_sources=[(fork.source.dataset, snapshot.snapshot_id, "version")],
         )
@@ -7516,9 +7618,16 @@ class OpteryxCatalog(SecretsMixin, Metastore):
         The existence check and the create are ONE transaction, so two concurrent
         CREATE INDEX of the same name cannot both succeed."""
         record = new_index_definition(
-            name=name, column=column, method=method, metric=metric, build=build,
-            clusters=clusters, embedding_identity=embedding_identity,
-            dimensions=dimensions, author=author, created_at_ms=int(time.time() * 1000),
+            name=name,
+            column=column,
+            method=method,
+            metric=metric,
+            build=build,
+            clusters=clusters,
+            embedding_identity=embedding_identity,
+            dimensions=dimensions,
+            author=author,
+            created_at_ms=int(time.time() * 1000),
         )
         collection, dataset_name = self._local_parts(dataset_identifier)
         dataset_ref = self._dataset_doc_ref(collection, dataset_name)
@@ -7554,7 +7663,9 @@ class OpteryxCatalog(SecretsMixin, Metastore):
         if record["build"] == "async":
             from .trigger_firing import fire_index_refreshes
 
-            fire_index_refreshes(self, f"{collection}.{dataset_name}", author=author, only=record["name"])
+            fire_index_refreshes(
+                self, f"{collection}.{dataset_name}", author=author, only=record["name"]
+            )
         return dict(record)
 
     def get_vector_index(self, dataset_identifier: str, name: str) -> dict:
@@ -7562,7 +7673,9 @@ class OpteryxCatalog(SecretsMixin, Metastore):
         index_name = normalize_index_name(name)
         definition = self._index_definitions(collection, dataset_name).get(index_name)
         if definition is None:
-            raise VectorIndexNotFound(f"Index not found: {index_name} on {collection}.{dataset_name}")
+            raise VectorIndexNotFound(
+                f"Index not found: {index_name} on {collection}.{dataset_name}"
+            )
         return dict(definition)
 
     def list_vector_indexes(self, dataset_identifier: str) -> list[dict]:
@@ -7572,7 +7685,9 @@ class OpteryxCatalog(SecretsMixin, Metastore):
         indexes = self._index_definitions(collection, dataset_name).values()
         return sorted(indexes, key=lambda index: index["name"])
 
-    def alter_vector_index(self, dataset_identifier: str, name: str, *, build: str, author: str) -> dict:
+    def alter_vector_index(
+        self, dataset_identifier: str, name: str, *, build: str, author: str
+    ) -> dict:
         """Change an index's build mode (ruled 2026-10-02). Applies from the next commit:
         files written while the index was async stay unindexed until a maintenance build."""
         if not author:
@@ -7686,15 +7801,21 @@ class OpteryxCatalog(SecretsMixin, Metastore):
                         f"this {operation} was not started."
                     )
             lease = MaintenanceLease(
-                dataset=qualified, claim_id=uuid.uuid4().hex, holder=holder, operation=operation,
-                claimed_at_ms=now_ms, expires_at_ms=now_ms + ttl_seconds * 1000,
+                dataset=qualified,
+                claim_id=uuid.uuid4().hex,
+                holder=holder,
+                operation=operation,
+                claimed_at_ms=now_ms,
+                expires_at_ms=now_ms + ttl_seconds * 1000,
             )
             transaction.set(lease_ref, lease.to_document())
             return lease
 
         return _claim(self.firestore_client.transaction())
 
-    def renew_maintenance_lease(self, lease: MaintenanceLease, *, ttl_seconds: int) -> MaintenanceLease:
+    def renew_maintenance_lease(
+        self, lease: MaintenanceLease, *, ttl_seconds: int
+    ) -> MaintenanceLease:
         """Extend a held lease. MaintenanceLeaseLost if this claim no longer holds it -
         the holder must stop: someone else may now be compacting or building."""
         validate_lease_request(lease.holder, lease.operation, ttl_seconds)
@@ -7706,7 +7827,10 @@ class OpteryxCatalog(SecretsMixin, Metastore):
             current = lease_ref.get(transaction=transaction)
             held = (current.to_dict() or {}) if current.exists else {}
             now_ms = int(time.time() * 1000)
-            if held.get("claim-id") != lease.claim_id or int(held.get("expires-at-ms") or 0) <= now_ms:
+            if (
+                held.get("claim-id") != lease.claim_id
+                or int(held.get("expires-at-ms") or 0) <= now_ms
+            ):
                 raise MaintenanceLeaseLost(
                     f"The {lease.operation} lease on {lease.dataset} claimed by {lease.holder} "
                     f"at {lease.claimed_at_ms} is no longer held"
@@ -7714,8 +7838,11 @@ class OpteryxCatalog(SecretsMixin, Metastore):
                     + ". Stop: anything not yet committed is an orphan for deep clean."
                 )
             renewed = MaintenanceLease(
-                dataset=lease.dataset, claim_id=lease.claim_id, holder=lease.holder,
-                operation=lease.operation, claimed_at_ms=lease.claimed_at_ms,
+                dataset=lease.dataset,
+                claim_id=lease.claim_id,
+                holder=lease.holder,
+                operation=lease.operation,
+                claimed_at_ms=lease.claimed_at_ms,
                 expires_at_ms=now_ms + ttl_seconds * 1000,
             )
             transaction.set(lease_ref, renewed.to_document())
@@ -7792,9 +7919,7 @@ class OpteryxCatalog(SecretsMixin, Metastore):
             # version has expired, the second that the walk gave up; in both
             # cases there is no snapshot in this listing to label, so the row
             # is omitted rather than the whole listing failing.
-            logger.debug(
-                "No `previous` virtual tag for %s (%s)", dataset_identifier, exc
-            )
+            logger.debug("No `previous` virtual tag for %s (%s)", dataset_identifier, exc)
             previous = None
 
         if previous is not None and previous.snapshot_id is not None:
@@ -9024,7 +9149,9 @@ class OpteryxCatalog(SecretsMixin, Metastore):
 
         _check_and_set(self.firestore_client.transaction())
 
-    def _dataset_document(self, collection: str, dataset_name: str, metadata: DatasetMetadata) -> dict:
+    def _dataset_document(
+        self, collection: str, dataset_name: str, metadata: DatasetMetadata
+    ) -> dict:
         """The whole dataset document for `metadata`, as every commit writes it.
 
         Shared by `save_dataset_metadata` and `create_dataset_with_files`, so a
@@ -9107,7 +9234,9 @@ class OpteryxCatalog(SecretsMixin, Metastore):
         if expected_current_snapshot_id is _NO_SNAPSHOT_EXPECTATION:
             self._set_carrying_vector_indexes(doc_ref, document)
         else:
-            self._set_if_pointer_unmoved(doc_ref, identifier, expected_current_snapshot_id, document)
+            self._set_if_pointer_unmoved(
+                doc_ref, identifier, expected_current_snapshot_id, document
+            )
 
         # Metadata persisted in primary `datasets` collection only.
 

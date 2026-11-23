@@ -196,7 +196,7 @@ def test_snapshots_ahead_of_a_rolled_back_head_are_not_the_previous_version():
 
 
 def test_last_user_snapshot_ignores_snapshots_ahead_of_a_rolled_back_head():
-    """"When did a human last change this?" must not name an undone commit."""
+    """ "When did a human last change this?" must not name an undone commit."""
     history = [
         _snap(1, True),
         _snap(2, False, parent=1, op="compact"),

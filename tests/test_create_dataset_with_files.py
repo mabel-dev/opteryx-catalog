@@ -12,12 +12,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.dirname(__file__))
 
 import pytest
+from test_commit_pointer_atomic import _atomic_catalog
+from test_commit_pointer_atomic import _AtomicTransaction
 
 from opteryx_catalog.catalog.dataset import SimpleDataset
 from opteryx_catalog.exceptions import DatasetAlreadyExists
-
-from test_commit_pointer_atomic import _AtomicTransaction
-from test_commit_pointer_atomic import _atomic_catalog
 
 IDENTIFIER = "reports.created"
 

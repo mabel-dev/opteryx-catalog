@@ -10,8 +10,6 @@ Three properties, each guarding a cost that used to be silent:
 3. `exists()` on the fileio adapter is a HEAD, never a download.
 """
 
-import pytest
-
 from opteryx_catalog.iops import gcs
 from opteryx_catalog.iops.base import _ByteBudgetLRU
 

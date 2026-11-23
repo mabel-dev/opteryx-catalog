@@ -39,7 +39,9 @@ class _Catalog:
 
 
 def _dataset(docs):
-    meta = DatasetMetadata(dataset_identifier="col.t", location="mem://", schema=None, properties={})
+    meta = DatasetMetadata(
+        dataset_identifier="col.t", location="mem://", schema=None, properties={}
+    )
     ds = SimpleDataset(identifier="col.t", _metadata=meta)
     ds.catalog = _Catalog(docs)
     return ds
@@ -51,7 +53,9 @@ def test_a_live_snapshot_is_fetched_by_id():
 
 
 def test_an_expired_snapshot_is_absent_by_id():
-    ds = _dataset({7: {"snapshot-id": 7, "timestamp-ms": 7, "manifest": "m", SNAPSHOT_EXPIRED_AT_KEY: 1}})
+    ds = _dataset(
+        {7: {"snapshot-id": 7, "timestamp-ms": 7, "manifest": "m", SNAPSHOT_EXPIRED_AT_KEY: 1}}
+    )
     assert ds.snapshot(7) is None
     assert ds.catalog._snapshot_cache == {}, "a tombstone is not cached as an artifact"
 

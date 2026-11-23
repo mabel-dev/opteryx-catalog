@@ -108,14 +108,24 @@ class ViewNotFound(ViewError):
     pass
 
 
+class PropertyGraphError(KeyError, CatalogError):
+    pass
+
+
+class PropertyGraphAlreadyExists(PropertyGraphError):
+    pass
+
+
+class PropertyGraphNotFound(PropertyGraphError):
+    pass
+
+
 class TriggerNotFound(KeyError, CatalogError):
     pass
 
 
 class ConstraintNotFound(KeyError, CatalogError):
     """A named relationship declaration is not on the dataset it was sought on."""
-
-    pass
 
 
 class NameInUse(CatalogError):

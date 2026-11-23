@@ -50,12 +50,20 @@ SSLMODES = ("disable", "require", "verify-full")
 
 
 def _parse_args(argv):
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument("--project", required=True, help="GCP project of the catalogs Firestore")
-    parser.add_argument("--database", required=True, help="Firestore database holding the workspaces")
+    parser.add_argument(
+        "--database", required=True, help="Firestore database holding the workspaces"
+    )
     parser.add_argument("--workspace", required=True)
-    parser.add_argument("--updated-by", required=True, help="who is recorded as the binding's author")
-    parser.add_argument("--clear", action="store_true", help="remove the binding (workspace reverts to native)")
+    parser.add_argument(
+        "--updated-by", required=True, help="who is recorded as the binding's author"
+    )
+    parser.add_argument(
+        "--clear", action="store_true", help="remove the binding (workspace reverts to native)"
+    )
     parser.add_argument("--kms-key", help="KMS key resource name that wraps the password")
     parser.add_argument(
         "--connection-url",
@@ -68,7 +76,9 @@ def _parse_args(argv):
     parser.add_argument("--dbname")
     parser.add_argument("--user")
     parser.add_argument("--sslmode", default="require", choices=SSLMODES)
-    parser.add_argument("--schema", default="public", help="schema used for <workspace>.<table> names")
+    parser.add_argument(
+        "--schema", default="public", help="schema used for <workspace>.<table> names"
+    )
     parser.add_argument("--timeout-s", type=int, default=30)
     parser.add_argument("--preserve-sql-case", action="store_true")
     return parser.parse_args(argv)
@@ -89,7 +99,10 @@ def main(argv=None) -> int:
 
         url = urllib.parse.urlsplit(args.connection_url)
         if url.scheme not in ("postgresql", "postgres"):
-            print(f"--connection-url must be a postgresql:// URL (got {url.scheme!r}://)", file=sys.stderr)
+            print(
+                f"--connection-url must be a postgresql:// URL (got {url.scheme!r}://)",
+                file=sys.stderr,
+            )
             return 2
         options = dict(urllib.parse.parse_qsl(url.query))
         args.host = args.host or url.hostname
@@ -98,7 +111,10 @@ def main(argv=None) -> int:
         args.user = args.user or url.username
         if "sslmode" in options:
             if options["sslmode"] not in SSLMODES:
-                print(f"unsupported sslmode {options['sslmode']!r}; expected one of {', '.join(SSLMODES)}", file=sys.stderr)
+                print(
+                    f"unsupported sslmode {options['sslmode']!r}; expected one of {', '.join(SSLMODES)}",
+                    file=sys.stderr,
+                )
                 return 2
             args.sslmode = options["sslmode"]
         # The URL may carry the password; the environment still takes precedence
@@ -108,7 +124,10 @@ def main(argv=None) -> int:
 
     missing = [name for name in ("host", "dbname", "user", "kms_key") if not getattr(args, name)]
     if missing:
-        print(f"missing required option(s): {', '.join('--' + m.replace('_', '-') for m in missing)}", file=sys.stderr)
+        print(
+            f"missing required option(s): {', '.join('--' + m.replace('_', '-') for m in missing)}",
+            file=sys.stderr,
+        )
         return 2
     if not password:
         print(
@@ -150,7 +169,9 @@ def main(argv=None) -> int:
         preserve_sql_case=args.preserve_sql_case,
         updated_by=args.updated_by,
     )
-    print(f"{args.workspace}: bound to postgres {args.user}@{args.host}:{args.port}/{args.dbname} (version {version})")
+    print(
+        f"{args.workspace}: bound to postgres {args.user}@{args.host}:{args.port}/{args.dbname} (version {version})"
+    )
     return 0
 
 

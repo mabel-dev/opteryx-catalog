@@ -48,10 +48,22 @@ def _stub_columns():
     # As control.opteryx's refresh writes them (workspace_catalog.py).
     return [
         {"id": 1, "name": "probe_id", "type": "VARCHAR", "nullable": False, "remote-type": 25},
-        {"id": 2, "name": "observed_at", "type": "TIMESTAMP", "nullable": False,
-         "remote-type": 1184},
-        {"id": 3, "name": "latency_ms", "type": "DECIMAL", "nullable": True,
-         "precision": 10, "scale": 3, "remote-type": 1700},
+        {
+            "id": 2,
+            "name": "observed_at",
+            "type": "TIMESTAMP",
+            "nullable": False,
+            "remote-type": 1184,
+        },
+        {
+            "id": 3,
+            "name": "latency_ms",
+            "type": "DECIMAL",
+            "nullable": True,
+            "precision": 10,
+            "scale": 3,
+            "remote-type": 1700,
+        },
     ]
 
 

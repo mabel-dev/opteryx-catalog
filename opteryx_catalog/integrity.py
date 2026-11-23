@@ -159,9 +159,7 @@ def _check_trigger(
     return None
 
 
-def _check_trigger_owner(
-    dataset_path: str, trigger: dict[str, Any]
-) -> dict[str, str] | None:
+def _check_trigger_owner(dataset_path: str, trigger: dict[str, Any]) -> dict[str, str] | None:
     """A finding for a trigger pinned to an identity nothing can bill.
 
     `create_trigger` and `set_trigger_owner` refuse a platform identity, but
@@ -257,10 +255,7 @@ def _check_mv_sources(
             continue
         src_ws, src_coll, src_name = parts
         source_ref = (
-            client.collection(src_ws)
-            .document(src_coll)
-            .collection("datasets")
-            .document(src_name)
+            client.collection(src_ws).document(src_coll).collection("datasets").document(src_name)
         )
         if not source_ref.get().exists:
             findings.append(
@@ -329,7 +324,8 @@ def _check_provenance(
     read_names = [
         entry.get("dataset")
         for entry in receipt
-        if entry.get("dataset") and not is_self(entry["dataset"], f"{collection_id}.{dataset_id}", workspace)
+        if entry.get("dataset")
+        and not is_self(entry["dataset"], f"{collection_id}.{dataset_id}", workspace)
     ]
 
     if kind == "task" and producer:

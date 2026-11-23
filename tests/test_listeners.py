@@ -21,6 +21,7 @@ from opteryx_catalog.exceptions import TaskNotFound
 from opteryx_catalog.opteryx_catalog import LISTENERS_SUBCOLLECTION
 from opteryx_catalog.opteryx_catalog import OpteryxCatalog
 
+
 class _Doc:
     """A stand-in for a Firestore document snapshot."""
 
@@ -164,9 +165,7 @@ def _add_mv(catalog, identifier="marts.daily"):
 
 def _listener_ids(catalog, identifier="ops.rollup"):
     collection, name = identifier.split(".", 1)
-    return sorted(
-        doc.id for doc in catalog._listeners_collection(collection, name).stream()
-    )
+    return sorted(doc.id for doc in catalog._listeners_collection(collection, name).stream())
 
 
 # --- adding
@@ -368,4 +367,3 @@ def test_listing_requires_a_user(capsys):
 
     with pytest.raises(ValueError, match="user must be provided"):
         catalog.list_listeners_for_user("")
-

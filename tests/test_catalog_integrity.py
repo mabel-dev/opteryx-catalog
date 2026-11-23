@@ -361,7 +361,12 @@ _BEFORE = 1_700_000_000_000
 def _current_snapshot(ref, snapshot_id, **fields):
     ref.set({**ref.get().to_dict(), "current-snapshot-id": snapshot_id})
     ref.collection("snapshots").document(str(snapshot_id)).set(
-        {"snapshot-id": snapshot_id, "timestamp-ms": _AFTER, "operation-type": "add-files", **fields}
+        {
+            "snapshot-id": snapshot_id,
+            "timestamp-ms": _AFTER,
+            "operation-type": "add-files",
+            **fields,
+        }
     )
 
 
@@ -409,7 +414,12 @@ def test_a_receipt_outside_the_producing_tasks_declaration_is_reported():
     _task(client, "ws", "ops", "t", reads=["ws.ops.a"])
     ref = _add_dataset(client, "ws", "mart", "y")
     _current_snapshot(
-        ref, 42, **{"read-sources": _receipt("ws.ops.a", "ws.ops.b", "ws.mart.y"), "produced-by": "task:ws.ops.t"}
+        ref,
+        42,
+        **{
+            "read-sources": _receipt("ws.ops.a", "ws.ops.b", "ws.mart.y"),
+            "produced-by": "task:ws.ops.t",
+        },
     )
 
     findings = audit_workspace(client, "ws")
@@ -424,7 +434,9 @@ def test_a_task_with_no_reads_recorded_yet_is_not_checked():
     client = _Client()
     _task(client, "ws", "ops", "t", writes=["ws.mart.y"])
     ref = _add_dataset(client, "ws", "mart", "y")
-    _current_snapshot(ref, 42, **{"read-sources": _receipt("ws.ops.b"), "produced-by": "task:ws.ops.t"})
+    _current_snapshot(
+        ref, 42, **{"read-sources": _receipt("ws.ops.b"), "produced-by": "task:ws.ops.t"}
+    )
 
     assert audit_workspace(client, "ws") == []
 
@@ -434,7 +446,11 @@ def test_a_receipt_outside_a_views_source_tables_is_reported():
     _add_dataset(client, "ws", "ops", "a")
     _mv_with_trigger(client, "ws", "mart", "v", ["ws.ops.a"])
     ref = _dataset_ref(client, "ws", "mart", "v")
-    _current_snapshot(ref, 42, **{"read-sources": _receipt("ws.ops.a", "ws.ops.b"), "produced-by": "view:ws.mart.v"})
+    _current_snapshot(
+        ref,
+        42,
+        **{"read-sources": _receipt("ws.ops.a", "ws.ops.b"), "produced-by": "view:ws.mart.v"},
+    )
 
     findings = audit_workspace(client, "ws")
 
@@ -456,16 +472,22 @@ def test_a_windowed_task_that_read_past_its_window_is_reported():
     again - the only place the platform can see that."""
     client = _Client()
     _task(
-        client, "ws", "ops", "t",
+        client,
+        "ws",
+        "ops",
+        "t",
         reads=["ws.ops.a"],
         **{"last-window-to": 100, "trigger": {"source": "ws.ops.a", "name": "fire_t"}},
     )
     _add_dataset(client, "ws", "ops", "a")
     ref = _add_dataset(client, "ws", "mart", "y")
     _current_snapshot(
-        ref, 42,
-        **{"read-sources": [{"dataset": "ws.ops.a", "snapshot-id": 120, "resolved-by": "current"}],
-           "produced-by": "task:ws.ops.t"},
+        ref,
+        42,
+        **{
+            "read-sources": [{"dataset": "ws.ops.a", "snapshot-id": 120, "resolved-by": "current"}],
+            "produced-by": "task:ws.ops.t",
+        },
     )
 
     findings = audit_workspace(client, "ws")
@@ -477,16 +499,22 @@ def test_a_windowed_task_that_read_past_its_window_is_reported():
 def test_a_windowed_task_that_read_its_window_exactly_is_fine():
     client = _Client()
     _task(
-        client, "ws", "ops", "t",
+        client,
+        "ws",
+        "ops",
+        "t",
         reads=["ws.ops.a"],
         **{"last-window-to": 100, "trigger": {"source": "ws.ops.a", "name": "fire_t"}},
     )
     _add_dataset(client, "ws", "ops", "a")
     ref = _add_dataset(client, "ws", "mart", "y")
     _current_snapshot(
-        ref, 42,
-        **{"read-sources": [{"dataset": "ws.ops.a", "snapshot-id": 100, "resolved-by": "current"}],
-           "produced-by": "task:ws.ops.t"},
+        ref,
+        42,
+        **{
+            "read-sources": [{"dataset": "ws.ops.a", "snapshot-id": 100, "resolved-by": "current"}],
+            "produced-by": "task:ws.ops.t",
+        },
     )
 
     assert audit_workspace(client, "ws") == []
@@ -497,19 +525,30 @@ def test_a_task_held_trigger_windows_over_its_declared_dataset():
     the holder is not the window source."""
     client = _Client()
     task = _task(
-        client, "ws", "ops", "t",
+        client,
+        "ws",
+        "ops",
+        "t",
         reads=["ws.ops.a"],
         **{"last-window-to": 100, "trigger": {"source": "ws.ops.t", "name": "nightly"}},
     )
     task.collection("triggers").document("nightly").set(
-        {"name": "nightly", "kind": "schedule", "target-task": "ws.ops.t", "window-source": "ws.ops.a"}
+        {
+            "name": "nightly",
+            "kind": "schedule",
+            "target-task": "ws.ops.t",
+            "window-source": "ws.ops.a",
+        }
     )
     _add_dataset(client, "ws", "ops", "a")
     ref = _add_dataset(client, "ws", "mart", "y")
     _current_snapshot(
-        ref, 42,
-        **{"read-sources": [{"dataset": "ws.ops.a", "snapshot-id": 150, "resolved-by": "current"}],
-           "produced-by": "task:ws.ops.t"},
+        ref,
+        42,
+        **{
+            "read-sources": [{"dataset": "ws.ops.a", "snapshot-id": 150, "resolved-by": "current"}],
+            "produced-by": "task:ws.ops.t",
+        },
     )
 
     assert [f["kind"] for f in audit_workspace(client, "ws")] == ["window-overrun"]

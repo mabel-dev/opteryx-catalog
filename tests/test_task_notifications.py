@@ -249,9 +249,7 @@ def test_the_error_text_is_carried_through():
 
 
 def test_the_title_and_body_are_clipped_to_the_routes_limits():
-    _, body = tn._compose(
-        "failed", "ws.ops.rollup", trigger="n", holder="h", detail="x" * 5000
-    )
+    _, body = tn._compose("failed", "ws.ops.rollup", trigger="n", holder="h", detail="x" * 5000)
 
     assert len(body) == tn.MAX_BODY
 
@@ -300,9 +298,11 @@ def test_a_queue_failure_is_alerted_and_does_not_stop_the_others(configured):
         ]
     )
 
-    with patch.object(tn, "_alert") as alert:
-        with patch.object(tn, "_enqueue", side_effect=[RuntimeError("no queue"), None]):
-            sent = tn.notify_run_finished(catalog, "ws.ops.rollup", "failed")
+    with (
+        patch.object(tn, "_alert") as alert,
+        patch.object(tn, "_enqueue", side_effect=[RuntimeError("no queue"), None]),
+    ):
+        sent = tn.notify_run_finished(catalog, "ws.ops.rollup", "failed")
 
     assert sent == 1
     assert alert.call_count == 1
@@ -314,9 +314,8 @@ def test_a_subscriber_the_feed_cannot_address_is_alerted(configured):
     would 400 - which Cloud Tasks would retry five times and then discard."""
     catalog = _Catalog([{"user": "not a valid client id", "outcome": "ERROR"}])
 
-    with patch.object(tn, "_alert") as alert:
-        with patch.object(tn, "_enqueue") as enqueue:
-            assert tn.notify_run_finished(catalog, "ws.ops.rollup", "failed") == 0
+    with patch.object(tn, "_alert") as alert, patch.object(tn, "_enqueue") as enqueue:
+        assert tn.notify_run_finished(catalog, "ws.ops.rollup", "failed") == 0
 
     assert enqueue.call_count == 0
     assert alert.call_count == 1
@@ -328,12 +327,13 @@ def test_the_request_targets_the_internal_route_with_the_admin_token(configured)
     catalog = _Catalog([{"user": "alice", "outcome": "ERROR"}])
     client = MagicMock()
 
-    with patch("google.cloud.tasks_v2.CloudTasksClient", return_value=client):
-        with patch("google.cloud.tasks_v2.HttpRequest") as http_request:
-            with patch("google.cloud.tasks_v2.Task"), patch(
-                "google.cloud.tasks_v2.CreateTaskRequest"
-            ):
-                tn.notify_run_finished(catalog, "ws.ops.rollup", "failed")
+    with (
+        patch("google.cloud.tasks_v2.CloudTasksClient", return_value=client),
+        patch("google.cloud.tasks_v2.HttpRequest") as http_request,
+        patch("google.cloud.tasks_v2.Task"),
+        patch("google.cloud.tasks_v2.CreateTaskRequest"),
+    ):
+        tn.notify_run_finished(catalog, "ws.ops.rollup", "failed")
 
     kwargs = http_request.call_args.kwargs
     assert kwargs["url"] == "https://control.opteryx.app/v1/internal/notifications"
@@ -354,7 +354,9 @@ def test_the_audience_is_the_one_control_verifies():
 def test_the_task_carries_an_oidc_token_for_the_runtime_service_account(configured, monkeypatch):
     monkeypatch.setattr(tn, "_runtime_service_account", lambda: RUNTIME_SA)
     with patch.object(tn, "_enqueue") as enqueue:
-        tn.notify_run_finished(_Catalog([{"user": "alice", "outcome": "ERROR"}]), "ws.ops.t", "failed")
+        tn.notify_run_finished(
+            _Catalog([{"user": "alice", "outcome": "ERROR"}]), "ws.ops.t", "failed"
+        )
 
     assert enqueue.call_args.kwargs == {
         "service_account": RUNTIME_SA,
@@ -365,9 +367,13 @@ def test_the_task_carries_an_oidc_token_for_the_runtime_service_account(configur
 def test_a_configured_producer_account_overrides_the_runtime_one(configured, monkeypatch):
     monkeypatch.setattr(tn, "_runtime_service_account", lambda: RUNTIME_SA)
     monkeypatch.setenv("NOTIFICATIONS_PRODUCER_SA", "other@p.iam.gserviceaccount.com")
-    monkeypatch.setenv("NOTIFICATIONS_OIDC_AUDIENCE", "https://control.example/v1/internal/notifications")
+    monkeypatch.setenv(
+        "NOTIFICATIONS_OIDC_AUDIENCE", "https://control.example/v1/internal/notifications"
+    )
     with patch.object(tn, "_enqueue") as enqueue:
-        tn.notify_run_finished(_Catalog([{"user": "alice", "outcome": "ERROR"}]), "ws.ops.t", "failed")
+        tn.notify_run_finished(
+            _Catalog([{"user": "alice", "outcome": "ERROR"}]), "ws.ops.t", "failed"
+        )
 
     assert enqueue.call_args.kwargs == {
         "service_account": "other@p.iam.gserviceaccount.com",
@@ -388,7 +394,9 @@ def test_with_the_shared_token_retired_oidc_alone_is_enough(configured, monkeypa
     assert enqueue.call_args.args[1] is None  # no shared token to send
 
 
-def test_with_no_credential_at_all_nothing_is_sent_and_it_is_a_warning(configured, monkeypatch, caplog):
+def test_with_no_credential_at_all_nothing_is_sent_and_it_is_a_warning(
+    configured, monkeypatch, caplog
+):
     monkeypatch.delenv("CONTROL_ADMIN_TOKEN")
     with patch.object(tn, "_enqueue") as enqueue, caplog.at_level("WARNING"):
         sent = tn.notify_run_finished(
@@ -496,11 +504,14 @@ _CONTROL_STUDIO_URL = re.compile(
 
 
 @pytest.mark.parametrize(
-    "identifier", ["ws.ops.rollup", "acme.raw.nightly_load", "ws.ops.name.with.dots", "w-s.o_p.Mixed9"]
+    "identifier",
+    ["ws.ops.rollup", "acme.raw.nightly_load", "ws.ops.name.with.dots", "w-s.o_p.Mixed9"],
 )
 def test_the_target_url_is_one_control_accepts(configured, identifier):
     with patch.object(tn, "_enqueue") as enqueue:
-        tn.notify_run_finished(_Catalog([{"user": "alice", "outcome": "ERROR"}]), identifier, "failed")
+        tn.notify_run_finished(
+            _Catalog([{"user": "alice", "outcome": "ERROR"}]), identifier, "failed"
+        )
     url = _enqueued(enqueue)[0]["target"]["url"]
     assert _CONTROL_STUDIO_URL.fullmatch(url), url
     assert url.startswith("/studio/manage-dataset.html?dataset=")
@@ -508,5 +519,7 @@ def test_the_target_url_is_one_control_accepts(configured, identifier):
 
 def test_an_unqualified_identifier_gets_no_url_rather_than_a_wrong_one(configured):
     with patch.object(tn, "_enqueue") as enqueue:
-        tn.notify_run_finished(_Catalog([{"user": "alice", "outcome": "ERROR"}]), "ops.rollup", "failed")
+        tn.notify_run_finished(
+            _Catalog([{"user": "alice", "outcome": "ERROR"}]), "ops.rollup", "failed"
+        )
     assert "url" not in _enqueued(enqueue)[0]["target"]

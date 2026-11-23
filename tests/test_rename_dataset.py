@@ -431,9 +431,7 @@ def test_a_dataset_with_triggers_cannot_be_renamed():
 
 
 def test_an_upstream_with_forks_cannot_be_renamed():
-    catalog, client = _catalog(
-        extra={OLD + ("forks", "ws:other:copy"): {"fork": "ws.other.copy"}}
-    )
+    catalog, client = _catalog(extra={OLD + ("forks", "ws:other:copy"): {"fork": "ws.other.copy"}})
 
     _refused_and_untouched(catalog, client, ForkError, match="ws.other.copy")
 

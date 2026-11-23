@@ -53,7 +53,7 @@ workspace handle to construct and must not pay for one per row.
 from __future__ import annotations
 
 import time
-from typing import Iterable
+from collections.abc import Iterable
 
 FAVOURITES_DOC = "$favourites"
 STARRED_SUBCOLLECTION = "starred"
@@ -151,7 +151,7 @@ def starred_principals(firestore_client, workspace: str) -> list[str]:
     try:
         docs = starred_collection(firestore_client, workspace).stream()
         return sorted(doc.id for doc in docs)
-    except Exception:
+    except Exception:  # noqa: BLE001 - fails CLOSED, see the docstring
         return []
 
 
@@ -182,7 +182,7 @@ def starred_workspaces(firestore_client, workspaces: Iterable[str], principal: s
                 # parent = `starred`, parent.parent = `$favourites`,
                 # parent.parent.parent = the workspace collection.
                 found.add(snap.reference.parent.parent.parent.id)
-    except Exception:
+    except Exception:  # noqa: BLE001 - fails CLOSED, see the docstring
         return []
 
     return [w for w in names if w in found]
@@ -190,13 +190,13 @@ def starred_workspaces(firestore_client, workspaces: Iterable[str], principal: s
 
 __all__ = [
     "FAVOURITES_DOC",
-    "STARRED_SUBCOLLECTION",
     "STARRED_AT_FIELD",
+    "STARRED_SUBCOLLECTION",
     "WILDCARD_PRINCIPAL",
-    "starred_collection",
-    "starred_ref",
-    "starred_principals",
     "star",
-    "unstar",
+    "starred_collection",
+    "starred_principals",
+    "starred_ref",
     "starred_workspaces",
+    "unstar",
 ]

@@ -58,7 +58,7 @@ VECTOR_INDEX_ENTRY_KEYS = (
 METHODS = frozenset({"ivf"})
 METRICS = frozenset({"cosine"})
 BUILD_MODES = frozenset({"sync", "async"})
-DEFAULT_BUILD_MODE = "async"   # ruled 2026-10-02: a write never pays embedding cost unless asked
+DEFAULT_BUILD_MODE = "async"  # ruled 2026-10-02: a write never pays embedding cost unless asked
 MAX_INDEX_NAME_LENGTH = 64
 _INDEX_NAME_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
 
@@ -108,7 +108,9 @@ def index_files(path: str, *, file_bytes: int, footer_bytes: int, logical_bytes:
         ("logical_bytes", logical_bytes),
     ):
         if type(size) is not int or size <= 0:
-            raise ValueError(f"{label} must be a positive integer (the size the builder wrote), not {size!r}.")
+            raise ValueError(
+                f"{label} must be a positive integer (the size the builder wrote), not {size!r}."
+            )
     if footer_bytes >= file_bytes:
         raise ValueError("footer_bytes must be smaller than file_bytes.")
     return IndexFiles(path, file_bytes, footer_bytes, logical_bytes)
@@ -122,7 +124,9 @@ def normalize_index_name(name: str) -> str:
     if not isinstance(name, str) or not name:
         raise ValueError("An index name is required.")
     if len(name) > MAX_INDEX_NAME_LENGTH:
-        raise ValueError(f"Index name is {len(name)} characters; the maximum is {MAX_INDEX_NAME_LENGTH}.")
+        raise ValueError(
+            f"Index name is {len(name)} characters; the maximum is {MAX_INDEX_NAME_LENGTH}."
+        )
     if not _INDEX_NAME_PATTERN.match(name):
         raise ValueError(
             f"'{name}' is not a valid index name. An index name starts with a letter and "

@@ -46,9 +46,7 @@ class _FakeDataset:
             dataset_identifier="ops.test", location="mem://", schema=None, properties={}
         )
         self.metadata.snapshots = list(snapshots)
-        self.metadata.current_snapshot_id = (
-            head if head is not None else snapshots[-1].snapshot_id
-        )
+        self.metadata.current_snapshot_id = head if head is not None else snapshots[-1].snapshot_id
         self.metadata.maintenance_policy = {"retained-snapshot-age-days": 7}
 
 

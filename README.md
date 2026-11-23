@@ -305,13 +305,25 @@ Every trigger method takes `holder_kind="dataset"` (the default) or `"task"`.
 
 ```python
 catalog.create_trigger(
-    "ops.rollup", "hourly", target_task="ops.rollup", kind="task", author="alice",
-    holder_kind="task", event_kind="schedule", schedule="0 * * * *",
-    time_zone="Europe/London", window_source="src.events",   # OVER src.events
+    "ops.rollup",
+    "hourly",
+    target_task="ops.rollup",
+    kind="task",
+    author="alice",
+    holder_kind="task",
+    event_kind="schedule",
+    schedule="0 * * * *",
+    time_zone="Europe/London",
+    window_source="src.events",  # OVER src.events
 )
 catalog.create_trigger(
-    "ops.rollup", "on_demand", target_task="ops.rollup", kind="task", author="alice",
-    holder_kind="task", event_kind="signal",
+    "ops.rollup",
+    "on_demand",
+    target_task="ops.rollup",
+    kind="task",
+    author="alice",
+    holder_kind="task",
+    event_kind="signal",
 )
 ```
 
@@ -459,7 +471,7 @@ everything else.
 ```python
 # Run against the SOURCE workspace - the one being copied out of.
 ichnos.mark_secure("ws.ops.billing_events_ingest", ["platform"], author="owner")
-ichnos.list_secure()          # everything ichnos has sanctioned, with who and when
+ichnos.list_secure()  # everything ichnos has sanctioned, with who and when
 ichnos.clear_secure("ws.ops.billing_events_ingest", author="owner")
 ```
 
@@ -642,12 +654,12 @@ the backfill runs against the smaller collection.
 
 ## Development & Linting 🧪
 
-This package includes a small `Makefile` target to run linting and formatting tools (`ruff`, `isort`, `pycln`).
+This package includes a small `Makefile` target to run linting and formatting tools (`ruff`, `pycln`).
 
 Install dev tools and run linters with:
 
 ```bash
-python -m pip install --upgrade pycln isort ruff
+python -m pip install --upgrade pycln ruff
 make lint
 ```
 

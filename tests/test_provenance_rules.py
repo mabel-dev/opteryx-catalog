@@ -205,7 +205,9 @@ def test_recompute_unions_appends_newest_first_back_to_a_rewrite():
 
 
 def test_recompute_stops_at_a_clear():
-    fetch = _chain(_doc(1, None, "append", [A]), _doc(2, 1, "truncate", []), _doc(3, 2, "add-files", [C]))
+    fetch = _chain(
+        _doc(1, None, "append", [A]), _doc(2, 1, "truncate", []), _doc(3, 2, "add-files", [C])
+    )
     assert recompute_sources(3, fetch, "ops.y", "ws") == ([C], True)
 
 
@@ -219,7 +221,11 @@ def test_recompute_treats_a_delete_of_everything_as_a_clear():
 
 
 def test_recompute_walks_through_maintenance():
-    fetch = _chain(_doc(1, None, "append", [A]), _doc(2, 1, "compact", []), _doc(3, 2, "statistics-refresh", []))
+    fetch = _chain(
+        _doc(1, None, "append", [A]),
+        _doc(2, 1, "compact", []),
+        _doc(3, 2, "statistics-refresh", []),
+    )
     assert recompute_sources(3, fetch, "ops.y", "ws") == ([A], True)
 
 
@@ -234,7 +240,9 @@ def test_recompute_is_incomplete_when_a_receipt_is_missing():
 
 
 def test_recompute_stops_at_a_rewrite_with_no_receipt_and_is_incomplete():
-    fetch = _chain(_doc(1, None, "append", [A]), _doc(2, 1, "overwrite", None), _doc(3, 2, "add-files", [C]))
+    fetch = _chain(
+        _doc(1, None, "append", [A]), _doc(2, 1, "overwrite", None), _doc(3, 2, "add-files", [C])
+    )
     assert recompute_sources(3, fetch, "ops.y", "ws") == ([C], False)
 
 

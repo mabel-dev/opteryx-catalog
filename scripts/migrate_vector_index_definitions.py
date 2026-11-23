@@ -64,7 +64,9 @@ def migrate(client, dataset_ref, legacy, apply: bool) -> tuple:
             outcome[key] = []
         doc = dataset_ref.get(transaction=transaction)
         if not doc.exists:
-            outcome["conflicts"] = [(d.get("name"), "the dataset document is gone") for _, d in legacy]
+            outcome["conflicts"] = [
+                (d.get("name"), "the dataset document is gone") for _, d in legacy
+            ]
             return
         definitions = dict((doc.to_dict() or {}).get(FIELD) or {})
         for _ref, definition in legacy:
@@ -77,8 +79,13 @@ def migrate(client, dataset_ref, legacy, apply: bool) -> tuple:
                 outcome["already"].append(name)
             else:
                 outcome["conflicts"].append(
-                    (name, f"the document holds index id {held.get('index-id')}, the old "
-                           f"subcollection {definition.get('index-id')}")
+                    (
+                        name,
+                        (
+                            f"the document holds index id {held.get('index-id')}, the old "
+                            f"subcollection {definition.get('index-id')}"
+                        ),
+                    )
                 )
         if apply and outcome["copied"]:
             transaction.update(dataset_ref, {FIELD: definitions})
@@ -103,8 +110,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("workspaces", nargs="*", help="limit to these workspaces (default: all)")
     parser.add_argument("--apply", action="store_true", help="write (default: dry run)")
-    parser.add_argument("--retire", action="store_true",
-                        help="with --apply: delete the migrated subcollection documents")
+    parser.add_argument(
+        "--retire",
+        action="store_true",
+        help="with --apply: delete the migrated subcollection documents",
+    )
     parser.add_argument("--project", default="mabeldev")
     parser.add_argument("--database", default="catalogs")
     args = parser.parse_args()
@@ -131,8 +141,10 @@ def main() -> int:
             for index in retire(dataset_ref, legacy):
                 print(f"[RETIRED] {name}: {index}")
                 retired += 1
-    print(f"{len(found)} dataset(s); {copied} definition(s) "
-          f"{'copied' if args.apply else 'to copy'}, {conflicts} skipped, {retired} retired")
+    print(
+        f"{len(found)} dataset(s); {copied} definition(s) "
+        f"{'copied' if args.apply else 'to copy'}, {conflicts} skipped, {retired} retired"
+    )
     return 1 if conflicts else 0
 
 

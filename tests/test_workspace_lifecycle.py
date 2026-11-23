@@ -245,7 +245,9 @@ def _catalog_with_contents(props_data=None, collections=None, missing_collection
     )
 
     dropped = []
-    catalog.drop_dataset = lambda identifier, author=None: dropped.append(("dataset", identifier, author))
+    catalog.drop_dataset = lambda identifier, author=None: dropped.append(
+        ("dataset", identifier, author)
+    )
     catalog.drop_view = lambda identifier, author=None: dropped.append(("view", identifier, author))
     catalog.drop_materialized_view = lambda identifier, author=None: dropped.append(
         ("mv", identifier, author)
@@ -501,9 +503,7 @@ def test_drop_workspace_deletes_storage_inline_by_exact_path():
         props_data={"deletion_protection": False},
         collections={"coll1": {"datasets": ["tbl1"], "materialized_views": ["mv1"]}},
     )
-    _with_dataset_locations(
-        catalog, {"coll1": ["gs://b/ws/coll1/tbl1", "gs://b/ws/coll1/mv1"]}
-    )
+    _with_dataset_locations(catalog, {"coll1": ["gs://b/ws/coll1/tbl1", "gs://b/ws/coll1/mv1"]})
     catalog.io = _RecordingIO()
 
     files = {

@@ -137,8 +137,11 @@ def test_fsck_reports_two_datasets_on_one_location(catalog):
         docs[("ws", "coll", "datasets", name)] = {"location": "gs://bucket/ws/coll/shared"}
     docs[("ws", "coll", "datasets", "c")] = {"location": "gs://bucket/ws/" + "c" * 32}
 
-    findings = [f for f in audit_workspace(_ListingClient(catalog.firestore_client), "ws")
-                if f["kind"] == "duplicate-location"]
+    findings = [
+        f
+        for f in audit_workspace(_ListingClient(catalog.firestore_client), "ws")
+        if f["kind"] == "duplicate-location"
+    ]
 
     assert sorted(f["path"] for f in findings) == [
         "ws/coll/datasets/a",

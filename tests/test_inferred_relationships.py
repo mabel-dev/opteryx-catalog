@@ -18,11 +18,6 @@ from __future__ import annotations
 
 import pytest
 
-from opteryx_catalog.exceptions import ConstraintNotFound
-from opteryx_catalog.opteryx_catalog import RELATIONSHIP_SUPPRESSIONS_SUBCOLLECTION
-from opteryx_catalog.opteryx_catalog import generated_constraint_name
-from opteryx_catalog.opteryx_catalog import relationship_pair_digest
-
 # The fake Firestore lives beside the Phase 1 tests. Shared rather than copied:
 # it reproduces rules real Firestore enforces (the property-path grammar, the
 # collection group registry) that a second, drifting copy would stop enforcing.
@@ -30,6 +25,10 @@ from test_declared_relationships import _add_dataset
 from test_declared_relationships import _catalog
 from test_declared_relationships import _declare
 
+from opteryx_catalog.exceptions import ConstraintNotFound
+from opteryx_catalog.opteryx_catalog import RELATIONSHIP_SUPPRESSIONS_SUBCOLLECTION
+from opteryx_catalog.opteryx_catalog import generated_constraint_name
+from opteryx_catalog.opteryx_catalog import relationship_pair_digest
 
 EVIDENCE = {
     "overlap": 0.94,

@@ -697,7 +697,7 @@ class GcsFileIO(FileIO):
                     headers["Authorization"] = f"Bearer {token}"
                 try:
                     response = self._session.post(url, headers=headers, params=params, timeout=60)
-                except requests.RequestException as err:  # noqa: PERF203 - retry boundary
+                except requests.RequestException as err:
                     last_error = err
                     response = None
                 if response is not None and response.status_code not in RETRYABLE_STATUSES:

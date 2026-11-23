@@ -18,14 +18,14 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 import pytest
 from rugo.parquet import write_parquet
+from test_mor_deletes import _current_entries
+from test_mor_deletes import _make_morsel
+from test_mor_deletes import _seed_dataset
 
 from opteryx_catalog.catalog.deletes import DELETE_FILE_PATH_KEY
 from opteryx_catalog.catalog.deletes import DELETED_RECORD_COUNT_KEY
 from opteryx_catalog.catalog.manifest import read_manifest_rows
-
-from test_mor_deletes import _current_entries
-from test_mor_deletes import _make_morsel
-from test_mor_deletes import _seed_dataset
+from opteryx_catalog.exceptions import AddFilesReadError
 
 
 def _stage(ds, storage, path, values):
@@ -75,9 +75,7 @@ def test_add_and_delete_land_in_one_snapshot():
 def test_only_one_snapshot_is_written():
     ds, storage = _seed_dataset({"f1.parquet": [1, 2, 3]})
     n_before = len(ds.metadata.snapshots)
-    ds.merge_commit(
-        [_stage(ds, storage, "f2.parquet", [7])], {"f1.parquet": [0]}, author="tester"
-    )
+    ds.merge_commit([_stage(ds, storage, "f2.parquet", [7])], {"f1.parquet": [0]}, author="tester")
     assert len(ds.metadata.snapshots) == n_before + 1
 
 
@@ -175,7 +173,7 @@ def test_unknown_file_aborts_the_whole_commit():
 def test_unreadable_new_file_aborts_before_any_delete_is_recorded():
     ds, _ = _seed_dataset({"f1.parquet": [1, 2, 3]})
     before = ds.metadata.current_snapshot_id
-    with pytest.raises(Exception):
+    with pytest.raises(AddFilesReadError, match="Cannot read missing.parquet"):
         ds.merge_commit(["missing.parquet"], {"f1.parquet": [0]}, author="tester")
     assert ds.metadata.current_snapshot_id == before
     assert _entry(_current_entries(ds), "f1.parquet")[DELETED_RECORD_COUNT_KEY] == 0
@@ -259,12 +257,13 @@ def test_an_unknown_operation_is_refused():
 
 def _uncommitted_dataset():
     """A dataset with a location and NO snapshots - what CREATE TABLE leaves."""
-    from opteryx_catalog.catalog.dataset import SimpleDataset
-    from opteryx_catalog.catalog.manifest import clear_parsed_manifest_cache
-    from opteryx_catalog.catalog.metadata import DatasetMetadata
     from test_mor_deletes import LOCATION
     from test_mor_deletes import _FakeCatalog
     from test_mor_deletes import _MemIO
+
+    from opteryx_catalog.catalog.dataset import SimpleDataset
+    from opteryx_catalog.catalog.manifest import clear_parsed_manifest_cache
+    from opteryx_catalog.catalog.metadata import DatasetMetadata
 
     clear_parsed_manifest_cache()
     storage: dict[str, bytes] = {}

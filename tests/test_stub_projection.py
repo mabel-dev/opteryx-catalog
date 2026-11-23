@@ -16,7 +16,6 @@ from opteryx_catalog.exceptions import WorkspaceNotFound
 from opteryx_catalog.stub_projection import STUB_MARKER
 from opteryx_catalog.stub_projection import sync_stub_datasets
 
-
 # ---------------------------------------------------------------------------
 # A Firestore double with just the shape this module uses: a workspace
 # collection of documents, each with a `datasets` subcollection, plus
@@ -69,9 +68,7 @@ class _Doc:
 
     @property
     def _exists_or_has_children(self):
-        return self._data is not None or any(
-            coll._docs for coll in self._subcollections.values()
-        )
+        return self._data is not None or any(coll._docs for coll in self._subcollections.values())
 
 
 class _Collection:
@@ -87,7 +84,9 @@ class _Collection:
         return [doc for doc in self._docs.values() if doc._exists_or_has_children]
 
     def stream(self):
-        return [_Snapshot(doc.id, doc._data) for doc in self._docs.values() if doc._data is not None]
+        return [
+            _Snapshot(doc.id, doc._data) for doc in self._docs.values() if doc._data is not None
+        ]
 
 
 class _FakeFirestore:
@@ -302,9 +301,7 @@ STATS = {
 
 
 def test_schema_and_statistics_are_stored_on_the_stub(db):
-    sync_stub_datasets(
-        db, WS, [("interop", "people", {"schema": COLUMNS, "statistics": STATS})]
-    )
+    sync_stub_datasets(db, WS, [("interop", "people", {"schema": COLUMNS, "statistics": STATS})])
     stored = _stubs(db)[("interop", "people")]
     assert stored["schema"] == COLUMNS
     assert stored["statistics"] == STATS
@@ -419,7 +416,7 @@ def test_bounds_are_normalised_to_storable_values(db):
         "columns": {
             "price": {"min": decimal.Decimal("0.10"), "max": decimal.Decimal("99.99")},
             "born": {"min": datetime.date(1999, 12, 31)},
-            "seen": {"min": datetime.datetime(2026, 8, 21, 12, 0, 0)},
+            "seen": {"min": datetime.datetime(2026, 8, 21, 12, 0, 0, tzinfo=datetime.UTC)},
             "ref": {"min": identifier},
         }
     }
@@ -431,7 +428,7 @@ def test_bounds_are_normalised_to_storable_values(db):
     assert columns["price"]["min"] == "0.10"
     assert columns["born"]["min"] == "1999-12-31"
     # datetime is a Firestore-native value and survives as one
-    assert columns["seen"]["min"] == datetime.datetime(2026, 8, 21, 12, 0, 0)
+    assert columns["seen"]["min"] == datetime.datetime(2026, 8, 21, 12, 0, 0, tzinfo=datetime.UTC)
     assert columns["ref"]["min"] == str(identifier)
 
 
@@ -453,9 +450,7 @@ def test_an_unrecognised_bound_is_rendered_not_dropped():
 def test_retain_keeps_stored_detail_when_the_caller_could_not_collect(db):
     from opteryx_catalog.stub_projection import RETAIN_DETAIL
 
-    sync_stub_datasets(
-        db, WS, [("interop", "people", {"schema": COLUMNS, "statistics": STATS})]
-    )
+    sync_stub_datasets(db, WS, [("interop", "people", {"schema": COLUMNS, "statistics": STATS})])
     result = sync_stub_datasets(db, WS, [("interop", "people", {RETAIN_DETAIL: True})])
     # nothing changed, so nothing was written - and crucially the schema did
     # not evaporate because one table failed to load during a good refresh
@@ -485,7 +480,9 @@ def test_retain_still_removes_a_table_that_left_the_listing(db):
 # -- the structural facts a catalog's own metadata already knows -------------
 
 
-SORT_ORDERS = [{"order-id": 1, "fields": [{"source-id": 2, "name": "country", "direction": "desc"}]}]
+SORT_ORDERS = [
+    {"order-id": 1, "fields": [{"source-id": 2, "name": "country", "direction": "desc"}]}
+]
 
 
 def test_structural_facts_land_in_the_fields_odata_reads(db):

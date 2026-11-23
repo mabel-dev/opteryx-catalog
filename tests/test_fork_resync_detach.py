@@ -59,7 +59,7 @@ class _Recorder:
 def _catalog(monkeypatch, storage, upstream, fork, *, upstream_exists=True):
     """A `personal` workspace catalog holding `fork`, able to see `upstream` in `samples`."""
     workspace, fork_collection, fork_name = FORK.split(".")
-    up_workspace, up_collection, up_name = UPSTREAM.split(".")
+    _up_workspace, up_collection, up_name = UPSTREAM.split(".")
 
     catalog = object.__new__(OpteryxCatalog)
     catalog.workspace = workspace
@@ -125,7 +125,7 @@ def test_resync_makes_the_fork_equal_its_upstream_again(monkeypatch):
 
 
 def test_resync_copies_no_data_files(monkeypatch):
-    storage, upstream, fork, catalog, _ = _forked_world(monkeypatch)
+    storage, upstream, _fork, catalog, _ = _forked_world(monkeypatch)
     upstream.add_files(
         [_stage(storage, UPSTREAM_LOCATION, "part-00001.parquet", [2])],
         author="gen",
@@ -170,7 +170,7 @@ def test_resync_rests_the_fork_on_the_upstreams_current_snapshot(monkeypatch):
     assert result["previous_base_snapshot"] == previous_base
     assert result["forced"] is False
     # The new pin is registered on the upstream before anything else is written.
-    [(args, kwargs)] = recorder.named("register_fork")
+    [(args, _kwargs)] = recorder.named("register_fork")
     assert args == (UPSTREAM, FORK, current)
     assert recorder.calls[0][0] == "register_fork"
 
@@ -274,7 +274,7 @@ def test_resync_refuses_when_the_upstream_is_gone(monkeypatch):
 
 
 def test_detach_copies_every_borrowed_file_into_the_forks_own_location(monkeypatch):
-    storage, upstream, fork, catalog, _ = _forked_world(monkeypatch, upstream_files=2)
+    storage, _upstream, fork, catalog, _ = _forked_world(monkeypatch, upstream_files=2)
     borrowed = _paths(fork)
 
     result = catalog.detach_fork(FORK, author="justin")
@@ -286,7 +286,7 @@ def test_detach_copies_every_borrowed_file_into_the_forks_own_location(monkeypat
 
 
 def test_detach_leaves_the_upstreams_files_where_they_were(monkeypatch):
-    storage, upstream, fork, catalog, _ = _forked_world(monkeypatch, upstream_files=2)
+    storage, upstream, _fork, catalog, _ = _forked_world(monkeypatch, upstream_files=2)
     upstream_files = {path: storage[path] for path in _paths(upstream)}
 
     catalog.detach_fork(FORK, author="justin")
@@ -296,7 +296,7 @@ def test_detach_leaves_the_upstreams_files_where_they_were(monkeypatch):
 
 
 def test_detach_copies_only_what_was_borrowed(monkeypatch):
-    storage, upstream, fork, catalog, _ = _forked_world(monkeypatch)
+    storage, _upstream, fork, catalog, _ = _forked_world(monkeypatch)
     own = _stage(storage, FORK_LOCATION, "own-00000.parquet", [9])
     fork.add_files([own], author="justin", read_sources=[])
 

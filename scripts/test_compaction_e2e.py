@@ -15,9 +15,9 @@ from pathlib import Path
 
 from draken.interop.vector_sequence import vector_from_sequence
 from draken.morsels.morsel import Morsel
+from opteryx_catalog.catalog.compaction import DatasetCompactor
 
 from opteryx_catalog import OpteryxCatalog
-from opteryx_catalog.catalog.compaction import DatasetCompactor
 from opteryx_catalog.catalog.manifest import read_manifest_rows
 
 # Add parent to path

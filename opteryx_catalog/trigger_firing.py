@@ -125,6 +125,7 @@ def _qualified_source(catalog, dataset_identifier: str) -> str:
         return dataset_identifier
     return f"{catalog.workspace}.{dataset_identifier}"
 
+
 _KILL_SWITCH_ENV = "OPTERYX_TRIGGER_FIRING"
 
 logger = logging.getLogger(__name__)
@@ -252,8 +253,7 @@ def policies_for(
                 continue
             if role not in VALID_ROLES:
                 logger.warning(
-                    "policies_for: skipping policy %s in %s for principal=%s - "
-                    "invalid role=%r",
+                    "policies_for: skipping policy %s in %s for principal=%s - invalid role=%r",
                     doc.id,
                     workspace,
                     principal,
@@ -549,10 +549,7 @@ def _fire_refresh(
     # it, and never lets it reach the commit - plus a status on the trigger
     # document, so the block is visible where an operator looks for the view's
     # staleness rather than only in the alert stream.
-    try:
-        catalog.enforce_materialized_view_egress(target_view, mv.get("source-tables") or [])
-    except EgressRestricted:
-        raise
+    catalog.enforce_materialized_view_egress(target_view, mv.get("source-tables") or [])
 
     # REFRESH MATERIALIZED VIEW, not the CoRTAS it desugars to. The statement
     # says what is happening, which is what the job list, the audit record and
@@ -790,15 +787,14 @@ def _fire_task(
             # successful run already took.
             return _superseded("already consumed by an earlier successful run")
 
-        if parent_version > last_window_to:
-            # GAP: the run that should have covered `last_window_to ->
-            # parent_version` never succeeded, so the commits in between were
-            # consumed by nobody. Widen this window back to the last covered
-            # point rather than starting at this commit's parent and leaving
-            # them behind for good. Because `mark_task_fired` stamps only on
-            # SUCCESS, the gap stays visible - and keeps widening the next
-            # window - until a run actually covers it.
-            parent_version = last_window_to
+        # GAP: if the run that should have covered `last_window_to ->
+        # parent_version` never succeeded, the commits in between were
+        # consumed by nobody. Widen this window back to the last covered
+        # point rather than starting at this commit's parent and leaving
+        # them behind for good. Because `mark_task_fired` stamps only on
+        # SUCCESS, the gap stays visible - and keeps widening the next
+        # window - until a run actually covers it.
+        parent_version = min(parent_version, last_window_to)
 
     # The egress gate, on the same terms as a refresh: before the job document,
     # so a blocked run leaves nothing for a worker to pick up, and re-checked
@@ -1117,13 +1113,13 @@ def fire_triggers(
         kind = trigger.get("kind")
         if kind == "materialized_view_refresh":
             target_view = trigger.get("target-view")
-            fire = lambda: _fire_refresh(
+            fire = lambda trigger=trigger: _fire_refresh(
                 catalog, dataset_identifier, trigger, author, snapshot_id
             )
             note = "materialized view refresh NOT enqueued - the view is going stale"
         elif kind == TASK_TRIGGER_KIND:
             target_view = trigger.get("target-task")
-            fire = lambda: _fire_task(
+            fire = lambda trigger=trigger: _fire_task(
                 catalog, dataset_identifier, trigger, author, snapshot_id, parent_snapshot_id
             )
             note = "task NOT enqueued - its output is going stale"
@@ -1140,7 +1136,9 @@ def fire_triggers(
         # Marked as seen even when suspended or throttled: a second trigger at
         # the same target must not fire in its place.
         seen_targets.add(target_view)
-        _dispatch(catalog, dataset_identifier, DATASET_HOLDER, trigger, target_view, fire, note, author)
+        _dispatch(
+            catalog, dataset_identifier, DATASET_HOLDER, trigger, target_view, fire, note, author
+        )
 
 
 # --- Vector index refreshes (docs/VECTOR_INDEX_DESIGN.md §10, D-16) ---------
@@ -1395,11 +1393,15 @@ def signal_signature(token: str, task_identifier: str, identity: str) -> str:
     return hmac.new(token.encode(), message, hashlib.sha256).hexdigest()
 
 
-def signal_signature_matches(token: str | None, task_identifier: str, identity: str, presented: str | None) -> bool:
+def signal_signature_matches(
+    token: str | None, task_identifier: str, identity: str, presented: str | None
+) -> bool:
     """Constant-time check of a presented signature; False when there is no token."""
     if not token or not presented:
         return False
-    return hmac.compare_digest(signal_signature(token, task_identifier, identity), presented.strip().lower())
+    return hmac.compare_digest(
+        signal_signature(token, task_identifier, identity), presented.strip().lower()
+    )
 
 
 def fire_signal(catalog, task_identifier: str, caller: str, channel: str = "bearer") -> dict:
@@ -1557,7 +1559,9 @@ def fire_due_schedules(client, now_ms: int | None = None, catalog_factory=None) 
                 # Not claimed: the due instant stays where it is, so RESUME's
                 # recompute-from-now is what moves it, and the record shows
                 # every tick that reached it while paused.
-                catalog.mark_trigger_fired(task_identifier, name, status="suspended", holder_kind=TASK_HOLDER)
+                catalog.mark_trigger_fired(
+                    task_identifier, name, status="suspended", holder_kind=TASK_HOLDER
+                )
                 outcome["status"] = "suspended"
                 outcomes.append(outcome)
                 continue
@@ -1576,8 +1580,16 @@ def fire_due_schedules(client, now_ms: int | None = None, catalog_factory=None) 
                 TASK_HOLDER,
                 trigger,
                 outcome["task"],
-                lambda catalog=catalog, task_identifier=task_identifier, trigger=trigger: _fire_task(
-                    catalog, task_identifier, trigger, "schedule", None, None, holder_kind=TASK_HOLDER
+                lambda catalog=catalog, task_identifier=task_identifier, trigger=trigger: (
+                    _fire_task(
+                        catalog,
+                        task_identifier,
+                        trigger,
+                        "schedule",
+                        None,
+                        None,
+                        holder_kind=TASK_HOLDER,
+                    )
                 ),
                 "scheduled task NOT enqueued",
                 "schedule",

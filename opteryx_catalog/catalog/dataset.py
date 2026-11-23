@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import logging
 import os
 import re
@@ -87,6 +88,79 @@ def _as_number_or_text(text: str):
     except ValueError:
         # Not a number, return the string itself for display
         return text
+
+
+# opteryx-core's native distogram when the engine is installed alongside the
+# catalog; the catalog does not depend on it, so without it a cruder re-bin runs.
+_HAS_OPTERYX = importlib.util.find_spec("opteryx") is not None
+
+
+def _merged_distribution(file_hist_infos, global_min, global_max, bins: int) -> list[int]:
+    """Re-bin per-file equal-width histograms onto `bins` buckets over the dataset's range.
+
+    Each file's histogram spans that file's own min..max, so buckets cannot be
+    added across files; they are re-placed on [global_min, global_max].
+    """
+    if _HAS_OPTERYX:
+        return _distogram_distribution(file_hist_infos, global_min, global_max, bins)
+    return _midpoint_distribution(file_hist_infos, global_min, global_max, bins)
+
+
+def _distogram_distribution(file_hist_infos, global_min, global_max, bins: int) -> list[int]:
+    from opteryx.third_party.maki_nage.distogram import Distogram
+    from opteryx.third_party.maki_nage.distogram import count_up_to
+    from opteryx.third_party.maki_nage.distogram import merge
+    from opteryx.third_party.maki_nage.distogram import update
+
+    dist_bin_count = max(50, bins * 5)
+    global_d = Distogram(bin_count=dist_bin_count)
+    for fmin, fmax, counts in file_hist_infos:
+        fbins = len(counts)
+        if fbins <= 0:
+            continue
+        temp = Distogram(bin_count=dist_bin_count)
+        span = float(fmax - fmin) if fmax != fmin else 0.0
+        for bi, cnt in enumerate(counts):
+            if cnt <= 0:
+                continue
+            rep = float(fmin) if span == 0.0 else fmin + (bi + 0.5) * span / fbins
+            update(temp, float(rep), int(cnt))
+        global_d = merge(global_d, temp)
+
+    distribution = [0] * bins
+    total = int(global_d.count() or 0)
+    if total == 0:
+        return distribution
+    prev = 0.0
+    gmin = float(global_min)
+    gmax = float(global_max)
+    for i in range(1, bins + 1):
+        edge = gmin + (i / bins) * (gmax - gmin)
+        cum = count_up_to(global_d, edge) or 0.0
+        distribution[i - 1] = round(cum - prev)
+        prev = cum
+    diff = total - sum(distribution)
+    if diff != 0:
+        distribution[-1] += diff
+    return distribution
+
+
+def _midpoint_distribution(file_hist_infos, global_min, global_max, bins: int) -> list[int]:
+    # shortcut: each file bucket's whole count lands in the global bucket holding its
+    # midpoint, coarse when file ranges are wide; install opteryx for the distogram merge.
+    distribution = [0] * bins
+    gspan = float(global_max - global_min)
+    for fmin, fmax, counts in file_hist_infos:
+        fbins = len(counts)
+        if fbins <= 0:
+            continue
+        for bi, cnt in enumerate(counts):
+            if cnt <= 0:
+                continue
+            rep = fmin + (bi + 0.5) * (fmax - fmin) / fbins
+            gi = int((rep - global_min) / gspan * bins)
+            distribution[min(max(gi, 0), bins - 1)] += int(cnt)
+    return distribution
 
 
 def _kmv_cardinality(hashes) -> tuple:
@@ -368,9 +442,7 @@ def visible_history(head: Snapshot | None, snapshots: list[Snapshot]) -> list[Sn
         # the head, which for such a dataset means nothing at all unless its
         # snapshots were loaded from somewhere that has more than the head.
         ceiling = (head.sequence_number or 0, head.snapshot_id or 0)
-        return [
-            s for s in snapshots if (s.sequence_number or 0, s.snapshot_id or 0) <= ceiling
-        ]
+        return [s for s in snapshots if (s.sequence_number or 0, s.snapshot_id or 0) <= ceiling]
 
     return snapshot_ancestry(head, snapshots)
 
@@ -587,7 +659,7 @@ def open_data_file_writer_at(
     sorted_descending: bool = False,
     write_options: dict | None = None,
     statistics: bool = True,
-) -> "DataFileWriter":
+) -> DataFileWriter:
     """Open one streaming data file under `location`, keyed by `field_id_by_name`.
 
     The file-naming, option-merging and accumulator wiring for every streamed
@@ -731,7 +803,7 @@ class DataFileWriter:
         self._records += int(morsel.num_rows)
         self._row_groups += 1
 
-    def close(self) -> "ParquetManifestEntry | WrittenDataFile":
+    def close(self) -> ParquetManifestEntry | WrittenDataFile:
         """Finish the file and return its manifest entry - or, for a writer
         opened with statistics=False, where it landed and its counts."""
         if self._done:
@@ -761,7 +833,9 @@ class DataFileWriter:
         try:
             self._stream.abort()
         except Exception:  # storage boundary, see docstring
-            logger.warning("Could not abort data file write of '%s'", self._data_path, exc_info=True)
+            logger.warning(
+                "Could not abort data file write of '%s'", self._data_path, exc_info=True
+            )
 
 
 @dataclass
@@ -883,9 +957,7 @@ class SimpleDataset(Dataset):
                 # and none of them read this.
                 upstream = None
         if upstream is not None:
-            behind = max(
-                0, upstream.current_sequence_number() - fork.source.sequence_number
-            )
+            behind = max(0, upstream.current_sequence_number() - fork.source.sequence_number)
 
         return {
             "upstream": fork.source.dataset,
@@ -1588,9 +1660,7 @@ class SimpleDataset(Dataset):
         summary = snap.summary or {}
         total = summary.get("total-records")
         live = (
-            None
-            if total is None
-            else int(total) - int(summary.get("total-deleted-records") or 0)
+            None if total is None else int(total) - int(summary.get("total-deleted-records") or 0)
         )
         effect = effect_for_operation(snap.operation_type, live)
         if preserves_sources:
@@ -2156,7 +2226,9 @@ class SimpleDataset(Dataset):
 
         return read_manifest_rows(manifest)
 
-    def _refuse_foreign_path(self, path, borrowed_paths=frozenset(), kind: str = "data file") -> None:
+    def _refuse_foreign_path(
+        self, path, borrowed_paths=frozenset(), kind: str = "data file"
+    ) -> None:
         """Refuse a path this commit may not register (`is_admissible_path`).
 
         `borrowed_paths` are the exception: files a fork's clone or resync took
@@ -2175,7 +2247,7 @@ class SimpleDataset(Dataset):
         self,
         entries: list,
         existing_paths: set[str],
-        borrowed_paths: "frozenset[str] | set[str]" = frozenset(),
+        borrowed_paths: frozenset[str] | set[str] = frozenset(),
     ) -> list[dict]:
         """Accept manifest entries a writer built as it wrote.
 
@@ -2193,7 +2265,9 @@ class SimpleDataset(Dataset):
         for entry in entries:
             row = entry.to_dict() if isinstance(entry, ParquetManifestEntry) else entry
             if not isinstance(row, dict):
-                raise TypeError(f"manifest entry must be a dict or ParquetManifestEntry, got {type(row).__name__}")
+                raise TypeError(
+                    f"manifest entry must be a dict or ParquetManifestEntry, got {type(row).__name__}"
+                )
             fp = row.get("file_path")
             if not fp:
                 raise ValueError("manifest entry has no file_path")
@@ -2212,8 +2286,8 @@ class SimpleDataset(Dataset):
 
     def _build_entries_for_files(
         self,
-        files: "list[str] | None",
-        existing_paths: "set[str]",
+        files: list[str] | None,
+        existing_paths: set[str],
         footer_only: bool = False,
     ) -> list[dict]:
         """Build manifest entries for files already written to storage.
@@ -2815,7 +2889,7 @@ class SimpleDataset(Dataset):
         newly_deleted_records: int,
         snapshot_id: int,
         audit_detail: dict,
-        added_entries: "Iterable[dict]" = (),
+        added_entries: Iterable[dict] = (),
         operation_type: str = "delete",
         audit_action: str = "delete",
         read_sources: Iterable[Any] | None = None,
@@ -2956,7 +3030,7 @@ class SimpleDataset(Dataset):
         for file_path, ordinals in positions.items():
             entry = by_path[file_path]
             record_count = int(entry.get("record_count") or 0)
-            new_positions = set(int(o) for o in ordinals)
+            new_positions = {int(o) for o in ordinals}
             if not new_positions:
                 continue
             out_of_range = [o for o in new_positions if o < 0 or o >= record_count]
@@ -3250,7 +3324,9 @@ class SimpleDataset(Dataset):
                         "IndexFiles - paths AND the sizes the builder wrote."
                     )
                 refs[index_id] = index_files_record(
-                    f.path, file_bytes=f.file_bytes, footer_bytes=f.footer_bytes,
+                    f.path,
+                    file_bytes=f.file_bytes,
+                    footer_bytes=f.footer_bytes,
                     logical_bytes=f.logical_bytes,
                 )
             out.append(with_index_refs(dict(entry), refs))
@@ -3291,7 +3367,9 @@ class SimpleDataset(Dataset):
                     )
             refs = {
                 index_id: index_files(
-                    f.path, file_bytes=f.file_bytes, footer_bytes=f.footer_bytes,
+                    f.path,
+                    file_bytes=f.file_bytes,
+                    footer_bytes=f.footer_bytes,
                     logical_bytes=f.logical_bytes,
                 )
                 for index_id, f in carried.items()
@@ -3413,7 +3491,7 @@ class SimpleDataset(Dataset):
         for file_path, ordinals in positions.items():
             entry = by_path[file_path]
             record_count = int(entry.get("record_count") or 0)
-            new_positions = set(int(o) for o in ordinals)
+            new_positions = {int(o) for o in ordinals}
             if not new_positions:
                 continue
             out_of_range = [o for o in new_positions if o < 0 or o >= record_count]
@@ -3683,20 +3761,19 @@ class SimpleDataset(Dataset):
         """
         snap = self.snapshot(snapshot_id)
         manifest_path = getattr(snap, "manifest_list", None) if snap is not None else None
-        if not manifest_path:
-            # A dataset PROJECTED from an external catalog has no snapshots -
-            # nothing commits to it, so there is no version history for a
-            # pointer to hang off - but it may still carry a statistics
-            # manifest, recorded on the document itself by the refresh that
-            # wrote it (opteryx_catalog.stub_projection's `manifest-list`).
-            # Same format, same reader; only the pointer lives elsewhere.
-            #
-            # Only when no snapshot was ASKED for: `describe(snapshot_id=...)`
-            # is a question about one point in history, and answering it with a
-            # statistics file that describes the source as it is now would be a
-            # different question's answer.
-            if snapshot_id is None:
-                manifest_path = getattr(self.metadata, "manifest_list", None)
+        # A dataset PROJECTED from an external catalog has no snapshots -
+        # nothing commits to it, so there is no version history for a
+        # pointer to hang off - but it may still carry a statistics
+        # manifest, recorded on the document itself by the refresh that
+        # wrote it (opteryx_catalog.stub_projection's `manifest-list`).
+        # Same format, same reader; only the pointer lives elsewhere.
+        #
+        # Only when no snapshot was ASKED for: `describe(snapshot_id=...)`
+        # is a question about one point in history, and answering it with a
+        # statistics file that describes the source as it is now would be a
+        # different question's answer.
+        if not manifest_path and snapshot_id is None:
+            manifest_path = getattr(self.metadata, "manifest_list", None)
         if not manifest_path:
             raise ValueError("No manifest available for this dataset/snapshot")
 
@@ -3904,75 +3981,9 @@ class SimpleDataset(Dataset):
                 and global_max is not None
                 and global_max > global_min
             ):
-                try:
-                    from opteryx_catalog.maki_nage.distogram import Distogram
-                    from opteryx_catalog.maki_nage.distogram import count as _count_dist
-                    from opteryx_catalog.maki_nage.distogram import count_up_to as _count_up_to
-                    from opteryx_catalog.maki_nage.distogram import merge as _merge_distogram
-                    from opteryx_catalog.maki_nage.distogram import update as _update_distogram
-
-                    dist_bin_count = max(50, effective_bins * 5)
-                    global_d = Distogram(bin_count=dist_bin_count)
-                    for fmin, fmax, counts in s["file_hist_infos"]:
-                        fbins = len(counts)
-                        if fbins <= 0:
-                            continue
-                        temp = Distogram(bin_count=dist_bin_count)
-                        span = float(fmax - fmin) if fmax != fmin else 0.0
-                        for bi, cnt in enumerate(counts):
-                            if cnt <= 0:
-                                continue
-                            if span == 0.0:
-                                rep = float(fmin)
-                            else:
-                                rep = fmin + (bi + 0.5) * span / fbins
-                            _update_distogram(temp, float(rep), int(cnt))
-                        global_d = _merge_distogram(global_d, temp)
-
-                    distribution = [0] * effective_bins
-                    total = int(_count_dist(global_d) or 0)
-                    if total == 0:
-                        distribution = [0] * effective_bins
-                    else:
-                        prev = 0.0
-                        gmin = float(global_min)
-                        gmax = float(global_max)
-                        for i in range(1, effective_bins + 1):
-                            edge = gmin + (i / effective_bins) * (gmax - gmin)
-                            cum = _count_up_to(global_d, edge) or 0.0
-                            distribution[i - 1] = round(cum - prev)
-                            prev = cum
-                        diff = total - sum(distribution)
-                        if diff != 0:
-                            distribution[-1] += diff
-                except Exception as exc:  # noqa: BLE001 - vendored numeric code, fallback below
-                    # `maki_nage.distogram` is vendored third-party numeric
-                    # code; a merge or quantile step can fail on degenerate
-                    # inputs in ways not worth enumerating here. The block
-                    # below recomputes the same distribution by linear
-                    # interpolation, so this is a real fallback path, not a
-                    # swallowed error.
-                    logger.debug(
-                        "Distogram merge failed for %s.%s (%s); interpolating instead",
-                        self.identifier,
-                        cname,
-                        exc,
-                    )
-                    distribution = [0] * effective_bins
-                    gspan = float(global_max - global_min)
-                    for fmin, fmax, counts in s["file_hist_infos"]:
-                        fbins = len(counts)
-                        if fbins <= 0:
-                            continue
-                        for bi, cnt in enumerate(counts):
-                            if cnt <= 0:
-                                continue
-                            rep = fmin + (bi + 0.5) * (fmax - fmin) / fbins
-                            gi = int((rep - global_min) / gspan * effective_bins)
-                            gi = max(gi, 0)
-                            if gi >= effective_bins:
-                                gi = effective_bins - 1
-                            distribution[gi] += int(cnt)
+                distribution = _merged_distribution(
+                    s["file_hist_infos"], global_min, global_max, effective_bins
+                )
 
             element_cardinality, element_cardinality_is_exact = _kmv_cardinality(
                 s["element_hashes"]
@@ -4244,7 +4255,9 @@ class SimpleDataset(Dataset):
                 )
         files = {
             path: index_files(
-                f.path, file_bytes=f.file_bytes, footer_bytes=f.footer_bytes,
+                f.path,
+                file_bytes=f.file_bytes,
+                footer_bytes=f.footer_bytes,
                 logical_bytes=f.logical_bytes,
             )
             for path, f in files.items()
@@ -4269,7 +4282,11 @@ class SimpleDataset(Dataset):
                 entry = with_index_refs(entry, refs)
             updated.append(entry)
         return self._commit_manifest_rewrite(
-            updated, prev, operation="index-build", author=author, agent=agent,
+            updated,
+            prev,
+            operation="index-build",
+            author=author,
+            agent=agent,
             message=self._index_build_message(index_id, index_name, len(files)),
         )
 
@@ -4283,7 +4300,7 @@ class SimpleDataset(Dataset):
                     if definition.get("index-id") == index_id:
                         index_name = definition.get("name")
                         break
-            except Exception:
+            except Exception:  # noqa: BLE001 - cosmetic: the message falls back to the id
                 index_name = None
         return f"Indexed {count} file{'' if count == 1 else 's'} for vector index {index_name or index_id}"
 
@@ -4298,7 +4315,9 @@ class SimpleDataset(Dataset):
             e["file_path"]: frozenset(index_refs(e)) for e in self._parent_manifest_entries(snap)
         }
 
-    def vector_index_files(self, index_id: str, snapshot_id: int | None = None) -> dict[str, IndexFiles]:
+    def vector_index_files(
+        self, index_id: str, snapshot_id: int | None = None
+    ) -> dict[str, IndexFiles]:
         """{data file path: IndexFiles} for one index at a snapshot (the current one by
         default): the files it covers, with their index files and sizes - what a search
         reads. A live file absent here is not covered yet."""
@@ -4324,7 +4343,9 @@ class SimpleDataset(Dataset):
         if missing:
             raise ValueError(f"{self.identifier}: snapshot {snapshot_id} holds no {missing}")
         deletes = self.delete_vectors_for(entries)
-        return {e["file_path"]: (index_refs(e), tuple(deletes.get(e["file_path"], ()))) for e in entries}
+        return {
+            e["file_path"]: (index_refs(e), tuple(deletes.get(e["file_path"], ()))) for e in entries
+        }
 
     def vector_index_build_plan(self, index_id: str) -> list[IndexBuildTask]:
         """The live data files index `index_id` does not cover, in manifest order - the
@@ -4338,9 +4359,7 @@ class SimpleDataset(Dataset):
         prev = self.snapshot(None)
         if prev is None or not getattr(prev, "manifest_list", None):
             return []
-        pending = [
-            e for e in self._parent_manifest_entries(prev) if index_id not in index_refs(e)
-        ]
+        pending = [e for e in self._parent_manifest_entries(prev) if index_id not in index_refs(e)]
         deletes = self.delete_vectors_for(pending)
         tasks = []
         for entry in pending:
@@ -4348,10 +4367,14 @@ class SimpleDataset(Dataset):
             size = entry.get("file_size_in_bytes")
             if type(size) is not int or size <= 0:
                 raise ValueError(f"{self.identifier}: manifest entry {path!r} has no file size")
-            tasks.append(IndexBuildTask(
-                data_file=path, data_bytes=size, deleted=tuple(deletes.get(path, ())),
-                path=vector_index_path(self.metadata.location, index_id, path),
-            ))
+            tasks.append(
+                IndexBuildTask(
+                    data_file=path,
+                    data_bytes=size,
+                    deleted=tuple(deletes.get(path, ())),
+                    path=vector_index_path(self.metadata.location, index_id, path),
+                )
+            )
         return tasks
 
     def remove_vector_index_files(self, index_id: str, *, author: str) -> int | None:
@@ -4375,7 +4398,11 @@ class SimpleDataset(Dataset):
         if not changed:
             return None
         return self._commit_manifest_rewrite(
-            updated, prev, operation="index-drop", author=author, agent="drop-vector-index",
+            updated,
+            prev,
+            operation="index-drop",
+            author=author,
+            agent="drop-vector-index",
             message=f"vector index {index_id} dropped",
         )
 

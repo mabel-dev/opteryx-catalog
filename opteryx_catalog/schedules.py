@@ -65,7 +65,9 @@ def validate_schedule(schedule: str | None, time_zone: str | None = None) -> tup
     try:
         ZoneInfo(zone)
     except (ZoneInfoNotFoundError, ValueError, TypeError) as exc:
-        raise ValueError(f"unknown time zone: {time_zone!r}; use an IANA name such as 'Europe/London'") from exc
+        raise ValueError(
+            f"unknown time zone: {time_zone!r}; use an IANA name such as 'Europe/London'"
+        ) from exc
     return expression, zone
 
 
@@ -92,7 +94,9 @@ def occurrences_between(schedule: str, time_zone: str | None, start_ms: int, end
     if end_ms <= start_ms:
         return 0
     expression, zone = validate_schedule(schedule, time_zone)
-    walker = _croniter()(expression, datetime.fromtimestamp(int(start_ms) / 1000, tz=ZoneInfo(zone)))
+    walker = _croniter()(
+        expression, datetime.fromtimestamp(int(start_ms) / 1000, tz=ZoneInfo(zone))
+    )
     count = 0
     while count < MAX_OCCURRENCES_COUNTED:
         following = int(walker.get_next(datetime).timestamp() * 1000)

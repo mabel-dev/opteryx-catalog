@@ -158,7 +158,9 @@ def _workspace_of(doc) -> str | None:
         return None
 
 
-def workspaces_billed_to(firestore_client, account_id: str, *, limit: int | None = None) -> list[str]:
+def workspaces_billed_to(
+    firestore_client, account_id: str, *, limit: int | None = None
+) -> list[str]:
     """Every workspace whose index points at `account_id`, by name.
 
     `limit=1` is the account-deactivation guard's "is anything still attached?"

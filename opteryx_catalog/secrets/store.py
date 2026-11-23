@@ -115,7 +115,7 @@ class SecretMaterial:
     dump.
     """
 
-    __slots__ = ("workspace", "name", "secret_type", "scope", "_payload")
+    __slots__ = ("_payload", "name", "scope", "secret_type", "workspace")
 
     def __init__(self, workspace: str, name: str, secret_type: str, scope, payload: dict):
         self.workspace = workspace
@@ -295,7 +295,8 @@ class SecretsMixin:
     def list_secrets(self) -> list[dict]:
         """Every secret in the workspace, without key material, by name (SHOW SECRETS)."""
         records = [
-            _public_fields(doc.id, doc.to_dict() or {}) for doc in self._secrets_collection().stream()
+            _public_fields(doc.id, doc.to_dict() or {})
+            for doc in self._secrets_collection().stream()
         ]
         return sorted(records, key=lambda record: record["name"])
 
@@ -344,7 +345,7 @@ class SecretsMixin:
 
         try:
             self._stamp_secret_use(doc_ref)
-        except Exception as err:  # the audit record below is the durable trail
+        except Exception as err:  # noqa: BLE001 - the audit record below is the durable trail
             logger.warning("could not stamp use of secret %s: %s", reference, type(err).__name__)
 
         emit_audit(

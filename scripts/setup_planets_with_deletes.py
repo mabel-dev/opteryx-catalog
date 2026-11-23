@@ -43,10 +43,8 @@ def _read_file_morsel(io, file_path: str):
     inp = io.new_input(file_path)
     with inp.open() as f:
         data = f.read()
-    morsels = []
     with read_parquet(bytes(data)) as reader:
-        for morsel in reader:
-            morsels.append(morsel)
+        morsels = list(reader)
     if not morsels:
         raise ValueError(f"{file_path} decoded to no row groups")
     return morsels[0] if len(morsels) == 1 else morsels[0].combine(morsels)

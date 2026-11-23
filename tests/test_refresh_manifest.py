@@ -624,9 +624,7 @@ def test_element_count_counts_elements_not_lists():
     from opteryx_catalog.catalog.dataset import _kmv_cardinality
 
     # Three lists, but only two distinct elements between them.
-    morsel = _make_test_morsel(
-        [("tags", "ARRAY")], [(["x", "y"],), (["x"],), (["y", "x"],)]
-    )
+    morsel = _make_test_morsel([("tags", "ARRAY")], [(["x", "y"],), (["x"],), (["y", "x"],)])
     entry = _entry_from_morsel(morsel)
     assert _kmv_cardinality(entry.element_min_k_hashes[0]) == (2, True)
 
@@ -654,9 +652,7 @@ def test_both_builders_agree_on_element_stats():
     )
     data = write_parquet(morsel, compression="zstd")
     from_bytes = _entry_from_morsel(morsel)
-    from_morsel = build_parquet_manifest_entry_from_morsel(
-        morsel, data, "f.parquet", len(data)
-    )
+    from_morsel = build_parquet_manifest_entry_from_morsel(morsel, data, "f.parquet", len(data))
 
     assert from_bytes.element_min_values == from_morsel.element_min_values
     assert from_bytes.element_max_values == from_morsel.element_max_values
