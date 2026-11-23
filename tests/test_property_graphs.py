@@ -96,3 +96,139 @@ def test_a_view_and_a_task_cannot_take_a_graph_name():
         catalog.create_view("ops.g", "SELECT 1", author="alice")
     with pytest.raises(NameInUse, match="already exists as a property graph"):
         catalog.create_task("ops.g", sql="SELECT 1", author="alice")
+
+
+# --- The definition, taken apart: what a reader draws the graph from ---
+
+# Exactly what the engine's binder renders (`_Element.rendered()`): properties
+# as (column, name) pairs, endpoints as (key, vertex, references) triples.
+VERTICES = [
+    {
+        "relation": ["ws", "ops", "people"],
+        "name": "p",
+        "key": ["id"],
+        "label": "Person",
+        "properties": [("id", "id"), ("full_name", "name")],
+    },
+    {
+        "relation": ["ws", "ops", "cities"],
+        "name": "c",
+        "key": ["id"],
+        "label": "City",
+        "properties": [],
+    },
+]
+EDGES = [
+    {
+        "relation": ["ws", "ops", "lives_in"],
+        "name": "l",
+        "key": ["person_id", "city_id"],
+        "label": "LivesIn",
+        "properties": [("since", "since")],
+        "source": (["person_id"], "p", ["id"]),
+        "destination": (["city_id"], "c", ["id"]),
+    }
+]
+
+
+def _nested_arrays(value) -> bool:
+    """True if any list sits directly inside a list - which Firestore refuses."""
+    if isinstance(value, dict):
+        return any(_nested_arrays(v) for v in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(isinstance(v, (list, tuple)) or _nested_arrays(v) for v in value)
+    return False
+
+
+def test_element_tables_are_stored_beside_the_statement():
+    catalog = _catalog()
+    catalog.create_property_graph(
+        "ops.g", STATEMENT, author="alice", vertex_tables=VERTICES, edge_tables=EDGES
+    )
+    record = catalog.load_property_graph("ops.g")
+
+    assert record["statement"] == STATEMENT
+    assert record["vertex-tables"][0] == {
+        "name": "p",
+        "label": "Person",
+        "relation": ["ws", "ops", "people"],
+        "key": ["id"],
+        "properties": [
+            {"column": "id", "name": "id"},
+            {"column": "full_name", "name": "name"},
+        ],
+    }
+    (edge,) = record["edge-tables"]
+    assert edge["source"] == {"vertex": "p", "key": ["person_id"], "references": ["id"]}
+    assert edge["destination"] == {"vertex": "c", "key": ["city_id"], "references": ["id"]}
+    assert not _nested_arrays(record)
+
+
+def test_a_caller_without_elements_stores_none_and_a_redefinition_drops_them():
+    catalog = _catalog()
+    catalog.create_property_graph("ops.old", STATEMENT, author="alice")
+    assert "vertex-tables" not in catalog.load_property_graph("ops.old")
+
+    catalog.create_property_graph(
+        "ops.g", STATEMENT, author="alice", vertex_tables=VERTICES, edge_tables=EDGES
+    )
+    catalog.create_property_graph("ops.g", STATEMENT, author="alice", update_if_exists=True)
+    record = catalog.load_property_graph("ops.g")
+    assert "vertex-tables" not in record and "edge-tables" not in record
+
+
+def test_a_graph_with_no_edges_records_an_empty_edge_list():
+    catalog = _catalog()
+    catalog.create_property_graph(
+        "ops.g", STATEMENT, author="alice", vertex_tables=VERTICES[:1], edge_tables=[]
+    )
+    assert catalog.load_property_graph("ops.g")["edge-tables"] == []
+
+
+@pytest.mark.parametrize(
+    "vertices, edges, message",
+    [
+        (VERTICES, None, "given together"),
+        (None, EDGES, "given together"),
+        ([], [], "at least one vertex table"),
+        (VERTICES, [{**EDGES[0], "source": (["person_id"], "nobody", ["id"])}], "not a vertex"),
+        (VERTICES, [{**EDGES[0], "destination": None}], r"\(key, vertex, references\)"),
+        ([{**VERTICES[0], "key": "id"}], [], "list of strings"),
+        ([{**VERTICES[0], "properties": [("id",)]}], [], r"\(column, name\) pair"),
+    ],
+)
+def test_malformed_element_tables_refuse_the_whole_create(vertices, edges, message, capsys):
+    catalog = _catalog()
+    with pytest.raises(ValueError, match=message):
+        catalog.create_property_graph(
+            "ops.g", STATEMENT, author="alice", vertex_tables=vertices, edge_tables=edges
+        )
+    assert not catalog.property_graph_exists("ops.g")
+    assert _audit(capsys) == []
+
+
+def test_list_property_graphs():
+    catalog = _catalog()
+    assert catalog.list_property_graphs("ops") == []
+    catalog.create_property_graph("ops.a", STATEMENT, author="alice")
+    catalog.create_property_graph("ops.b", STATEMENT, author="alice")
+    catalog.create_view("ops.v", "SELECT 1", author="alice")
+    catalog.drop_property_graph("ops.a", author="alice")
+    assert catalog.list_property_graphs("ops") == ["b"]
+
+
+@pytest.mark.parametrize("kind", ["property graph", "task"])
+def test_a_collection_holding_a_graph_or_task_cannot_be_dropped(kind):
+    """Firestore does not cascade a document delete to its subcollections, so
+    dropping the collection document would strand these as ghost paths."""
+    from opteryx_catalog.exceptions import CollectionNotEmpty
+
+    catalog = _catalog()
+    catalog._collection_ref("ops").set({})
+    if kind == "task":
+        catalog.create_task("ops.k", sql="SELECT 1", author="alice")
+    else:
+        catalog.create_property_graph("ops.g", STATEMENT, author="alice")
+    with pytest.raises(CollectionNotEmpty):
+        catalog.drop_collection("ops", author="alice")
+    assert catalog._collection_ref("ops").get().exists

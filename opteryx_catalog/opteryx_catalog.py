@@ -1001,6 +1001,83 @@ def _refuse_resurrection(stored_doc, document: dict) -> None:
         )
 
 
+def _graph_strings(value: Any, what: str) -> list[str]:
+    if not isinstance(value, (list, tuple)) or not all(isinstance(v, str) for v in value):
+        raise ValueError(f"{what} must be a list of strings, got {value!r}")
+    return list(value)
+
+
+def _graph_element(element: dict, edge: bool, vertex_names: frozenset) -> dict:
+    """One element table, from the binder's rendering to the stored shape.
+
+    The binder renders properties as `(column, name)` pairs and each endpoint as
+    a `(key, vertex, references)` triple. Firestore refuses an array directly
+    inside an array, so pairs and triples become maps here; a list of strings
+    inside a map inside an array is fine.
+    """
+    # Every malformed shape is a ValueError, type or not: one refusal for "this
+    # is not a graph definition", as `create_property_graph` documents.
+    if not isinstance(element, dict):
+        raise ValueError(f"an element table must be a dict, got {element!r}")  # noqa: TRY004
+    name, label = element.get("name"), element.get("label")
+    if not isinstance(name, str) or not isinstance(label, str):
+        raise ValueError(f"an element table needs a string name and label, got {element!r}")  # noqa: TRY004
+    properties = []
+    for pair in element.get("properties") or []:
+        if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+            raise ValueError(f"`{name}` property must be a (column, name) pair, got {pair!r}")
+        column, alias = _graph_strings(pair, f"`{name}` property")
+        properties.append({"column": column, "name": alias})
+    stored = {
+        "name": name,
+        "label": label,
+        # Parts, not a dotted string: a collection may itself be dotted, and a
+        # reader linking to the table's page needs to know where it splits.
+        "relation": _graph_strings(element.get("relation"), f"`{name}` relation"),
+        "key": _graph_strings(element.get("key"), f"`{name}` key"),
+        "properties": properties,
+    }
+    if not edge:
+        return stored
+    for end in ("source", "destination"):
+        triple = element.get(end)
+        if not isinstance(triple, (list, tuple)) or len(triple) != 3:
+            raise ValueError(
+                f"edge `{name}` {end} must be (key, vertex, references), got {triple!r}"
+            )
+        key, vertex, references = triple
+        if vertex not in vertex_names:
+            # The one cross-reference a reader relies on to draw the edge at all.
+            raise ValueError(f"edge `{name}` {end} names `{vertex}`, which is not a vertex table")
+        stored[end] = {
+            "vertex": vertex,
+            "key": _graph_strings(key, f"edge `{name}` {end} key"),
+            "references": _graph_strings(references, f"edge `{name}` {end} references"),
+        }
+    return stored
+
+
+def _property_graph_elements(vertex_tables: list, edge_tables: list) -> dict:
+    """The `vertex-tables` / `edge-tables` fields of a property graph record.
+
+    This is the engine's bound definition, re-shaped for Firestore and checked
+    only as far as a reader depends on it (strings where strings are expected,
+    every endpoint naming a vertex table of this graph). Column existence, key
+    validity, and name/label uniqueness are the binder's job and are not
+    repeated here - the catalog has no schema to check them against.
+    """
+    if not isinstance(vertex_tables, (list, tuple)) or not vertex_tables:
+        raise ValueError("a property graph needs at least one vertex table")
+    if not isinstance(edge_tables, (list, tuple)):
+        raise ValueError(f"edge_tables must be a list, got {edge_tables!r}")  # noqa: TRY004
+    vertices = [_graph_element(v, False, frozenset()) for v in vertex_tables]
+    vertex_names = frozenset(v["name"] for v in vertices)
+    return {
+        "vertex-tables": vertices,
+        "edge-tables": [_graph_element(e, True, vertex_names) for e in edge_tables],
+    }
+
+
 class OpteryxCatalog(SecretsMixin, Metastore):
     """Firestore-backed Metastore implementation.
 
@@ -3616,9 +3693,17 @@ class OpteryxCatalog(SecretsMixin, Metastore):
         if data.get("locked-by") is not None:
             raise CollectionLocked(f"Collection is locked: {collection}")
 
-        if any(True for _ in self._datasets_collection(collection).stream()) or any(
-            True for _ in self._views_collection(collection).stream()
-        ):
+        # Every kind of object that lives under the collection document. Deleting
+        # the document does not cascade to its subcollections in Firestore, so a
+        # kind left off this list survives the drop as a ghost path: unlisted,
+        # yet still holding its name (see integrity.py).
+        holders = (
+            self._datasets_collection,
+            self._views_collection,
+            self._property_graphs_collection,
+            self._tasks_collection,
+        )
+        if any(any(True for _ in holder(collection).stream()) for holder in holders):
             raise CollectionNotEmpty(f"Collection is not empty: {collection}")
 
         doc_ref.delete()
@@ -3916,9 +4001,17 @@ class OpteryxCatalog(SecretsMixin, Metastore):
     #
     # A property graph is catalog TEXT, like a view: the engine validates the
     # definition against its tables and hands over the canonical CREATE PROPERTY
-    # GRAPH statement (every key, endpoint, label and property written out), which
-    # is all that is stored. Unlike a view it keeps no statement history: a graph
-    # owns no data and its definition is replaced whole.
+    # GRAPH statement (every key, endpoint, label and property written out). Unlike
+    # a view it keeps no statement history: a graph owns no data and its
+    # definition is replaced whole.
+    #
+    # The statement is the definition. Beside it the engine may also hand over
+    # the same definition already taken apart - `vertex-tables` and
+    # `edge-tables`, see `_property_graph_elements` - because the binder has it
+    # in that form anyway and every reader that wants to DRAW a graph (the
+    # Studio, OData) would otherwise have to parse SQL to get it back. It is a
+    # projection of the statement, written from the same bind, never edited on
+    # its own.
 
     @staticmethod
     def _property_graph_parts(identifier: str | tuple) -> tuple[str, str]:
@@ -3934,15 +4027,38 @@ class OpteryxCatalog(SecretsMixin, Metastore):
         author: str | None = None,
         update_if_exists: bool = False,
         description: str | None = None,
+        vertex_tables: list[dict] | None = None,
+        edge_tables: list[dict] | None = None,
     ) -> dict:
         """Store a property graph's canonical definition; returns the stored record.
 
+        `vertex_tables` and `edge_tables` are the bound element tables exactly
+        as the engine's binder renders them (`_Element.rendered()`), stored as
+        `vertex-tables` / `edge-tables` in a Firestore-safe shape. Both or
+        neither: `None` for both is a caller that predates the fields, and the
+        record then carries no structure at all - absent means "not recorded",
+        which a reader must not mistake for a graph with no edges. Because the
+        record is replaced whole, a redefinition that omits them also drops
+        the previous structure rather than leaving it to contradict the new
+        statement.
+
         Raises `PropertyGraphAlreadyExists` when the graph exists and
-        `update_if_exists` is False, and `NameInUse` when another kind of
-        object holds the name.
+        `update_if_exists` is False, `NameInUse` when another kind of object
+        holds the name, and `ValueError` for malformed element tables.
         """
         if author is None:
             raise ValueError("author must be provided when creating a property graph")
+        if (vertex_tables is None) != (edge_tables is None):
+            raise ValueError(
+                "vertex_tables and edge_tables describe one graph and are given together"
+            )
+        # Shape-checked before anything is read or written, so a malformed
+        # structure refuses the whole create rather than landing half a record.
+        elements = (
+            _property_graph_elements(vertex_tables, edge_tables)
+            if vertex_tables is not None
+            else {}
+        )
         collection, graph_name = self._property_graph_parts(identifier)
         doc_ref = self._property_graph_doc_ref(collection, graph_name)
         self.assert_name_free(collection, graph_name, "property graph")
@@ -3960,6 +4076,7 @@ class OpteryxCatalog(SecretsMixin, Metastore):
             "author": author,
             "description": description,
             "timestamp-ms": int(time.time() * 1000),
+            **elements,
         }
         doc_ref.set(record)
 
@@ -3987,6 +4104,10 @@ class OpteryxCatalog(SecretsMixin, Metastore):
     def property_graph_exists(self, identifier: str | tuple) -> bool:
         collection, graph_name = self._property_graph_parts(identifier)
         return self._property_graph_doc_ref(collection, graph_name).get().exists
+
+    def list_property_graphs(self, collection: str) -> list[str]:
+        """Names of the property graphs in a collection."""
+        return [doc.id for doc in self._property_graphs_collection(collection).stream()]
 
     def drop_property_graph(self, identifier: str | tuple, author: str | None = None) -> None:
         """Drop a property graph. It owns no storage, so nothing is reclaimed.
